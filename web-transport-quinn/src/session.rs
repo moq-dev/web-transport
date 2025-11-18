@@ -176,7 +176,12 @@ impl Session {
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
         // Also the header is very important for determining the session ID without reliable reset.
         send.set_priority(i32::MAX).ok();
+        let hex_str: String = self.header_bi.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+        let stream_id_u64: u64 = send.id().into();
+        println!("open_bi: Created QUIC stream ID: {} (index={}, {}), writing header ({} bytes): [{}]",
+            stream_id_u64, send.id().index(), send.id(), self.header_bi.len(), hex_str);
         Self::write_full(&mut send, &self.header_bi).await?;
+        println!("open_bi: QUIC stream ID {} header written successfully", stream_id_u64);
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
@@ -452,6 +457,7 @@ impl SessionAccept {
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next_unpin(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
                 let (send, recv) = res?;
+                println!("poll_accept_bi: Accepted stream ID: {}, queuing for decode", recv.id());
                 let pending = Self::decode_bi(send, recv, self.session_id);
                 self.pending_bi.push(Box::pin(pending));
 
@@ -471,6 +477,7 @@ impl SessionAccept {
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
+                println!("poll_accept_bi: Returning validated stream ID: {} to application", recv.id());
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
                 return Poll::Ready(Ok((send, recv)));
@@ -486,10 +493,13 @@ impl SessionAccept {
         mut recv: quinn::RecvStream,
         expected_session: VarInt,
     ) -> Result<Option<(quinn::SendStream, quinn::RecvStream)>, SessionError> {
+        println!("decode_bi: START - stream ID: {}", recv.id());
         let typ = VarInt::read(&mut recv)
             .await
             .map_err(|_| WebTransportError::UnknownSession)?;
+        println!("decode_bi: Stream {} - read type byte: 0x{:02x} (expected WEBTRANSPORT = 0x41)", recv.id(), typ.into_inner());
         if Frame(typ) != Frame::WEBTRANSPORT {
+            println!("decode_bi: Stream {} - type mismatch! Got 0x{:02x}, ignoring stream", recv.id(), typ.into_inner());
             log::debug!("ignoring unknown bidirectional stream: {typ:?}");
             return Ok(None);
         }
@@ -498,10 +508,13 @@ impl SessionAccept {
         let session_id = VarInt::read(&mut recv)
             .await
             .map_err(|_| WebTransportError::UnknownSession)?;
+        println!("decode_bi: Stream {} - read session_id: {}, expected: {}", recv.id(), session_id.into_inner(), expected_session.into_inner());
         if session_id != expected_session {
+            println!("decode_bi: Stream {} - session ID mismatch!", recv.id());
             return Err(WebTransportError::UnknownSession.into());
         }
 
+        println!("decode_bi: Stream {} - SUCCESS, returning to application", recv.id());
         Ok(Some((send, recv)))
     }
 }
