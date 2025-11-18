@@ -15,7 +15,7 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: quinn::RecvStream) -> Self {
+    pub fn new(stream: quinn::RecvStream) -> Self {
         Self { inner: stream }
     }
 

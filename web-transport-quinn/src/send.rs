@@ -18,7 +18,7 @@ pub struct SendStream {
 }
 
 impl SendStream {
-    pub(crate) fn new(stream: quinn::SendStream) -> Self {
+    pub fn new(stream: quinn::SendStream) -> Self {
         Self { stream }
     }
 
