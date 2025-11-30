@@ -93,19 +93,35 @@ impl Session {
     }
 
     // Keep reading from the control stream until it's closed.
+    // NOTE: We must keep the send half alive to prevent sending FIN to the peer.
     async fn run_closed(&mut self, connect: Connect) -> (u32, String) {
-        let (_send, mut recv) = connect.into_inner();
+        let (_send_keep_alive, mut recv) = connect.into_inner();
+
+        // Log when the capsule reader starts
+        log::debug!("WebTransport capsule reader started, waiting for capsules on CONNECT stream");
 
         loop {
             match web_transport_proto::Capsule::read(&mut recv).await {
                 Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
+                    log::info!("WebTransport session closed gracefully: code={}, reason={}", code, reason);
                     return (code, reason);
                 }
                 Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
                     log::warn!("unknown capsule: type={typ} size={}", payload.len());
                 }
-                Err(_) => {
-                    return (1, "capsule error".to_string());
+                Err(e) => {
+                    // Distinguish between expected and unexpected stream closure.
+                    // UnexpectedEnd typically means the peer closed the CONNECT stream,
+                    // which is a valid way to end the WebTransport session (graceful close).
+                    // Other errors (parse errors, connection errors) are true errors.
+                    let error_str = format!("{e:?}");
+                    if error_str.contains("UnexpectedEnd") {
+                        log::info!("WebTransport CONNECT stream closed by peer (graceful)");
+                        return (0, "session closed".to_string());
+                    } else {
+                        log::error!("WebTransport CONNECT stream capsule read error: {e:?}");
+                        return (1, format!("capsule error: {e:?}"));
+                    }
                 }
             }
         }
