@@ -42,7 +42,7 @@ impl Connect {
         let (send, mut recv) = conn.accept_bi().await?;
 
         let request = web_transport_proto::ConnectRequest::read(&mut recv).await?;
-        log::debug!("received CONNECT request: {request:?}");
+        tracing::debug!(?request, "received CONNECT request");
 
         // The request was successfully decoded, so we can send a response.
         Ok(Self {
@@ -56,7 +56,7 @@ impl Connect {
     pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
         let resp = ConnectResponse { status };
 
-        log::debug!("sending CONNECT response: {resp:?}");
+        tracing::debug!(?resp, "sending CONNECT response");
         resp.write(&mut self.send).await?;
 
         Ok(())
@@ -69,11 +69,11 @@ impl Connect {
         // Create a new CONNECT request that we'll send using HTTP/3
         let request = ConnectRequest { url };
 
-        log::debug!("sending CONNECT request: {request:?}");
+        tracing::debug!(?request, "sending CONNECT request");
         request.write(&mut send).await?;
 
         let response = web_transport_proto::ConnectResponse::read(&mut recv).await?;
-        log::debug!("received CONNECT response: {response:?}");
+        tracing::debug!(?response, "received CONNECT response");
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {

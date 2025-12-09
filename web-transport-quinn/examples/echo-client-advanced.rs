@@ -19,8 +19,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Enable info logging.
-    let env = env_logger::Env::default().default_filter_or("info");
-    env_logger::init_from_env(env);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
 
     let args = Args::parse();
 
@@ -54,27 +58,27 @@ async fn main() -> anyhow::Result<()> {
     let client = web_transport_quinn::Client::new(client, config);
 
     // Connect to the given URL.
-    log::info!("connecting to {}", args.url);
+    tracing::info!(url = %args.url, "connecting");
     let session = client.connect(args.url).await?;
 
-    log::info!("connected");
+    tracing::info!("connected");
 
     // Create a bidirectional stream.
     let (mut send, mut recv) = session.open_bi().await?;
 
-    log::info!("created stream");
+    tracing::info!("created stream");
 
     // Send a message.
     let msg = "hello world".to_string();
     send.write_all(msg.as_bytes()).await?;
-    log::info!("sent: {msg}");
+    tracing::info!(%msg, "sent");
 
     // Shut down the send stream.
     send.finish()?;
 
     // Read back the message.
     let msg = recv.read_to_end(1024).await?;
-    log::info!("recv: {}", String::from_utf8_lossy(&msg));
+    tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
     Ok(())
 }

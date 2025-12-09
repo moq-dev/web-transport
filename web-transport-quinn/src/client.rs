@@ -77,13 +77,13 @@ impl ClientBuilder {
 
         // Log any errors that occurred while loading the native root certificates.
         for err in native.errors {
-            log::warn!("failed to load root cert: {err:?}");
+            tracing::warn!(?err, "failed to load root cert");
         }
 
         // Add the platform's native root certificates.
         for cert in native.certs {
             if let Err(err) = roots.add(cert) {
-                log::warn!("failed to add root cert: {err:?}");
+                tracing::warn!(?err, "failed to add root cert");
             }
         }
 
