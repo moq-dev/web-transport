@@ -34,7 +34,7 @@ The only requirement is that the ALPN is set to `web_transport_quinn::ALPN` (aka
 Afterwards, you use [web_transport_quinn::accept](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.accept.html) (as a server) or [web_transport_quinn::connect](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.connect.html) (as a client) to establish a WebTransport session.
 This will take over the QUIC connection and perform the boring HTTP/3 handshake for you.
 
-See the [examples](examples) or [moq-native](https://github.com/kixelated/moq-rs/blob/main/moq-native/src/quic.rs) for a full setup.
+See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/blob/main/moq-native/src/quic.rs) for a full setup.
 
 ```rust
     // Create a QUIC client.
