@@ -102,7 +102,7 @@ impl Session {
                     return (code, reason);
                 }
                 Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
-                    log::warn!("unknown capsule: type={typ} size={}", payload.len());
+                    tracing::warn!(%typ, size = payload.len(), "unknown capsule");
                 }
                 Err(_) => {
                     return (1, "capsule error".to_string());
@@ -392,7 +392,7 @@ impl SessionAccept {
                 Some(Ok(res)) => res,
                 Some(Err(err)) => {
                     // Ignore the error, the stream was probably reset early.
-                    log::warn!("failed to decode unidirectional stream: {err:?}");
+                    tracing::warn!(?err, "failed to decode unidirectional stream");
                     continue;
                 }
                 None => return Poll::Pending,
@@ -412,7 +412,7 @@ impl SessionAccept {
                 }
                 _ => {
                     // ignore unknown streams
-                    log::debug!("ignoring unknown unidirectional stream: {typ:?}");
+                    tracing::debug!(?typ, "ignoring unknown unidirectional stream");
                 }
             }
         }
@@ -463,7 +463,7 @@ impl SessionAccept {
                 Some(Ok(res)) => res,
                 Some(Err(err)) => {
                     // Ignore the error, the stream was probably reset early.
-                    log::warn!("failed to decode bidirectional stream: {err:?}");
+                    tracing::warn!(?err, "failed to decode bidirectional stream");
                     continue;
                 }
                 None => return Poll::Pending,
@@ -490,7 +490,7 @@ impl SessionAccept {
             .await
             .map_err(|_| WebTransportError::UnknownSession)?;
         if Frame(typ) != Frame::WEBTRANSPORT {
-            log::debug!("ignoring unknown bidirectional stream: {typ:?}");
+            tracing::debug!(?typ, "ignoring unknown bidirectional stream");
             return Ok(None);
         }
 

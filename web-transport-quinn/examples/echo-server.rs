@@ -24,8 +24,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Enable info logging.
-    let env = env_logger::Env::default().default_filter_or("info");
-    env_logger::init_from_env(env);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
 
     let args = Args::parse();
 
@@ -52,14 +56,14 @@ async fn main() -> anyhow::Result<()> {
         .with_addr(args.addr)
         .with_certificate(chain, key)?;
 
-    log::info!("listening on {}", args.addr);
+    tracing::info!(addr = %args.addr, "listening");
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {
         tokio::spawn(async move {
             let err = run_conn(conn).await;
             if let Err(err) = err {
-                log::error!("connection failed: {err}")
+                tracing::error!(?err, "connection failed")
             }
         });
     }
@@ -70,15 +74,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
-    log::info!("received WebTransport request: {}", request.url());
+    tracing::info!(url = %request.url(), "received WebTransport request");
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
-    log::info!("accepted session");
+    tracing::info!("accepted session");
 
     // Run the session
     if let Err(err) = run_session(session).await {
-        log::info!("closing session: {err}");
+        tracing::info!(?err, "closing session");
     }
 
     Ok(())
@@ -90,25 +94,25 @@ async fn run_session(session: Session) -> anyhow::Result<()> {
         tokio::select! {
             res = session.accept_bi() => {
                 let (mut send, mut recv) = res?;
-                log::info!("accepted stream");
+                tracing::info!("accepted stream");
 
                 // Read the message and echo it back.
                 let msg = recv.read_to_end(1024).await?;
-                log::info!("recv: {}", String::from_utf8_lossy(&msg));
+                tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
                 send.write_all(&msg).await?;
-                log::info!("send: {}", String::from_utf8_lossy(&msg));
+                tracing::info!(msg = %String::from_utf8_lossy(&msg), "send");
             },
             res = session.read_datagram() => {
                 let msg = res?;
-                log::info!("accepted datagram");
-                log::info!("recv: {}", String::from_utf8_lossy(&msg));
+                tracing::info!("accepted datagram");
+                tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
                 session.send_datagram(msg.clone())?;
-                log::info!("send: {}", String::from_utf8_lossy(&msg));
+                tracing::info!(msg = %String::from_utf8_lossy(&msg), "send");
             },
         };
 
-        log::info!("echo successful!");
+        tracing::info!("echo successful");
     }
 }
