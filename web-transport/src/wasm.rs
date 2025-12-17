@@ -23,12 +23,6 @@ impl ClientBuilder {
         }
     }
 
-    pub fn with_unreliable(self, val: bool) -> Self {
-        Self {
-            inner: self.inner.with_unreliable(val),
-        }
-    }
-
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
             inner: self.inner.with_congestion_control(cc),

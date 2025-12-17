@@ -17,13 +17,6 @@ impl ClientBuilder {
         Self::default()
     }
 
-    /// For compatibility with WASM. Panics if `val` is false, but does nothing else.
-    pub fn with_unreliable(self, val: bool) -> Self {
-        Self {
-            inner: self.inner.with_unreliable(val),
-        }
-    }
-
     /// Allow a lower latency congestion controller.
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
