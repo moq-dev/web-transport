@@ -259,8 +259,8 @@ impl RecvStream {
         let dst = unsafe { &mut *(dst as *mut _ as *mut [u8]) };
 
         let size = match self.inner.read(dst).await? {
-            Some(size) => size,
-            None => return Ok(None),
+            Some(size) if size > 0 => size,
+            _ => return Ok(None),
         };
 
         unsafe { buf.advance_mut(size) };
