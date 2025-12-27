@@ -195,8 +195,8 @@ pub trait RecvStream: MaybeSend {
                 std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
             };
             let size = match self.read(dst).await? {
-                Some(size) => size,
-                None => return Ok(None),
+                Some(size) if size > 0 => size,
+                _ => return Ok(None),
             };
 
             unsafe { buf.advance_mut(size) };
@@ -253,8 +253,8 @@ pub trait RecvStream: MaybeSend {
             let mut size = 0;
             while buf.has_remaining_mut() {
                 match self.read_buf(buf).await? {
-                    Some(n) => size += n,
-                    None => break,
+                    Some(n) if n > 0 => size += n,
+                    _ => break,
                 }
             }
             Ok(size)

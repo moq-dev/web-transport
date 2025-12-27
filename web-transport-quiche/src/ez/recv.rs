@@ -282,11 +282,11 @@ impl RecvStream {
             })
             .await?
         {
-            Some(n) => {
+            Some(n) if n > 0 => {
                 unsafe { buf.advance_mut(n) };
                 Ok(Some(n))
             }
-            None => Ok(None),
+            _ => Ok(None),
         }
     }
 
