@@ -1,0 +1,18 @@
+[package]
+name = "web-transport-any"
+description = "Concrete wrapper for all known WebTransport implementors."
+authors = ["Luke Curley", "Jeremy Hiatt"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.0"
+edition = "2021"
+
+keywords = ["quic", "http3", "webtransport", "websocket"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+bytes = "1"
+web-transport-trait = { workspace = true }
+web-transport-quinn = { path = "../web-transport-quinn" }
+web-transport-ws = { path = "../web-transport-ws" }

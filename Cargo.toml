@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "web-transport",
+    "web-transport-any",
     "web-transport-proto",
     "web-transport-quiche",
     "web-transport-quinn",
@@ -11,5 +12,6 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+web-transport-any = { path = "web-transport-any", version = "0.1" }
 web-transport-proto = { path = "web-transport-proto", version = "0.3" }
 web-transport-trait = { path = "web-transport-trait", version = "0.3" }
