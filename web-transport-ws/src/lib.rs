@@ -3,10 +3,10 @@ mod frame;
 mod session;
 mod stream;
 
-pub(crate) use error::*;
 pub(crate) use frame::*;
 pub(crate) use stream::*;
 
+pub use error::*;
 pub use session::*;
 pub use tokio_tungstenite;
 pub use tokio_tungstenite::tungstenite;
