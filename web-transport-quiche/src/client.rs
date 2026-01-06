@@ -7,7 +7,7 @@ use crate::{
 };
 
 /// An error returned when connecting to a WebTransport endpoint.
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug)]
 pub enum ClientError {
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),

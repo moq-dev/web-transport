@@ -7,7 +7,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered};
 use crate::{ez, h3};
 
 /// An error returned when receiving a new WebTransport session.
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug)]
 pub enum ServerError {
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
