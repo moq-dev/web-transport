@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{ConnectError, SettingsError};
 
 /// An error returned when connecting to a WebTransport endpoint.
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum ClientError {
     #[error("unexpected end of stream")]
     UnexpectedEnd,
@@ -201,7 +201,7 @@ impl From<quinn::ClosedStream> for ClosedStream {
 }
 
 /// An error returned when receiving a new WebTransport session.
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum ServerError {
     #[error("unexpected end of stream")]
     UnexpectedEnd,
@@ -218,7 +218,7 @@ pub enum ServerError {
     #[error("failed to exchange h3 settings")]
     SettingsError(#[from] SettingsError),
 
-    #[error("failed to exchange h3 connect")]
+    #[error("failed to exchange h3 connect: {0}")]
     ConnectError(#[from] ConnectError),
 
     #[error("io error: {0}")]

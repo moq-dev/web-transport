@@ -1,14 +1,16 @@
+use std::ops::Deref;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use std::sync::Arc;
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use http::{header::GetAll, HeaderMap, HeaderValue};
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use url::Url;
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
-use crate::{Connect, ServerError, Session, Settings};
+use crate::{protocol_negotation, Connect, ServerError, Session, Settings};
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Server] using sane defaults.
@@ -91,6 +93,14 @@ pub struct Server {
     accept: FuturesUnordered<BoxFuture<'static, Result<Request, ServerError>>>,
 }
 
+impl Deref for Server {
+    type Target = quinn::Endpoint;
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoint
+    }
+}
+
 impl Server {
     /// Manaully create a new server with a manually constructed Endpoint.
     ///
@@ -108,9 +118,13 @@ impl Server {
             tokio::select! {
                 res = self.endpoint.accept() => {
                     let conn = res?;
+                    log::debug!("new connection request {}", conn.remote_address());
                     self.accept.push(Box::pin(async move {
                         let conn = conn.await?;
-                        Request::accept(conn).await
+                        let addr = conn.remote_address();
+                        Request::accept(conn).await.inspect_err(|err| {
+                            log::error!("[{addr}] Error accepting connection: {err}");
+                        })
                     }));
                 }
                 Some(res) = self.accept.next() => {
@@ -133,11 +147,18 @@ pub struct Request {
 impl Request {
     /// Accept a new WebTransport session from a client.
     pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
+        log::debug!("[{}] New connection request", conn.remote_address());
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
+        log::debug!("[{}] Settings handled", conn.remote_address());
 
         // Accept the CONNECT request but don't send a response yet.
         let connect = Connect::accept(&conn).await?;
+        log::debug!(
+            "[{}] New connection  accepted  {:?}",
+            conn.remote_address(),
+            connect.url()
+        );
 
         // Return the resulting request with a reference to the settings/connect streams.
         Ok(Self {
@@ -152,9 +173,29 @@ impl Request {
         self.connect.url()
     }
 
+    pub fn subprotocols(&self) -> GetAll<HeaderValue> {
+        self.connect
+            .request
+            .headers
+            .get_all(protocol_negotation::AVAILABLE_NAME)
+    }
+
     /// Accept the session, returning a 200 OK.
     pub async fn ok(mut self) -> Result<Session, ServerError> {
         self.connect.respond(http::StatusCode::OK).await?;
+        Ok(Session::new(self.conn, self.settings, self.connect))
+    }
+
+    /// Accept the session, returning a 200 OK.
+    pub async fn ok_with_subprotocol(
+        mut self,
+        selected_protocol: HeaderValue,
+    ) -> Result<Session, ServerError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(protocol_negotation::SELECTED_NAME, selected_protocol);
+        self.connect
+            .respond_with_headers(http::StatusCode::OK, headers)
+            .await?;
         Ok(Session::new(self.conn, self.settings, self.connect))
     }
 

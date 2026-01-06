@@ -48,6 +48,18 @@ use settings::*;
 /// The HTTP/3 ALPN is required when negotiating a QUIC connection.
 pub const ALPN: &str = "h3";
 
+pub mod protocol_negotation {
+    /// WebTransport sub-protocol negotiation,
+    ///
+    /// according to [draft 14](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-14.html#section-3.3)
+    use http::HeaderName;
+
+    /// The header name for the available protocols, sent within the WebTransport Connect request.
+    pub const AVAILABLE_NAME: HeaderName = HeaderName::from_static("wt-available-protocols");
+    /// The header name for the selected protocol, sent within the WebTransport Connect response.
+    pub const SELECTED_NAME: HeaderName = HeaderName::from_static("wt-protocol");
+}
+
 /// Export our simple crypto provider.
 pub mod crypto;
 

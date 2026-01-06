@@ -10,10 +10,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
+use http::HeaderMap;
 use url::Url;
 
 use crate::{
-    ClientError, Connect, RecvStream, SendStream, SessionError, Settings, WebTransportError,
+    protocol_negotation, ClientError, Connect, RecvStream, SendStream, SessionError, Settings,
+    WebTransportError,
 };
 
 use web_transport_proto::{Frame, StreamUni, VarInt};
@@ -48,6 +50,8 @@ pub struct Session {
 
     // The URL used to create the session.
     url: Url,
+    /// the protocol negotiated during the handshake
+    protocol: Option<String>,
 }
 
 impl Session {
@@ -78,6 +82,12 @@ impl Session {
             header_bi,
             header_datagram,
             url: connect.url().clone(),
+            protocol: connect.response.as_ref().and_then(|response| {
+                response
+                    .headers
+                    .get(protocol_negotation::SELECTED_NAME)
+                    .and_then(|value| value.to_str().ok().map(|protocol| protocol.to_string()))
+            }),
             settings: Some(Arc::new(settings)),
         };
 
@@ -111,14 +121,23 @@ impl Session {
         }
     }
 
+    /// The webtransport subprotocol that was negotiated with the server, if any
+    pub fn protocol(&self) -> Option<String> {
+        self.protocol.clone()
+    }
+
     /// Connect using an established QUIC connection if you want to create the connection yourself.
     /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
-    pub async fn connect(conn: quinn::Connection, url: Url) -> Result<Session, ClientError> {
+    pub async fn connect(
+        conn: quinn::Connection,
+        url: Url,
+        headers: HeaderMap,
+    ) -> Result<Session, ClientError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = Connect::open(&conn, url).await?;
+        let connect = Connect::open_with_headers(&conn, url, headers).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.
@@ -289,6 +308,7 @@ impl Session {
             accept: None,
             settings: None,
             url,
+            protocol: None,
         }
     }
 

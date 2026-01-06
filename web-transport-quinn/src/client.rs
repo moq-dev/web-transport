@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use http::HeaderMap;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::{client::danger::ServerCertVerifier, pki_types::CertificateDer};
@@ -212,7 +213,7 @@ impl Client {
     }
 
     /// Connect to the server.
-    pub async fn connect(&self, url: Url) -> Result<Session, ClientError> {
+    pub async fn connect(&self, url: Url, headers: HeaderMap) -> Result<Session, ClientError> {
         let port = url.port().unwrap_or(443);
 
         // TODO error on username:password in host
@@ -247,7 +248,7 @@ impl Client {
         let conn = conn.await?;
 
         // Connect with the connection we established.
-        Session::connect(conn, url).await
+        Session::connect(conn, url, headers).await
     }
 }
 

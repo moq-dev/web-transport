@@ -48,7 +48,7 @@ pub struct Client {
 impl Client {
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, Error> {
-        Ok(self.inner.connect(url).await?.into())
+        Ok(self.inner.connect(url, Default::default()).await?.into())
     }
 }
 
@@ -291,7 +291,7 @@ impl RecvStream {
 ///
 /// The source can either be a session error or a stream error.
 /// TODO This interface is currently not generic.
-#[derive(Debug, thiserror::Error, Clone)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("session error: {0}")]
     Session(#[from] quinn::SessionError),
