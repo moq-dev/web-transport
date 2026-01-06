@@ -13,6 +13,3 @@ pub use frame::*;
 pub use settings::*;
 pub use stream::*;
 pub use varint::*;
-
-mod huffman;
-mod qpack;

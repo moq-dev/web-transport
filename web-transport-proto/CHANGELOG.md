@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Switch to full qpack support to allow for webtransport sub-protocol header negotiation
+
 ## [0.2.7](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.6...web-transport-proto-v0.2.7) - 2025-09-03
 
 ### Other

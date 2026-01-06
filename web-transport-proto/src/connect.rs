@@ -1,21 +1,33 @@
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 
 use bytes::{Buf, BufMut, BytesMut};
+use http::{
+    uri::{Parts, Scheme},
+    Extensions, HeaderMap, HeaderValue, Method, Uri,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use qpack::http_headers::{Header, HeaderError};
 use url::Url;
 
-use super::{qpack, Frame, VarInt};
+use super::{Frame, VarInt};
 
 use thiserror::Error;
 
 // Errors that can occur during the connect request.
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum ConnectError {
     #[error("unexpected end of input")]
     UnexpectedEnd,
 
-    #[error("qpack error")]
-    QpackError(#[from] qpack::DecodeError),
+    #[error("qpack encoding error")]
+    QpackEncodeError(#[from] qpack::EncoderError),
+
+    #[error("qpack decoding error")]
+    QpackDecodeError(#[from] qpack::DecoderError),
+
+    #[error("Header parsing error")]
+    HeaderParsingError(#[from] HeaderError),
 
     #[error("unexpected frame {0:?}")]
     UnexpectedFrame(Frame),
@@ -23,8 +35,8 @@ pub enum ConnectError {
     #[error("invalid method")]
     InvalidMethod,
 
-    #[error("invalid url")]
-    InvalidUrl(#[from] url::ParseError),
+    #[error("Http error")]
+    HttpError(#[from] http::Error),
 
     #[error("invalid status")]
     InvalidStatus,
@@ -63,6 +75,40 @@ impl From<std::io::Error> for ConnectError {
 #[derive(Debug)]
 pub struct ConnectRequest {
     pub url: Url,
+    pub headers: HeaderMap,
+}
+
+fn uri_to_url(uri: Uri) -> Result<Url, ConnectError> {
+    let Parts {
+        scheme,
+        authority,
+        path_and_query,
+        ..
+    } = uri.into_parts();
+    let scheme = scheme.unwrap_or(Scheme::HTTPS);
+    let Some(authority) = authority else {
+        return Err(ConnectError::WrongAuthority);
+    };
+    let Some(path_and_query) = path_and_query else {
+        return Err(ConnectError::WrongPath);
+    };
+    Ok(
+        Url::parse(&format!("{scheme}://{authority}{path_and_query}"))
+            .expect("Failed to parse URL"),
+    )
+}
+
+fn url_to_uri(url: &Url) -> Result<Uri, ConnectError> {
+    let mut path_and_query = url.path().to_owned();
+    if let Some(query) = url.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    Ok(Uri::builder()
+        .authority(url.authority())
+        .scheme(url.scheme())
+        .path_and_query(path_and_query)
+        .build()?)
 }
 
 impl ConnectRequest {
@@ -74,37 +120,22 @@ impl ConnectRequest {
 
         // We no longer return UnexpectedEnd because we know the buffer should be large enough.
 
-        let headers = qpack::Headers::decode(&mut data)?;
+        let decoded = qpack::decode_stateless(&mut data, u64::MAX)?;
+        let (method, uri, protocol, headers) =
+            qpack::http_headers::Header::try_from(decoded.fields)?.into_request_parts()?;
 
-        let scheme = match headers.get(":scheme") {
-            Some("https") => "https",
-            Some(scheme) => Err(ConnectError::WrongScheme(Some(scheme.to_string())))?,
-            None => return Err(ConnectError::WrongScheme(None)),
-        };
+        if method != http::Method::CONNECT {
+            return Err(ConnectError::WrongMethod(Some(method)));
+        }
 
-        let authority = headers
-            .get(":authority")
-            .ok_or(ConnectError::WrongAuthority)?;
-
-        let path_and_query = headers.get(":path").ok_or(ConnectError::WrongPath)?;
-
-        let method = headers.get(":method");
-        match method
-            .map(|method| method.try_into().map_err(|_| ConnectError::InvalidMethod))
-            .transpose()?
-        {
-            Some(http::Method::CONNECT) => (),
-            o => return Err(ConnectError::WrongMethod(o)),
-        };
-
-        let protocol = headers.get(":protocol");
-        if protocol != Some("webtransport") {
+        if protocol != Some("webtransport".to_owned()) {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
-        let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
-
-        Ok(Self { url })
+        Ok(Self {
+            url: uri_to_url(uri)?,
+            headers,
+        })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -123,31 +154,31 @@ impl ConnectRequest {
         }
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        let mut headers = qpack::Headers::default();
-        headers.set(":method", "CONNECT");
-        headers.set(":scheme", self.url.scheme());
-        headers.set(":authority", self.url.authority());
-        let path_and_query = match self.url.query() {
-            Some(query) => format!("{}?{}", self.url.path(), query),
-            None => self.url.path().to_string(),
-        };
-        headers.set(":path", &path_and_query);
-        headers.set(":protocol", "webtransport");
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
+        // protocol header
+        let mut ext = Extensions::new();
+        ext.insert("webtransport".to_owned());
+        let headers = Header::request(
+            Method::CONNECT,
+            url_to_uri(&self.url)?,
+            self.headers.clone(),
+            ext,
+        )?;
 
         // Use a temporary buffer so we can compute the size.
         let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
+        headers.encode(&mut tmp)?;
         let size = VarInt::from_u32(tmp.len() as u32);
 
         Frame::HEADERS.encode(buf);
         size.encode(buf);
         buf.put_slice(&tmp);
+        Ok(())
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
         let mut buf = BytesMut::new();
-        self.encode(&mut buf);
+        self.encode(&mut buf)?;
         stream.write_all_buf(&mut buf).await?;
         Ok(())
     }
@@ -156,6 +187,7 @@ impl ConnectRequest {
 #[derive(Debug)]
 pub struct ConnectResponse {
     pub status: http::status::StatusCode,
+    pub headers: HeaderMap,
 }
 
 impl ConnectResponse {
@@ -165,20 +197,15 @@ impl ConnectResponse {
             return Err(ConnectError::UnexpectedFrame(typ));
         }
 
-        let headers = qpack::Headers::decode(&mut data)?;
+        let decoded = qpack::decode_stateless(&mut data, u64::MAX)?;
+        let (status, headers) =
+            qpack::http_headers::Header::try_from(decoded.fields)?.into_response_parts()?;
 
-        let status = match headers
-            .get(":status")
-            .map(|status| {
-                http::StatusCode::from_str(status).map_err(|_| ConnectError::InvalidStatus)
-            })
-            .transpose()?
-        {
-            Some(status) if status.is_success() => status,
-            o => return Err(ConnectError::WrongStatus(o)),
-        };
+        if !status.is_success() {
+            return Err(ConnectError::WrongStatus(Some(status)));
+        }
 
-        Ok(Self { status })
+        Ok(Self { status, headers })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -198,13 +225,17 @@ impl ConnectResponse {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        let mut headers = qpack::Headers::default();
-        headers.set(":status", self.status.as_str());
-        headers.set("sec-webtransport-http3-draft", "draft02");
+        let mut headers = self.headers.clone();
+        headers.insert(
+            "sec-webtransport-http3-draft",
+            HeaderValue::from_static("draft02"),
+        );
+
+        let headers = Header::response(self.status, headers);
 
         // Use a temporary buffer so we can compute the size.
         let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
+        headers.encode(&mut tmp).expect("Header encoding failed");
         let size = VarInt::from_u32(tmp.len() as u32);
 
         Frame::HEADERS.encode(buf);
