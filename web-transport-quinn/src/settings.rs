@@ -47,7 +47,7 @@ impl Settings {
         let mut recv = conn.accept_uni().await?;
         let settings = web_transport_proto::Settings::read(&mut recv).await?;
 
-        log::debug!("received SETTINGS frame: {settings:?}");
+        tracing::debug!(?settings, "received SETTINGS frame");
 
         if settings.supports_webtransport() == 0 {
             return Err(SettingsError::WebTransportUnsupported);
@@ -60,7 +60,7 @@ impl Settings {
         let mut settings = web_transport_proto::Settings::default();
         settings.enable_webtransport(1);
 
-        log::debug!("sending SETTINGS frame: {settings:?}");
+        tracing::debug!(?settings, "sending SETTINGS frame");
 
         let mut send = conn.open_uni().await?;
         settings.write(&mut send).await?;

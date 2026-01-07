@@ -23,15 +23,19 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Enable info logging.
-    let env = env_logger::Env::default().default_filter_or("info");
-    env_logger::init_from_env(env);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
     let client = web_transport_quinn::ClientBuilder::new();
 
     let client = if args.tls_disable_verify {
-        log::warn!("disabling TLS certificate verification; a MITM attack is possible");
+        tracing::warn!("disabling TLS certificate verification; a MITM attack is possible");
 
         // Accept any certificate.
         client.dangerous().with_no_certificate_verification()?
@@ -54,29 +58,29 @@ async fn main() -> anyhow::Result<()> {
         client.with_system_roots()?
     };
 
-    log::info!("connecting to {}", args.url);
+    tracing::info!(url = %args.url, "connecting");
 
     // Connect to the given URL.
     let session = client.connect(args.url).await?;
 
-    log::info!("connected");
+    tracing::info!("connected");
 
     // Create a bidirectional stream.
     let (mut send, mut recv) = session.open_bi().await?;
 
-    log::info!("created stream");
+    tracing::info!("created stream");
 
     // Send a message.
     let msg = "hello world".to_string();
     send.write_all(msg.as_bytes()).await?;
-    log::info!("sent: {msg}");
+    tracing::info!(%msg, "sent");
 
     // Shut down the send stream.
     send.finish()?;
 
     // Read back the message.
     let msg = recv.read_to_end(1024).await?;
-    log::info!("recv: {}", String::from_utf8_lossy(&msg));
+    tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
     session.close(42069, b"bye");
     session.closed().await;
