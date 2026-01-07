@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.2.0...web-transport-ws-v0.2.1) - 2026-01-07
+
+### Other
+
+- Double check that read_buf is properly implemented. ([#137](https://github.com/moq-dev/web-transport/pull/137))
+- Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
+- Update README.md with usage details; WebSocket is built in to node, deno and bun ([#128](https://github.com/moq-dev/web-transport/pull/128))
+- Fix buffer capacity check in varint encode to account for byteOffset ([#127](https://github.com/moq-dev/web-transport/pull/127))
+- Fix the example for guest. ([#126](https://github.com/moq-dev/web-transport/pull/126))
+
 ## [0.1.4](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.1.3...web-transport-ws-v0.1.4) - 2025-11-14
 
 ### Other

@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.3...web-transport-wasm-v0.5.4) - 2026-01-07
+
+### Other
+
+- Double check that read_buf is properly implemented. ([#137](https://github.com/moq-dev/web-transport/pull/137))
+- Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
+
 ## [0.5.3](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.2...web-transport-wasm-v0.5.3) - 2025-10-17
 
 ### Other
