@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.10.1...web-transport-quinn-v0.10.2) - 2026-01-07
+
+### Other
+
+- Migrate to tracing. ([#131](https://github.com/moq-dev/web-transport/pull/131))
+- Remove with_unreliable. ([#136](https://github.com/moq-dev/web-transport/pull/136))
+- Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
+
 ## [0.9.1](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.9.0...web-transport-quinn-v0.9.1) - 2025-11-14
 
 ### Other

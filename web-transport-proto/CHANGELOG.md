@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.3.0...web-transport-proto-v0.3.1) - 2026-01-07
+
+### Other
+
+- Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
+
 ## [0.2.8](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.7...web-transport-proto-v0.2.8) - 2025-10-17
 
 ### Other
