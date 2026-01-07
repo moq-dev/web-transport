@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.7](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.6...web-transport-proto-v0.2.7) - 2025-09-03
+## [0.2.7](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.6...web-transport-proto-v0.2.7) - 2025-09-03
 
 ### Other
 
-- Rename the repo. ([#94](https://github.com/kixelated/web-transport/pull/94))
-- Fix clippy warnings ([#91](https://github.com/kixelated/web-transport/pull/91))
-- Add support for session closed capsule ([#86](https://github.com/kixelated/web-transport/pull/86))
+- Rename the repo. ([#94](https://github.com/moq-dev/web-transport/pull/94))
+- Fix clippy warnings ([#91](https://github.com/moq-dev/web-transport/pull/91))
+- Add support for session closed capsule ([#86](https://github.com/moq-dev/web-transport/pull/86))
 # Changelog
 All notable changes to this project will be documented in this file.
 
@@ -22,39 +22,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.8](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.7...web-transport-proto-v0.2.8) - 2025-10-17
+## [0.2.8](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.7...web-transport-proto-v0.2.8) - 2025-10-17
 
 ### Other
 
-- Make traits compatible with WASM ([#107](https://github.com/kixelated/web-transport/pull/107))
-- Check all feature combinations ([#102](https://github.com/kixelated/web-transport/pull/102))
+- Make traits compatible with WASM ([#107](https://github.com/moq-dev/web-transport/pull/107))
+- Check all feature combinations ([#102](https://github.com/moq-dev/web-transport/pull/102))
 
-## [0.2.6](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.5...web-transport-proto-v0.2.6) - 2025-05-15
-
-### Other
-
-- Add (generic) support for learning when a stream is closed. ([#73](https://github.com/kixelated/web-transport/pull/73))
-- Add url query to CONNECT :path request ([#70](https://github.com/kixelated/web-transport/pull/70))
-
-## [0.2.5](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.4...web-transport-proto-v0.2.5) - 2025-03-26
+## [0.2.6](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.5...web-transport-proto-v0.2.6) - 2025-05-15
 
 ### Other
 
-- Added Ring feature flag ([#68](https://github.com/kixelated/web-transport/pull/68))
+- Add (generic) support for learning when a stream is closed. ([#73](https://github.com/moq-dev/web-transport/pull/73))
+- Add url query to CONNECT :path request ([#70](https://github.com/moq-dev/web-transport/pull/70))
 
-## [0.2.4](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.3...web-transport-proto-v0.2.4) - 2025-01-15
+## [0.2.5](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.4...web-transport-proto-v0.2.5) - 2025-03-26
+
+### Other
+
+- Added Ring feature flag ([#68](https://github.com/moq-dev/web-transport/pull/68))
+
+## [0.2.4](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.3...web-transport-proto-v0.2.4) - 2025-01-15
 
 ### Other
 
-- Bump some deps. ([#55](https://github.com/kixelated/web-transport/pull/55))
-- Clippy fixes. ([#53](https://github.com/kixelated/web-transport/pull/53))
+- Bump some deps. ([#55](https://github.com/moq-dev/web-transport/pull/55))
+- Clippy fixes. ([#53](https://github.com/moq-dev/web-transport/pull/53))
 
-## [0.2.3](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.2...web-transport-proto-v0.2.3) - 2024-09-02
-
-### Other
-- Don't set the N bit for literals. ([#41](https://github.com/kixelated/web-transport/pull/41))
-
-## [0.2.2](https://github.com/kixelated/web-transport/compare/web-transport-proto-v0.2.1...web-transport-proto-v0.2.2) - 2024-08-15
+## [0.2.3](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.2...web-transport-proto-v0.2.3) - 2024-09-02
 
 ### Other
-- Some more documentation. ([#34](https://github.com/kixelated/web-transport/pull/34))
+- Don't set the N bit for literals. ([#41](https://github.com/moq-dev/web-transport/pull/41))
+
+## [0.2.2](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.2.1...web-transport-proto-v0.2.2) - 2024-08-15
+
+### Other
+- Some more documentation. ([#34](https://github.com/moq-dev/web-transport/pull/34))

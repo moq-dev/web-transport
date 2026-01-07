@@ -55,8 +55,8 @@ impl RecvStream {
     /// Advances the buffer by the number of bytes read.
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>, Error> {
         let chunk = match self.read(buf.remaining_mut()).await? {
-            Some(chunk) => chunk,
-            None => return Ok(None),
+            Some(chunk) if !chunk.is_empty() => chunk,
+            _ => return Ok(None),
         };
 
         let size = chunk.len();

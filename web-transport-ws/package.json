@@ -1,11 +1,11 @@
 {
-	"name": "@kixelated/web-transport-ws",
+	"name": "@moq/web-transport-ws",
 	"author": "Luke Curley <kixelated@gmail.com>",
 	"version": "0.1.2",
 	"description": "WebTransport polyfill using WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
-	"repository": "github:kixelated/web-transport",
+	"repository": "github:moq-dev/web-transport",
 	"exports": {
 		".": "./src/index.ts"
 	},
@@ -22,7 +22,6 @@
 	},
 	"devDependencies": {
 		"typescript": "^5.9.2",
-		"ws": "^8.16.0",
 		"rimraf": "^6.0.1",
 		"@types/node": "^24.3.0",
 		"tsx": "^4.20.5"

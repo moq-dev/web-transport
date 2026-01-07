@@ -17,13 +17,6 @@ impl ClientBuilder {
         Self::default()
     }
 
-    /// For compatibility with WASM. Panics if `val` is false, but does nothing else.
-    pub fn with_unreliable(self, val: bool) -> Self {
-        Self {
-            inner: self.inner.with_unreliable(val),
-        }
-    }
-
     /// Allow a lower latency congestion controller.
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
@@ -87,7 +80,7 @@ impl Server {
 
 /// A WebTransport Session, able to accept/create streams and send/recv datagrams.
 ///
-/// The session can be cloned to create multiple handles.
+/// The session can be cloned to create multiple handles, which is which no method is &mut.
 /// The session will be closed with on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Session {
@@ -98,19 +91,19 @@ impl Session {
     /// Block until the peer creates a new unidirectional stream.
     ///
     /// Won't return None unless the connection is closed.
-    pub async fn accept_uni(&mut self) -> Result<RecvStream, Error> {
+    pub async fn accept_uni(&self) -> Result<RecvStream, Error> {
         let stream = self.inner.accept_uni().await?;
         Ok(RecvStream::new(stream))
     }
 
     /// Block until the peer creates a new bidirectional stream.
-    pub async fn accept_bi(&mut self) -> Result<(SendStream, RecvStream), Error> {
+    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         let (s, r) = self.inner.accept_bi().await?;
         Ok((SendStream::new(s), RecvStream::new(r)))
     }
 
     /// Open a new bidirectional stream, which may block when there are too many concurrent streams.
-    pub async fn open_bi(&mut self) -> Result<(SendStream, RecvStream), Error> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         Ok(self
             .inner
             .open_bi()
@@ -119,7 +112,7 @@ impl Session {
     }
 
     /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
-    pub async fn open_uni(&mut self) -> Result<SendStream, Error> {
+    pub async fn open_uni(&self) -> Result<SendStream, Error> {
         Ok(self.inner.open_uni().await.map(SendStream::new)?)
     }
 
@@ -132,7 +125,7 @@ impl Session {
     /// - Peer is not receiving datagrams.
     /// - Peer has too many outstanding datagrams.
     /// - ???
-    pub async fn send_datagram(&mut self, payload: Bytes) -> Result<(), Error> {
+    pub async fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
         // NOTE: This is not async, but we need to make it async to match the wasm implementation.
         Ok(self.inner.send_datagram(payload)?)
     }
@@ -143,12 +136,12 @@ impl Session {
     }
 
     /// Receive a datagram over the network.
-    pub async fn recv_datagram(&mut self) -> Result<Bytes, Error> {
+    pub async fn recv_datagram(&self) -> Result<Bytes, Error> {
         Ok(self.inner.read_datagram().await?)
     }
 
     /// Close the connection immediately with a code and reason.
-    pub fn close(&mut self, code: u32, reason: &str) {
+    pub fn close(&self, code: u32, reason: &str) {
         self.inner.close(code, reason.as_bytes())
     }
 
@@ -266,8 +259,8 @@ impl RecvStream {
         let dst = unsafe { &mut *(dst as *mut _ as *mut [u8]) };
 
         let size = match self.inner.read(dst).await? {
-            Some(size) => size,
-            None => return Ok(None),
+            Some(size) if size > 0 => size,
+            _ => return Ok(None),
         };
 
         unsafe { buf.advance_mut(size) };

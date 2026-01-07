@@ -23,12 +23,6 @@ impl ClientBuilder {
         }
     }
 
-    pub fn with_unreliable(self, val: bool) -> Self {
-        Self {
-            inner: self.inner.with_unreliable(val),
-        }
-    }
-
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
             inner: self.inner.with_congestion_control(cc),
@@ -63,27 +57,27 @@ impl Client {
 pub struct Session(web_transport_wasm::Session);
 
 impl Session {
-    pub async fn accept_uni(&mut self) -> Result<RecvStream, Error> {
+    pub async fn accept_uni(&self) -> Result<RecvStream, Error> {
         let stream = self.0.accept_uni().await?;
         Ok(RecvStream(stream))
     }
 
-    pub async fn accept_bi(&mut self) -> Result<(SendStream, RecvStream), Error> {
+    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         let (s, r) = self.0.accept_bi().await?;
         Ok((SendStream(s), RecvStream(r)))
     }
 
-    pub async fn open_bi(&mut self) -> Result<(SendStream, RecvStream), Error> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         let (s, r) = self.0.open_bi().await?;
         Ok((SendStream(s), RecvStream(r)))
     }
 
-    pub async fn open_uni(&mut self) -> Result<SendStream, Error> {
+    pub async fn open_uni(&self) -> Result<SendStream, Error> {
         self.0.open_uni().await.map(SendStream)
     }
 
     /// Close the connection immediately
-    pub fn close(&mut self, code: u32, reason: &str) {
+    pub fn close(&self, code: u32, reason: &str) {
         self.0.close(code, reason)
     }
 
@@ -92,11 +86,11 @@ impl Session {
     }
 
     /// Send a datagram.
-    pub async fn send_datagram(&mut self, payload: Bytes) -> Result<(), Error> {
+    pub async fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
         self.0.send_datagram(payload).await
     }
 
-    pub async fn recv_datagram(&mut self) -> Result<Bytes, Error> {
+    pub async fn recv_datagram(&self) -> Result<Bytes, Error> {
         self.0.recv_datagram().await
     }
 

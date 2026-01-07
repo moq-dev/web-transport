@@ -2,7 +2,7 @@
 name = "web-transport-quinn"
 description = "WebTransport library for Quinn"
 authors = ["Luke Curley"]
-repository = "https://github.com/kixelated/web-transport"
+repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
 version = "0.10.1"

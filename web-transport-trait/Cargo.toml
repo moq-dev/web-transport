@@ -2,7 +2,7 @@
 name = "web-transport-trait"
 description = "An async WebTransport trait."
 authors = ["Luke Curley"]
-repository = "https://github.com/kixelated/web-transport"
+repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
 version = "0.3.0"

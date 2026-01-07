@@ -44,15 +44,6 @@ impl ClientBuilder {
         }
     }
 
-    /// For compatibility with WASM. Panics if `val` is false, but does nothing else.
-    pub fn with_unreliable(self, val: bool) -> Self {
-        if !val {
-            panic!("with_unreliable must be true for quic transport");
-        }
-
-        self
-    }
-
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = match algorithm {

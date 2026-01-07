@@ -701,12 +701,12 @@ impl generic::RecvStream for RecvStream {
         }
 
         Ok(match self.read_chunk(buf.remaining_mut()).await? {
-            Some(data) => {
+            Some(data) if !data.is_empty() => {
                 let size = data.len();
                 buf.put(data);
                 Some(size)
             }
-            None => None,
+            _ => None,
         })
     }
 

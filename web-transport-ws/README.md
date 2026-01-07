@@ -16,7 +16,7 @@ This is a simplified version of [QMux](https://datatracker.ietf.org/doc/draft-op
 Check if WebTransport is available, otherwise install the polyfill:
 
 ```javascript
-import { install } from "@kixelated/web-transport-ws"
+import { install } from "@moq/web-transport-ws"
 
 // Install the polyfill if needed.
 install();
@@ -40,6 +40,29 @@ cargo build
 npm install
 npm run build
 ```
+
+### Usage
+```bash
+cargo run --example server
+```
+
+```bash
+bun examples/client.ts
+```
+
+```bash
+deno -A --sloppy-imports examples/client.ts
+```
+
+#### Bundle TypeScript source to single JavaScript file
+```bash
+bun build --target=node --outfile=examples/client.js examples/client.ts 
+```
+
+```bash
+node examples/client.js
+```
+
 
 ## License
 
