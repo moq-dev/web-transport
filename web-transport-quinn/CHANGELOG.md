@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Migrate to tracing. ([#131](https://github.com/moq-dev/web-transport/pull/131))
 - Remove with_unreliable. ([#136](https://github.com/moq-dev/web-transport/pull/136))
 - Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
 
