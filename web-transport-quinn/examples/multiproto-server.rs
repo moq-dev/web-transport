@@ -127,7 +127,6 @@ async fn run_echo_v0(session: Session) -> anyhow::Result<()> {
 
                 send.write_all(&msg).await?;
                 tracing::info!(msg = %String::from_utf8_lossy(&msg), " ➡️ sent");
-                tracing::info!("send: {}", String::from_utf8_lossy(&msg));
             },
             res = session.read_datagram() => {
                 let msg = res?;
@@ -158,6 +157,7 @@ async fn run_ping_v0(session: Session) -> anyhow::Result<()> {
         } else {
             tracing::info!(command = %ping_msg, "incorrect command. closing sessions");
             session.close(1, b"unknown command");
+            return Ok(());
         }
     }
 }

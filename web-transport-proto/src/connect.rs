@@ -73,7 +73,9 @@ impl From<std::io::Error> for ConnectError {
 
 #[derive(Debug)]
 pub struct ConnectRequest {
+    /// The URL to connect to.
     pub url: Url,
+    /// The subprotocols requested (if any).
     pub subprotocols: Vec<String>,
 }
 
@@ -183,7 +185,9 @@ impl ConnectRequest {
 
 #[derive(Debug)]
 pub struct ConnectResponse {
+    /// The status code of the response.
     pub status: http::status::StatusCode,
+    /// The subprotocol selected by the server, if any
     pub subprotocol: Option<String>,
 }
 

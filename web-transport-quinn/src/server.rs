@@ -174,7 +174,7 @@ impl Request {
         Ok(Session::new(self.conn, self.settings, self.connect))
     }
 
-    /// Accept the session, returning a 200 OK.
+    /// Accept the session, returning a 200 OK with the given protocol selected
     pub async fn ok_with_protocol(mut self, protocol: String) -> Result<Session, ServerError> {
         self.connect
             .respond(http::StatusCode::OK, Some(protocol))

@@ -84,6 +84,10 @@ impl Connect {
         Ok(())
     }
 
+    /// Open a new WebTransport session on the given connection for the given URL.
+    ///
+    /// You may add any number of subprotocols allowing the server to select from.
+    /// If the list is empty the field will be omitted in the request header.
     pub async fn open(
         conn: &quinn::Connection,
         url: Url,
