@@ -91,6 +91,14 @@ pub struct Server {
     accept: FuturesUnordered<BoxFuture<'static, Result<Request, ServerError>>>,
 }
 
+impl core::ops::Deref for Server {
+    type Target = quinn::Endpoint;
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoint
+    }
+}
+
 impl Server {
     /// Manaully create a new server with a manually constructed Endpoint.
     ///
@@ -130,6 +138,14 @@ pub struct Request {
     connect: Connect,
 }
 
+impl core::ops::Deref for Request {
+    type Target = Connect;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connect
+    }
+}
+
 impl Request {
     /// Accept a new WebTransport session from a client.
     pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
@@ -154,13 +170,21 @@ impl Request {
 
     /// Accept the session, returning a 200 OK.
     pub async fn ok(mut self) -> Result<Session, ServerError> {
-        self.connect.respond(http::StatusCode::OK).await?;
+        self.connect.respond(http::StatusCode::OK, None).await?;
+        Ok(Session::new(self.conn, self.settings, self.connect))
+    }
+
+    /// Accept the session, returning a 200 OK.
+    pub async fn ok_with_protocol(mut self, protocol: String) -> Result<Session, ServerError> {
+        self.connect
+            .respond(http::StatusCode::OK, Some(protocol))
+            .await?;
         Ok(Session::new(self.conn, self.settings, self.connect))
     }
 
     /// Reject the session, returing your favorite HTTP status code.
     pub async fn close(mut self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(status).await?;
+        self.connect.respond(status, None).await?;
         Ok(())
     }
 }

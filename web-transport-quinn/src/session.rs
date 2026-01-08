@@ -48,6 +48,8 @@ pub struct Session {
 
     // The URL used to create the session.
     url: Url,
+    // The subprotocol negotiated with the server
+    subprotocol: Option<String>,
 }
 
 impl Session {
@@ -78,6 +80,7 @@ impl Session {
             header_bi,
             header_datagram,
             url: connect.url().clone(),
+            subprotocol: connect.subprotocol(),
             settings: Some(Arc::new(settings)),
         };
 
@@ -114,11 +117,23 @@ impl Session {
     /// Connect using an established QUIC connection if you want to create the connection yourself.
     /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
     pub async fn connect(conn: quinn::Connection, url: Url) -> Result<Session, ClientError> {
+        Self::connect_with_subprotocols(conn, url, Vec::new()).await
+    }
+
+    /// Connect using an established QUIC connection providing specific subprotocols,
+    /// if you want to create the connection yourself.
+    ///
+    /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
+    pub async fn connect_with_subprotocols(
+        conn: quinn::Connection,
+        url: Url,
+        subprotocols: Vec<String>,
+    ) -> Result<Session, ClientError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = Connect::open(&conn, url).await?;
+        let connect = Connect::open(&conn, url, subprotocols).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.
@@ -289,11 +304,16 @@ impl Session {
             accept: None,
             settings: None,
             url,
+            subprotocol: None,
         }
     }
 
     pub fn url(&self) -> &Url {
         &self.url
+    }
+
+    pub fn subprotocol(&self) -> Option<&String> {
+        self.subprotocol.as_ref()
     }
 }
 

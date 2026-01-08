@@ -213,6 +213,15 @@ impl Client {
 
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, ClientError> {
+        self.connect_with_subprotocols(url, Vec::new()).await
+    }
+
+    /// Connect to the server, specifying subprotocols to be sent.
+    pub async fn connect_with_subprotocols(
+        &self,
+        url: Url,
+        subprotocols: Vec<String>,
+    ) -> Result<Session, ClientError> {
         let port = url.port().unwrap_or(443);
 
         // TODO error on username:password in host
@@ -247,7 +256,7 @@ impl Client {
         let conn = conn.await?;
 
         // Connect with the connection we established.
-        Session::connect(conn, url).await
+        Session::connect_with_subprotocols(conn, url, subprotocols).await
     }
 }
 

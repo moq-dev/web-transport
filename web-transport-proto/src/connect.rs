@@ -8,6 +8,17 @@ use super::{qpack, Frame, VarInt};
 
 use thiserror::Error;
 
+mod protocol_negotiation {
+    //! WebTransport sub-protocol negotiation,
+    //!
+    //! according to [draft 14](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-14.html#section-3.3)
+
+    /// The header name for the available protocols, sent within the WebTransport Connect request.
+    pub const AVAILABLE_NAME: &str = "wt-available-protocols";
+    /// The header name for the selected protocol, sent within the WebTransport Connect response.
+    pub const SELECTED_NAME: &str = "wt-protocol";
+}
+
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
 pub enum ConnectError {
@@ -63,6 +74,7 @@ impl From<std::io::Error> for ConnectError {
 #[derive(Debug)]
 pub struct ConnectRequest {
     pub url: Url,
+    pub subprotocols: Vec<String>,
 }
 
 impl ConnectRequest {
@@ -102,9 +114,19 @@ impl ConnectRequest {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
+        let subprotocols =
+            if let Some(subprotocols) = headers.get(protocol_negotiation::AVAILABLE_NAME) {
+                subprotocols
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
-        Ok(Self { url })
+        Ok(Self { url, subprotocols })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -134,6 +156,12 @@ impl ConnectRequest {
         };
         headers.set(":path", &path_and_query);
         headers.set(":protocol", "webtransport");
+        if !self.subprotocols.is_empty() {
+            headers.set(
+                protocol_negotiation::AVAILABLE_NAME,
+                &self.subprotocols.join(", "),
+            );
+        }
 
         // Use a temporary buffer so we can compute the size.
         let mut tmp = Vec::new();
@@ -156,6 +184,7 @@ impl ConnectRequest {
 #[derive(Debug)]
 pub struct ConnectResponse {
     pub status: http::status::StatusCode,
+    pub subprotocol: Option<String>,
 }
 
 impl ConnectResponse {
@@ -178,7 +207,14 @@ impl ConnectResponse {
             o => return Err(ConnectError::WrongStatus(o)),
         };
 
-        Ok(Self { status })
+        let subprotocol = headers
+            .get(protocol_negotiation::SELECTED_NAME)
+            .map(|s| s.to_string());
+
+        Ok(Self {
+            status,
+            subprotocol,
+        })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -201,6 +237,9 @@ impl ConnectResponse {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
+        if let Some(subprotocol) = &self.subprotocol {
+            headers.set(protocol_negotiation::SELECTED_NAME, subprotocol);
+        }
 
         // Use a temporary buffer so we can compute the size.
         let mut tmp = Vec::new();

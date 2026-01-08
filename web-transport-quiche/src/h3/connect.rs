@@ -60,7 +60,10 @@ impl Connect {
     ///
     /// This is called by the server to accept or reject the connection.
     pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let response = ConnectResponse { status };
+        let response = ConnectResponse {
+            status,
+            subprotocol: None,
+        };
         tracing::debug!(?response, "sending CONNECT");
         response.write(&mut self.send).await?;
 
@@ -77,7 +80,10 @@ impl Connect {
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest { url };
+        let request = ConnectRequest {
+            url,
+            subprotocols: vec![],
+        };
 
         tracing::debug!(?request, "sending CONNECT");
         request.write(&mut send).await?;
