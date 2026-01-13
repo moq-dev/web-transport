@@ -11,6 +11,13 @@ edition = "2021"
 keywords = ["quic", "http3", "webtransport", "websocket", "polyfill"]
 categories = ["network-programming", "web-programming"]
 
+[features]
+default = []
+native-tls = ["tokio-tungstenite/native-tls"]
+native-tls-vendored = ["tokio-tungstenite/native-tls-vendored"]
+rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
+rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+
 [dependencies]
 bytes = "1"
 futures = "0.3"
