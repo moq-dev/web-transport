@@ -2,7 +2,7 @@ use anyhow::Context;
 
 use clap::Parser;
 use http::StatusCode;
-use web_transport_quinn::Session;
+use web_transport_quinn::{proto::ConnectResponse, Session};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -39,7 +39,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {
-        tracing::debug!(url = %conn.url(), "New connection");
         tokio::spawn(async move {
             let err = run_conn(conn).await;
             if let Err(err) = err {
@@ -69,22 +68,25 @@ impl TryFrom<&String> for Protocol {
 }
 
 async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
-    tracing::info!(url = %request.url(),"received WebTransport request");
+    tracing::info!(url = %request.url, "received WebTransport request");
     let Some(protocol) = request
-        .subprotocols
+        .protocols
         .iter()
         .filter_map(|subprotocol| Protocol::try_from(subprotocol).ok())
         .next()
     else {
         // no valid protocol found, we close the connection
-        return Ok(request.close(StatusCode::BAD_REQUEST).await?);
+        return Ok(request.reject(StatusCode::BAD_REQUEST).await?);
     };
 
     match protocol {
         Protocol::EchoV0 => {
             // Accept the session.
             let session = request
-                .ok_with_protocol("echo/0".to_owned())
+                .respond(ConnectResponse {
+                    status: StatusCode::OK,
+                    protocol: Some("echo/0".to_owned()),
+                })
                 .await
                 .context("failed to accept session")?;
             tracing::info!("accepted session");
@@ -97,7 +99,10 @@ async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
         Protocol::PingV0 => {
             // Accept the session.
             let session = request
-                .ok_with_protocol("ping/0".to_owned())
+                .respond(ConnectResponse {
+                    status: StatusCode::OK,
+                    protocol: Some("ping/0".to_owned()),
+                })
                 .await
                 .context("failed to accept session")?;
             tracing::info!("accepted session");

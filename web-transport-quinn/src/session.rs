@@ -10,13 +10,12 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
-use url::Url;
 
 use crate::{
-    ClientError, Connect, RecvStream, SendStream, SessionError, Settings, WebTransportError,
+    proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
+    ClientError, ConnectComplete, RecvStream, SendStream, SessionError, Settings,
+    WebTransportError,
 };
-
-use web_transport_proto::{Frame, StreamUni, VarInt};
 
 /// An established WebTransport session, acting like a full QUIC connection. See [`quinn::Connection`].
 ///
@@ -46,14 +45,19 @@ pub struct Session {
     #[allow(dead_code)]
     settings: Option<Arc<Settings>>,
 
-    // The URL used to create the session.
-    url: Url,
-    // The subprotocol negotiated with the server
-    subprotocol: Option<String>,
+    // The request send by the client.
+    request: ConnectRequest,
+
+    // The response sent by the server.
+    response: ConnectResponse,
 }
 
 impl Session {
-    pub(crate) fn new(conn: quinn::Connection, settings: Settings, connect: Connect) -> Self {
+    pub(crate) fn new(
+        conn: quinn::Connection,
+        settings: Settings,
+        connect: ConnectComplete,
+    ) -> Self {
         // The session ID is the stream ID of the CONNECT request.
         let session_id = connect.session_id();
 
@@ -79,9 +83,9 @@ impl Session {
             header_uni,
             header_bi,
             header_datagram,
-            url: connect.url().clone(),
-            subprotocol: connect.subprotocol(),
             settings: Some(Arc::new(settings)),
+            request: connect.request.clone(),
+            response: connect.response.clone(),
         };
 
         // Run a background task to check if the connect stream is closed.
@@ -96,11 +100,9 @@ impl Session {
     }
 
     // Keep reading from the control stream until it's closed.
-    async fn run_closed(&mut self, connect: Connect) -> (u32, String) {
-        let (_send, mut recv) = connect.into_inner();
-
+    async fn run_closed(&mut self, mut connect: ConnectComplete) -> (u32, String) {
         loop {
-            match web_transport_proto::Capsule::read(&mut recv).await {
+            match web_transport_proto::Capsule::read(&mut connect.recv).await {
                 Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
                     return (code, reason);
                 }
@@ -116,24 +118,15 @@ impl Session {
 
     /// Connect using an established QUIC connection if you want to create the connection yourself.
     /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
-    pub async fn connect(conn: quinn::Connection, url: Url) -> Result<Session, ClientError> {
-        Self::connect_with_subprotocols(conn, url, Vec::new()).await
-    }
-
-    /// Connect using an established QUIC connection providing specific subprotocols,
-    /// if you want to create the connection yourself.
-    ///
-    /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
-    pub async fn connect_with_subprotocols(
+    pub async fn connect(
         conn: quinn::Connection,
-        url: Url,
-        subprotocols: Vec<String>,
+        request: ConnectRequest,
     ) -> Result<Session, ClientError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = Connect::open(&conn, url, subprotocols).await?;
+        let connect = ConnectComplete::open(&conn, request).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.
@@ -294,7 +287,11 @@ impl Session {
     ///
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
-    pub fn raw(conn: quinn::Connection, url: Url) -> Self {
+    pub fn raw(
+        conn: quinn::Connection,
+        request: ConnectRequest,
+        response: ConnectResponse,
+    ) -> Self {
         Self {
             conn,
             session_id: None,
@@ -303,17 +300,17 @@ impl Session {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
-            url,
-            subprotocol: None,
+            request,
+            response,
         }
     }
 
-    pub fn url(&self) -> &Url {
-        &self.url
+    pub fn request(&self) -> &ConnectRequest {
+        &self.request
     }
 
-    pub fn subprotocol(&self) -> Option<&String> {
-        self.subprotocol.as_ref()
+    pub fn response(&self) -> &ConnectResponse {
+        &self.response
     }
 }
 

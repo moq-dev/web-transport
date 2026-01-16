@@ -9,14 +9,55 @@ use super::{qpack, Frame, VarInt};
 use thiserror::Error;
 
 mod protocol_negotiation {
-    //! WebTransport sub-protocol negotiation,
+    //! WebTransport sub-protocol negotiation using RFC 8941 Structured Fields,
     //!
     //! according to [draft 14](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-14.html#section-3.3)
+
+    use sfv::{Item, ItemSerializer, List, ListEntry, ListSerializer, Parser, StringRef};
 
     /// The header name for the available protocols, sent within the WebTransport Connect request.
     pub const AVAILABLE_NAME: &str = "wt-available-protocols";
     /// The header name for the selected protocol, sent within the WebTransport Connect response.
     pub const SELECTED_NAME: &str = "wt-protocol";
+
+    /// Encode a list of protocol strings as an RFC 8941 Structured Field List.
+    pub fn encode_list(protocols: &[String]) -> Option<String> {
+        let mut serializer = ListSerializer::new();
+        for protocol in protocols {
+            let s = StringRef::from_str(protocol).ok()?;
+            let _ = serializer.bare_item(s);
+        }
+        serializer.finish()
+    }
+
+    /// Decode an RFC 8941 Structured Field List of strings.
+    pub fn decode_list(value: &str) -> Vec<String> {
+        let Ok(list) = Parser::new(value).parse::<List>() else {
+            return Vec::new();
+        };
+
+        list.iter()
+            .filter_map(|entry| {
+                if let ListEntry::Item(item) = entry {
+                    Some(item.bare_item.as_string()?.as_str().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Encode a single string as an RFC 8941 Structured Field Item.
+    pub fn encode_item(protocol: &str) -> Option<String> {
+        let s = StringRef::from_str(protocol).ok()?;
+        Some(ItemSerializer::new().bare_item(s).finish())
+    }
+
+    /// Decode an RFC 8941 Structured Field Item (single string).
+    pub fn decode_item(value: &str) -> Option<String> {
+        let item = Parser::new(value).parse::<Item>().ok()?;
+        Some(item.bare_item.as_string()?.as_str().to_string())
+    }
 }
 
 // Errors that can occur during the connect request.
@@ -71,12 +112,14 @@ impl From<std::io::Error> for ConnectError {
     }
 }
 
-#[derive(Debug)]
+/// A CONNECT request to initiate a WebTransport session.
+#[derive(Debug, Clone)]
 pub struct ConnectRequest {
     /// The URL to connect to.
     pub url: Url,
+
     /// The subprotocols requested (if any).
-    pub subprotocols: Vec<String>,
+    pub protocols: Vec<String>,
 }
 
 impl ConnectRequest {
@@ -116,19 +159,14 @@ impl ConnectRequest {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
-        let subprotocols =
-            if let Some(subprotocols) = headers.get(protocol_negotiation::AVAILABLE_NAME) {
-                subprotocols
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        let protocols = headers
+            .get(protocol_negotiation::AVAILABLE_NAME)
+            .map(protocol_negotiation::decode_list)
+            .unwrap_or_default();
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
-        Ok(Self { url, subprotocols })
+        Ok(Self { url, protocols })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -158,11 +196,8 @@ impl ConnectRequest {
         };
         headers.set(":path", &path_and_query);
         headers.set(":protocol", "webtransport");
-        if !self.subprotocols.is_empty() {
-            headers.set(
-                protocol_negotiation::AVAILABLE_NAME,
-                &self.subprotocols.join(", "),
-            );
+        if let Some(encoded) = protocol_negotiation::encode_list(&self.protocols) {
+            headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
         // Use a temporary buffer so we can compute the size.
@@ -183,12 +218,23 @@ impl ConnectRequest {
     }
 }
 
-#[derive(Debug)]
+impl From<Url> for ConnectRequest {
+    fn from(url: Url) -> Self {
+        Self {
+            url,
+            protocols: Vec::new(),
+        }
+    }
+}
+
+/// A CONNECT response to accept or reject a WebTransport session.
+#[derive(Debug, Clone)]
 pub struct ConnectResponse {
     /// The status code of the response.
     pub status: http::status::StatusCode,
+
     /// The subprotocol selected by the server, if any
-    pub subprotocol: Option<String>,
+    pub protocol: Option<String>,
 }
 
 impl ConnectResponse {
@@ -211,14 +257,11 @@ impl ConnectResponse {
             o => return Err(ConnectError::WrongStatus(o)),
         };
 
-        let subprotocol = headers
+        let protocol = headers
             .get(protocol_negotiation::SELECTED_NAME)
-            .map(|s| s.to_string());
+            .and_then(protocol_negotiation::decode_item);
 
-        Ok(Self {
-            status,
-            subprotocol,
-        })
+        Ok(Self { status, protocol })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -241,8 +284,12 @@ impl ConnectResponse {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
-        if let Some(subprotocol) = &self.subprotocol {
-            headers.set(protocol_negotiation::SELECTED_NAME, subprotocol);
+        if let Some(encoded) = self
+            .protocol
+            .as_ref()
+            .and_then(|s| protocol_negotiation::encode_item(s))
+        {
+            headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
         }
 
         // Use a temporary buffer so we can compute the size.
@@ -260,5 +307,14 @@ impl ConnectResponse {
         self.encode(&mut buf);
         stream.write_all_buf(&mut buf).await?;
         Ok(())
+    }
+}
+
+impl From<http::StatusCode> for ConnectResponse {
+    fn from(status: http::StatusCode) -> Self {
+        Self {
+            status,
+            protocol: None,
+        }
     }
 }

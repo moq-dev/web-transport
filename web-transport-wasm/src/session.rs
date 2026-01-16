@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use js_sys::Uint8Array;
+use js_sys::{Reflect, Uint8Array};
 use url::Url;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -20,11 +20,22 @@ use web_streams::{Reader, Writer};
 pub struct Session {
     inner: WebTransport,
     url: Url,
+    protocol: Option<String>,
 }
 
 impl Session {
     pub fn new(inner: WebTransport, url: Url) -> Self {
-        Self { inner, url }
+        // TODO use the web_sys bindings when updated.
+        // Until then, we try to access the protocol property on the inner object.
+        let protocol = Reflect::get(&inner, &"protocol".into())
+            .ok()
+            .and_then(|p| p.as_string());
+
+        Self {
+            inner,
+            url,
+            protocol,
+        }
     }
 
     /// Accept a new unidirectional stream from the peer.
@@ -121,6 +132,11 @@ impl Session {
     /// Return the URL used to create the session.
     pub fn url(&self) -> &Url {
         &self.url
+    }
+
+    /// Return the application protocol used to create the session.
+    pub fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
     }
 }
 

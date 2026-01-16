@@ -4,11 +4,13 @@ use std::sync::Arc;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use url::Url;
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
-use crate::{Connect, ServerError, Session, Settings};
+use crate::{
+    proto::{ConnectRequest, ConnectResponse},
+    Connect, ServerError, Session, Settings,
+};
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Server] using sane defaults.
@@ -139,10 +141,10 @@ pub struct Request {
 }
 
 impl core::ops::Deref for Request {
-    type Target = Connect;
+    type Target = ConnectRequest;
 
     fn deref(&self) -> &Self::Target {
-        &self.connect
+        &self.connect.request
     }
 }
 
@@ -163,28 +165,32 @@ impl Request {
         })
     }
 
-    /// Returns the URL provided by the client.
-    pub fn url(&self) -> &Url {
-        self.connect.url()
+    /// Reply to the session with the given status code.
+    ///
+    /// If you want to reject the session, use a non-200 status code.
+    pub async fn respond(
+        self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<Session, ServerError> {
+        let response = response.into();
+        let connect = self.connect.respond(response).await?;
+        Ok(Session::new(self.conn, self.settings, connect))
     }
 
-    /// Accept the session, returning a 200 OK.
-    pub async fn ok(mut self) -> Result<Session, ServerError> {
-        self.connect.respond(http::StatusCode::OK, None).await?;
-        Ok(Session::new(self.conn, self.settings, self.connect))
-    }
-
-    /// Accept the session, returning a 200 OK with the given protocol selected
-    pub async fn ok_with_protocol(mut self, protocol: String) -> Result<Session, ServerError> {
-        self.connect
-            .respond(http::StatusCode::OK, Some(protocol))
-            .await?;
-        Ok(Session::new(self.conn, self.settings, self.connect))
-    }
-
-    /// Reject the session, returing your favorite HTTP status code.
-    pub async fn close(mut self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(status, None).await?;
+    /// Reject the session with the given status code.
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
+        let response = ConnectResponse {
+            status,
+            protocol: None,
+        };
+        self.connect.respond(response).await?;
         Ok(())
+    }
+
+    /// Returns the CONNECT request that was sent by the client.
+    ///
+    /// NOTE: You can access this via the Deref impl.
+    pub fn connect(&self) -> &ConnectRequest {
+        &self.connect.request
     }
 }

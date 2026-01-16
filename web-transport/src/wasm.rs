@@ -98,6 +98,11 @@ impl Session {
     pub fn url(&self) -> &Url {
         self.0.url()
     }
+
+    /// Return the application protocol used to create the session.
+    pub fn protocol(&self) -> Option<&str> {
+        self.0.protocol()
+    }
 }
 
 impl From<web_transport_wasm::Session> for Session {

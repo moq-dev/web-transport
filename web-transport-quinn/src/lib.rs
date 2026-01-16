@@ -59,3 +59,6 @@ pub use http;
 
 /// Re-export the generic WebTransport implementation.
 pub use web_transport_trait as generic;
+
+/// Re-export the WebTransport protocol implementation.
+pub use web_transport_proto as proto;

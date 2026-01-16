@@ -1,6 +1,8 @@
 use clap::Parser;
 use url::Url;
 
+use web_transport_quinn::proto::ConnectRequest;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -35,19 +37,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(url = %args.url, "connecting");
 
     let session = client
-        .connect_with_subprotocols(args.url, vec![args.protocol.clone()])
+        .connect(ConnectRequest {
+            url: args.url,
+            protocols: vec![args.protocol.clone()],
+        })
         .await?;
 
     // client confirms the server responded with the expected protocol
-    let Some(protocol) = session.subprotocol() else {
+    let Some(protocol) = &session.response().protocol else {
         tracing::warn!("protocol negotiation failed: server didn't respond with a protocol");
         session.close(42069, b"bye");
         session.closed().await;
         return Ok(());
     };
     if protocol != &args.protocol {
-        tracing::warn!(expected=%args.protocol, found=%protocol,
-            "protocol mismatch. closing.");
+        tracing::warn!(expected=%args.protocol, found=%protocol, "protocol mismatch. closing.");
         session.close(42069, b"bye");
         session.closed().await;
         return Ok(());
