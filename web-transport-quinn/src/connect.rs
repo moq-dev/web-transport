@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use web_transport_proto::{ConnectRequest, ConnectResponse, VarInt};
 
 use thiserror::Error;
@@ -22,17 +24,31 @@ pub enum ConnectError {
 
     #[error("http error status: {0}")]
     ErrorStatus(http::StatusCode),
+
+    #[error("protocol mismatch. The server responded with {0} but we didn't offer that.")]
+    ProtocolMismatch(String),
 }
 
 pub struct Connect {
     // The request that was sent by the client.
     request: ConnectRequest,
 
+    // protocol negotiated, if any
+    protocol: Option<String>,
+
     // A reference to the send/recv stream, so we don't close it until dropped.
     send: quinn::SendStream,
 
     #[allow(dead_code)]
     recv: quinn::RecvStream,
+}
+
+impl Deref for Connect {
+    type Target = ConnectRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 
 impl Connect {
@@ -47,33 +63,59 @@ impl Connect {
         // The request was successfully decoded, so we can send a response.
         Ok(Self {
             request,
+            protocol: None,
             send,
             recv,
         })
     }
 
     // Called by the server to send a response to the client.
-    pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let resp = ConnectResponse { status };
+    pub async fn respond(
+        &mut self,
+        status: http::StatusCode,
+        protocol: Option<String>,
+    ) -> Result<(), ConnectError> {
+        let resp = ConnectResponse {
+            status,
+            protocol: protocol.clone(),
+        };
 
         tracing::debug!(?resp, "sending CONNECT response");
         resp.write(&mut self.send).await?;
+        self.protocol = protocol;
 
         Ok(())
     }
 
-    pub async fn open(conn: &quinn::Connection, url: Url) -> Result<Self, ConnectError> {
+    /// Open a new WebTransport session on the given connection for the given URL.
+    ///
+    /// You may add any number of protocols allowing the server to select from.
+    /// If the list is empty the field will be omitted in the request header.
+    pub async fn open(
+        conn: &quinn::Connection,
+        url: Url,
+        protocols: Vec<String>,
+    ) -> Result<Self, ConnectError> {
         // Create a new stream that will be used to send the CONNECT frame.
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest { url };
+        let request = ConnectRequest {
+            url,
+            protocols: protocols.clone(),
+        };
 
         tracing::debug!(?request, "sending CONNECT request");
         request.write(&mut send).await?;
 
         let response = web_transport_proto::ConnectResponse::read(&mut recv).await?;
         tracing::debug!(?response, "received CONNECT response");
+
+        if let Some(protocol) = &response.protocol {
+            if !protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
+        }
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
@@ -82,6 +124,7 @@ impl Connect {
 
         Ok(Self {
             request,
+            protocol: response.protocol,
             send,
             recv,
         })
@@ -93,6 +136,11 @@ impl Connect {
         // We don't use the quinn::VarInt because that would mean a quinn dependency in web-transport-proto
         let stream_id = quinn::VarInt::from(self.send.id());
         VarInt::try_from(stream_id.into_inner()).unwrap()
+    }
+
+    // The webtransport protocol picked by the server, if any
+    pub fn protocol(&self) -> Option<String> {
+        self.protocol.clone()
     }
 
     // The URL in the CONNECT request.
