@@ -16,7 +16,8 @@ categories = ["network-programming", "web-programming"]
 bytes = "1"
 http = "1"
 thiserror = "2"
-
+sfv = "0.14.0"
+tracing = "0.1.44"
 # Just for AsyncRead and AsyncWrite traits
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 url = "2"

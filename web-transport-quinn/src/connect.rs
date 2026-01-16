@@ -24,6 +24,9 @@ pub enum ConnectError {
 
     #[error("http error status: {0}")]
     ErrorStatus(http::StatusCode),
+
+    #[error("protocol mismatch. The server responded with {0} but we didn't offer that.")]
+    ProtocolMismatch(String),
 }
 
 pub struct Connect {
@@ -97,13 +100,22 @@ impl Connect {
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest { url, protocols };
+        let request = ConnectRequest {
+            url,
+            protocols: protocols.clone(),
+        };
 
         tracing::debug!(?request, "sending CONNECT request");
         request.write(&mut send).await?;
 
         let response = web_transport_proto::ConnectResponse::read(&mut recv).await?;
         tracing::debug!(?response, "received CONNECT response");
+
+        if let Some(protocol) = &response.protocol {
+            if !protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
+        }
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
