@@ -15,6 +15,8 @@ mod protocol_negotiation {
 
     use sfv::{Item, ItemSerializer, List, ListEntry, ListSerializer, Parser, StringRef};
 
+    use crate::ConnectError;
+
     /// The header name for the available protocols, sent within the WebTransport Connect request.
     pub const AVAILABLE_NAME: &str = "wt-available-protocols";
     /// The header name for the selected protocol, sent within the WebTransport Connect response.
@@ -31,18 +33,18 @@ mod protocol_negotiation {
     }
 
     /// Decode an RFC 8941 Structured Field List of strings.
-    pub fn decode_list(value: &str) -> Vec<String> {
-        let Ok(list) = Parser::new(value).parse::<List>() else {
-            return Vec::new();
-        };
+    pub fn decode_list(value: &str) -> Result<Vec<String>, ConnectError> {
+        let list = Parser::new(value).parse::<List>()?;
 
         list.iter()
-            .filter_map(|entry| {
-                if let ListEntry::Item(item) = entry {
-                    Some(item.bare_item.as_string()?.as_str().to_string())
-                } else {
-                    None
-                }
+            .map(|entry| match entry {
+                ListEntry::Item(item) => Ok(item
+                    .bare_item
+                    .as_string()
+                    .ok_or(ConnectError::InvalidProtocol)?
+                    .as_str()
+                    .to_string()),
+                _ => Err(ConnectError::InvalidProtocol),
             })
             .collect()
     }
@@ -54,9 +56,14 @@ mod protocol_negotiation {
     }
 
     /// Decode an RFC 8941 Structured Field Item (single string).
-    pub fn decode_item(value: &str) -> Option<String> {
-        let item = Parser::new(value).parse::<Item>().ok()?;
-        Some(item.bare_item.as_string()?.as_str().to_string())
+    pub fn decode_item(value: &str) -> Result<String, ConnectError> {
+        let item = Parser::new(value).parse::<Item>()?;
+        Ok(item
+            .bare_item
+            .as_string()
+            .ok_or(ConnectError::InvalidProtocol)?
+            .as_str()
+            .to_string())
     }
 }
 
@@ -99,6 +106,12 @@ pub enum ConnectError {
     #[error("expected path header")]
     WrongPath,
 
+    #[error("invalid protocol header")]
+    InvalidProtocol,
+
+    #[error("structured field error: {0}")]
+    StructuredFieldError(Arc<sfv::Error>),
+
     #[error("non-200 status: {0:?}")]
     ErrorStatus(http::StatusCode),
 
@@ -109,6 +122,12 @@ pub enum ConnectError {
 impl From<std::io::Error> for ConnectError {
     fn from(err: std::io::Error) -> Self {
         ConnectError::Io(Arc::new(err))
+    }
+}
+
+impl From<sfv::Error> for ConnectError {
+    fn from(err: sfv::Error) -> Self {
+        ConnectError::StructuredFieldError(Arc::new(err))
     }
 }
 
@@ -162,6 +181,8 @@ impl ConnectRequest {
         let protocols = headers
             .get(protocol_negotiation::AVAILABLE_NAME)
             .map(protocol_negotiation::decode_list)
+            .transpose()
+            .map_err(|_| ConnectError::InvalidProtocol)?
             .unwrap_or_default();
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
@@ -259,7 +280,9 @@ impl ConnectResponse {
 
         let protocol = headers
             .get(protocol_negotiation::SELECTED_NAME)
-            .and_then(protocol_negotiation::decode_item);
+            .map(protocol_negotiation::decode_item)
+            .transpose()
+            .map_err(|_| ConnectError::InvalidProtocol)?;
 
         Ok(Self { status, protocol })
     }
