@@ -80,7 +80,7 @@ impl Session {
             header_bi,
             header_datagram,
             url: connect.url().clone(),
-            subprotocol: connect.subprotocol(),
+            subprotocol: connect.protocol(),
             settings: Some(Arc::new(settings)),
         };
 

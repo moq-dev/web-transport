@@ -30,8 +30,8 @@ pub struct Connect {
     // The request that was sent by the client.
     request: ConnectRequest,
 
-    // Subprotocol negotiated, if any
-    subprotocol: Option<String>,
+    // protocol negotiated, if any
+    protocol: Option<String>,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
     send: quinn::SendStream,
@@ -60,7 +60,7 @@ impl Connect {
         // The request was successfully decoded, so we can send a response.
         Ok(Self {
             request,
-            subprotocol: None,
+            protocol: None,
             send,
             recv,
         })
@@ -70,34 +70,34 @@ impl Connect {
     pub async fn respond(
         &mut self,
         status: http::StatusCode,
-        subprotocol: Option<String>,
+        protocol: Option<String>,
     ) -> Result<(), ConnectError> {
         let resp = ConnectResponse {
             status,
-            subprotocol: subprotocol.clone(),
+            protocol: protocol.clone(),
         };
 
         tracing::debug!(?resp, "sending CONNECT response");
         resp.write(&mut self.send).await?;
-        self.subprotocol = subprotocol;
+        self.protocol = protocol;
 
         Ok(())
     }
 
     /// Open a new WebTransport session on the given connection for the given URL.
     ///
-    /// You may add any number of subprotocols allowing the server to select from.
+    /// You may add any number of protocols allowing the server to select from.
     /// If the list is empty the field will be omitted in the request header.
     pub async fn open(
         conn: &quinn::Connection,
         url: Url,
-        subprotocols: Vec<String>,
+        protocols: Vec<String>,
     ) -> Result<Self, ConnectError> {
         // Create a new stream that will be used to send the CONNECT frame.
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest { url, subprotocols };
+        let request = ConnectRequest { url, protocols };
 
         tracing::debug!(?request, "sending CONNECT request");
         request.write(&mut send).await?;
@@ -112,7 +112,7 @@ impl Connect {
 
         Ok(Self {
             request,
-            subprotocol: response.subprotocol,
+            protocol: response.protocol,
             send,
             recv,
         })
@@ -126,9 +126,9 @@ impl Connect {
         VarInt::try_from(stream_id.into_inner()).unwrap()
     }
 
-    // The webtransport subprotocol picked by the server, if any
-    pub fn subprotocol(&self) -> Option<String> {
-        self.subprotocol.clone()
+    // The webtransport protocol picked by the server, if any
+    pub fn protocol(&self) -> Option<String> {
+        self.protocol.clone()
     }
 
     // The URL in the CONNECT request.

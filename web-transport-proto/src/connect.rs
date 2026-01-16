@@ -75,8 +75,8 @@ impl From<std::io::Error> for ConnectError {
 pub struct ConnectRequest {
     /// The URL to connect to.
     pub url: Url,
-    /// The subprotocols requested (if any).
-    pub subprotocols: Vec<String>,
+    /// The webtransport sub protocols requested (if any).
+    pub protocols: Vec<String>,
 }
 
 impl ConnectRequest {
@@ -116,19 +116,18 @@ impl ConnectRequest {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
-        let subprotocols =
-            if let Some(subprotocols) = headers.get(protocol_negotiation::AVAILABLE_NAME) {
-                subprotocols
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+        let protocols = if let Some(protocols) = headers.get(protocol_negotiation::AVAILABLE_NAME) {
+            protocols
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
-        Ok(Self { url, subprotocols })
+        Ok(Self { url, protocols })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -158,10 +157,10 @@ impl ConnectRequest {
         };
         headers.set(":path", &path_and_query);
         headers.set(":protocol", "webtransport");
-        if !self.subprotocols.is_empty() {
+        if !self.protocols.is_empty() {
             headers.set(
                 protocol_negotiation::AVAILABLE_NAME,
-                &self.subprotocols.join(", "),
+                &self.protocols.join(", "),
             );
         }
 
@@ -187,8 +186,8 @@ impl ConnectRequest {
 pub struct ConnectResponse {
     /// The status code of the response.
     pub status: http::status::StatusCode,
-    /// The subprotocol selected by the server, if any
-    pub subprotocol: Option<String>,
+    /// The webtransport sub protocol selected by the server, if any
+    pub protocol: Option<String>,
 }
 
 impl ConnectResponse {
@@ -211,14 +210,11 @@ impl ConnectResponse {
             o => return Err(ConnectError::WrongStatus(o)),
         };
 
-        let subprotocol = headers
+        let protocol = headers
             .get(protocol_negotiation::SELECTED_NAME)
             .map(|s| s.to_string());
 
-        Ok(Self {
-            status,
-            subprotocol,
-        })
+        Ok(Self { status, protocol })
     }
 
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
@@ -241,8 +237,8 @@ impl ConnectResponse {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
-        if let Some(subprotocol) = &self.subprotocol {
-            headers.set(protocol_negotiation::SELECTED_NAME, subprotocol);
+        if let Some(protocol) = &self.protocol {
+            headers.set(protocol_negotiation::SELECTED_NAME, protocol);
         }
 
         // Use a temporary buffer so we can compute the size.

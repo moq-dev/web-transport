@@ -62,7 +62,7 @@ impl Connect {
     pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
         let response = ConnectResponse {
             status,
-            subprotocol: None,
+            protocol: None,
         };
         tracing::debug!(?response, "sending CONNECT");
         response.write(&mut self.send).await?;
@@ -82,7 +82,7 @@ impl Connect {
         // Create a new CONNECT request that we'll send using HTTP/3
         let request = ConnectRequest {
             url,
-            subprotocols: vec![],
+            protocols: vec![],
         };
 
         tracing::debug!(?request, "sending CONNECT");

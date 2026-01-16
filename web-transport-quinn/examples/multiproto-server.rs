@@ -71,7 +71,7 @@ impl TryFrom<&String> for Protocol {
 async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
     tracing::info!(url = %request.url(),"received WebTransport request");
     let Some(protocol) = request
-        .subprotocols
+        .protocols
         .iter()
         .filter_map(|subprotocol| Protocol::try_from(subprotocol).ok())
         .next()
