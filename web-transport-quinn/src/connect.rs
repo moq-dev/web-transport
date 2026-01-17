@@ -28,12 +28,12 @@ pub enum ConnectError {
 
 pub struct Connect {
     // The request that was sent by the client.
-    pub request: ConnectRequest,
+    pub(crate) request: ConnectRequest,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
-    pub send: quinn::SendStream,
+    pub(crate) send: quinn::SendStream,
 
-    pub recv: quinn::RecvStream,
+    pub(crate) recv: quinn::RecvStream,
 }
 
 impl Connect {

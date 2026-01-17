@@ -102,7 +102,7 @@ impl core::ops::Deref for Server {
 }
 
 impl Server {
-    /// Manaully create a new server with a manually constructed Endpoint.
+    /// Manually create a new server with a manually constructed Endpoint.
     ///
     /// NOTE: The ALPN must be set to `crate::ALPN` for WebTransport to work.
     pub fn new(endpoint: quinn::Endpoint) -> Self {

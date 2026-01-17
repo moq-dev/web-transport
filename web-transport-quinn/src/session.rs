@@ -45,7 +45,7 @@ pub struct Session {
     #[allow(dead_code)]
     settings: Option<Arc<Settings>>,
 
-    // The request send by the client.
+    // The request sent by the client.
     request: ConnectRequest,
 
     // The response sent by the server.
