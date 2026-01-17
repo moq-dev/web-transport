@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes};
 use url::Url;
 
+use web_transport_quinn::http;
 // Export the Quinn implementation to simplify Cargo.toml
 pub use web_transport_quinn as quinn;
 
@@ -72,7 +73,8 @@ impl Server {
     /// Accept an incoming connection.
     pub async fn accept(&mut self) -> Result<Option<Session>, Error> {
         match self.inner.accept().await {
-            Some(session) => Ok(Some(session.ok().await?.into())),
+            // TODO add sub-protocol support
+            Some(session) => Ok(Some(session.respond(http::StatusCode::OK).await?.into())),
             None => Ok(None),
         }
     }
@@ -152,7 +154,12 @@ impl Session {
 
     /// Return the URL used to create the session.
     pub fn url(&self) -> &Url {
-        self.inner.url()
+        &self.inner.request().url
+    }
+
+    /// Return the application protocol used to create the session.
+    pub fn protocol(&self) -> Option<&str> {
+        self.inner.response().protocol.as_deref()
     }
 }
 

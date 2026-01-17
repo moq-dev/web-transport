@@ -4,6 +4,7 @@ use anyhow::Context;
 use clap::Parser;
 use rustls::pki_types::CertificateDer;
 use url::Url;
+use web_transport_quinn::proto::ConnectRequest;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -18,6 +19,10 @@ struct Args {
     /// Dangerous: Disable TLS certificate verification.
     #[arg(long, default_value = "false")]
     tls_disable_verify: bool,
+
+    /// Optional WebTransport subprotocol to negotiate.
+    #[arg(long)]
+    protocol: Option<String>,
 }
 
 #[tokio::main]
@@ -61,9 +66,23 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(url = %args.url, "connecting");
 
     // Connect to the given URL.
-    let session = client.connect(args.url).await?;
+    let mut request = ConnectRequest::new(args.url);
+    if let Some(protocol) = &args.protocol {
+        request = request.with_protocol(protocol);
+    }
+    let session = client.connect(request).await?;
 
     tracing::info!("connected");
+
+    match (&args.protocol, &session.response().protocol) {
+        (Some(_), Some(protocol)) => {
+            tracing::info!(%protocol, "negotiated protocol");
+        }
+        (Some(requested), None) => {
+            tracing::warn!(%requested, "server did not negotiate protocol");
+        }
+        _ => {}
+    }
 
     // Create a bidirectional stream.
     let (mut send, mut recv) = session.open_bi().await?;

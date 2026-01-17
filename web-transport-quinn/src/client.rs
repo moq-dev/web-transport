@@ -1,11 +1,12 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use crate::proto::ConnectRequest;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::{client::danger::ServerCertVerifier, pki_types::CertificateDer};
 use tokio::net::lookup_host;
-use url::{Host, Url};
+use url::Host;
 
 use crate::crypto;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -212,11 +213,17 @@ impl Client {
     }
 
     /// Connect to the server.
-    pub async fn connect(&self, url: Url) -> Result<Session, ClientError> {
-        let port = url.port().unwrap_or(443);
+    pub async fn connect(
+        &self,
+        request: impl Into<ConnectRequest>,
+    ) -> Result<Session, ClientError> {
+        let request = request.into();
+
+        let port = request.url.port().unwrap_or(443);
 
         // TODO error on username:password in host
-        let (host, remote) = match url
+        let (host, remote) = match request
+            .url
             .host()
             .ok_or_else(|| ClientError::InvalidDnsName("".to_string()))?
         {
@@ -247,7 +254,7 @@ impl Client {
         let conn = conn.await?;
 
         // Connect with the connection we established.
-        Session::connect(conn, url).await
+        Session::connect(conn, request).await
     }
 }
 

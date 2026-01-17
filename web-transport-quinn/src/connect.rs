@@ -1,7 +1,6 @@
 use web_transport_proto::{ConnectRequest, ConnectResponse, VarInt};
 
 use thiserror::Error;
-use url::Url;
 
 #[derive(Error, Debug, Clone)]
 pub enum ConnectError {
@@ -22,17 +21,19 @@ pub enum ConnectError {
 
     #[error("http error status: {0}")]
     ErrorStatus(http::StatusCode),
+
+    #[error("server returned protocol not in request: {0}")]
+    ProtocolMismatch(String),
 }
 
 pub struct Connect {
     // The request that was sent by the client.
-    request: ConnectRequest,
+    pub request: ConnectRequest,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
-    send: quinn::SendStream,
+    pub send: quinn::SendStream,
 
-    #[allow(dead_code)]
-    recv: quinn::RecvStream,
+    pub recv: quinn::RecvStream,
 }
 
 impl Connect {
@@ -53,21 +54,57 @@ impl Connect {
     }
 
     // Called by the server to send a response to the client.
-    pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let resp = ConnectResponse { status };
+    pub async fn respond(
+        mut self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<ConnectComplete, ConnectError> {
+        let response = response.into();
 
-        tracing::debug!(?resp, "sending CONNECT response");
-        resp.write(&mut self.send).await?;
+        // Validate that our protocol was in the client's request.
+        if let Some(protocol) = &response.protocol {
+            if !self.request.protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
+        }
 
-        Ok(())
+        tracing::debug!(?response, "sending CONNECT response");
+        response.write(&mut self.send).await?;
+
+        Ok(ConnectComplete {
+            request: self.request,
+            response,
+            send: self.send,
+            recv: self.recv,
+        })
     }
+}
 
-    pub async fn open(conn: &quinn::Connection, url: Url) -> Result<Self, ConnectError> {
+pub struct ConnectComplete {
+    // The request that was sent by the client.
+    pub request: ConnectRequest,
+
+    // The response sent by the server.
+    pub response: ConnectResponse,
+
+    // A reference to the send/recv stream, so we don't close it until dropped.
+    pub send: quinn::SendStream,
+
+    pub recv: quinn::RecvStream,
+}
+
+impl ConnectComplete {
+    /// Open a new WebTransport session on the given connection for the given URL.
+    ///
+    /// You may add any number of subprotocols allowing the server to select from.
+    /// If the list is empty the field will be omitted in the request header.
+    pub async fn open(
+        conn: &quinn::Connection,
+        request: impl Into<ConnectRequest>,
+    ) -> Result<Self, ConnectError> {
+        let request = request.into();
+
         // Create a new stream that will be used to send the CONNECT frame.
         let (mut send, mut recv) = conn.open_bi().await?;
-
-        // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest { url };
 
         tracing::debug!(?request, "sending CONNECT request");
         request.write(&mut send).await?;
@@ -80,8 +117,16 @@ impl Connect {
             return Err(ConnectError::ErrorStatus(response.status));
         }
 
+        // Validate that the server's protocol was in our request.
+        if let Some(protocol) = &response.protocol {
+            if !request.protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
+        }
+
         Ok(Self {
             request,
+            response,
             send,
             recv,
         })
@@ -93,14 +138,5 @@ impl Connect {
         // We don't use the quinn::VarInt because that would mean a quinn dependency in web-transport-proto
         let stream_id = quinn::VarInt::from(self.send.id());
         VarInt::try_from(stream_id.into_inner()).unwrap()
-    }
-
-    // The URL in the CONNECT request.
-    pub fn url(&self) -> &Url {
-        &self.request.url
-    }
-
-    pub(super) fn into_inner(self) -> (quinn::SendStream, quinn::RecvStream) {
-        (self.send, self.recv)
     }
 }
