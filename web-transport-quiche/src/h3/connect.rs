@@ -1,4 +1,4 @@
-use web_transport_proto::{ConnectRequest, ConnectResponse, VarInt};
+use crate::proto::{ConnectRequest, ConnectResponse, VarInt};
 
 use thiserror::Error;
 use url::Url;
@@ -59,11 +59,11 @@ impl Connect {
     /// Send an HTTP/3 CONNECT response to the client.
     ///
     /// This is called by the server to accept or reject the connection.
-    pub async fn respond(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let response = ConnectResponse {
-            status,
-            protocol: None,
-        };
+    pub async fn respond(
+        &mut self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<(), ConnectError> {
+        let response = response.into();
         tracing::debug!(?response, "sending CONNECT");
         response.write(&mut self.send).await?;
 
@@ -73,17 +73,17 @@ impl Connect {
     /// Send an HTTP/3 CONNECT request to the server and wait for the response.
     ///
     /// This is called by the client to initiate a WebTransport session.
-    pub async fn open(conn: &ez::Connection, url: Url) -> Result<Self, ConnectError> {
+    pub async fn open(
+        conn: &ez::Connection,
+        request: impl Into<ConnectRequest>,
+    ) -> Result<Self, ConnectError> {
         tracing::debug!("opening bi");
 
         // Create a new stream that will be used to send the CONNECT frame.
         let (mut send, mut recv) = conn.open_bi().await?;
 
         // Create a new CONNECT request that we'll send using HTTP/3
-        let request = ConnectRequest {
-            url,
-            protocols: vec![],
-        };
+        let request = request.into();
 
         tracing::debug!(?request, "sending CONNECT");
         request.write(&mut send).await?;

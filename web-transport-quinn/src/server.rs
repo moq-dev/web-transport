@@ -179,11 +179,7 @@ impl Request {
 
     /// Reject the session with the given status code.
     pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
-        let response = ConnectResponse {
-            status,
-            protocol: None,
-        };
-        self.connect.respond(response).await?;
+        self.connect.respond(ConnectResponse::new(status)).await?;
         Ok(())
     }
 

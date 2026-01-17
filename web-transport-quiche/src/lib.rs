@@ -41,3 +41,5 @@ pub use send::*;
 pub use server::*;
 
 pub use ez::{CertificateKind, CertificatePath, Settings};
+
+pub use web_transport_proto as proto;

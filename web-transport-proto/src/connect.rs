@@ -8,65 +8,6 @@ use super::{qpack, Frame, VarInt};
 
 use thiserror::Error;
 
-mod protocol_negotiation {
-    //! WebTransport sub-protocol negotiation using RFC 8941 Structured Fields,
-    //!
-    //! according to [draft 14](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-14.html#section-3.3)
-
-    use sfv::{Item, ItemSerializer, List, ListEntry, ListSerializer, Parser, StringRef};
-
-    use crate::ConnectError;
-
-    /// The header name for the available protocols, sent within the WebTransport Connect request.
-    pub const AVAILABLE_NAME: &str = "wt-available-protocols";
-    /// The header name for the selected protocol, sent within the WebTransport Connect response.
-    pub const SELECTED_NAME: &str = "wt-protocol";
-
-    /// Encode a list of protocol strings as an RFC 8941 Structured Field List.
-    pub fn encode_list(protocols: &[String]) -> Option<String> {
-        let mut serializer = ListSerializer::new();
-        for protocol in protocols {
-            let s = StringRef::from_str(protocol).ok()?;
-            let _ = serializer.bare_item(s);
-        }
-        serializer.finish()
-    }
-
-    /// Decode an RFC 8941 Structured Field List of strings.
-    pub fn decode_list(value: &str) -> Result<Vec<String>, ConnectError> {
-        let list = Parser::new(value).parse::<List>()?;
-
-        list.iter()
-            .map(|entry| match entry {
-                ListEntry::Item(item) => Ok(item
-                    .bare_item
-                    .as_string()
-                    .ok_or(ConnectError::InvalidProtocol)?
-                    .as_str()
-                    .to_string()),
-                _ => Err(ConnectError::InvalidProtocol),
-            })
-            .collect()
-    }
-
-    /// Encode a single string as an RFC 8941 Structured Field Item.
-    pub fn encode_item(protocol: &str) -> Option<String> {
-        let s = StringRef::from_str(protocol).ok()?;
-        Some(ItemSerializer::new().bare_item(s).finish())
-    }
-
-    /// Decode an RFC 8941 Structured Field Item (single string).
-    pub fn decode_item(value: &str) -> Result<String, ConnectError> {
-        let item = Parser::new(value).parse::<Item>()?;
-        Ok(item
-            .bare_item
-            .as_string()
-            .ok_or(ConnectError::InvalidProtocol)?
-            .as_str()
-            .to_string())
-    }
-}
-
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
 pub enum ConnectError {
@@ -132,6 +73,7 @@ impl From<sfv::Error> for ConnectError {
 }
 
 /// A CONNECT request to initiate a WebTransport session.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConnectRequest {
     /// The URL to connect to.
@@ -142,6 +84,27 @@ pub struct ConnectRequest {
 }
 
 impl ConnectRequest {
+    pub fn new(url: impl Into<Url>) -> Self {
+        Self {
+            url: url.into(),
+            protocols: Vec::new(),
+        }
+    }
+
+    pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.protocols.push(protocol.into());
+        self
+    }
+
+    pub fn with_protocols(
+        mut self,
+        protocols: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.protocols
+            .extend(protocols.into_iter().map(|p| p.into()));
+        self
+    }
+
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ConnectError> {
         let (typ, mut data) = Frame::read(buf).map_err(|_| ConnectError::UnexpectedEnd)?;
         if typ != Frame::HEADERS {
@@ -206,7 +169,7 @@ impl ConnectRequest {
         }
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
         headers.set(":method", "CONNECT");
         headers.set(":scheme", self.url.scheme());
@@ -217,7 +180,9 @@ impl ConnectRequest {
         };
         headers.set(":path", &path_and_query);
         headers.set(":protocol", "webtransport");
-        if let Some(encoded) = protocol_negotiation::encode_list(&self.protocols) {
+
+        if !self.protocols.is_empty() {
+            let encoded = protocol_negotiation::encode_list(&self.protocols)?;
             headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
@@ -229,11 +194,13 @@ impl ConnectRequest {
         Frame::HEADERS.encode(buf);
         size.encode(buf);
         buf.put_slice(&tmp);
+
+        Ok(())
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
         let mut buf = BytesMut::new();
-        self.encode(&mut buf);
+        self.encode(&mut buf)?;
         stream.write_all_buf(&mut buf).await?;
         Ok(())
     }
@@ -249,6 +216,7 @@ impl From<Url> for ConnectRequest {
 }
 
 /// A CONNECT response to accept or reject a WebTransport session.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ConnectResponse {
     /// The status code of the response.
@@ -259,6 +227,18 @@ pub struct ConnectResponse {
 }
 
 impl ConnectResponse {
+    pub fn new(status: http::StatusCode) -> Self {
+        Self {
+            status,
+            protocol: None,
+        }
+    }
+
+    pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.protocol = Some(protocol.into());
+        self
+    }
+
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ConnectError> {
         let (typ, mut data) = Frame::read(buf).map_err(|_| ConnectError::UnexpectedEnd)?;
         if typ != Frame::HEADERS {
@@ -303,15 +283,13 @@ impl ConnectResponse {
         }
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
-        if let Some(encoded) = self
-            .protocol
-            .as_ref()
-            .and_then(|s| protocol_negotiation::encode_item(s))
-        {
+
+        if let Some(protocol) = self.protocol.as_ref() {
+            let encoded = protocol_negotiation::encode_item(protocol)?;
             headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
         }
 
@@ -323,11 +301,13 @@ impl ConnectResponse {
         Frame::HEADERS.encode(buf);
         size.encode(buf);
         buf.put_slice(&tmp);
+
+        Ok(())
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
         let mut buf = BytesMut::new();
-        self.encode(&mut buf);
+        self.encode(&mut buf)?;
         stream.write_all_buf(&mut buf).await?;
         Ok(())
     }
@@ -339,5 +319,64 @@ impl From<http::StatusCode> for ConnectResponse {
             status,
             protocol: None,
         }
+    }
+}
+
+mod protocol_negotiation {
+    //! WebTransport sub-protocol negotiation using RFC 8941 Structured Fields,
+    //!
+    //! according to [draft 14](https://www.ietf.org/archive/id/draft-ietf-webtrans-http3-14.html#section-3.3)
+
+    use sfv::{Item, ItemSerializer, List, ListEntry, ListSerializer, Parser, StringRef};
+
+    use crate::ConnectError;
+
+    /// The header name for the available protocols, sent within the WebTransport Connect request.
+    pub const AVAILABLE_NAME: &str = "wt-available-protocols";
+    /// The header name for the selected protocol, sent within the WebTransport Connect response.
+    pub const SELECTED_NAME: &str = "wt-protocol";
+
+    /// Encode a list of protocol strings as an RFC 8941 Structured Field List.
+    pub fn encode_list(protocols: &[String]) -> Result<String, ConnectError> {
+        let mut serializer = ListSerializer::new();
+        for protocol in protocols {
+            let s = StringRef::from_str(protocol)?;
+            let _ = serializer.bare_item(s);
+        }
+        serializer.finish().ok_or(ConnectError::InvalidProtocol)
+    }
+
+    /// Decode an RFC 8941 Structured Field List of strings.
+    pub fn decode_list(value: &str) -> Result<Vec<String>, ConnectError> {
+        let list = Parser::new(value).parse::<List>()?;
+
+        list.iter()
+            .map(|entry| match entry {
+                ListEntry::Item(item) => Ok(item
+                    .bare_item
+                    .as_string()
+                    .ok_or(ConnectError::InvalidProtocol)?
+                    .as_str()
+                    .to_string()),
+                _ => Err(ConnectError::InvalidProtocol),
+            })
+            .collect()
+    }
+
+    /// Encode a single string as an RFC 8941 Structured Field Item.
+    pub fn encode_item(protocol: &str) -> Result<String, ConnectError> {
+        let s = StringRef::from_str(protocol)?;
+        Ok(ItemSerializer::new().bare_item(s).finish())
+    }
+
+    /// Decode an RFC 8941 Structured Field Item (single string).
+    pub fn decode_item(value: &str) -> Result<String, ConnectError> {
+        let item = Parser::new(value).parse::<Item>()?;
+        Ok(item
+            .bare_item
+            .as_string()
+            .ok_or(ConnectError::InvalidProtocol)?
+            .as_str()
+            .to_string())
     }
 }

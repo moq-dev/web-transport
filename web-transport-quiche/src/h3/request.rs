@@ -1,6 +1,6 @@
 use url::Url;
 
-use crate::{ez, h3, Connection, ServerError};
+use crate::{ez, h3, proto::ConnectResponse, Connection, ServerError};
 
 /// A mostly complete WebTransport handshake, just awaiting the server's decision on whether to accept or reject the session based on the URL.
 pub struct Request {
@@ -32,8 +32,11 @@ impl Request {
     }
 
     /// Accept the session, returning a 200 OK.
-    pub async fn ok(mut self) -> Result<Connection, ServerError> {
-        self.connect.respond(http::StatusCode::OK).await?;
+    pub async fn respond(
+        mut self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<Connection, ServerError> {
+        self.connect.respond(response.into()).await?;
         Ok(Connection::new(self.conn, self.settings, self.connect))
     }
 

@@ -4,7 +4,7 @@ use anyhow::Context;
 
 use clap::Parser;
 use rustls::pki_types::CertificateDer;
-use web_transport_quinn::Session;
+use web_transport_quinn::{proto::ConnectResponse, Session};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -19,6 +19,10 @@ struct Args {
     /// Use the private key at this path, encoded as PEM.
     #[arg(long)]
     pub tls_key: path::PathBuf,
+
+    /// Optional WebTransport subprotocol to support.
+    #[arg(long)]
+    pub protocol: Option<String>,
 }
 
 #[tokio::main]
@@ -60,8 +64,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {
+        let protocol = args.protocol.clone();
         tokio::spawn(async move {
-            let err = run_conn(conn).await;
+            let err = run_conn(conn, protocol).await;
             if let Err(err) = err {
                 tracing::error!(?err, "connection failed")
             }
@@ -73,12 +78,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
+async fn run_conn(
+    request: web_transport_quinn::Request,
+    protocol: Option<String>,
+) -> anyhow::Result<()> {
     tracing::info!(url = %request.url, "received WebTransport request");
 
+    // Negotiate protocol if both client and server support it.
+    let negotiated = protocol.filter(|p| request.protocols.contains(p));
+    if let Some(protocol) = &negotiated {
+        tracing::info!(%protocol, "negotiated protocol");
+    }
+
     // Accept the session.
+    let mut response = ConnectResponse::new(http::StatusCode::OK);
+    if let Some(protocol) = negotiated {
+        response = response.with_protocol(protocol);
+    }
     let session = request
-        .respond(http::StatusCode::OK)
+        .respond(response)
         .await
         .context("failed to accept session")?;
     tracing::info!("accepted session");

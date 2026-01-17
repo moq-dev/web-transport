@@ -21,6 +21,9 @@ pub enum ConnectError {
 
     #[error("http error status: {0}")]
     ErrorStatus(http::StatusCode),
+
+    #[error("server returned protocol not in request: {0}")]
+    ProtocolMismatch(String),
 }
 
 pub struct Connect {
@@ -56,6 +59,14 @@ impl Connect {
         response: impl Into<ConnectResponse>,
     ) -> Result<ConnectComplete, ConnectError> {
         let response = response.into();
+
+        // Validate that our protocol was in the client's request.
+        if let Some(protocol) = &response.protocol {
+            if !self.request.protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
+        }
+
         tracing::debug!(?response, "sending CONNECT response");
         response.write(&mut self.send).await?;
 
@@ -104,6 +115,13 @@ impl ConnectComplete {
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
             return Err(ConnectError::ErrorStatus(response.status));
+        }
+
+        // Validate that the server's protocol was in our request.
+        if let Some(protocol) = &response.protocol {
+            if !request.protocols.contains(protocol) {
+                return Err(ConnectError::ProtocolMismatch(protocol.clone()));
+            }
         }
 
         Ok(Self {
