@@ -11,6 +11,7 @@ const params = new URLSearchParams(window.location.search);
 
 const url = params.get("url") || "https://localhost:4443";
 const datagram = params.get("datagram") || false;
+const protocol = params.get("protocol") || null;
 
 function log(msg) {
 	const element = document.createElement("div");
@@ -21,17 +22,32 @@ function log(msg) {
 
 async function run() {
 	// Connect using the hex fingerprint in the cert folder.
-	const transport = new WebTransport(url, {
+	const options = {
 		serverCertificateHashes: [
 			{
 				algorithm: "sha-256",
 				value: new Uint8Array(fingerprint),
 			},
 		],
-	});
+	};
+
+	// Add protocols if specified via query parameter
+	if (protocol) {
+		options.protocols = [protocol];
+		log(`requesting protocol: ${protocol}`);
+	}
+
+	const transport = new WebTransport(url, options);
 	await transport.ready;
 
 	log("connected");
+
+	// Log the negotiated protocol
+	if (transport.protocol) {
+		log(`negotiated protocol: ${transport.protocol}`);
+	} else if (protocol) {
+		log("no protocol negotiated (server did not select one)");
+	}
 
 	let writer;
 	let reader;
