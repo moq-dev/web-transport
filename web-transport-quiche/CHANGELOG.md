@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.2...web-transport-quiche-v0.0.3) - 2026-01-23
+
+### Other
+
+- Sub-protocol negotiation + breaking API changes ([#143](https://github.com/moq-dev/web-transport/pull/143))
+
 ## [0.0.2](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.1...web-transport-quiche-v0.0.2) - 2026-01-07
 
 ### Other
