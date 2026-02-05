@@ -12,6 +12,7 @@ mod recv;
 mod send;
 mod server;
 mod stream;
+pub mod tls;
 
 pub use client::*;
 pub use connection::*;
@@ -23,7 +24,7 @@ pub use stream::*;
 use driver::*;
 use lock::*;
 
+pub use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+pub use tls::{CertResolver, CertifiedKey};
 pub use tokio_quiche::metrics::{DefaultMetrics, Metrics};
-pub use tokio_quiche::settings::{
-    CertificateKind, QuicSettings as Settings, TlsCertificatePaths as CertificatePath,
-};
+pub use tokio_quiche::settings::QuicSettings as Settings;

@@ -78,6 +78,11 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerInit> {
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
     }
+
+    /// Set ALPN protocols.
+    pub fn with_alpn(self, alpn: Vec<Vec<u8>>) -> Self {
+        Self(self.0.with_alpn(alpn))
+    }
 }
 
 impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
@@ -101,9 +106,26 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
         Self(self.0.with_settings(settings))
     }
 
-    /// Configure the server to use the specified certificate for TLS.
-    pub fn with_cert<'a>(self, tls: ez::CertificatePath<'a>) -> io::Result<Server<M>> {
-        Ok(Server::new(self.0.with_cert(tls)?))
+    /// Set ALPN protocols.
+    pub fn with_alpn(self, alpn: Vec<Vec<u8>>) -> Self {
+        Self(self.0.with_alpn(alpn))
+    }
+
+    /// Configure the server to use a static certificate for TLS.
+    pub fn with_single_cert(
+        self,
+        chain: Vec<ez::CertificateDer<'static>>,
+        key: ez::PrivateKeyDer<'static>,
+    ) -> io::Result<Server<M>> {
+        Ok(Server::new(self.0.with_single_cert(chain, key)?))
+    }
+
+    /// Configure the server to use a dynamic certificate resolver for TLS.
+    pub fn with_cert_resolver(
+        self,
+        resolver: std::sync::Arc<dyn ez::CertResolver>,
+    ) -> io::Result<Server<M>> {
+        Ok(Server::new(self.0.with_cert_resolver(resolver)?))
     }
 }
 
