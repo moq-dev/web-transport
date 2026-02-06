@@ -31,7 +31,10 @@ fn der_to_boring_key(key: &PrivateKeyDer) -> Result<PKey<Private>, boring::error
         PrivateKeyDer::Sec1(d) => Ok(PKey::from_ec_key(EcKey::private_key_from_der(
             d.secret_sec1_der(),
         )?)?),
-        _ => Err(PKey::<Private>::private_key_from_der(&[]).unwrap_err()),
+        _ => {
+            tracing::warn!("unsupported private key format");
+            Err(PKey::<Private>::private_key_from_der(&[]).unwrap_err())
+        }
     }
 }
 
@@ -42,6 +45,9 @@ fn alpn_select<'a>(server: &[Vec<u8>], client: &'a [u8]) -> Option<&'a [u8]> {
         let mut rest = client;
         while !rest.is_empty() {
             let len = rest[0] as usize;
+            if len == 0 || 1 + len > rest.len() {
+                break;
+            }
             let proto = &rest[1..1 + len];
             rest = &rest[1 + len..];
             if proto == server_proto.as_slice() {
@@ -63,21 +69,38 @@ impl ConnectionHook for StaticCertHook {
         &self,
         _settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
+        let mut builder = SslContextBuilder::new(SslMethod::tls())
+            .inspect_err(|err| tracing::warn!(%err, "failed to create SSL context"))
+            .ok()?;
 
         // Set the leaf certificate.
-        let leaf = X509::from_der(self.chain.first()?.as_ref()).ok()?;
-        builder.set_certificate(&leaf).ok()?;
+        let leaf = X509::from_der(self.chain.first()?.as_ref())
+            .inspect_err(|err| tracing::warn!(%err, "failed to parse leaf certificate DER"))
+            .ok()?;
+        builder
+            .set_certificate(&leaf)
+            .inspect_err(|err| tracing::warn!(%err, "failed to set leaf certificate"))
+            .ok()?;
 
         // Set intermediate certificates.
         for cert_der in self.chain.iter().skip(1) {
-            let cert = X509::from_der(cert_der.as_ref()).ok()?;
-            builder.add_extra_chain_cert(cert).ok()?;
+            let cert = X509::from_der(cert_der.as_ref())
+                .inspect_err(|err| tracing::warn!(%err, "failed to parse intermediate certificate DER"))
+                .ok()?;
+            builder
+                .add_extra_chain_cert(cert)
+                .inspect_err(|err| tracing::warn!(%err, "failed to add intermediate certificate"))
+                .ok()?;
         }
 
         // Set the private key.
-        let key = der_to_boring_key(&self.key).ok()?;
-        builder.set_private_key(&key).ok()?;
+        let key = der_to_boring_key(&self.key)
+            .inspect_err(|err| tracing::warn!(%err, "failed to parse private key"))
+            .ok()?;
+        builder
+            .set_private_key(&key)
+            .inspect_err(|err| tracing::warn!(%err, "failed to set private key"))
+            .ok()?;
 
         // Select the first server ALPN protocol that the client also supports.
         if !self.alpn.is_empty() {
@@ -101,7 +124,9 @@ impl ConnectionHook for DynamicCertHook {
         &self,
         _settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
+        let mut builder = SslContextBuilder::new(SslMethod::tls())
+            .inspect_err(|err| tracing::warn!(%err, "failed to create SSL context"))
+            .ok()?;
 
         let resolver = self.resolver.clone();
 
@@ -119,20 +144,28 @@ impl ConnectionHook for DynamicCertHook {
                     .ok_or(SelectCertError::ERROR)?
                     .as_ref(),
             )
+            .inspect_err(|err| tracing::warn!(%err, "failed to parse leaf certificate DER"))
             .map_err(|_| SelectCertError::ERROR)?;
             ssl.set_certificate(&leaf)
+                .inspect_err(|err| tracing::warn!(%err, "failed to set leaf certificate"))
                 .map_err(|_| SelectCertError::ERROR)?;
 
             // Set intermediate certificates.
             for cert_der in certified.chain.iter().skip(1) {
-                let cert = X509::from_der(cert_der.as_ref()).map_err(|_| SelectCertError::ERROR)?;
+                let cert = X509::from_der(cert_der.as_ref())
+                    .inspect_err(|err| tracing::warn!(%err, "failed to parse intermediate certificate DER"))
+                    .map_err(|_| SelectCertError::ERROR)?;
                 ssl.add_chain_cert(&cert)
+                    .inspect_err(|err| tracing::warn!(%err, "failed to add intermediate certificate"))
                     .map_err(|_| SelectCertError::ERROR)?;
             }
 
             // Set the private key.
-            let key = der_to_boring_key(&certified.key).map_err(|_| SelectCertError::ERROR)?;
+            let key = der_to_boring_key(&certified.key)
+                .inspect_err(|err| tracing::warn!(%err, "failed to parse private key"))
+                .map_err(|_| SelectCertError::ERROR)?;
             ssl.set_private_key(&key)
+                .inspect_err(|err| tracing::warn!(%err, "failed to set private key"))
                 .map_err(|_| SelectCertError::ERROR)?;
 
             Ok(())
