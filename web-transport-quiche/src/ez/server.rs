@@ -261,11 +261,6 @@ impl<M: Metrics> Server<M> {
         self.accept.recv().await
     }
 
-    /// Returns the local address of the first listener.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addrs.first().copied()
-    }
-
     /// Returns the local addresses of all listeners.
     pub fn local_addrs(&self) -> &[SocketAddr] {
         &self.local_addrs
