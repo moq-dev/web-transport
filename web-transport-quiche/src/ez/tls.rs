@@ -3,7 +3,9 @@ use std::sync::Arc;
 use boring::ec::EcKey;
 use boring::pkey::{PKey, Private};
 use boring::rsa::Rsa;
-use boring::ssl::{ClientHello, NameType, SelectCertError, SslContextBuilder, SslMethod};
+use boring::ssl::{
+    AlpnError, ClientHello, NameType, SelectCertError, SslContextBuilder, SslMethod,
+};
 use boring::x509::X509;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_quiche::quic::ConnectionHook;
@@ -33,13 +35,21 @@ fn der_to_boring_key(key: &PrivateKeyDer) -> Result<PKey<Private>, boring::error
     }
 }
 
-fn alpn_wire_format(alpn: &[Vec<u8>]) -> Vec<u8> {
-    let mut wire = Vec::new();
-    for proto in alpn {
-        wire.push(proto.len() as u8);
-        wire.extend_from_slice(proto);
+/// Select the first server protocol also offered by the client (in ALPN wire format).
+/// Returns a slice into `client` so the lifetime is correct for the ALPN select callback.
+fn alpn_select<'a>(server: &[Vec<u8>], client: &'a [u8]) -> Option<&'a [u8]> {
+    for server_proto in server {
+        let mut rest = client;
+        while !rest.is_empty() {
+            let len = rest[0] as usize;
+            let proto = &rest[1..1 + len];
+            rest = &rest[1 + len..];
+            if proto == server_proto.as_slice() {
+                return Some(proto);
+            }
+        }
     }
-    wire
+    None
 }
 
 pub(crate) struct StaticCertHook {
@@ -69,10 +79,12 @@ impl ConnectionHook for StaticCertHook {
         let key = der_to_boring_key(&self.key).ok()?;
         builder.set_private_key(&key).ok()?;
 
-        // Set ALPN protocols.
+        // Select the first server ALPN protocol that the client also supports.
         if !self.alpn.is_empty() {
-            let wire = alpn_wire_format(&self.alpn);
-            builder.set_alpn_protos(&wire).ok()?;
+            let alpn = self.alpn.clone();
+            builder.set_alpn_select_callback(move |_, client| {
+                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::NOACK)
+            });
         }
 
         Some(builder)
@@ -92,7 +104,6 @@ impl ConnectionHook for DynamicCertHook {
         let mut builder = SslContextBuilder::new(SslMethod::tls()).ok()?;
 
         let resolver = self.resolver.clone();
-        let alpn = self.alpn.clone();
 
         builder.set_select_certificate_callback(move |mut client_hello: ClientHello<'_>| {
             let sni = client_hello.servername(NameType::HOST_NAME);
@@ -124,20 +135,15 @@ impl ConnectionHook for DynamicCertHook {
             ssl.set_private_key(&key)
                 .map_err(|_| SelectCertError::ERROR)?;
 
-            // Set ALPN protocols.
-            if !alpn.is_empty() {
-                let wire = alpn_wire_format(&alpn);
-                ssl.set_alpn_protos(&wire)
-                    .map_err(|_| SelectCertError::ERROR)?;
-            }
-
             Ok(())
         });
 
-        // Set ALPN on the context level too (for cases where callback isn't invoked).
+        // Select the first server ALPN protocol that the client also supports.
         if !self.alpn.is_empty() {
-            let wire = alpn_wire_format(&self.alpn);
-            builder.set_alpn_protos(&wire).ok()?;
+            let alpn = self.alpn.clone();
+            builder.set_alpn_select_callback(move |_, client| {
+                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::NOACK)
+            });
         }
 
         Some(builder)

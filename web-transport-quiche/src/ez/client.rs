@@ -137,11 +137,13 @@ impl<M: Metrics> ClientBuilder<M> {
 
         let (tls_cert, hooks) = match self.tls {
             Some((chain, key)) => {
+                // ALPN is left empty; tokio-quiche sets h3 at the config level after the hook.
                 let hook = StaticCertHook {
                     chain,
                     key,
                     alpn: Vec::new(),
                 };
+                // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
                 let dummy_tls = TlsCertificatePaths {
                     cert: "",
                     private_key: "",

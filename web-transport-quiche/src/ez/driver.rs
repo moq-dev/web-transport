@@ -178,8 +178,8 @@ impl Driver {
         _handshake_info: &HandshakeInfo,
     ) -> Result<(), ConnectionError> {
         // Capture the negotiated ALPN protocol.
-        let alpn = qconn.application_proto().to_vec();
-        self.state.lock().alpn = Some(alpn);
+        let alpn = qconn.application_proto();
+        self.state.lock().alpn = if alpn.is_empty() { None } else { Some(alpn.to_vec()) };
 
         // Run poll once to advance any pending operations.
         match self.poll(Waker::noop(), qconn) {
