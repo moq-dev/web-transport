@@ -33,6 +33,9 @@ pub(super) struct DriverState {
 
     local: ConnectionClosed,
     remote: ConnectionClosed,
+
+    /// The negotiated ALPN protocol, set after the handshake completes.
+    alpn: Option<Vec<u8>>,
 }
 
 impl DriverState {
@@ -54,6 +57,7 @@ impl DriverState {
             remote: ConnectionClosed::default(),
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
+            alpn: None,
         }
     }
 
@@ -67,6 +71,11 @@ impl DriverState {
 
     pub fn is_closed(&self) -> bool {
         self.local.is_closed() || self.remote.is_closed()
+    }
+
+    /// Returns the negotiated ALPN protocol, if the handshake has completed.
+    pub fn alpn(&self) -> Option<&[u8]> {
+        self.alpn.as_deref()
     }
 
     #[must_use = "wake the driver"]
@@ -168,6 +177,10 @@ impl Driver {
         qconn: &mut QuicheConnection,
         _handshake_info: &HandshakeInfo,
     ) -> Result<(), ConnectionError> {
+        // Capture the negotiated ALPN protocol.
+        let alpn = qconn.application_proto().to_vec();
+        self.state.lock().alpn = Some(alpn);
+
         // Run poll once to advance any pending operations.
         match self.poll(Waker::noop(), qconn) {
             Poll::Ready(Err(e)) => Err(e),

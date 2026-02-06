@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::io;
+use std::sync::Arc;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
@@ -155,8 +155,7 @@ impl<M: Metrics> ClientBuilder<M> {
             None => (None, Hooks::default()),
         };
 
-        let params =
-            tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);
+        let params = tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);
 
         let accept_bi = flume::unbounded();
         let accept_uni = flume::unbounded();

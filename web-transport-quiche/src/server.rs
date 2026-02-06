@@ -146,6 +146,11 @@ impl<M: ez::Metrics> Server<M> {
         }
     }
 
+    /// Returns the local address of the first listener.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.local_addr()
+    }
+
     /// Accept a new WebTransport session [h3::Request] from a client.
     ///
     /// Returns [h3::Request] which allows the server to inspect the URL and decide whether to accept or reject the session.

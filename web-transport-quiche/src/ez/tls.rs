@@ -23,16 +23,12 @@ pub trait CertResolver: Send + Sync {
 fn der_to_boring_key(key: &PrivateKeyDer) -> Result<PKey<Private>, boring::error::ErrorStack> {
     match key {
         PrivateKeyDer::Pkcs8(d) => PKey::private_key_from_der(d.secret_pkcs8_der()),
-        PrivateKeyDer::Pkcs1(d) => {
-            Ok(PKey::from_rsa(Rsa::private_key_from_der(
-                d.secret_pkcs1_der(),
-            )?)?)
-        }
-        PrivateKeyDer::Sec1(d) => {
-            Ok(PKey::from_ec_key(EcKey::private_key_from_der(
-                d.secret_sec1_der(),
-            )?)?)
-        }
+        PrivateKeyDer::Pkcs1(d) => Ok(PKey::from_rsa(Rsa::private_key_from_der(
+            d.secret_pkcs1_der(),
+        )?)?),
+        PrivateKeyDer::Sec1(d) => Ok(PKey::from_ec_key(EcKey::private_key_from_der(
+            d.secret_sec1_der(),
+        )?)?),
         _ => Err(PKey::<Private>::private_key_from_der(&[]).unwrap_err()),
     }
 }
@@ -100,9 +96,7 @@ impl ConnectionHook for DynamicCertHook {
 
         builder.set_select_certificate_callback(move |mut client_hello: ClientHello<'_>| {
             let sni = client_hello.servername(NameType::HOST_NAME);
-            let certified = resolver
-                .resolve(sni)
-                .ok_or(SelectCertError::ERROR)?;
+            let certified = resolver.resolve(sni).ok_or(SelectCertError::ERROR)?;
 
             let ssl = client_hello.ssl_mut();
 
@@ -120,15 +114,13 @@ impl ConnectionHook for DynamicCertHook {
 
             // Set intermediate certificates.
             for cert_der in certified.chain.iter().skip(1) {
-                let cert =
-                    X509::from_der(cert_der.as_ref()).map_err(|_| SelectCertError::ERROR)?;
+                let cert = X509::from_der(cert_der.as_ref()).map_err(|_| SelectCertError::ERROR)?;
                 ssl.add_chain_cert(&cert)
                     .map_err(|_| SelectCertError::ERROR)?;
             }
 
             // Set the private key.
-            let key =
-                der_to_boring_key(&certified.key).map_err(|_| SelectCertError::ERROR)?;
+            let key = der_to_boring_key(&certified.key).map_err(|_| SelectCertError::ERROR)?;
             ssl.set_private_key(&key)
                 .map_err(|_| SelectCertError::ERROR)?;
 

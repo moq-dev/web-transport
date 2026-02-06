@@ -4,7 +4,6 @@ use anyhow::Context;
 
 use bytes::Bytes;
 use clap::Parser;
-use rustls_pemfile;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

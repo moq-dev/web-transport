@@ -40,6 +40,10 @@ pub use recv::*;
 pub use send::*;
 pub use server::*;
 
-pub use ez::{CertificateDer, CertResolver, CertifiedKey, PrivateKeyDer, Settings};
+pub use ez::{CertResolver, CertificateDer, CertifiedKey, PrivateKeyDer, Settings};
 
+pub use http;
 pub use web_transport_proto as proto;
+
+/// The ALPN used for WebTransport over HTTP/3.
+pub const ALPN: &str = "h3";

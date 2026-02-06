@@ -1,10 +1,11 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{io, marker::PhantomData};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 use tokio_quiche::socket::{QuicListener, SocketCapabilities};
-use tokio_quiche::quic::SimpleConnectionIdGenerator;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -154,10 +155,7 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     }
 
     /// Configure the server to use a dynamic certificate resolver for TLS.
-    pub fn with_cert_resolver(
-        mut self,
-        resolver: Arc<dyn CertResolver>,
-    ) -> io::Result<Server<M>> {
+    pub fn with_cert_resolver(mut self, resolver: Arc<dyn CertResolver>) -> io::Result<Server<M>> {
         let alpn = std::mem::take(&mut self.alpn);
         let hook = DynamicCertHook { resolver, alpn };
 
@@ -179,21 +177,29 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
             connection_hook: Some(hook),
         };
 
-        let params =
-            tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
+        // Capture local addresses before the listeners are consumed.
+        let local_addrs: Vec<SocketAddr> = self
+            .state
+            .listeners
+            .iter()
+            .map(|l| l.socket.local_addr().unwrap())
+            .collect();
+
+        let params = tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
         let server = tokio_quiche::listen_with_capabilities(
             self.state.listeners,
             params,
             SimpleConnectionIdGenerator,
             self.metrics,
         )?;
-        Ok(Server::new(server))
+        Ok(Server::new(server, local_addrs))
     }
 }
 
 /// A QUIC server that accepts new connections.
 pub struct Server<M: Metrics = DefaultMetrics> {
     accept: mpsc::Receiver<Connection>,
+    local_addrs: Vec<SocketAddr>,
     // Cancels socket tasks when dropped.
     #[allow(dead_code)]
     tasks: JoinSet<io::Result<()>>,
@@ -201,7 +207,10 @@ pub struct Server<M: Metrics = DefaultMetrics> {
 }
 
 impl<M: Metrics> Server<M> {
-    fn new(sockets: Vec<tokio_quiche::QuicConnectionStream<M>>) -> Self {
+    fn new(
+        sockets: Vec<tokio_quiche::QuicConnectionStream<M>>,
+        local_addrs: Vec<SocketAddr>,
+    ) -> Self {
         let mut tasks = JoinSet::default();
 
         let accept = mpsc::channel(sockets.len());
@@ -214,6 +223,7 @@ impl<M: Metrics> Server<M> {
 
         Self {
             accept: accept.1,
+            local_addrs,
             _metrics: PhantomData,
             tasks,
         }
@@ -249,5 +259,15 @@ impl<M: Metrics> Server<M> {
     /// Returns `None` when the server is shutting down.
     pub async fn accept(&mut self) -> Option<Connection> {
         self.accept.recv().await
+    }
+
+    /// Returns the local address of the first listener.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addrs.first().copied()
+    }
+
+    /// Returns the local addresses of all listeners.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
     }
 }
