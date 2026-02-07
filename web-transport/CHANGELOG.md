@@ -31,6 +31,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- release ([#146](https://github.com/moq-dev/web-transport/pull/146))
+- Manually run release-plz because CI is broken? ([#145](https://github.com/moq-dev/web-transport/pull/145))
+- Sub-protocol negotiation + breaking API changes ([#143](https://github.com/moq-dev/web-transport/pull/143))
+- release ([#122](https://github.com/moq-dev/web-transport/pull/122))
+- Double check that read_buf is properly implemented. ([#137](https://github.com/moq-dev/web-transport/pull/137))
+- Remove with_unreliable. ([#136](https://github.com/moq-dev/web-transport/pull/136))
+- Don't require &mut for web-transport ([#134](https://github.com/moq-dev/web-transport/pull/134))
+- Rename the repo into a new org. ([#132](https://github.com/moq-dev/web-transport/pull/132))
+- We should bump the web-transport-trait crates. ([#123](https://github.com/moq-dev/web-transport/pull/123))
+- release ([#119](https://github.com/moq-dev/web-transport/pull/119))
+- Avoid some spurious semver changes and bump the rest ([#121](https://github.com/moq-dev/web-transport/pull/121))
+- Initial web-transport-quiche support ([#118](https://github.com/moq-dev/web-transport/pull/118))
+
+## [0.10.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.9.7...web-transport-v0.10.0) - 2026-02-07
+
+### Other
+
 - Manually run release-plz because CI is broken? ([#145](https://github.com/moq-dev/web-transport/pull/145))
 - Sub-protocol negotiation + breaking API changes ([#143](https://github.com/moq-dev/web-transport/pull/143))
 - release ([#122](https://github.com/moq-dev/web-transport/pull/122))
