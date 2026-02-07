@@ -32,21 +32,21 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let tls = web_transport_quiche::ez::CertificatePath {
-        cert: args
-            .tls_cert
-            .to_str()
-            .context("failed to convert path to str")?,
-        private_key: args
-            .tls_key
-            .to_str()
-            .context("failed to convert path to str")?,
-        kind: web_transport_quiche::ez::CertificateKind::X509,
-    };
+    // Load the certificate chain from PEM.
+    let cert_pem = std::fs::read(&args.tls_cert).context("failed to read certificate file")?;
+    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<_, _>>()
+        .context("failed to parse certificate PEM")?;
+
+    // Load the private key from PEM.
+    let key_pem = std::fs::read(&args.tls_key).context("failed to read private key file")?;
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .context("failed to parse private key PEM")?
+        .context("no private key found in PEM file")?;
 
     let mut server = web_transport_quiche::ServerBuilder::default()
         .with_bind(args.bind)?
-        .with_cert(tls)?;
+        .with_single_cert(chain, key)?;
 
     tracing::info!("listening on {}", args.bind);
 

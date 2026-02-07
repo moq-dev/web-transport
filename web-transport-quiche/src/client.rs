@@ -2,7 +2,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::{
-    ez::{self, CertificatePath, DefaultMetrics, Metrics},
+    ez::{self, DefaultMetrics, Metrics},
     h3, Connection, Settings,
 };
 
@@ -71,9 +71,13 @@ impl<M: Metrics> ClientBuilder<M> {
         Self(self.0.with_settings(settings))
     }
 
-    /// Optional: Use a client certificate for TLS.
-    pub fn with_cert(self, tls: CertificatePath<'_>) -> Result<Self, ClientError> {
-        Ok(Self(self.0.with_cert(tls)?))
+    /// Optional: Use a client certificate for mTLS.
+    pub fn with_single_cert(
+        self,
+        chain: Vec<ez::CertificateDer<'static>>,
+        key: ez::PrivateKeyDer<'static>,
+    ) -> Self {
+        Self(self.0.with_single_cert(chain, key))
     }
 
     /// Connect to the WebTransport server at the given URL.

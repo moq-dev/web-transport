@@ -206,6 +206,11 @@ impl Connection {
     pub fn is_closed(&self) -> bool {
         self.close.is_closed()
     }
+
+    /// Returns the negotiated ALPN protocol, if the handshake has completed.
+    pub fn alpn(&self) -> Option<Vec<u8>> {
+        self.driver.lock().alpn().map(|a| a.to_vec())
+    }
 }
 
 impl Deref for Connection {

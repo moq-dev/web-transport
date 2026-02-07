@@ -1,16 +1,18 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::{io, marker::PhantomData};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio_quiche::socket::SocketCapabilities;
-use tokio_quiche::{
-    quic::SimpleConnectionIdGenerator,
-    settings::{Hooks, TlsCertificatePaths},
-    socket::QuicListener,
-};
+use tokio_quiche::quic::SimpleConnectionIdGenerator;
+use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
+use tokio_quiche::socket::{QuicListener, SocketCapabilities};
 
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+use crate::ez::tls::{DynamicCertHook, StaticCertHook};
 use crate::ez::DriverState;
 
-use super::{Connection, DefaultMetrics, Driver, Lock, Metrics, Settings};
+use super::{CertResolver, Connection, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
 /// Used with [ServerBuilder] to require specific parameters.
 #[derive(Default)]
@@ -27,6 +29,7 @@ pub struct ServerBuilder<M: Metrics = DefaultMetrics, S = ServerInit> {
     settings: Settings,
     metrics: M,
     state: S,
+    alpn: Vec<Vec<u8>>,
 }
 
 impl Default for ServerBuilder<DefaultMetrics> {
@@ -44,6 +47,7 @@ impl ServerBuilder<DefaultMetrics, ServerInit> {
             settings: Settings::default(),
             metrics: m,
             state: ServerInit {},
+            alpn: Vec::new(),
         }
     }
 }
@@ -54,6 +58,7 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
             settings: self.settings,
             metrics: self.metrics,
             state: ServerWithListener { listeners: vec![] },
+            alpn: self.alpn,
         }
     }
 
@@ -81,6 +86,12 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Set ALPN protocols.
+    pub fn with_alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
+        self.alpn = alpn;
         self
     }
 }
@@ -125,23 +136,70 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
         self
     }
 
-    /// Configure the server to use the specified certificate for TLS.
-    pub fn with_cert<'a>(self, tls: TlsCertificatePaths<'a>) -> io::Result<Server<M>> {
-        let params =
-            tokio_quiche::ConnectionParams::new_server(self.settings, tls, Hooks::default());
+    /// Set ALPN protocols.
+    pub fn with_alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
+        self.alpn = alpn;
+        self
+    }
+
+    /// Configure the server to use a static certificate for TLS.
+    pub fn with_single_cert(
+        mut self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> io::Result<Server<M>> {
+        let alpn = std::mem::take(&mut self.alpn);
+        let hook = StaticCertHook { chain, key, alpn };
+
+        self.build_with_hook(Arc::new(hook))
+    }
+
+    /// Configure the server to use a dynamic certificate resolver for TLS.
+    pub fn with_cert_resolver(mut self, resolver: Arc<dyn CertResolver>) -> io::Result<Server<M>> {
+        let alpn = std::mem::take(&mut self.alpn);
+        let hook = DynamicCertHook { resolver, alpn };
+
+        self.build_with_hook(Arc::new(hook))
+    }
+
+    fn build_with_hook(
+        self,
+        hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>,
+    ) -> io::Result<Server<M>> {
+        // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
+        let dummy_tls = TlsCertificatePaths {
+            cert: "",
+            private_key: "",
+            kind: CertificateKind::X509,
+        };
+
+        let hooks = Hooks {
+            connection_hook: Some(hook),
+        };
+
+        // Capture local addresses before the listeners are consumed.
+        let local_addrs: Vec<SocketAddr> = self
+            .state
+            .listeners
+            .iter()
+            .map(|l| l.socket.local_addr().unwrap())
+            .collect();
+
+        let params = tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
         let server = tokio_quiche::listen_with_capabilities(
             self.state.listeners,
             params,
             SimpleConnectionIdGenerator,
             self.metrics,
         )?;
-        Ok(Server::new(server))
+        Ok(Server::new(server, local_addrs))
     }
 }
 
 /// A QUIC server that accepts new connections.
 pub struct Server<M: Metrics = DefaultMetrics> {
     accept: mpsc::Receiver<Connection>,
+    local_addrs: Vec<SocketAddr>,
     // Cancels socket tasks when dropped.
     #[allow(dead_code)]
     tasks: JoinSet<io::Result<()>>,
@@ -149,7 +207,10 @@ pub struct Server<M: Metrics = DefaultMetrics> {
 }
 
 impl<M: Metrics> Server<M> {
-    fn new(sockets: Vec<tokio_quiche::QuicConnectionStream<M>>) -> Self {
+    fn new(
+        sockets: Vec<tokio_quiche::QuicConnectionStream<M>>,
+        local_addrs: Vec<SocketAddr>,
+    ) -> Self {
         let mut tasks = JoinSet::default();
 
         let accept = mpsc::channel(sockets.len());
@@ -162,6 +223,7 @@ impl<M: Metrics> Server<M> {
 
         Self {
             accept: accept.1,
+            local_addrs,
             _metrics: PhantomData,
             tasks,
         }
@@ -197,5 +259,10 @@ impl<M: Metrics> Server<M> {
     /// Returns `None` when the server is shutting down.
     pub async fn accept(&mut self) -> Option<Connection> {
         self.accept.recv().await
+    }
+
+    /// Returns the local addresses of all listeners.
+    pub fn local_addrs(&self) -> &[SocketAddr] {
+        &self.local_addrs
     }
 }

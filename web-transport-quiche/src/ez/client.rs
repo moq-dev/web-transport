@@ -1,18 +1,19 @@
 use std::io;
 use std::sync::Arc;
-use tokio_quiche::settings::{Hooks, TlsCertificatePaths};
+use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+use crate::ez::tls::StaticCertHook;
 use crate::ez::DriverState;
 
-use super::{
-    CertificateKind, CertificatePath, Connection, DefaultMetrics, Driver, Lock, Metrics, Settings,
-};
+use super::{Connection, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
 /// Construct a QUIC client using sane defaults.
 pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     settings: Settings,
     socket: Option<tokio::net::UdpSocket>,
-    tls: Option<(String, String, CertificateKind)>,
+    tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     metrics: M,
 }
 
@@ -77,14 +78,18 @@ impl<M: Metrics> ClientBuilder<M> {
         self
     }
 
-    /// Optional: Use a client certificate for TLS.
-    pub fn with_cert(self, tls: CertificatePath<'_>) -> io::Result<Self> {
-        Ok(Self {
-            tls: Some((tls.cert.to_owned(), tls.private_key.to_owned(), tls.kind)),
+    /// Optional: Use a client certificate for mTLS.
+    pub fn with_single_cert(
+        self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Self {
+        Self {
+            tls: Some((chain, key)),
             settings: self.settings,
             metrics: self.metrics,
             socket: self.socket,
-        })
+        }
     }
 
     /// Connect to the QUIC server at the given host and port.
@@ -126,21 +131,33 @@ impl<M: Metrics> ClientBuilder<M> {
             Arc<tokio::net::UdpSocket>,
         >::from_udp(socket)?;
 
-        let tls = self
-            .tls
-            .as_ref()
-            .map(|(cert, private_key, kind)| TlsCertificatePaths {
-                cert: cert.as_str(),
-                private_key: private_key.as_str(),
-                kind: *kind,
-            });
-
         if !self.settings.verify_peer {
             tracing::warn!("TLS certificate verification is disabled, a MITM attack is possible");
         }
 
-        let params =
-            tokio_quiche::ConnectionParams::new_client(self.settings, tls, Hooks::default());
+        let (tls_cert, hooks) = match self.tls {
+            Some((chain, key)) => {
+                // ALPN is left empty; tokio-quiche sets h3 at the config level after the hook.
+                let hook = StaticCertHook {
+                    chain,
+                    key,
+                    alpn: Vec::new(),
+                };
+                // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
+                let dummy_tls = TlsCertificatePaths {
+                    cert: "",
+                    private_key: "",
+                    kind: CertificateKind::X509,
+                };
+                let hooks = Hooks {
+                    connection_hook: Some(Arc::new(hook)),
+                };
+                (Some(dummy_tls), hooks)
+            }
+            None => (None, Hooks::default()),
+        };
+
+        let params = tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);
 
         let accept_bi = flume::unbounded();
         let accept_uni = flume::unbounded();
