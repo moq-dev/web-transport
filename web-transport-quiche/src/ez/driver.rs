@@ -179,7 +179,11 @@ impl Driver {
     ) -> Result<(), ConnectionError> {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
-        self.state.lock().alpn = if alpn.is_empty() { None } else { Some(alpn.to_vec()) };
+        self.state.lock().alpn = if alpn.is_empty() {
+            None
+        } else {
+            Some(alpn.to_vec())
+        };
 
         // Run poll once to advance any pending operations.
         match self.poll(Waker::noop(), qconn) {

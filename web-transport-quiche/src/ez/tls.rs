@@ -33,7 +33,7 @@ fn der_to_boring_key(key: &PrivateKeyDer) -> Result<PKey<Private>, boring::error
         )?)?),
         _ => {
             tracing::warn!("unsupported private key format");
-            Err(PKey::<Private>::private_key_from_der(&[]).unwrap_err())
+            Err(boring::error::ErrorStack::get())
         }
     }
 }
@@ -74,9 +74,17 @@ impl ConnectionHook for StaticCertHook {
             .ok()?;
 
         // Set the leaf certificate.
-        let leaf = X509::from_der(self.chain.first()?.as_ref())
-            .inspect_err(|err| tracing::warn!(%err, "failed to parse leaf certificate DER"))
-            .ok()?;
+        let leaf = X509::from_der(
+            self.chain
+                .first()
+                .or_else(|| {
+                    tracing::warn!("empty certificate chain");
+                    None
+                })?
+                .as_ref(),
+        )
+        .inspect_err(|err| tracing::warn!(%err, "failed to parse leaf certificate DER"))
+        .ok()?;
         builder
             .set_certificate(&leaf)
             .inspect_err(|err| tracing::warn!(%err, "failed to set leaf certificate"))
@@ -85,7 +93,9 @@ impl ConnectionHook for StaticCertHook {
         // Set intermediate certificates.
         for cert_der in self.chain.iter().skip(1) {
             let cert = X509::from_der(cert_der.as_ref())
-                .inspect_err(|err| tracing::warn!(%err, "failed to parse intermediate certificate DER"))
+                .inspect_err(
+                    |err| tracing::warn!(%err, "failed to parse intermediate certificate DER"),
+                )
                 .ok()?;
             builder
                 .add_extra_chain_cert(cert)
@@ -106,7 +116,7 @@ impl ConnectionHook for StaticCertHook {
         if !self.alpn.is_empty() {
             let alpn = self.alpn.clone();
             builder.set_alpn_select_callback(move |_, client| {
-                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::NOACK)
+                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::ALERT_FATAL)
             });
         }
 
@@ -153,10 +163,14 @@ impl ConnectionHook for DynamicCertHook {
             // Set intermediate certificates.
             for cert_der in certified.chain.iter().skip(1) {
                 let cert = X509::from_der(cert_der.as_ref())
-                    .inspect_err(|err| tracing::warn!(%err, "failed to parse intermediate certificate DER"))
+                    .inspect_err(
+                        |err| tracing::warn!(%err, "failed to parse intermediate certificate DER"),
+                    )
                     .map_err(|_| SelectCertError::ERROR)?;
                 ssl.add_chain_cert(&cert)
-                    .inspect_err(|err| tracing::warn!(%err, "failed to add intermediate certificate"))
+                    .inspect_err(
+                        |err| tracing::warn!(%err, "failed to add intermediate certificate"),
+                    )
                     .map_err(|_| SelectCertError::ERROR)?;
             }
 
@@ -175,7 +189,7 @@ impl ConnectionHook for DynamicCertHook {
         if !self.alpn.is_empty() {
             let alpn = self.alpn.clone();
             builder.set_alpn_select_callback(move |_, client| {
-                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::NOACK)
+                alpn_select(alpn.as_slice(), client).ok_or(AlpnError::ALERT_FATAL)
             });
         }
 
