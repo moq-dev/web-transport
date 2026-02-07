@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.3...web-transport-quiche-v0.0.4) - 2026-02-07
+
+### Other
+
+- Add a helper to set up quiche certs. ([#147](https://github.com/moq-dev/web-transport/pull/147))
+
 ## [0.0.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.2...web-transport-quiche-v0.0.3) - 2026-01-23
 
 ### Other
