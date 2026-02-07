@@ -29,6 +29,9 @@ pub struct Connect {
     // The request that was sent by the client.
     request: ConnectRequest,
 
+    // The response sent by the server, if available.
+    response: Option<ConnectResponse>,
+
     // A reference to the send/recv stream, so we don't close it until dropped.
     send: ez::SendStream,
 
@@ -51,6 +54,7 @@ impl Connect {
         // The request was successfully decoded, so we can send a response.
         Ok(Self {
             request,
+            response: None,
             send,
             recv,
         })
@@ -66,6 +70,7 @@ impl Connect {
         let response = response.into();
         tracing::debug!(?response, "sending CONNECT");
         response.write(&mut self.send).await?;
+        self.response = Some(response);
 
         Ok(())
     }
@@ -98,6 +103,7 @@ impl Connect {
 
         Ok(Self {
             request,
+            response: Some(response),
             send,
             recv,
         })
@@ -111,6 +117,10 @@ impl Connect {
     // The URL in the CONNECT request.
     pub fn url(&self) -> &Url {
         &self.request.url
+    }
+
+    pub fn protocol(&self) -> Option<&str> {
+        self.response.as_ref()?.protocol.as_deref()
     }
 
     pub fn into_inner(self) -> (ez::SendStream, ez::RecvStream) {

@@ -62,6 +62,9 @@ pub struct Connection {
 
     // The URL used to create the session.
     url: Url,
+
+    // The negotiated WebTransport protocol (CONNECT response).
+    protocol: Option<String>,
 }
 
 impl Connection {
@@ -95,6 +98,7 @@ impl Connection {
             header_bi,
             header_datagram,
             url: connect.url().clone(),
+            protocol: connect.protocol().map(str::to_string),
             settings: Some(Arc::new(settings)),
         };
 
@@ -304,6 +308,7 @@ impl Connection {
             accept: None,
             settings: None,
             url,
+            protocol: None,
         }
     }
 
@@ -344,6 +349,10 @@ impl web_transport_trait::Session for Connection {
 
     fn max_datagram_size(&self) -> usize {
         todo!()
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
     }
 
     fn close(&self, code: u32, reason: &str) {

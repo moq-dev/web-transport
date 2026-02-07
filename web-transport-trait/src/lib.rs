@@ -63,6 +63,11 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// The maximum size of a datagram that can be sent.
     fn max_datagram_size(&self) -> usize;
 
+    /// Return the negotiated WebTransport subprotocol, if any.
+    fn protocol(&self) -> Option<&str> {
+        None
+    }
+
     /// Close the connection immediately with a code and reason.
     fn close(&self, code: u32, reason: &str);
 

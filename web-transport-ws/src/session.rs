@@ -483,6 +483,10 @@ impl generic::Session for Session {
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
         todo!()
     }
+
+    fn protocol(&self) -> Option<&str> {
+        None
+    }
 }
 
 struct SendState {

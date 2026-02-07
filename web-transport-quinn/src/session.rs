@@ -563,4 +563,8 @@ impl web_transport_trait::Session for Session {
     fn max_datagram_size(&self) -> usize {
         Self::max_datagram_size(self)
     }
+
+    fn protocol(&self) -> Option<&str> {
+        self.response.protocol.as_deref()
+    }
 }
