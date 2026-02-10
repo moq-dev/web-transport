@@ -1,5 +1,6 @@
 use crate::{ez, h3, ClientError, RecvStream, SendStream, SessionError};
 
+use bytes::Buf;
 use futures::{ready, stream::FuturesUnordered, Stream, StreamExt};
 use web_transport_proto::{Frame, StreamUni, VarInt};
 
@@ -107,23 +108,75 @@ impl Connection {
     }
 
     // Keep reading from the control stream until it's closed.
+    // The CONNECT stream carries HTTP/3 DATA frames containing capsule protocol data.
     async fn run_closed(self, connect: h3::Connect) {
-        let (_send, mut recv) = connect.into_inner();
+        let _session_id = connect.session_id();
+        let (_send, mut recv, mut buf) = connect.into_inner();
 
         loop {
-            match web_transport_proto::Capsule::read(&mut recv).await {
-                Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
-                    // TODO We shouldn't be closing the QUIC connection with the same error.
-                    // Instead, we should return it to the application.
-                    self.close(code, &reason);
-                    return;
+            // Read HTTP/3 frames from the CONNECT stream.
+            // After the HEADERS exchange, the stream carries DATA frames with capsule data.
+            let capsule_data = loop {
+                // Try to parse an HTTP/3 frame from the buffer using a Cursor (peek, don't consume).
+                let mut cursor = std::io::Cursor::new(buf.as_slice());
+                match Frame::read(&mut cursor) {
+                    Ok((typ, mut payload)) => {
+                        let data = payload.chunk().to_vec();
+                        // Advance past the payload so the cursor reflects the full frame.
+                        payload.advance(payload.remaining());
+                        drop(payload);
+                        let consumed = cursor.position() as usize;
+                        buf.drain(..consumed);
+
+                        if typ == Frame::DATA {
+                            break data;
+                        } else if typ.is_grease() {
+                            continue;
+                        } else {
+                            continue;
+                        }
+                    }
+                    Err(_) => {
+                        // Need more data, read from the stream.
+                    }
                 }
-                Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
-                    tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
+
+                match recv.read_buf(&mut buf).await {
+                    Ok(None) => {
+                        if !self.conn.is_closed() {
+                            self.close(0, "connect stream finished");
+                        }
+                        return;
+                    }
+                    Ok(Some(_n)) => {}
+                    Err(_e) => {
+                        if !self.conn.is_closed() {
+                            self.close(500, "connect stream read error");
+                        }
+                        return;
+                    }
                 }
-                Err(_) => {
-                    self.close(500, "capsule error");
-                    return;
+            };
+
+            // Decode capsules from the DATA frame payload.
+            // A single DATA frame may contain multiple capsules (or only GREASE).
+            let mut payload = capsule_data.as_slice();
+            while payload.has_remaining() {
+                match web_transport_proto::Capsule::decode(&mut payload) {
+                    Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
+                        self.close(code, &reason);
+                        return;
+                    }
+                    Ok(web_transport_proto::Capsule::Grease) => {}
+                    Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
+                        tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
+                    }
+                    Err(_e) => {
+                        if !self.conn.is_closed() {
+                            self.close(500, "capsule decode error");
+                        }
+                        return;
+                    }
                 }
             }
         }

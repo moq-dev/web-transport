@@ -34,6 +34,10 @@ pub struct Connect {
 
     #[allow(dead_code)]
     recv: ez::RecvStream,
+
+    // Leftover bytes from reading the CONNECT request/response.
+    // These may contain capsule data that arrived with the HEADERS frame.
+    buf: Vec<u8>,
 }
 
 impl Connect {
@@ -41,18 +45,33 @@ impl Connect {
     ///
     /// This is called by the server to receive the CONNECT request.
     pub async fn accept(conn: &ez::Connection) -> Result<Self, ConnectError> {
-        // Accept the stream that will be used to send the HTTP CONNECT request.
-        // If they try to send any other type of HTTP request, we will error out.
         let (send, mut recv) = conn.accept_bi().await?;
 
-        let request = web_transport_proto::ConnectRequest::read(&mut recv).await?;
-        tracing::debug!(?request, "received CONNECT");
+        let mut buf = Vec::new();
+        let request = loop {
+            if recv.read_buf(&mut buf).await?.is_none() {
+                return Err(ConnectError::UnexpectedEnd);
+            }
 
-        // The request was successfully decoded, so we can send a response.
+            let mut cursor = std::io::Cursor::new(buf.as_slice());
+            match ConnectRequest::decode(&mut cursor) {
+                Ok(request) => {
+                    let consumed = cursor.position() as usize;
+                    buf.drain(..consumed);
+                    break request;
+                }
+                Err(web_transport_proto::ConnectError::UnexpectedEnd) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        tracing::debug!(?request, leftover = buf.len(), "received CONNECT");
+
         Ok(Self {
             request,
             send,
             recv,
+            buf,
         })
     }
 
@@ -79,19 +98,33 @@ impl Connect {
     ) -> Result<Self, ConnectError> {
         tracing::debug!("opening bi");
 
-        // Create a new stream that will be used to send the CONNECT frame.
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Create a new CONNECT request that we'll send using HTTP/3
         let request = request.into();
 
         tracing::debug!(?request, "sending CONNECT");
         request.write(&mut send).await?;
 
-        let response = web_transport_proto::ConnectResponse::read(&mut recv).await?;
-        tracing::debug!(?response, "received CONNECT");
+        let mut buf = Vec::new();
+        let response = loop {
+            if recv.read_buf(&mut buf).await?.is_none() {
+                return Err(ConnectError::UnexpectedEnd);
+            }
 
-        // Throw an error if we didn't get a 200 OK.
+            let mut cursor = std::io::Cursor::new(buf.as_slice());
+            match ConnectResponse::decode(&mut cursor) {
+                Ok(response) => {
+                    let consumed = cursor.position() as usize;
+                    buf.drain(..consumed);
+                    break response;
+                }
+                Err(web_transport_proto::ConnectError::UnexpectedEnd) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        tracing::debug!(?response, leftover = buf.len(), "received CONNECT");
+
         if response.status != http::StatusCode::OK {
             return Err(ConnectError::Status(response.status));
         }
@@ -100,6 +133,7 @@ impl Connect {
             request,
             send,
             recv,
+            buf,
         })
     }
 
@@ -113,7 +147,8 @@ impl Connect {
         &self.request.url
     }
 
-    pub fn into_inner(self) -> (ez::SendStream, ez::RecvStream) {
-        (self.send, self.recv)
+    /// Returns the inner streams and any leftover bytes from reading the CONNECT handshake.
+    pub fn into_inner(self) -> (ez::SendStream, ez::RecvStream, Vec<u8>) {
+        (self.send, self.recv, self.buf)
     }
 }
