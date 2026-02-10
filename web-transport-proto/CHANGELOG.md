@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.4.0...web-transport-proto-v0.5.0) - 2026-02-10
+
+### Other
+
+- Fix capsule protocol handling ([#152](https://github.com/moq-dev/web-transport/pull/152))
+
 ## [0.4.0](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.3.1...web-transport-proto-v0.4.0) - 2026-01-23
 
 ### Other

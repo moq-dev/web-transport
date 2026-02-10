@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.2.4...web-transport-ws-v0.2.5) - 2026-02-10
+
+### Other
+
+- updated the following local packages: web-transport-proto
+
 ## [0.2.4](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.2.3...web-transport-ws-v0.2.4) - 2026-02-07
 
 ### Other

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.5...web-transport-quiche-v0.0.6) - 2026-02-10
+
+### Other
+
+- Add Incoming struct to inspect connections before accepting ([#155](https://github.com/moq-dev/web-transport/pull/155))
+- Fix capsule protocol handling ([#152](https://github.com/moq-dev/web-transport/pull/152))
+- Fix stream capacity tracking panic ([#153](https://github.com/moq-dev/web-transport/pull/153))
+
 ## [0.0.5](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.4...web-transport-quiche-v0.0.5) - 2026-02-07
 
 ### Other
