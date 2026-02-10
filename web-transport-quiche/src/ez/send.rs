@@ -149,8 +149,6 @@ impl SendState {
                 "sent STREAM",
             );
 
-            self.capacity -= n;
-
             if n < chunk.len() {
                 // NOTE: This logic should rarely be executed because we gate based on stream capacity.
 
