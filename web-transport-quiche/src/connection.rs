@@ -112,7 +112,10 @@ impl Connection {
 
         loop {
             match web_transport_proto::Capsule::read(&mut recv).await {
-                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession { code, reason })) => {
+                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason,
+                })) => {
                     // TODO We shouldn't be closing the QUIC connection with the same error.
                     // Instead, we should return it to the application.
                     self.close(code, &reason);

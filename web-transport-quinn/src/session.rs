@@ -103,7 +103,10 @@ impl Session {
     async fn run_closed(&mut self, mut connect: ConnectComplete) -> (u32, String) {
         loop {
             match web_transport_proto::Capsule::read(&mut connect.recv).await {
-                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession { code, reason })) => {
+                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason,
+                })) => {
                     return (code, reason);
                 }
                 Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
