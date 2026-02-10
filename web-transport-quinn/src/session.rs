@@ -103,11 +103,18 @@ impl Session {
     async fn run_closed(&mut self, mut connect: ConnectComplete) -> (u32, String) {
         loop {
             match web_transport_proto::Capsule::read(&mut connect.recv).await {
-                Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
+                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason,
+                })) => {
                     return (code, reason);
                 }
-                Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
+                Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
+                Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
                     tracing::warn!(%typ, size = payload.len(), "unknown capsule");
+                }
+                Ok(None) => {
+                    return (0, "stream closed".to_string());
                 }
                 Err(_) => {
                     return (1, "capsule error".to_string());

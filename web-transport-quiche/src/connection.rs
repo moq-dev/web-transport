@@ -116,14 +116,22 @@ impl Connection {
 
         loop {
             match web_transport_proto::Capsule::read(&mut recv).await {
-                Ok(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
+                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason,
+                })) => {
                     // TODO We shouldn't be closing the QUIC connection with the same error.
                     // Instead, we should return it to the application.
                     self.close(code, &reason);
                     return;
                 }
-                Ok(web_transport_proto::Capsule::Unknown { typ, payload }) => {
+                Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
+                Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
                     tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
+                }
+                Ok(None) => {
+                    // Stream closed without capsule
+                    return;
                 }
                 Err(_) => {
                     self.close(500, "capsule error");
