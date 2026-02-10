@@ -12,6 +12,9 @@ pub enum ServerError {
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
 
+    #[error("connection error: {0}")]
+    Connection(#[from] ez::ConnectionError),
+
     #[error("settings error: {0}")]
     Settings(#[from] h3::SettingsError),
 
@@ -158,19 +161,15 @@ impl<M: ez::Metrics> Server<M> {
         loop {
             tokio::select! {
                 Some(incoming) = self.inner.accept() => {
-                    match incoming.accept().await {
-                        Ok(conn) => {
-                            self.accept.push(Box::pin(h3::Request::accept(conn)));
-                        }
-                        Err(err) => {
-                            tracing::warn!("ignoring failed connection handshake: {}", err);
-                        }
-                    }
+                    self.accept.push(Box::pin(async move {
+                        let conn = incoming.accept().await?;
+                        h3::Request::accept(conn).await
+                    }));
                 }
                 Some(res) = self.accept.next() => {
                     match res {
                         Ok(session) => return Some(session),
-                        Err(err) => tracing::warn!("ignoring failed HTTP/3 handshake: {}", err),
+                        Err(err) => tracing::warn!("ignoring failed handshake: {}", err),
                     }
                 }
                 else => return None,
