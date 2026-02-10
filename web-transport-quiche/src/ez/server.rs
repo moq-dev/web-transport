@@ -12,7 +12,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use crate::ez::tls::{DynamicCertHook, StaticCertHook};
 use crate::ez::DriverState;
 
-use super::{CertResolver, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
+use super::{
+    CertResolver, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings,
+};
 
 /// Used with [ServerBuilder] to require specific parameters.
 #[derive(Default)]

@@ -213,11 +213,7 @@ impl Driver {
         let alpn = qconn.application_proto();
         let wakers = {
             let mut state = self.state.lock();
-            state.alpn = if alpn.is_empty() {
-                None
-            } else {
-                Some(alpn.to_vec())
-            };
+            state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
             state.complete_handshake()
         };
 
