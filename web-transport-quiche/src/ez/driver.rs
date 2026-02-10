@@ -36,6 +36,9 @@ pub(super) struct DriverState {
 
     /// The negotiated ALPN protocol, set after the handshake completes.
     alpn: Option<Vec<u8>>,
+
+    /// Wakers waiting for the handshake to complete.
+    handshake_wakers: Vec<Waker>,
 }
 
 impl DriverState {
@@ -58,6 +61,7 @@ impl DriverState {
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
             alpn: None,
+            handshake_wakers: Vec::new(),
         }
     }
 
@@ -76,6 +80,34 @@ impl DriverState {
     /// Returns the negotiated ALPN protocol, if the handshake has completed.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    /// Poll for handshake completion.
+    /// Returns Ready once the handshake completes, or if the connection is closed.
+    pub fn poll_handshake(&mut self, waker: &Waker) -> Poll<Result<(), ConnectionError>> {
+        // Check if already established
+        if self.alpn.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Check if connection is closed
+        if let Poll::Ready(err) = self.local.poll(waker) {
+            return Poll::Ready(Err(err));
+        }
+        if let Poll::Ready(err) = self.remote.poll(waker) {
+            return Poll::Ready(Err(err));
+        }
+
+        // Wait for handshake
+        self.handshake_wakers.push(waker.clone());
+        Poll::Pending
+    }
+
+    /// Notify all wakers waiting for handshake completion.
+    /// Should be called when the handshake completes.
+    #[must_use = "wake the handshake wakers"]
+    pub fn complete_handshake(&mut self) -> Vec<Waker> {
+        std::mem::take(&mut self.handshake_wakers)
     }
 
     #[must_use = "wake the driver"]
@@ -179,11 +211,16 @@ impl Driver {
     ) -> Result<(), ConnectionError> {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
-        self.state.lock().alpn = if alpn.is_empty() {
-            None
-        } else {
-            Some(alpn.to_vec())
+        let wakers = {
+            let mut state = self.state.lock();
+            state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
+            state.complete_handshake()
         };
+
+        // Wake all tasks waiting for handshake completion.
+        for waker in wakers {
+            waker.wake();
+        }
 
         // Run poll once to advance any pending operations.
         match self.poll(Waker::noop(), qconn) {
