@@ -158,8 +158,14 @@ impl<M: ez::Metrics> Server<M> {
         loop {
             tokio::select! {
                 Some(incoming) = self.inner.accept() => {
-                    let conn = incoming.accept();
-                    self.accept.push(Box::pin(h3::Request::accept(conn)));
+                    match incoming.accept().await {
+                        Ok(conn) => {
+                            self.accept.push(Box::pin(h3::Request::accept(conn)));
+                        }
+                        Err(err) => {
+                            tracing::warn!("ignoring failed connection handshake: {}", err);
+                        }
+                    }
                 }
                 Some(res) = self.accept.next() => {
                     match res {

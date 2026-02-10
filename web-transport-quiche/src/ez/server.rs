@@ -12,7 +12,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use crate::ez::tls::{DynamicCertHook, StaticCertHook};
 use crate::ez::DriverState;
 
-use super::{CertResolver, Connection, DefaultMetrics, Driver, Lock, Metrics, Settings};
+use super::{CertResolver, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
 /// Used with [ServerBuilder] to require specific parameters.
 #[derive(Default)]
@@ -201,6 +201,7 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
 /// The peer address is available before calling [Incoming::accept].
 pub struct Incoming {
     connection: Connection,
+    driver: Lock<DriverState>,
 }
 
 impl Incoming {
@@ -209,9 +210,17 @@ impl Incoming {
         self.connection.peer_addr()
     }
 
-    /// Accept the connection, starting the post-handshake driver.
-    pub fn accept(self) -> Connection {
-        self.connection
+    /// Accept the connection, waiting for the TLS handshake to complete.
+    ///
+    /// Returns the connection once the handshake is complete, or an error if the connection
+    /// is closed before the handshake finishes.
+    pub async fn accept(self) -> Result<Connection, ConnectionError> {
+        use std::future::poll_fn;
+
+        // Wait for handshake to complete
+        poll_fn(|cx| self.driver.lock().poll_handshake(cx.waker())).await?;
+
+        Ok(self.connection)
     }
 }
 
@@ -263,8 +272,11 @@ impl<M: Metrics> Server<M> {
             let session = Driver::new(state.clone(), accept_bi.0, accept_uni.0);
 
             let inner = initial.start(session);
-            let connection = Connection::new(inner, state, accept_bi.1, accept_uni.1);
-            let incoming = Incoming { connection };
+            let connection = Connection::new(inner, state.clone(), accept_bi.1, accept_uni.1);
+            let incoming = Incoming {
+                connection,
+                driver: state,
+            };
 
             if accept.send(incoming).await.is_err() {
                 return Ok(());
