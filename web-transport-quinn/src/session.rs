@@ -106,7 +106,7 @@ impl Session {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession { code, reason })) => {
                     return (code, reason);
                 }
-                Ok(Some(web_transport_proto::Capsule::Grease)) => {}
+                Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
                 Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
                     tracing::warn!(%typ, size = payload.len(), "unknown capsule");
                 }
