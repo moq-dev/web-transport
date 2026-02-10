@@ -157,7 +157,10 @@ impl<M: ez::Metrics> Server<M> {
     pub async fn accept(&mut self) -> Option<h3::Request> {
         loop {
             tokio::select! {
-                Some(conn) = self.inner.accept() => self.accept.push(Box::pin(h3::Request::accept(conn))),
+                Some(incoming) = self.inner.accept() => {
+                    let conn = incoming.accept();
+                    self.accept.push(Box::pin(h3::Request::accept(conn)));
+                }
                 Some(res) = self.accept.next() => {
                     match res {
                         Ok(session) => return Some(session),
