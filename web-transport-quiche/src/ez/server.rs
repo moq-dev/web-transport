@@ -196,9 +196,28 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     }
 }
 
+/// A pre-accepted QUIC connection with the TLS handshake already complete.
+///
+/// The peer address is available before calling [Incoming::accept].
+pub struct Incoming {
+    connection: Connection,
+}
+
+impl Incoming {
+    /// Returns the peer's socket address.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.connection.peer_addr()
+    }
+
+    /// Accept the connection, starting the post-handshake driver.
+    pub fn accept(self) -> Connection {
+        self.connection
+    }
+}
+
 /// A QUIC server that accepts new connections.
 pub struct Server<M: Metrics = DefaultMetrics> {
-    accept: mpsc::Receiver<Connection>,
+    accept: mpsc::Receiver<Incoming>,
     local_addrs: Vec<SocketAddr>,
     // Cancels socket tasks when dropped.
     #[allow(dead_code)]
@@ -231,7 +250,7 @@ impl<M: Metrics> Server<M> {
 
     async fn run_socket(
         socket: tokio_quiche::QuicConnectionStream<M>,
-        accept: mpsc::Sender<Connection>,
+        accept: mpsc::Sender<Incoming>,
     ) -> io::Result<()> {
         let mut rx = socket.into_inner();
         while let Some(initial) = rx.recv().await {
@@ -245,8 +264,9 @@ impl<M: Metrics> Server<M> {
 
             let inner = initial.start(session);
             let connection = Connection::new(inner, state, accept_bi.1, accept_uni.1);
+            let incoming = Incoming { connection };
 
-            if accept.send(connection).await.is_err() {
+            if accept.send(incoming).await.is_err() {
                 return Ok(());
             }
         }
@@ -254,10 +274,10 @@ impl<M: Metrics> Server<M> {
         Ok(())
     }
 
-    /// Accept a new QUIC [Connection] from a client.
+    /// Accept a new QUIC [Incoming] from a client.
     ///
     /// Returns `None` when the server is shutting down.
-    pub async fn accept(&mut self) -> Option<Connection> {
+    pub async fn accept(&mut self) -> Option<Incoming> {
         self.accept.recv().await
     }
 
