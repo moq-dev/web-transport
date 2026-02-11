@@ -102,12 +102,12 @@ async fn run_conn(conn: quinn::Incoming) -> anyhow::Result<()> {
     tracing::info!("established QUIC connection");
 
     // Perform the WebTransport handshake.
-    let request = web_transport_quinn::Request::accept(conn).await?;
+    let request = web_transport_quinn::Request::new(conn).await?;
     tracing::info!(url = %request.url, "received WebTransport request");
 
     // Accept the session.
     let session = request
-        .respond(http::StatusCode::OK)
+        .ok(http::StatusCode::OK)
         .await
         .context("failed to accept session")?;
 

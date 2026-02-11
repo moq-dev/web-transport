@@ -1,7 +1,6 @@
 use crate::proto::{ConnectRequest, ConnectResponse, VarInt};
 
 use thiserror::Error;
-use url::Url;
 
 use crate::ez;
 
@@ -25,12 +24,9 @@ pub enum ConnectError {
 }
 
 /// An HTTP/3 CONNECT request/response for establishing a WebTransport session.
-pub struct Connect {
+pub struct Connecting {
     // The request that was sent by the client.
-    request: ConnectRequest,
-
-    // The response sent by the server, if available.
-    response: Option<ConnectResponse>,
+    pub request: ConnectRequest,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
     send: ez::SendStream,
@@ -39,7 +35,7 @@ pub struct Connect {
     recv: ez::RecvStream,
 }
 
-impl Connect {
+impl Connecting {
     /// Accept an HTTP/3 CONNECT request from the client.
     ///
     /// This is called by the server to receive the CONNECT request.
@@ -54,7 +50,6 @@ impl Connect {
         // The request was successfully decoded, so we can send a response.
         Ok(Self {
             request,
-            response: None,
             send,
             recv,
         })
@@ -63,18 +58,51 @@ impl Connect {
     /// Send an HTTP/3 CONNECT response to the client.
     ///
     /// This is called by the server to accept or reject the connection.
-    pub async fn respond(
-        &mut self,
+    pub async fn ok(
+        mut self,
         response: impl Into<ConnectResponse>,
-    ) -> Result<(), ConnectError> {
+    ) -> Result<Connected, ConnectError> {
         let response = response.into();
+
         tracing::debug!(?response, "sending CONNECT");
         response.write(&mut self.send).await?;
-        self.response = Some(response);
 
-        Ok(())
+        Ok(Connected {
+            request: self.request,
+            response,
+            send: self.send,
+            recv: self.recv,
+        })
     }
 
+    pub async fn close(self, status: http::StatusCode) -> Result<(), ConnectError> {
+        let mut connect = self.ok(status).await?;
+        connect.send.finish()?;
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for Connecting {
+    type Target = ConnectRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+pub struct Connected {
+    // The request that was sent by the client.
+    pub request: ConnectRequest,
+
+    // The response sent by the server.
+    pub response: ConnectResponse,
+
+    // A reference to the send/recv stream, so we don't close it until dropped.
+    pub(crate) send: ez::SendStream,
+    pub(crate) recv: ez::RecvStream,
+}
+
+impl Connected {
     /// Send an HTTP/3 CONNECT request to the server and wait for the response.
     ///
     /// This is called by the client to initiate a WebTransport session.
@@ -103,7 +131,7 @@ impl Connect {
 
         Ok(Self {
             request,
-            response: Some(response),
+            response,
             send,
             recv,
         })
@@ -112,18 +140,5 @@ impl Connect {
     // The session ID is the stream ID of the CONNECT request.
     pub fn session_id(&self) -> VarInt {
         VarInt::try_from(u64::from(self.send.id())).unwrap()
-    }
-
-    // The URL in the CONNECT request.
-    pub fn url(&self) -> &Url {
-        &self.request.url
-    }
-
-    pub fn protocol(&self) -> Option<&str> {
-        self.response.as_ref()?.protocol.as_deref()
-    }
-
-    pub fn into_inner(self) -> (ez::SendStream, ez::RecvStream) {
-        (self.send, self.recv)
     }
 }

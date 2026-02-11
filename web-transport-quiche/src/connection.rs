@@ -1,7 +1,7 @@
 use crate::{ez, h3, ClientError, RecvStream, SendStream, SessionError};
 
 use futures::{ready, stream::FuturesUnordered, Stream, StreamExt};
-use web_transport_proto::{Frame, StreamUni, VarInt};
+use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt};
 
 use std::{
     future::{poll_fn, Future},
@@ -60,15 +60,17 @@ pub struct Connection {
     #[allow(dead_code)]
     settings: Option<Arc<h3::Settings>>,
 
-    // The URL used to create the session.
-    url: Url,
-
-    // The negotiated WebTransport protocol (CONNECT response).
-    protocol: Option<String>,
+    // The request and response that were sent and received.
+    request: ConnectRequest,
+    response: ConnectResponse,
 }
 
 impl Connection {
-    pub(super) fn new(conn: ez::Connection, settings: h3::Settings, connect: h3::Connect) -> Self {
+    pub(super) fn new(
+        conn: ez::Connection,
+        settings: h3::Settings,
+        connect: h3::Connected,
+    ) -> Self {
         // The session ID is the stream ID of the CONNECT request.
         let session_id = connect.session_id();
 
@@ -97,25 +99,23 @@ impl Connection {
             header_uni,
             header_bi,
             header_datagram,
-            url: connect.url().clone(),
-            protocol: connect.protocol().map(str::to_string),
+            request: connect.request.clone(),
+            response: connect.response.clone(),
             settings: Some(Arc::new(settings)),
         };
 
         // Run a background task to check if the connect stream is closed.
         tokio::spawn(this.clone().run_closed(connect));
 
-        tracing::debug!(url = %this.url, "WebTransport connection established");
+        tracing::debug!(url = %this.request().url, "WebTransport connection established");
 
         this
     }
 
     // Keep reading from the control stream until it's closed.
-    async fn run_closed(self, connect: h3::Connect) {
-        let (_send, mut recv) = connect.into_inner();
-
+    async fn run_closed(self, mut connect: h3::Connected) {
         loop {
-            match web_transport_proto::Capsule::read(&mut recv).await {
+            match web_transport_proto::Capsule::read(&mut connect.recv).await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
                     code,
                     reason,
@@ -149,7 +149,7 @@ impl Connection {
         let settings = h3::Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = h3::Connect::open(&conn, url).await?;
+        let connect = h3::Connected::open(&conn, url).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.
@@ -304,7 +304,7 @@ impl Connection {
     ///
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
-    pub fn raw(conn: ez::Connection, url: Url) -> Self {
+    pub fn raw(conn: ez::Connection, request: ConnectRequest, response: ConnectResponse) -> Self {
         let drop = Arc::new(ConnectionDrop { conn: conn.clone() });
         Self {
             conn,
@@ -315,14 +315,17 @@ impl Connection {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
-            url,
-            protocol: None,
+            request,
+            response,
         }
     }
 
-    /// Returns the URL used to establish this connection.
-    pub fn url(&self) -> &Url {
-        &self.url
+    pub fn request(&self) -> &ConnectRequest {
+        &self.request
+    }
+
+    pub fn response(&self) -> &ConnectResponse {
+        &self.response
     }
 }
 
@@ -360,7 +363,7 @@ impl web_transport_trait::Session for Connection {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+        self.response().protocol.as_deref()
     }
 
     fn close(&self, code: u32, reason: &str) {

@@ -37,6 +37,9 @@ pub(super) struct DriverState {
     /// The negotiated ALPN protocol, set after the handshake completes.
     alpn: Option<Vec<u8>>,
 
+    /// The SNI server name from the TLS ClientHello, set after the handshake completes.
+    server_name: Option<String>,
+
     /// Wakers waiting for the handshake to complete.
     handshake_wakers: Vec<Waker>,
 }
@@ -61,6 +64,7 @@ impl DriverState {
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
             alpn: None,
+            server_name: None,
             handshake_wakers: Vec::new(),
         }
     }
@@ -80,6 +84,16 @@ impl DriverState {
     /// Returns the negotiated ALPN protocol, if the handshake has completed.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.alpn.as_deref()
+    }
+
+    /// Returns the SNI server name from the TLS ClientHello.
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    /// Sets the SNI server name (captured from the TLS ClientHello).
+    pub fn set_server_name(&mut self, name: Option<String>) {
+        self.server_name = name;
     }
 
     /// Poll for handshake completion.

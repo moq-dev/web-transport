@@ -96,7 +96,7 @@ async fn run_conn(
         response = response.with_protocol(protocol);
     }
     let session = request
-        .respond(response)
+        .ok(response)
         .await
         .context("failed to accept session")?;
     tracing::info!("accepted session");

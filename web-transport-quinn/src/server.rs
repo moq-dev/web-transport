@@ -9,7 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
-    Connect, ServerError, Session, Settings,
+    Connecting, ServerError, Session, Settings,
 };
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -120,7 +120,7 @@ impl Server {
                     let conn = res?;
                     self.accept.push(Box::pin(async move {
                         let conn = conn.await?;
-                        Request::accept(conn).await
+                        Request::new(conn).await
                     }));
                 }
                 Some(res) = self.accept.next() => {
@@ -137,25 +137,17 @@ impl Server {
 pub struct Request {
     conn: quinn::Connection,
     settings: Settings,
-    connect: Connect,
-}
-
-impl core::ops::Deref for Request {
-    type Target = ConnectRequest;
-
-    fn deref(&self) -> &Self::Target {
-        &self.connect.request
-    }
+    connect: Connecting,
 }
 
 impl Request {
     /// Accept a new WebTransport session from a client.
-    pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
+    pub async fn new(conn: quinn::Connection) -> Result<Self, ServerError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
         // Accept the CONNECT request but don't send a response yet.
-        let connect = Connect::accept(&conn).await?;
+        let connect = Connecting::accept(&conn).await?;
 
         // Return the resulting request with a reference to the settings/connect streams.
         Ok(Self {
@@ -165,28 +157,26 @@ impl Request {
         })
     }
 
-    /// Reply to the session with the given status code.
+    /// Reply to the session with the given response, usually 200 OK.
     ///
-    /// If you want to reject the session, use a non-200 status code.
-    pub async fn respond(
-        self,
-        response: impl Into<ConnectResponse>,
-    ) -> Result<Session, ServerError> {
+    /// [ConnectResponse::with_protocol] can be used to select a subprotocol.
+    pub async fn ok(self, response: impl Into<ConnectResponse>) -> Result<Session, ServerError> {
         let response = response.into();
-        let connect = self.connect.respond(response).await?;
+        let connect = self.connect.ok(response).await?;
         Ok(Session::new(self.conn, self.settings, connect))
     }
 
     /// Reject the session with the given status code.
-    pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(ConnectResponse::new(status)).await?;
+    pub async fn close(self, status: http::StatusCode) -> Result<(), ServerError> {
+        self.connect.close(status).await?;
         Ok(())
     }
+}
 
-    /// Returns the CONNECT request that was sent by the client.
-    ///
-    /// NOTE: You can access this via the Deref impl.
-    pub fn connect(&self) -> &ConnectRequest {
-        &self.connect.request
+impl core::ops::Deref for Request {
+    type Target = ConnectRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connect
     }
 }

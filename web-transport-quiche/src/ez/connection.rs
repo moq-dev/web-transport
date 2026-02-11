@@ -211,6 +211,11 @@ impl Connection {
     pub fn alpn(&self) -> Option<Vec<u8>> {
         self.driver.lock().alpn().map(|a| a.to_vec())
     }
+
+    /// Returns the SNI server name from the TLS ClientHello, if the handshake has completed.
+    pub fn server_name(&self) -> Option<String> {
+        self.driver.lock().server_name().map(|s| s.to_string())
+    }
 }
 
 impl Deref for Connection {

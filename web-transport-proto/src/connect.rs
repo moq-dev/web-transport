@@ -234,6 +234,10 @@ impl ConnectResponse {
         }
     }
 
+    pub fn ok() -> Self {
+        Self::new(http::StatusCode::OK)
+    }
+
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = Some(protocol.into());
         self

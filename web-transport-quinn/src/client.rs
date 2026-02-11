@@ -29,6 +29,7 @@ pub enum CongestionControl {
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
+#[derive(Clone)]
 pub struct ClientBuilder {
     provider: crypto::Provider,
     congestion_controller:

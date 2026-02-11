@@ -1,3 +1,4 @@
+use boring::ssl::NameType;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{io, marker::PhantomData};
@@ -212,6 +213,30 @@ impl Incoming {
         self.connection.peer_addr()
     }
 
+    /// Returns the local socket address for this connection.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.connection.local_addr()
+    }
+
+    /// Returns the negotiated ALPN protocol, if the handshake has completed.
+    pub fn alpn(&self) -> Option<Vec<u8>> {
+        self.driver.lock().alpn().map(|a| a.to_vec())
+    }
+
+    /// Returns the SNI server name from the TLS ClientHello.
+    ///
+    /// Available immediately, before [Incoming::accept] is called.
+    pub fn server_name(&self) -> Option<String> {
+        self.driver.lock().server_name().map(|s| s.to_string())
+    }
+
+    /// Reject the connection with an error code and reason.
+    ///
+    /// This is equivalent to [Connection::close].
+    pub fn reject(self, code: u64, reason: &str) {
+        self.connection.close(code, reason);
+    }
+
     /// Accept the connection, waiting for the TLS handshake to complete.
     ///
     /// Returns the connection once the handshake is complete, or an error if the connection
@@ -265,12 +290,19 @@ impl<M: Metrics> Server<M> {
     ) -> io::Result<()> {
         let mut rx = socket.into_inner();
         while let Some(initial) = rx.recv().await {
-            let initial = initial?;
+            let mut initial = initial?;
+
+            // Capture the SNI server name from the TLS ClientHello before starting the handshake.
+            let server_name = initial
+                .ssl_mut()
+                .servername(NameType::HOST_NAME)
+                .map(|s| s.to_string());
 
             let accept_bi = flume::unbounded();
             let accept_uni = flume::unbounded();
 
             let state = Lock::new(DriverState::new(true));
+            state.lock().set_server_name(server_name);
             let session = Driver::new(state.clone(), accept_bi.0, accept_uni.0);
 
             let inner = initial.start(session);

@@ -13,8 +13,7 @@ use futures::stream::{FuturesUnordered, Stream, StreamExt};
 
 use crate::{
     proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
-    ClientError, ConnectComplete, RecvStream, SendStream, SessionError, Settings,
-    WebTransportError,
+    ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
 
 /// An established WebTransport session, acting like a full QUIC connection. See [`quinn::Connection`].
@@ -53,11 +52,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(
-        conn: quinn::Connection,
-        settings: Settings,
-        connect: ConnectComplete,
-    ) -> Self {
+    pub(crate) fn new(conn: quinn::Connection, settings: Settings, connect: Connected) -> Self {
         // The session ID is the stream ID of the CONNECT request.
         let session_id = connect.session_id();
 
@@ -100,7 +95,7 @@ impl Session {
     }
 
     // Keep reading from the control stream until it's closed.
-    async fn run_closed(&mut self, mut connect: ConnectComplete) -> (u32, String) {
+    async fn run_closed(&mut self, mut connect: Connected) -> (u32, String) {
         loop {
             match web_transport_proto::Capsule::read(&mut connect.recv).await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
@@ -133,7 +128,7 @@ impl Session {
         let settings = Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = ConnectComplete::open(&conn, request).await?;
+        let connect = Connected::open(&conn, request).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.
