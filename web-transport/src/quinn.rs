@@ -1,14 +1,13 @@
 use bytes::{Buf, BufMut, Bytes};
 use url::Url;
 
-use web_transport_quinn::http;
 // Export the Quinn implementation to simplify Cargo.toml
 pub use web_transport_quinn as quinn;
 
 pub use web_transport_quinn::CongestionControl;
 
 /// Create a [Client] that can be used to dial multiple [Session]s.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,
 }
@@ -74,7 +73,7 @@ impl Server {
     pub async fn accept(&mut self) -> Result<Option<Session>, Error> {
         match self.inner.accept().await {
             // TODO add sub-protocol support
-            Some(session) => Ok(Some(session.respond(http::StatusCode::OK).await?.into())),
+            Some(session) => Ok(Some(session.ok().await?.into())),
             None => Ok(None),
         }
     }

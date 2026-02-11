@@ -91,7 +91,7 @@ async fn run_conn(
     }
 
     // Accept the session.
-    let mut response = ConnectResponse::new(http::StatusCode::OK);
+    let mut response = ConnectResponse::OK;
     if let Some(protocol) = negotiated {
         response = response.with_protocol(protocol);
     }

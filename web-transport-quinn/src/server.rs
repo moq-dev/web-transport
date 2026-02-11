@@ -9,7 +9,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
-    Connect, ServerError, Session, Settings,
+    Connecting, ServerError, Session, Settings,
 };
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -137,15 +137,7 @@ impl Server {
 pub struct Request {
     conn: quinn::Connection,
     settings: Settings,
-    connect: Connect,
-}
-
-impl core::ops::Deref for Request {
-    type Target = ConnectRequest;
-
-    fn deref(&self) -> &Self::Target {
-        &self.connect.request
-    }
+    connect: Connecting,
 }
 
 impl Request {
@@ -155,7 +147,7 @@ impl Request {
         let settings = Settings::connect(&conn).await?;
 
         // Accept the CONNECT request but don't send a response yet.
-        let connect = Connect::accept(&conn).await?;
+        let connect = Connecting::accept(&conn).await?;
 
         // Return the resulting request with a reference to the settings/connect streams.
         Ok(Self {
@@ -165,9 +157,13 @@ impl Request {
         })
     }
 
-    /// Reply to the session with the given status code.
+    pub async fn ok(self) -> Result<Session, ServerError> {
+        self.respond(ConnectResponse::OK).await
+    }
+
+    /// Reply to the session with the given response, usually 200 OK.
     ///
-    /// If you want to reject the session, use a non-200 status code.
+    /// [ConnectResponse::with_protocol] can be used to select a subprotocol.
     pub async fn respond(
         self,
         response: impl Into<ConnectResponse>,
@@ -179,14 +175,15 @@ impl Request {
 
     /// Reject the session with the given status code.
     pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(ConnectResponse::new(status)).await?;
+        self.connect.reject(status).await?;
         Ok(())
     }
+}
 
-    /// Returns the CONNECT request that was sent by the client.
-    ///
-    /// NOTE: You can access this via the Deref impl.
-    pub fn connect(&self) -> &ConnectRequest {
-        &self.connect.request
+impl core::ops::Deref for Request {
+    type Target = ConnectRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connect
     }
 }

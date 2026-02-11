@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use web_transport_proto::{ConnectRequest, ConnectResponse, VarInt};
 
 use thiserror::Error;
@@ -26,17 +28,17 @@ pub enum ConnectError {
     ProtocolMismatch(String),
 }
 
-pub struct Connect {
+/// An HTTP/3 CONNECT request/response for establishing a WebTransport session.
+pub struct Connecting {
     // The request that was sent by the client.
-    pub(crate) request: ConnectRequest,
+    pub request: ConnectRequest,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
     pub(crate) send: quinn::SendStream,
-
     pub(crate) recv: quinn::RecvStream,
 }
 
-impl Connect {
+impl Connecting {
     pub async fn accept(conn: &quinn::Connection) -> Result<Self, ConnectError> {
         // Accept the stream that will be used to send the HTTP CONNECT request.
         // If they try to send any other type of HTTP request, we will error out.
@@ -53,11 +55,11 @@ impl Connect {
         })
     }
 
-    // Called by the server to send a response to the client.
+    // Called by the server to send a response to the client and establish the session.
     pub async fn respond(
         mut self,
         response: impl Into<ConnectResponse>,
-    ) -> Result<ConnectComplete, ConnectError> {
+    ) -> Result<Connected, ConnectError> {
         let response = response.into();
 
         // Validate that our protocol was in the client's request.
@@ -70,16 +72,30 @@ impl Connect {
         tracing::debug!(?response, "sending CONNECT response");
         response.write(&mut self.send).await?;
 
-        Ok(ConnectComplete {
+        Ok(Connected {
             request: self.request,
             response,
             send: self.send,
             recv: self.recv,
         })
     }
+
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
+        let mut connect = self.respond(status).await?;
+        connect.send.finish().ok();
+        Ok(())
+    }
 }
 
-pub struct ConnectComplete {
+impl Deref for Connecting {
+    type Target = ConnectRequest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+pub struct Connected {
     // The request that was sent by the client.
     pub request: ConnectRequest,
 
@@ -87,12 +103,11 @@ pub struct ConnectComplete {
     pub response: ConnectResponse,
 
     // A reference to the send/recv stream, so we don't close it until dropped.
-    pub send: quinn::SendStream,
-
-    pub recv: quinn::RecvStream,
+    pub(crate) send: quinn::SendStream,
+    pub(crate) recv: quinn::RecvStream,
 }
 
-impl ConnectComplete {
+impl Connected {
     /// Open a new WebTransport session on the given connection for the given URL.
     ///
     /// You may add any number of subprotocols allowing the server to select from.

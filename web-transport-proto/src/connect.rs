@@ -227,6 +227,11 @@ pub struct ConnectResponse {
 }
 
 impl ConnectResponse {
+    pub const OK: Self = Self {
+        status: http::StatusCode::OK,
+        protocol: None,
+    };
+
     pub fn new(status: http::StatusCode) -> Self {
         Self {
             status,
@@ -310,6 +315,12 @@ impl ConnectResponse {
         self.encode(&mut buf)?;
         stream.write_all_buf(&mut buf).await?;
         Ok(())
+    }
+}
+
+impl Default for ConnectResponse {
+    fn default() -> Self {
+        Self::OK
     }
 }
 

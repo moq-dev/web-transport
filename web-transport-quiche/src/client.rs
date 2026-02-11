@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use url::Url;
+use web_transport_proto::ConnectRequest;
 
 use crate::{
     ez::{self, DefaultMetrics, Metrics},
@@ -83,16 +83,21 @@ impl<M: Metrics> ClientBuilder<M> {
     /// Connect to the WebTransport server at the given URL.
     ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect(self, url: Url) -> Result<Connection, ClientError> {
-        let port = url.port().unwrap_or(443);
+    pub async fn connect(
+        self,
+        request: impl Into<ConnectRequest>,
+    ) -> Result<Connection, ClientError> {
+        let request = request.into();
 
-        let host = match url.host() {
+        let port = request.url.port().unwrap_or(443);
+
+        let host = match request.url.host() {
             Some(host) => host.to_string(),
-            None => return Err(ClientError::InvalidUrl(url.to_string())),
+            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
         };
 
         let conn = self.0.connect(&host, port).await?;
 
-        Connection::connect(conn, url).await
+        Connection::connect(conn, request).await
     }
 }
