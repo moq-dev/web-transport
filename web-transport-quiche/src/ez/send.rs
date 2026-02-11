@@ -16,9 +16,8 @@ use crate::ez::DriverState;
 
 use super::{Lock, StreamError, StreamId};
 
-// "senddrop" in ascii; if you see this then call finish().await or close(code)
-// decimal: 7308889627613622128
-const DROP_CODE: u64 = 0x656E646464726F70;
+// "send" in ascii; if you see this then call finish().await or close(code)
+const DROP_CODE: u64 = 0x73656E64;
 
 // TODO Move a lot of this into a state machine enum.
 pub(super) struct SendState {
