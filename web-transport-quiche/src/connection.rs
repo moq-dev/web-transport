@@ -10,8 +10,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use url::Url;
-
 // "conn" in ascii; if you see this then close(code)
 // hex: 0x636E6E6F, or 0x52E50ACE926F as an HTTP error code
 // decimal: 1668181615, or 91143682298479 as an HTTP error code
@@ -144,12 +142,15 @@ impl Connection {
     /// Connect using an established QUIC connection if you want to create the connection yourself.
     ///
     /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
-    pub async fn connect(conn: ez::Connection, url: Url) -> Result<Connection, ClientError> {
+    pub async fn connect(
+        conn: ez::Connection,
+        request: impl Into<ConnectRequest>,
+    ) -> Result<Connection, ClientError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = h3::Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
-        let connect = h3::Connected::open(&conn, url).await?;
+        let connect = h3::Connected::open(&conn, request).await?;
 
         // Return the resulting session with a reference to the control/connect streams.
         // If either stream is closed, then the session will be closed, so we need to keep them around.

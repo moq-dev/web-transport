@@ -106,10 +106,7 @@ async fn run_conn(conn: quinn::Incoming) -> anyhow::Result<()> {
     tracing::info!(url = %request.url, "received WebTransport request");
 
     // Accept the session.
-    let session = request
-        .respond(http::StatusCode::OK)
-        .await
-        .context("failed to accept session")?;
+    let session = request.ok().await.context("failed to accept session")?;
 
     tracing::info!("accepted session");
 

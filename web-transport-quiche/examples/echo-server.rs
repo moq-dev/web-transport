@@ -71,10 +71,7 @@ async fn run_conn(request: web_transport_quiche::h3::Request) -> anyhow::Result<
     tracing::info!("received WebTransport request: {}", request.url);
 
     // Accept the session.
-    let session = request
-        .respond(http::StatusCode::OK)
-        .await
-        .context("failed to accept session")?;
+    let session = request.ok().await.context("failed to accept session")?;
     tracing::info!("accepted session");
 
     loop {

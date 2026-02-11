@@ -89,16 +89,15 @@ impl<M: Metrics> ClientBuilder<M> {
     ) -> Result<Connection, ClientError> {
         let request = request.into();
 
-        let url = request.url;
-        let port = url.port().unwrap_or(443);
+        let port = request.url.port().unwrap_or(443);
 
-        let host = match url.host() {
+        let host = match request.url.host() {
             Some(host) => host.to_string(),
-            None => return Err(ClientError::InvalidUrl(url.to_string())),
+            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
         };
 
         let conn = self.0.connect(&host, port).await?;
 
-        Connection::connect(conn, url).await
+        Connection::connect(conn, request).await
     }
 }
