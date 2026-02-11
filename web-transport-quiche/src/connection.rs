@@ -304,7 +304,11 @@ impl Connection {
     ///
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
-    pub fn raw(conn: ez::Connection, request: ConnectRequest, response: ConnectResponse) -> Self {
+    pub fn raw(
+        conn: ez::Connection,
+        request: impl Into<ConnectRequest>,
+        response: impl Into<ConnectResponse>,
+    ) -> Self {
         let drop = Arc::new(ConnectionDrop { conn: conn.clone() });
         Self {
             conn,
@@ -315,8 +319,8 @@ impl Connection {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
-            request,
-            response,
+            request: request.into(),
+            response: response.into(),
         }
     }
 

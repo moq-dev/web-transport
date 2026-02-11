@@ -122,8 +122,10 @@ impl Session {
     /// This will only work with a brand new QUIC connection using the HTTP/3 ALPN.
     pub async fn connect(
         conn: quinn::Connection,
-        request: ConnectRequest,
+        request: impl Into<ConnectRequest>,
     ) -> Result<Session, ClientError> {
+        let request = request.into();
+
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
@@ -291,8 +293,8 @@ impl Session {
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
     pub fn raw(
         conn: quinn::Connection,
-        request: ConnectRequest,
-        response: ConnectResponse,
+        request: impl Into<ConnectRequest>,
+        response: impl Into<ConnectResponse>,
     ) -> Self {
         Self {
             conn,
@@ -302,8 +304,8 @@ impl Session {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
-            request,
-            response,
+            request: request.into(),
+            response: response.into(),
         }
     }
 

@@ -120,7 +120,7 @@ impl Server {
                     let conn = res?;
                     self.accept.push(Box::pin(async move {
                         let conn = conn.await?;
-                        Request::new(conn).await
+                        Request::accept(conn).await
                     }));
                 }
                 Some(res) = self.accept.next() => {
@@ -142,7 +142,7 @@ pub struct Request {
 
 impl Request {
     /// Accept a new WebTransport session from a client.
-    pub async fn new(conn: quinn::Connection) -> Result<Self, ServerError> {
+    pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
         // Perform the H3 handshake by sending/reciving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 

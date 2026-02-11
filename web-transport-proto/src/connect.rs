@@ -227,15 +227,16 @@ pub struct ConnectResponse {
 }
 
 impl ConnectResponse {
+    pub const OK: Self = Self {
+        status: http::StatusCode::OK,
+        protocol: None,
+    };
+
     pub fn new(status: http::StatusCode) -> Self {
         Self {
             status,
             protocol: None,
         }
-    }
-
-    pub fn ok() -> Self {
-        Self::new(http::StatusCode::OK)
     }
 
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
