@@ -15,9 +15,8 @@ use super::{
     StreamId,
 };
 
-// "conndrop" in ascii; if you see this then close(code)
-// decimal: 8029476563109179248
-const DROP_CODE: u64 = 0x6F6E6E6464726F70;
+// "drop" in ascii; if you see this then close(code)
+const DROP_CODE: u64 = 0x64726F70;
 
 type OpenBiResult =
     Poll<Result<(Option<Waker>, StreamId, Lock<SendState>, Lock<RecvState>), ConnectionError>>;

@@ -17,9 +17,8 @@ use super::{Lock, StreamError, StreamId};
 
 use tokio_quiche::quic::QuicheConnection;
 
-// "recvdrop" in ascii; if you see this then read everything or close(code)
-// decimal: 7305813194079104880
-const DROP_CODE: u64 = 0x6563766464726F70;
+// "recv" in ascii; if you see this then read everything or close(code)
+const DROP_CODE: u64 = 0x72656376;
 
 pub(super) struct RecvState {
     id: StreamId,
