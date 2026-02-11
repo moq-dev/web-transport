@@ -91,12 +91,6 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
         self.settings = settings;
         self
     }
-
-    /// Set ALPN protocols.
-    pub fn with_alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
-        self.alpn = alpn;
-        self
-    }
 }
 
 impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
@@ -136,12 +130,6 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
-        self
-    }
-
-    /// Set ALPN protocols.
-    pub fn with_alpn(mut self, alpn: Vec<Vec<u8>>) -> Self {
-        self.alpn = alpn;
         self
     }
 

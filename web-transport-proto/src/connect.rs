@@ -96,12 +96,8 @@ impl ConnectRequest {
         self
     }
 
-    pub fn with_protocols(
-        mut self,
-        protocols: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.protocols
-            .extend(protocols.into_iter().map(|p| p.into()));
+    pub fn with_protocols(mut self, protocols: impl IntoIterator<Item = String>) -> Self {
+        self.protocols.extend(protocols);
         self
     }
 
