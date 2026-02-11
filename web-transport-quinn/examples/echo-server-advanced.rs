@@ -107,7 +107,7 @@ async fn run_conn(conn: quinn::Incoming) -> anyhow::Result<()> {
 
     // Accept the session.
     let session = request
-        .ok(http::StatusCode::OK)
+        .respond(http::StatusCode::OK)
         .await
         .context("failed to accept session")?;
 

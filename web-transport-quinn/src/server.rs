@@ -157,18 +157,25 @@ impl Request {
         })
     }
 
+    pub async fn ok(self) -> Result<Session, ServerError> {
+        self.respond(ConnectResponse::OK).await
+    }
+
     /// Reply to the session with the given response, usually 200 OK.
     ///
     /// [ConnectResponse::with_protocol] can be used to select a subprotocol.
-    pub async fn ok(self, response: impl Into<ConnectResponse>) -> Result<Session, ServerError> {
+    pub async fn respond(
+        self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<Session, ServerError> {
         let response = response.into();
-        let connect = self.connect.ok(response).await?;
+        let connect = self.connect.respond(response).await?;
         Ok(Session::new(self.conn, self.settings, connect))
     }
 
     /// Reject the session with the given status code.
-    pub async fn close(self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.close(status).await?;
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
+        self.connect.reject(status).await?;
         Ok(())
     }
 }

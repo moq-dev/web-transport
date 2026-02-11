@@ -25,14 +25,22 @@ impl Request {
     }
 
     /// Accept the session, returning a 200 OK.
-    pub async fn ok(self, response: impl Into<ConnectResponse>) -> Result<Connection, ServerError> {
-        let connect = self.connect.ok(response.into()).await?;
+    pub async fn ok(self) -> Result<Connection, ServerError> {
+        self.respond(ConnectResponse::OK).await
+    }
+
+    /// Accept the session with the given response.
+    pub async fn respond(
+        self,
+        response: impl Into<ConnectResponse>,
+    ) -> Result<Connection, ServerError> {
+        let connect = self.connect.respond(response.into()).await?;
         Ok(Connection::new(self.conn, self.settings, connect))
     }
 
     /// Reject the session, returing your favorite HTTP status code.
-    pub async fn close(self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.ok(status).await?;
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
+        self.connect.reject(status).await?;
         Ok(())
     }
 }

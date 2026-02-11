@@ -55,10 +55,14 @@ impl Connecting {
         })
     }
 
+    pub async fn ok(self) -> Result<Connected, ConnectError> {
+        self.respond(ConnectResponse::OK).await
+    }
+
     /// Send an HTTP/3 CONNECT response to the client.
     ///
     /// This is called by the server to accept or reject the connection.
-    pub async fn ok(
+    pub async fn respond(
         mut self,
         response: impl Into<ConnectResponse>,
     ) -> Result<Connected, ConnectError> {
@@ -75,8 +79,8 @@ impl Connecting {
         })
     }
 
-    pub async fn close(self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let mut connect = self.ok(status).await?;
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
+        let mut connect = self.respond(status).await?;
         connect.send.finish()?;
         Ok(())
     }

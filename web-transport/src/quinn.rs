@@ -74,7 +74,7 @@ impl Server {
     pub async fn accept(&mut self) -> Result<Option<Session>, Error> {
         match self.inner.accept().await {
             // TODO add sub-protocol support
-            Some(session) => Ok(Some(session.ok(http::StatusCode::OK).await?.into())),
+            Some(session) => Ok(Some(session.respond(http::StatusCode::OK).await?.into())),
             None => Ok(None),
         }
     }

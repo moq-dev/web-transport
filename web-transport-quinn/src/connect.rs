@@ -55,8 +55,8 @@ impl Connecting {
         })
     }
 
-    // Called by the server to send a response to the client.
-    pub async fn ok(
+    // Called by the server to send a response to the client and establish the session.
+    pub async fn respond(
         mut self,
         response: impl Into<ConnectResponse>,
     ) -> Result<Connected, ConnectError> {
@@ -80,8 +80,8 @@ impl Connecting {
         })
     }
 
-    pub async fn close(self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let mut connect = self.ok(status).await?;
+    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
+        let mut connect = self.respond(status).await?;
         connect.send.finish().ok();
         Ok(())
     }

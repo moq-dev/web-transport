@@ -318,6 +318,12 @@ impl ConnectResponse {
     }
 }
 
+impl Default for ConnectResponse {
+    fn default() -> Self {
+        Self::OK
+    }
+}
+
 impl From<http::StatusCode> for ConnectResponse {
     fn from(status: http::StatusCode) -> Self {
         Self {
