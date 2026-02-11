@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.1.0...web-transport-quiche-v0.2.0) - 2026-02-11
+
+### Other
+
+- Fix a panic caused by longer error codes. ([#160](https://github.com/moq-dev/web-transport/pull/160))
+- Async accept ([#159](https://github.com/moq-dev/web-transport/pull/159))
+
 ## [0.0.6](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.0.5...web-transport-quiche-v0.0.6) - 2026-02-10
 
 ### Other
