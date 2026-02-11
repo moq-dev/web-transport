@@ -178,6 +178,13 @@ impl Request {
         self.connect.reject(status).await?;
         Ok(())
     }
+
+    /// Returns the CONNECT request that was sent by the client.
+    ///
+    /// DEPRECATED: You can access this via the Deref impl.
+    pub fn connect(&self) -> &ConnectRequest {
+        &self.connect
+    }
 }
 
 impl core::ops::Deref for Request {
