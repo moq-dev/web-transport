@@ -8,7 +8,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Connection-level statistics.
 ///
-/// All methods return `Option` — `None` means the implementation doesn't track
+/// Methods return `Option` — `None` means the implementation doesn't track
 /// this metric, while `Some(0)` means actually zero.
 pub trait Stats {
     /// Total bytes sent over the connection, including retransmissions and overhead.
@@ -26,17 +26,17 @@ pub trait Stats {
         None
     }
 
-    /// Total number of QUIC packets sent.
+    /// Total number of datagrams sent.
     fn packets_sent(&self) -> Option<u64> {
         None
     }
 
-    /// Total number of QUIC packets received.
+    /// Total number of datagrams received.
     fn packets_received(&self) -> Option<u64> {
         None
     }
 
-    /// Total number of QUIC packets detected as lost.
+    /// Total number of datagrams detected as lost.
     fn packets_lost(&self) -> Option<u64> {
         None
     }
@@ -52,9 +52,9 @@ pub trait Stats {
     }
 }
 
-/// Default implementation that returns `None` for all stats.
-pub struct DefaultStats;
-impl Stats for DefaultStats {}
+/// Default stats implementation that returns `None` for all metrics.
+pub struct StatsUnavailable;
+impl Stats for StatsUnavailable {}
 
 /// Error trait for WebTransport operations.
 ///
@@ -125,9 +125,9 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// Block until the connection is closed by either side.
     fn closed(&self) -> impl Future<Output = Self::Error> + MaybeSend;
 
-    /// Return connection-level statistics.
+    /// Return connection-level statistics, if supported.
     fn stats(&self) -> impl Stats {
-        DefaultStats
+        StatsUnavailable
     }
 }
 

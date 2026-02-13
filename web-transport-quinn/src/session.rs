@@ -316,6 +316,14 @@ impl Session {
     pub fn response(&self) -> &ConnectResponse {
         &self.response
     }
+
+    /// Return connection-level statistics.
+    pub fn stats(&self) -> SessionStats {
+        SessionStats {
+            stats: self.conn.stats(),
+            rtt: self.conn.rtt(),
+        }
+    }
 }
 
 impl Deref for Session {
@@ -527,12 +535,12 @@ impl SessionAccept {
     }
 }
 
-pub struct QuinnStats {
+pub struct SessionStats {
     stats: quinn::ConnectionStats,
     rtt: std::time::Duration,
 }
 
-impl web_transport_trait::Stats for QuinnStats {
+impl web_transport_trait::Stats for SessionStats {
     fn bytes_sent(&self) -> Option<u64> {
         Some(self.stats.udp_tx.bytes)
     }
@@ -546,7 +554,11 @@ impl web_transport_trait::Stats for QuinnStats {
     }
 
     fn packets_sent(&self) -> Option<u64> {
-        Some(self.stats.path.sent_packets)
+        Some(self.stats.udp_tx.datagrams)
+    }
+
+    fn packets_received(&self) -> Option<u64> {
+        Some(self.stats.udp_rx.datagrams)
     }
 
     fn packets_lost(&self) -> Option<u64> {
@@ -613,10 +625,7 @@ impl web_transport_trait::Session for Session {
     }
 
     #[allow(refining_impl_trait)]
-    fn stats(&self) -> QuinnStats {
-        QuinnStats {
-            stats: self.conn.stats(),
-            rtt: self.conn.rtt(),
-        }
+    fn stats(&self) -> SessionStats {
+        Self::stats(self)
     }
 }
