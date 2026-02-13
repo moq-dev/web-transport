@@ -81,11 +81,6 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerInit> {
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
     }
-
-    /// Set ALPN protocols.
-    pub fn with_alpn(self, alpn: Vec<Vec<u8>>) -> Self {
-        Self(self.0.with_alpn(alpn))
-    }
 }
 
 impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
@@ -107,11 +102,6 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
-    }
-
-    /// Set ALPN protocols.
-    pub fn with_alpn(self, alpn: Vec<Vec<u8>>) -> Self {
-        Self(self.0.with_alpn(alpn))
     }
 
     /// Configure the server to use a static certificate for TLS.
