@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- release ([#162](https://github.com/moq-dev/web-transport/pull/162))
+- Fix some API mistakes. ([#163](https://github.com/moq-dev/web-transport/pull/163))
+
+## [0.5.2](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.1...web-transport-proto-v0.5.2) - 2026-02-13
+
+### Other
+
 - Fix some API mistakes. ([#163](https://github.com/moq-dev/web-transport/pull/163))
 
 ## [0.5.1](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.0...web-transport-proto-v0.5.1) - 2026-02-11
