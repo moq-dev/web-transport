@@ -11,28 +11,42 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// All methods return `Option` — `None` means the implementation doesn't track
 /// this metric, while `Some(0)` means actually zero.
 pub trait Stats {
+    /// Total bytes sent over the connection, including retransmissions and overhead.
     fn bytes_sent(&self) -> Option<u64> {
         None
     }
+
+    /// Total bytes received over the connection, including duplicate and overhead.
     fn bytes_received(&self) -> Option<u64> {
         None
     }
+
+    /// Total bytes lost (detected via retransmission or acknowledgement).
     fn bytes_lost(&self) -> Option<u64> {
         None
     }
+
+    /// Total number of QUIC packets sent.
     fn packets_sent(&self) -> Option<u64> {
         None
     }
+
+    /// Total number of QUIC packets received.
     fn packets_received(&self) -> Option<u64> {
         None
     }
+
+    /// Total number of QUIC packets detected as lost.
     fn packets_lost(&self) -> Option<u64> {
         None
     }
+
+    /// Smoothed round-trip time estimate.
     fn rtt(&self) -> Option<Duration> {
         None
     }
-    /// Estimated available send bandwidth in bits per second.
+
+    /// Estimated available send bandwidth, in bits per second.
     fn estimated_send_rate(&self) -> Option<u64> {
         None
     }
