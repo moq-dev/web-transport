@@ -527,6 +527,46 @@ impl SessionAccept {
     }
 }
 
+pub struct QuinnStats {
+    stats: quinn::ConnectionStats,
+    rtt: std::time::Duration,
+}
+
+impl web_transport_trait::Stats for QuinnStats {
+    fn bytes_sent(&self) -> Option<u64> {
+        Some(self.stats.udp_tx.bytes)
+    }
+
+    fn bytes_received(&self) -> Option<u64> {
+        Some(self.stats.udp_rx.bytes)
+    }
+
+    fn bytes_lost(&self) -> Option<u64> {
+        Some(self.stats.path.lost_bytes)
+    }
+
+    fn packets_sent(&self) -> Option<u64> {
+        Some(self.stats.path.sent_packets)
+    }
+
+    fn packets_lost(&self) -> Option<u64> {
+        Some(self.stats.path.lost_packets)
+    }
+
+    fn rtt(&self) -> Option<std::time::Duration> {
+        Some(self.rtt)
+    }
+
+    fn estimated_send_rate(&self) -> Option<u64> {
+        let rtt_secs = self.rtt.as_secs_f64();
+        if self.stats.path.cwnd > 0 && rtt_secs > 0.0 {
+            Some((self.stats.path.cwnd as f64 * 8.0 / rtt_secs) as u64)
+        } else {
+            None
+        }
+    }
+}
+
 impl web_transport_trait::Session for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
@@ -570,5 +610,13 @@ impl web_transport_trait::Session for Session {
 
     fn protocol(&self) -> Option<&str> {
         self.response.protocol.as_deref()
+    }
+
+    #[allow(refining_impl_trait)]
+    fn stats(&self) -> QuinnStats {
+        QuinnStats {
+            stats: self.conn.stats(),
+            rtt: self.conn.rtt(),
+        }
     }
 }

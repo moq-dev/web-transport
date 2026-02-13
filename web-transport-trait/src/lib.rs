@@ -1,9 +1,46 @@
 mod util;
 
 use std::future::Future;
+use std::time::Duration;
 
 pub use crate::util::{MaybeSend, MaybeSync};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// Connection-level statistics.
+///
+/// All methods return `Option` — `None` means the implementation doesn't track
+/// this metric, while `Some(0)` means actually zero.
+pub trait Stats {
+    fn bytes_sent(&self) -> Option<u64> {
+        None
+    }
+    fn bytes_received(&self) -> Option<u64> {
+        None
+    }
+    fn bytes_lost(&self) -> Option<u64> {
+        None
+    }
+    fn packets_sent(&self) -> Option<u64> {
+        None
+    }
+    fn packets_received(&self) -> Option<u64> {
+        None
+    }
+    fn packets_lost(&self) -> Option<u64> {
+        None
+    }
+    fn rtt(&self) -> Option<Duration> {
+        None
+    }
+    /// Estimated available send bandwidth in bits per second.
+    fn estimated_send_rate(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Default implementation that returns `None` for all stats.
+pub struct DefaultStats;
+impl Stats for DefaultStats {}
 
 /// Error trait for WebTransport operations.
 ///
@@ -73,6 +110,11 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 
     /// Block until the connection is closed by either side.
     fn closed(&self) -> impl Future<Output = Self::Error> + MaybeSend;
+
+    /// Return connection-level statistics.
+    fn stats(&self) -> impl Stats {
+        DefaultStats
+    }
 }
 
 /// An outgoing stream of bytes to the peer.
