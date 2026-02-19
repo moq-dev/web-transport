@@ -161,11 +161,17 @@ impl ConnectRequest {
     /// Read a CONNECT request from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
         loop {
-            let typ = Frame(VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?);
-            let size = VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?;
+            let typ = Frame(
+                VarInt::read(stream)
+                    .await
+                    .map_err(|_| ConnectError::UnexpectedEnd)?,
+            );
+            let size = VarInt::read(stream)
+                .await
+                .map_err(|_| ConnectError::UnexpectedEnd)?;
 
-            let size = size.into_inner() as usize;
-            if size > MAX_FRAME_SIZE {
+            let size = size.into_inner();
+            if size > MAX_FRAME_SIZE as u64 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "frame too large",
@@ -173,18 +179,21 @@ impl ConnectRequest {
                 .into());
             }
 
-            let mut payload = vec![0u8; size];
-            stream.read_exact(&mut payload).await?;
+            let mut payload = stream.take(size);
 
             if typ.is_grease() {
+                tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
                 continue;
             }
+
+            let mut buf = Vec::with_capacity(size as usize);
+            payload.read_to_end(&mut buf).await?;
 
             if typ != Frame::HEADERS {
                 return Err(ConnectError::UnexpectedFrame(typ));
             }
 
-            return Self::decode_headers(&mut payload.as_slice());
+            return Self::decode_headers(&mut buf.as_slice());
         }
     }
 
@@ -298,11 +307,17 @@ impl ConnectResponse {
     /// Read a CONNECT response from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
         loop {
-            let typ = Frame(VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?);
-            let size = VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?;
+            let typ = Frame(
+                VarInt::read(stream)
+                    .await
+                    .map_err(|_| ConnectError::UnexpectedEnd)?,
+            );
+            let size = VarInt::read(stream)
+                .await
+                .map_err(|_| ConnectError::UnexpectedEnd)?;
 
-            let size = size.into_inner() as usize;
-            if size > MAX_FRAME_SIZE {
+            let size = size.into_inner();
+            if size > MAX_FRAME_SIZE as u64 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "frame too large",
@@ -310,18 +325,21 @@ impl ConnectResponse {
                 .into());
             }
 
-            let mut payload = vec![0u8; size];
-            stream.read_exact(&mut payload).await?;
+            let mut payload = stream.take(size);
 
             if typ.is_grease() {
+                tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
                 continue;
             }
+
+            let mut buf = Vec::with_capacity(size as usize);
+            payload.read_to_end(&mut buf).await?;
 
             if typ != Frame::HEADERS {
                 return Err(ConnectError::UnexpectedFrame(typ));
             }
 
-            return Self::decode_headers(&mut payload.as_slice());
+            return Self::decode_headers(&mut buf.as_slice());
         }
     }
 
@@ -426,5 +444,181 @@ mod protocol_negotiation {
             .ok_or(ConnectError::InvalidProtocol)?
             .as_str()
             .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a framed CONNECT request on the wire.
+    fn encode_request(url: &str) -> Vec<u8> {
+        let req = ConnectRequest::new(Url::parse(url).unwrap());
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// Build a framed CONNECT response on the wire.
+    fn encode_response() -> Vec<u8> {
+        let resp = ConnectResponse::OK;
+        let mut buf = Vec::new();
+        resp.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// Encode a GREASE frame: type (0x21 = first GREASE value) + length + payload.
+    fn encode_grease_frame(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        VarInt::from_u32(0x21).encode(&mut buf); // GREASE frame type
+        VarInt::from_u32(payload.len() as u32).encode(&mut buf);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    // ---- ConnectRequest::read tests ----
+
+    #[tokio::test]
+    async fn request_read_exact_consumption() {
+        // Verify read() consumes only the frame bytes, not trailing data.
+        let mut wire = encode_request("https://example.com/path");
+        let trailing = b"trailing data";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/path");
+
+        // The cursor should be positioned right after the frame, leaving trailing data.
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn request_read_roundtrip() {
+        let wire = encode_request("https://example.com/foo?bar=1");
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/foo?bar=1");
+    }
+
+    #[tokio::test]
+    async fn request_read_skips_grease() {
+        // Prepend a GREASE frame before the real HEADERS frame.
+        let mut wire = encode_grease_frame(b"junk");
+        wire.extend_from_slice(&encode_request("https://example.com/"));
+
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn request_read_rejects_frame_too_large() {
+        // Craft a frame header claiming a huge payload.
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        // 128 KiB > MAX_FRAME_SIZE (64 KiB)
+        VarInt::from_u32(128 * 1024).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Io(_)),
+            "expected Io error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_read_rejects_wrong_frame_type() {
+        let mut wire = Vec::new();
+        Frame::DATA.encode(&mut wire);
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::UnexpectedFrame(f) if f == Frame::DATA),
+            "expected UnexpectedFrame(DATA), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_read_empty_stream() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    // ---- ConnectResponse::read tests ----
+
+    #[tokio::test]
+    async fn response_read_exact_consumption() {
+        let mut wire = encode_response();
+        let trailing = b"extra bytes";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn response_read_roundtrip() {
+        let wire = encode_response();
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_read_skips_grease() {
+        let mut wire = encode_grease_frame(b"grease");
+        wire.extend_from_slice(&encode_response());
+
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_read_rejects_frame_too_large() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(128 * 1024).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::Io(_)),
+            "expected Io error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_rejects_wrong_frame_type() {
+        let mut wire = Vec::new();
+        Frame::SETTINGS.encode(&mut wire);
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::UnexpectedFrame(f) if f == Frame::SETTINGS),
+            "expected UnexpectedFrame(SETTINGS), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_empty_stream() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
     }
 }

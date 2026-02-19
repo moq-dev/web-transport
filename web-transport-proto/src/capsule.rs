@@ -78,22 +78,55 @@ impl Capsule {
         }
     }
 
+    /// Read a capsule from a stream, consuming only the exact bytes of the capsule.
+    ///
+    /// Returns `Ok(None)` if the stream is cleanly closed (EOF before any bytes).
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Self>, CapsuleError> {
-        let mut buf = Vec::new();
-        loop {
-            if stream.read_buf(&mut buf).await? == 0 {
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(CapsuleError::UnexpectedEnd);
-            }
+        let typ = match VarInt::read(stream).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // Clean EOF
+        };
+        let length = VarInt::read(stream)
+            .await
+            .map_err(|_| CapsuleError::UnexpectedEnd)?;
 
-            let mut limit = std::io::Cursor::new(&buf);
-            match Self::decode(&mut limit) {
-                Ok(capsule) => return Ok(Some(capsule)),
-                Err(CapsuleError::UnexpectedEnd) => continue,
-                Err(e) => return Err(e),
+        let length = length.into_inner();
+        let typ_val = typ.into_inner();
+
+        if length > MAX_MESSAGE_SIZE as u64 {
+            return Err(CapsuleError::MessageTooLong);
+        }
+
+        let mut payload = stream.take(length);
+
+        if let Some(num) = is_grease(typ_val) {
+            tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+            return Ok(Some(Self::Grease { num }));
+        }
+
+        let mut buf = Vec::with_capacity(length as usize);
+        payload.read_to_end(&mut buf).await?;
+
+        match typ_val {
+            CLOSE_WEBTRANSPORT_SESSION_TYPE => {
+                let mut data = buf.as_slice();
+                if data.remaining() < 4 {
+                    return Err(CapsuleError::UnexpectedEnd);
+                }
+
+                let error_code = data.get_u32();
+                let error_message =
+                    String::from_utf8(data.to_vec()).map_err(|_| CapsuleError::InvalidUtf8)?;
+
+                Ok(Some(Self::CloseWebTransportSession {
+                    code: error_code,
+                    reason: error_message,
+                }))
             }
+            _ => Ok(Some(Self::Unknown {
+                typ: VarInt::from_u64(typ_val).unwrap(),
+                payload: Bytes::from(buf),
+            })),
         }
     }
 
@@ -372,5 +405,57 @@ mod tests {
         let capsule = Capsule::Grease { num: u64::MAX };
         let mut buf = Vec::new();
         capsule.encode(&mut buf);
+    }
+
+    #[tokio::test]
+    async fn test_read_exact_consumption() {
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 42,
+            reason: "bye".to_string(),
+        };
+        let mut wire = Vec::new();
+        capsule.encode(&mut wire);
+        let trailing = b"leftover";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decoded = Capsule::read(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(capsule, decoded);
+
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn test_read_roundtrip() {
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 100,
+            reason: "test".to_string(),
+        };
+        let mut wire = Vec::new();
+        capsule.encode(&mut wire);
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decoded = Capsule::read(&mut cursor).await.unwrap().unwrap();
+        assert_eq!(capsule, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_read_eof_returns_none() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let result = Capsule::read(&mut cursor).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_too_large() {
+        let mut wire = Vec::new();
+        VarInt::from_u64(0x2843).unwrap().encode(&mut wire); // type
+        VarInt::from_u32((MAX_MESSAGE_SIZE as u32) + 1).encode(&mut wire); // too large
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = Capsule::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, CapsuleError::MessageTooLong));
     }
 }
