@@ -56,6 +56,13 @@ macro_rules! frames {
     }
 }
 
+/// Maximum size of a frame payload (64 KiB).
+///
+/// This bounds the allocation when reading frames from an async stream,
+/// preventing a malicious peer from triggering huge allocations via a
+/// crafted frame-length field.
+pub(crate) const MAX_FRAME_SIZE: u64 = 65536;
+
 // Sent at the start of a bidirectional stream.
 frames! {
     DATA = 0x00,

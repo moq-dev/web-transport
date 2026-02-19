@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Frame, StreamUni, VarInt, VarIntUnexpectedEnd};
+use super::{Frame, StreamUni, VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Setting(pub VarInt);
@@ -99,6 +99,9 @@ pub enum SettingsError {
     #[error("invalid size")]
     InvalidSize,
 
+    #[error("frame too large")]
+    FrameTooLarge,
+
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
 }
@@ -139,9 +142,6 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Maximum size of a SETTINGS frame payload (64 KiB).
-    const MAX_FRAME_SIZE: usize = 65536;
-
     /// Read settings from a stream, consuming only the exact bytes of the stream type + frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, SettingsError> {
         let typ = StreamUni(
@@ -164,12 +164,8 @@ impl Settings {
                 .map_err(|_| SettingsError::UnexpectedEnd)?;
 
             let size = size.into_inner();
-            if size > Self::MAX_FRAME_SIZE as u64 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "frame too large",
-                )
-                .into());
+            if size > MAX_FRAME_SIZE {
+                return Err(SettingsError::FrameTooLarge);
             }
 
             let mut payload = stream.take(size);
@@ -384,8 +380,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = Settings::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, SettingsError::Io(_)),
-            "expected Io error, got {err:?}"
+            matches!(err, SettingsError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 

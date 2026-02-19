@@ -131,7 +131,7 @@ impl Capsule {
                 }))
             }
             _ => Ok(Some(Self::Unknown {
-                typ: VarInt::from_u64(typ_val).unwrap(),
+                typ,
                 payload: Bytes::from(buf),
             })),
         }

@@ -4,16 +4,9 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
-use super::{qpack, Frame, VarInt};
+use super::{qpack, Frame, VarInt, MAX_FRAME_SIZE};
 
 use thiserror::Error;
-
-/// Maximum size of a CONNECT HEADERS frame payload (64 KiB).
-///
-/// This bounds the allocation when reading frames from an async stream,
-/// preventing a malicious peer from triggering huge allocations via a
-/// crafted frame-length field.
-const MAX_FRAME_SIZE: usize = 65536;
 
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
@@ -59,6 +52,9 @@ pub enum ConnectError {
 
     #[error("structured field error: {0}")]
     StructuredFieldError(Arc<sfv::Error>),
+
+    #[error("frame too large")]
+    FrameTooLarge,
 
     #[error("non-200 status: {0:?}")]
     ErrorStatus(http::StatusCode),
@@ -160,48 +156,8 @@ impl ConnectRequest {
 
     /// Read a CONNECT request from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        loop {
-            let typ = Frame(
-                VarInt::read(stream)
-                    .await
-                    .map_err(|_| ConnectError::UnexpectedEnd)?,
-            );
-            let size = VarInt::read(stream)
-                .await
-                .map_err(|_| ConnectError::UnexpectedEnd)?;
-
-            let size = size.into_inner();
-            if size > MAX_FRAME_SIZE as u64 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "frame too large",
-                )
-                .into());
-            }
-
-            let mut payload = stream.take(size);
-
-            if typ.is_grease() {
-                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
-                if n < size {
-                    return Err(ConnectError::UnexpectedEnd);
-                }
-                continue;
-            }
-
-            let mut buf = Vec::with_capacity(size as usize);
-            payload.read_to_end(&mut buf).await?;
-
-            if buf.len() < size as usize {
-                return Err(ConnectError::UnexpectedEnd);
-            }
-
-            if typ != Frame::HEADERS {
-                return Err(ConnectError::UnexpectedFrame(typ));
-            }
-
-            return Self::decode_headers(&mut buf.as_slice());
-        }
+        let buf = read_headers_frame(stream).await?;
+        Self::decode_headers(&mut buf.as_slice())
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
@@ -313,48 +269,8 @@ impl ConnectResponse {
 
     /// Read a CONNECT response from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        loop {
-            let typ = Frame(
-                VarInt::read(stream)
-                    .await
-                    .map_err(|_| ConnectError::UnexpectedEnd)?,
-            );
-            let size = VarInt::read(stream)
-                .await
-                .map_err(|_| ConnectError::UnexpectedEnd)?;
-
-            let size = size.into_inner();
-            if size > MAX_FRAME_SIZE as u64 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "frame too large",
-                )
-                .into());
-            }
-
-            let mut payload = stream.take(size);
-
-            if typ.is_grease() {
-                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
-                if n < size {
-                    return Err(ConnectError::UnexpectedEnd);
-                }
-                continue;
-            }
-
-            let mut buf = Vec::with_capacity(size as usize);
-            payload.read_to_end(&mut buf).await?;
-
-            if buf.len() < size as usize {
-                return Err(ConnectError::UnexpectedEnd);
-            }
-
-            if typ != Frame::HEADERS {
-                return Err(ConnectError::UnexpectedFrame(typ));
-            }
-
-            return Self::decode_headers(&mut buf.as_slice());
-        }
+        let buf = read_headers_frame(stream).await?;
+        Self::decode_headers(&mut buf.as_slice())
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
@@ -399,6 +315,50 @@ impl From<http::StatusCode> for ConnectResponse {
             status,
             protocol: None,
         }
+    }
+}
+
+/// Read the next HEADERS frame from the stream, skipping any GREASE frames.
+///
+/// Returns the raw payload bytes of the HEADERS frame.
+async fn read_headers_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, ConnectError> {
+    loop {
+        let typ = Frame(
+            VarInt::read(stream)
+                .await
+                .map_err(|_| ConnectError::UnexpectedEnd)?,
+        );
+        let size = VarInt::read(stream)
+            .await
+            .map_err(|_| ConnectError::UnexpectedEnd)?;
+
+        let size = size.into_inner();
+        if size > MAX_FRAME_SIZE {
+            return Err(ConnectError::FrameTooLarge);
+        }
+
+        let mut payload = stream.take(size);
+
+        if typ.is_grease() {
+            let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+            if n < size {
+                return Err(ConnectError::UnexpectedEnd);
+            }
+            continue;
+        }
+
+        let mut buf = Vec::with_capacity(size as usize);
+        payload.read_to_end(&mut buf).await?;
+
+        if buf.len() < size as usize {
+            return Err(ConnectError::UnexpectedEnd);
+        }
+
+        if typ != Frame::HEADERS {
+            return Err(ConnectError::UnexpectedFrame(typ));
+        }
+
+        return Ok(buf);
     }
 }
 
@@ -540,8 +500,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::Io(_)),
-            "expected Io error, got {err:?}"
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 
@@ -610,8 +570,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::Io(_)),
-            "expected Io error, got {err:?}"
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 
