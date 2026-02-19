@@ -8,6 +8,13 @@ use super::{qpack, Frame, VarInt};
 
 use thiserror::Error;
 
+/// Maximum size of a CONNECT HEADERS frame payload (64 KiB).
+///
+/// This bounds the allocation when reading frames from an async stream,
+/// preventing a malicious peer from triggering huge allocations via a
+/// crafted frame-length field.
+const MAX_FRAME_SIZE: usize = 65536;
+
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
 pub enum ConnectError {
@@ -157,7 +164,16 @@ impl ConnectRequest {
             let typ = Frame(VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?);
             let size = VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?;
 
-            let mut payload = vec![0u8; size.into_inner() as usize];
+            let size = size.into_inner() as usize;
+            if size > MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                )
+                .into());
+            }
+
+            let mut payload = vec![0u8; size];
             stream.read_exact(&mut payload).await?;
 
             if typ.is_grease() {
@@ -285,7 +301,16 @@ impl ConnectResponse {
             let typ = Frame(VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?);
             let size = VarInt::read(stream).await.map_err(|_| ConnectError::UnexpectedEnd)?;
 
-            let mut payload = vec![0u8; size.into_inner() as usize];
+            let size = size.into_inner() as usize;
+            if size > MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                )
+                .into());
+            }
+
+            let mut payload = vec![0u8; size];
             stream.read_exact(&mut payload).await?;
 
             if typ.is_grease() {
