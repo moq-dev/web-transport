@@ -21,3 +21,6 @@ thiserror = "2"
 # Just for AsyncRead and AsyncWrite traits
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "io-util"] }

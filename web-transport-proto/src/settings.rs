@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{Frame, StreamUni, VarInt, VarIntUnexpectedEnd};
+use super::{Frame, StreamUni, VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Setting(pub VarInt);
@@ -99,6 +99,9 @@ pub enum SettingsError {
     #[error("invalid size")]
     InvalidSize,
 
+    #[error("frame too large")]
+    FrameTooLarge,
+
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
 }
@@ -139,22 +142,64 @@ impl Settings {
         Ok(settings)
     }
 
+    /// Read settings from a stream, consuming only the exact bytes of the stream type + frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, SettingsError> {
-        let mut buf = Vec::new();
+        let typ = StreamUni(
+            VarInt::read(stream)
+                .await
+                .map_err(|_| SettingsError::UnexpectedEnd)?,
+        );
+        if typ != StreamUni::CONTROL {
+            return Err(SettingsError::UnexpectedStreamType(typ));
+        }
 
         loop {
-            if stream.read_buf(&mut buf).await? == 0 {
+            let frame_typ = Frame(
+                VarInt::read(stream)
+                    .await
+                    .map_err(|_| SettingsError::UnexpectedEnd)?,
+            );
+            let size = VarInt::read(stream)
+                .await
+                .map_err(|_| SettingsError::UnexpectedEnd)?;
+
+            let size = size.into_inner();
+            if size > MAX_FRAME_SIZE {
+                return Err(SettingsError::FrameTooLarge);
+            }
+
+            let mut payload = stream.take(size);
+
+            if frame_typ.is_grease() {
+                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                if n < size {
+                    return Err(SettingsError::UnexpectedEnd);
+                }
+                continue;
+            }
+
+            let mut buf = Vec::with_capacity(size as usize);
+            payload.read_to_end(&mut buf).await?;
+
+            if buf.len() < size as usize {
                 return Err(SettingsError::UnexpectedEnd);
             }
 
-            // Look at the buffer we've already read.
-            let mut limit = std::io::Cursor::new(&buf);
+            if frame_typ != Frame::SETTINGS {
+                return Err(SettingsError::UnexpectedFrame(frame_typ));
+            }
 
-            match Settings::decode(&mut limit) {
-                Ok(settings) => return Ok(settings),
-                Err(SettingsError::UnexpectedEnd) => continue, // More data needed.
-                Err(e) => return Err(e),
-            };
+            let mut data = buf.as_slice();
+            let mut settings = Settings::default();
+            while data.has_remaining() {
+                let id = Setting::decode(&mut data).map_err(|_| SettingsError::InvalidSize)?;
+                let value = VarInt::decode(&mut data).map_err(|_| SettingsError::InvalidSize)?;
+                if !id.is_grease() {
+                    settings.0.insert(id, value);
+                }
+            }
+
+            return Ok(settings);
         }
     }
 
@@ -250,5 +295,148 @@ impl Deref for Settings {
 impl DerefMut for Settings {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn encode_settings(settings: &Settings) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        settings.encode(&mut buf);
+        buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn read_exact_consumption() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(1);
+
+        let mut wire = encode_settings(&settings);
+        let trailing = b"trailing";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = Cursor::new(wire);
+        let decoded = Settings::read(&mut cursor).await.unwrap();
+        assert_eq!(decoded.supports_webtransport(), 1);
+
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn read_roundtrip() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(4);
+
+        let wire = encode_settings(&settings);
+        let mut cursor = Cursor::new(wire);
+        let decoded = Settings::read(&mut cursor).await.unwrap();
+        assert_eq!(decoded.supports_webtransport(), 4);
+    }
+
+    #[tokio::test]
+    async fn read_empty_stream() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn read_wrong_stream_type() {
+        let mut wire = Vec::new();
+        StreamUni::PUSH.encode(&mut wire); // Wrong stream type
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedStreamType(_)));
+    }
+
+    #[tokio::test]
+    async fn read_wrong_frame_type() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        Frame::HEADERS.encode(&mut wire); // Wrong frame type
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, SettingsError::UnexpectedFrame(f) if f == Frame::HEADERS),
+            "expected UnexpectedFrame(HEADERS), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_rejects_frame_too_large() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        Frame::SETTINGS.encode(&mut wire);
+        VarInt::from_u32(128 * 1024).encode(&mut wire); // > 64 KiB
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, SettingsError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skips_grease_frame() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(1);
+
+        // Build: CONTROL stream type + GREASE frame + SETTINGS frame
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+
+        // Insert a GREASE frame (type 0x21 is the first GREASE value)
+        VarInt::from_u32(0x21).encode(&mut wire);
+        VarInt::from_u32(4).encode(&mut wire);
+        wire.extend_from_slice(b"junk");
+
+        // Now the real SETTINGS frame (without the stream type prefix, since we already wrote it)
+        Frame::SETTINGS.encode(&mut wire);
+        let mut tmp = Vec::new();
+        for (id, value) in settings.iter() {
+            id.encode(&mut tmp);
+            value.encode(&mut tmp);
+        }
+        VarInt::from_u32(tmp.len() as u32).encode(&mut wire);
+        wire.extend_from_slice(&tmp);
+
+        let mut cursor = Cursor::new(wire);
+        let decoded = Settings::read(&mut cursor).await.unwrap();
+        assert_eq!(decoded.supports_webtransport(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_truncated_payload() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        Frame::SETTINGS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire); // claims 100 bytes
+        wire.extend_from_slice(b"short"); // only 5 bytes
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn read_truncated_grease() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        VarInt::from_u32(0x21).encode(&mut wire); // GREASE frame type
+        VarInt::from_u32(50).encode(&mut wire); // claims 50 bytes
+        wire.extend_from_slice(b"ab"); // only 2 bytes
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedEnd));
     }
 }

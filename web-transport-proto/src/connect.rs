@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
-use super::{qpack, Frame, VarInt};
+use super::{qpack, Frame, VarInt, MAX_FRAME_SIZE};
 
 use thiserror::Error;
 
@@ -52,6 +52,9 @@ pub enum ConnectError {
 
     #[error("structured field error: {0}")]
     StructuredFieldError(Arc<sfv::Error>),
+
+    #[error("frame too large")]
+    FrameTooLarge,
 
     #[error("non-200 status: {0:?}")]
     ErrorStatus(http::StatusCode),
@@ -107,9 +110,11 @@ impl ConnectRequest {
             return Err(ConnectError::UnexpectedFrame(typ));
         }
 
-        // We no longer return UnexpectedEnd because we know the buffer should be large enough.
+        Self::decode_headers(&mut data)
+    }
 
-        let headers = qpack::Headers::decode(&mut data)?;
+    fn decode_headers<B: Buf>(data: &mut B) -> Result<Self, ConnectError> {
+        let headers = qpack::Headers::decode(data)?;
 
         let scheme = match headers.get(":scheme") {
             Some("https") => "https",
@@ -149,20 +154,10 @@ impl ConnectRequest {
         Ok(Self { url, protocols })
     }
 
+    /// Read a CONNECT request from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        let mut buf = Vec::new();
-        loop {
-            if stream.read_buf(&mut buf).await? == 0 {
-                return Err(ConnectError::UnexpectedEnd);
-            }
-
-            let mut limit = std::io::Cursor::new(&buf);
-            match Self::decode(&mut limit) {
-                Ok(request) => return Ok(request),
-                Err(ConnectError::UnexpectedEnd) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        let buf = read_headers_frame(stream).await?;
+        Self::decode_headers(&mut buf.as_slice())
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
@@ -246,7 +241,11 @@ impl ConnectResponse {
             return Err(ConnectError::UnexpectedFrame(typ));
         }
 
-        let headers = qpack::Headers::decode(&mut data)?;
+        Self::decode_headers(&mut data)
+    }
+
+    fn decode_headers<B: Buf>(data: &mut B) -> Result<Self, ConnectError> {
+        let headers = qpack::Headers::decode(data)?;
 
         let status = match headers
             .get(":status")
@@ -268,20 +267,10 @@ impl ConnectResponse {
         Ok(Self { status, protocol })
     }
 
+    /// Read a CONNECT response from a stream, consuming only the exact bytes of the frame.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        let mut buf = Vec::new();
-        loop {
-            if stream.read_buf(&mut buf).await? == 0 {
-                return Err(ConnectError::UnexpectedEnd);
-            }
-
-            let mut limit = std::io::Cursor::new(&buf);
-            match Self::decode(&mut limit) {
-                Ok(response) => return Ok(response),
-                Err(ConnectError::UnexpectedEnd) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        let buf = read_headers_frame(stream).await?;
+        Self::decode_headers(&mut buf.as_slice())
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
@@ -326,6 +315,50 @@ impl From<http::StatusCode> for ConnectResponse {
             status,
             protocol: None,
         }
+    }
+}
+
+/// Read the next HEADERS frame from the stream, skipping any GREASE frames.
+///
+/// Returns the raw payload bytes of the HEADERS frame.
+async fn read_headers_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, ConnectError> {
+    loop {
+        let typ = Frame(
+            VarInt::read(stream)
+                .await
+                .map_err(|_| ConnectError::UnexpectedEnd)?,
+        );
+        let size = VarInt::read(stream)
+            .await
+            .map_err(|_| ConnectError::UnexpectedEnd)?;
+
+        let size = size.into_inner();
+        if size > MAX_FRAME_SIZE {
+            return Err(ConnectError::FrameTooLarge);
+        }
+
+        let mut payload = stream.take(size);
+
+        if typ.is_grease() {
+            let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+            if n < size {
+                return Err(ConnectError::UnexpectedEnd);
+            }
+            continue;
+        }
+
+        let mut buf = Vec::with_capacity(size as usize);
+        payload.read_to_end(&mut buf).await?;
+
+        if buf.len() < size as usize {
+            return Err(ConnectError::UnexpectedEnd);
+        }
+
+        if typ != Frame::HEADERS {
+            return Err(ConnectError::UnexpectedFrame(typ));
+        }
+
+        return Ok(buf);
     }
 }
 
@@ -385,5 +418,221 @@ mod protocol_negotiation {
             .ok_or(ConnectError::InvalidProtocol)?
             .as_str()
             .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a framed CONNECT request on the wire.
+    fn encode_request(url: &str) -> Vec<u8> {
+        let req = ConnectRequest::new(Url::parse(url).unwrap());
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// Build a framed CONNECT response on the wire.
+    fn encode_response() -> Vec<u8> {
+        let resp = ConnectResponse::OK;
+        let mut buf = Vec::new();
+        resp.encode(&mut buf).unwrap();
+        buf
+    }
+
+    /// Encode a GREASE frame: type (0x21 = first GREASE value) + length + payload.
+    fn encode_grease_frame(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        VarInt::from_u32(0x21).encode(&mut buf); // GREASE frame type
+        VarInt::from_u32(payload.len() as u32).encode(&mut buf);
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    // ---- ConnectRequest::read tests ----
+
+    #[tokio::test]
+    async fn request_read_exact_consumption() {
+        // Verify read() consumes only the frame bytes, not trailing data.
+        let mut wire = encode_request("https://example.com/path");
+        let trailing = b"trailing data";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/path");
+
+        // The cursor should be positioned right after the frame, leaving trailing data.
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn request_read_roundtrip() {
+        let wire = encode_request("https://example.com/foo?bar=1");
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/foo?bar=1");
+    }
+
+    #[tokio::test]
+    async fn request_read_skips_grease() {
+        // Prepend a GREASE frame before the real HEADERS frame.
+        let mut wire = encode_grease_frame(b"junk");
+        wire.extend_from_slice(&encode_request("https://example.com/"));
+
+        let mut cursor = Cursor::new(wire);
+        let req = ConnectRequest::read(&mut cursor).await.unwrap();
+        assert_eq!(req.url.as_str(), "https://example.com/");
+    }
+
+    #[tokio::test]
+    async fn request_read_rejects_frame_too_large() {
+        // Craft a frame header claiming a huge payload.
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        // 128 KiB > MAX_FRAME_SIZE (64 KiB)
+        VarInt::from_u32(128 * 1024).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_read_rejects_wrong_frame_type() {
+        let mut wire = Vec::new();
+        Frame::DATA.encode(&mut wire);
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::UnexpectedFrame(f) if f == Frame::DATA),
+            "expected UnexpectedFrame(DATA), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_read_empty_stream() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    // ---- ConnectResponse::read tests ----
+
+    #[tokio::test]
+    async fn response_read_exact_consumption() {
+        let mut wire = encode_response();
+        let trailing = b"extra bytes";
+        wire.extend_from_slice(trailing);
+
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+
+        let pos = cursor.position() as usize;
+        let remaining = &cursor.into_inner()[pos..];
+        assert_eq!(remaining, trailing);
+    }
+
+    #[tokio::test]
+    async fn response_read_roundtrip() {
+        let wire = encode_response();
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_read_skips_grease() {
+        let mut wire = encode_grease_frame(b"grease");
+        wire.extend_from_slice(&encode_response());
+
+        let mut cursor = Cursor::new(wire);
+        let resp = ConnectResponse::read(&mut cursor).await.unwrap();
+        assert_eq!(resp.status, http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_read_rejects_frame_too_large() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(128 * 1024).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_rejects_wrong_frame_type() {
+        let mut wire = Vec::new();
+        Frame::SETTINGS.encode(&mut wire);
+        VarInt::from_u32(0).encode(&mut wire);
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::UnexpectedFrame(f) if f == Frame::SETTINGS),
+            "expected UnexpectedFrame(SETTINGS), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_read_empty_stream() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    // ---- Truncated payload tests ----
+
+    #[tokio::test]
+    async fn request_read_truncated_payload() {
+        // Frame header claims 100 bytes but only 5 are present.
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"short");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn response_read_truncated_payload() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"short");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn request_read_truncated_grease() {
+        // GREASE frame claims 100 bytes but only 3 are present.
+        let mut wire = Vec::new();
+        VarInt::from_u32(0x21).encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"abc");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
     }
 }
