@@ -175,12 +175,19 @@ impl Settings {
             let mut payload = stream.take(size);
 
             if frame_typ.is_grease() {
-                tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                if n < size {
+                    return Err(SettingsError::UnexpectedEnd);
+                }
                 continue;
             }
 
             let mut buf = Vec::with_capacity(size as usize);
             payload.read_to_end(&mut buf).await?;
+
+            if buf.len() < size as usize {
+                return Err(SettingsError::UnexpectedEnd);
+            }
 
             if frame_typ != Frame::SETTINGS {
                 return Err(SettingsError::UnexpectedFrame(frame_typ));
@@ -409,5 +416,31 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let decoded = Settings::read(&mut cursor).await.unwrap();
         assert_eq!(decoded.supports_webtransport(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_truncated_payload() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        Frame::SETTINGS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire); // claims 100 bytes
+        wire.extend_from_slice(b"short"); // only 5 bytes
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn read_truncated_grease() {
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        VarInt::from_u32(0x21).encode(&mut wire); // GREASE frame type
+        VarInt::from_u32(50).encode(&mut wire); // claims 50 bytes
+        wire.extend_from_slice(b"ab"); // only 2 bytes
+
+        let mut cursor = Cursor::new(wire);
+        let err = Settings::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, SettingsError::UnexpectedEnd));
     }
 }

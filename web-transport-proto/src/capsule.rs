@@ -100,12 +100,19 @@ impl Capsule {
         let mut payload = stream.take(length);
 
         if let Some(num) = is_grease(typ_val) {
-            tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+            let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+            if n < length {
+                return Err(CapsuleError::UnexpectedEnd);
+            }
             return Ok(Some(Self::Grease { num }));
         }
 
         let mut buf = Vec::with_capacity(length as usize);
         payload.read_to_end(&mut buf).await?;
+
+        if buf.len() < length as usize {
+            return Err(CapsuleError::UnexpectedEnd);
+        }
 
         match typ_val {
             CLOSE_WEBTRANSPORT_SESSION_TYPE => {
@@ -457,5 +464,32 @@ mod tests {
         let mut cursor = std::io::Cursor::new(wire);
         let err = Capsule::read(&mut cursor).await.unwrap_err();
         assert!(matches!(err, CapsuleError::MessageTooLong));
+    }
+
+    #[tokio::test]
+    async fn test_read_truncated_payload() {
+        // CloseWebTransportSession needs at least 4 bytes for error code,
+        // but the stream is shorter than the declared length.
+        let mut wire = Vec::new();
+        VarInt::from_u64(0x2843).unwrap().encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire); // claims 100 bytes
+        wire.extend_from_slice(b"short"); // only 5 bytes
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = Capsule::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, CapsuleError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn test_read_truncated_grease() {
+        // GREASE capsule type (0x17 = first grease value), claims 50 bytes, only 2 present.
+        let mut wire = Vec::new();
+        VarInt::from_u32(0x17).encode(&mut wire);
+        VarInt::from_u32(50).encode(&mut wire);
+        wire.extend_from_slice(b"ab");
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let err = Capsule::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, CapsuleError::UnexpectedEnd));
     }
 }

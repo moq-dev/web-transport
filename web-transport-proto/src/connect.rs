@@ -182,12 +182,19 @@ impl ConnectRequest {
             let mut payload = stream.take(size);
 
             if typ.is_grease() {
-                tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                if n < size {
+                    return Err(ConnectError::UnexpectedEnd);
+                }
                 continue;
             }
 
             let mut buf = Vec::with_capacity(size as usize);
             payload.read_to_end(&mut buf).await?;
+
+            if buf.len() < size as usize {
+                return Err(ConnectError::UnexpectedEnd);
+            }
 
             if typ != Frame::HEADERS {
                 return Err(ConnectError::UnexpectedFrame(typ));
@@ -328,12 +335,19 @@ impl ConnectResponse {
             let mut payload = stream.take(size);
 
             if typ.is_grease() {
-                tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                let n = tokio::io::copy(&mut payload, &mut tokio::io::sink()).await?;
+                if n < size {
+                    return Err(ConnectError::UnexpectedEnd);
+                }
                 continue;
             }
 
             let mut buf = Vec::with_capacity(size as usize);
             payload.read_to_end(&mut buf).await?;
+
+            if buf.len() < size as usize {
+                return Err(ConnectError::UnexpectedEnd);
+            }
 
             if typ != Frame::HEADERS {
                 return Err(ConnectError::UnexpectedFrame(typ));
@@ -619,6 +633,46 @@ mod tests {
     async fn response_read_empty_stream() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    // ---- Truncated payload tests ----
+
+    #[tokio::test]
+    async fn request_read_truncated_payload() {
+        // Frame header claims 100 bytes but only 5 are present.
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"short");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn response_read_truncated_payload() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"short");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
+        assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[tokio::test]
+    async fn request_read_truncated_grease() {
+        // GREASE frame claims 100 bytes but only 3 are present.
+        let mut wire = Vec::new();
+        VarInt::from_u32(0x21).encode(&mut wire);
+        VarInt::from_u32(100).encode(&mut wire);
+        wire.extend_from_slice(b"abc");
+
+        let mut cursor = Cursor::new(wire);
+        let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(matches!(err, ConnectError::UnexpectedEnd));
     }
 }
