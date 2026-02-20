@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- release ([#173](https://github.com/moq-dev/web-transport/pull/173))
+- release ([#171](https://github.com/moq-dev/web-transport/pull/171))
+
+## [0.11.6](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.5...web-transport-quinn-v0.11.6) - 2026-02-20
+
+### Other
+
 - release ([#171](https://github.com/moq-dev/web-transport/pull/171))
 
 ## [0.11.5](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.4...web-transport-quinn-v0.11.5) - 2026-02-20
