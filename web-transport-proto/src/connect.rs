@@ -10,6 +10,7 @@ use thiserror::Error;
 
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum ConnectError {
     #[error("unexpected end of input")]
     UnexpectedEnd,
@@ -52,6 +53,9 @@ pub enum ConnectError {
 
     #[error("structured field error: {0}")]
     StructuredFieldError(Arc<sfv::Error>),
+
+    #[error("frame too large")]
+    FrameTooLarge,
 
     #[error("non-200 status: {0:?}")]
     ErrorStatus(http::StatusCode),
@@ -331,7 +335,7 @@ async fn read_headers_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<
 
         let size = size.into_inner();
         if size > MAX_FRAME_SIZE {
-            return Err(std::io::Error::other("frame too large"))?;
+            return Err(ConnectError::FrameTooLarge);
         }
 
         let mut payload = stream.take(size);
@@ -497,8 +501,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::Io(_)),
-            "expected Io, got {err:?}"
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 
@@ -567,8 +571,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::Io(_)),
-            "expected Io, got {err:?}"
+            matches!(err, ConnectError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 
