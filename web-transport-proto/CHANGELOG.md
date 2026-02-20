@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- release ([#167](https://github.com/moq-dev/web-transport/pull/167))
+- Remove FrameTooLarge error variants to avoid semver breakage ([#170](https://github.com/moq-dev/web-transport/pull/170))
+- Fix opening connection stability with Chromium as a client ([#168](https://github.com/moq-dev/web-transport/pull/168))
+- release ([#166](https://github.com/moq-dev/web-transport/pull/166))
+
+## [0.5.3](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.2...web-transport-proto-v0.5.3) - 2026-02-20
+
+### Other
+
 - Remove FrameTooLarge error variants to avoid semver breakage ([#170](https://github.com/moq-dev/web-transport/pull/170))
 - Fix opening connection stability with Chromium as a client ([#168](https://github.com/moq-dev/web-transport/pull/168))
 - release ([#166](https://github.com/moq-dev/web-transport/pull/166))
