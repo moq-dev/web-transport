@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -18,7 +18,7 @@ thiserror = "2"
 url = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-web-transport-quinn = { version = "0.11.4", path = "../web-transport-quinn" }
+web-transport-quinn = { version = "0.11.5", path = "../web-transport-quinn" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-transport-wasm = { version = "0.5.5", path = "../web-transport-wasm" }
