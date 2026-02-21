@@ -86,6 +86,7 @@ settings! {
 }
 
 #[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum SettingsError {
     #[error("unexpected end of input")]
     UnexpectedEnd,
@@ -98,6 +99,9 @@ pub enum SettingsError {
 
     #[error("invalid size")]
     InvalidSize,
+
+    #[error("frame too large")]
+    FrameTooLarge,
 
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
@@ -162,7 +166,7 @@ impl Settings {
 
             let size = size.into_inner();
             if size > MAX_FRAME_SIZE {
-                return Err(std::io::Error::other("frame too large"))?;
+                return Err(SettingsError::FrameTooLarge);
             }
 
             let mut payload = stream.take(size);
@@ -377,8 +381,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = Settings::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, SettingsError::Io(_)),
-            "expected Io, got {err:?}"
+            matches!(err, SettingsError::FrameTooLarge),
+            "expected FrameTooLarge, got {err:?}"
         );
     }
 

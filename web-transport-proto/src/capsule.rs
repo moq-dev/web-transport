@@ -206,6 +206,7 @@ fn is_grease(val: u64) -> Option<u64> {
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum CapsuleError {
     #[error("unexpected end of buffer")]
     UnexpectedEnd,

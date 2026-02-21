@@ -33,6 +33,7 @@ features = [
     "ReadableStreamReadResult",
     "WebTransport",
     "WebTransportOptions",
+    "WebTransportHash",
     "WebTransportBidirectionalStream",
     "WebTransportCloseInfo",
     "WebTransportSendStream",
