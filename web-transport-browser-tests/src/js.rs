@@ -3,8 +3,8 @@
 ///
 /// The returned string is a self-contained async IIFE that can be evaluated
 /// directly via `page.evaluate()`.
-pub fn wrap_test_js(server_url: &str, fingerprint: &[u8], user_code: &str) -> String {
-    let fingerprint_bytes = fingerprint
+pub fn wrap_test_js(server_url: &str, certificate_hash: &[u8], user_code: &str) -> String {
+    let hash_bytes = certificate_hash
         .iter()
         .map(|b| b.to_string())
         .collect::<Vec<_>>()
@@ -13,7 +13,7 @@ pub fn wrap_test_js(server_url: &str, fingerprint: &[u8], user_code: &str) -> St
     format!(
         r#"(async () => {{
     const SERVER_URL = "{server_url}";
-    const CERT_HASH = new Uint8Array([{fingerprint_bytes}]);
+    const CERT_HASH = new Uint8Array([{hash_bytes}]);
 
     async function connectWebTransport(url, options) {{
         const wt = new WebTransport(url || SERVER_URL, {{
@@ -29,7 +29,10 @@ pub fn wrap_test_js(server_url: &str, fingerprint: &[u8], user_code: &str) -> St
 
     try {{
         const result = await (async () => {{ {user_code} }})();
-        return JSON.stringify(result || {{ success: true, message: "ok" }});
+        if (result === undefined || result === null) {{
+            return JSON.stringify({{ success: false, message: "test code did not return a result" }});
+        }}
+        return JSON.stringify(result);
     }} catch (e) {{
         return JSON.stringify({{
             success: false,
