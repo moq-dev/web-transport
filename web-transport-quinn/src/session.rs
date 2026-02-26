@@ -44,6 +44,14 @@ pub struct Session {
     #[allow(dead_code)]
     settings: Option<Arc<Settings>>,
 
+    // The send side of the CONNECT stream, used to write the CloseWebTransportSession capsule.
+    // Wrapped in Arc<Mutex<Option<...>>> so close() can take it exactly once.
+    connect_send: Arc<Mutex<Option<quinn::SendStream>>>,
+
+    // Close info received from the peer via a CloseWebTransportSession capsule.
+    // Set by the background task when a capsule is received.
+    close_capsule: Arc<Mutex<Option<(u32, String)>>>,
+
     // The request sent by the client.
     request: ConnectRequest,
 
@@ -71,6 +79,8 @@ impl Session {
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id);
 
+        let close_capsule = Arc::new(Mutex::new(None));
+
         let this = Self {
             conn,
             accept: Some(Arc::new(Mutex::new(accept))),
@@ -79,40 +89,60 @@ impl Session {
             header_bi,
             header_datagram,
             settings: Some(Arc::new(settings)),
+            connect_send: Arc::new(Mutex::new(Some(connect.send))),
+            close_capsule: close_capsule.clone(),
             request: connect.request.clone(),
             response: connect.response.clone(),
         };
 
-        // Run a background task to check if the connect stream is closed.
-        let mut this2 = this.clone();
+        // Run a background task to read capsules from the CONNECT recv stream.
+        let conn2 = this.conn.clone();
+        let connect_send2 = this.connect_send.clone();
         tokio::spawn(async move {
-            let (code, reason) = this2.run_closed(connect).await;
-            // TODO We shouldn't be closing the QUIC connection with the same error.
-            this2.close(code, reason.as_bytes());
+            let close_info = Self::run_closed(connect.recv).await;
+
+            // Send capsule close info (if any) for Session::closed() to consume.
+            // This MUST happen before conn.close() so the info is available
+            // when conn.closed() resolves on other tasks.
+            if let Some(ref info) = close_info {
+                *close_capsule.lock().unwrap() = Some(info.clone());
+            }
+
+            // Take the send stream so that any concurrent/future close() call
+            // sees None and doesn't try to write a capsule that can't be delivered
+            // (the peer already closed).
+            let _send = connect_send2.lock().unwrap().take();
+
+            // Close the QUIC connection.
+            let code = close_info.as_ref().map_or(0, |(c, _)| *c);
+            let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
+                .try_into()
+                .unwrap();
+            conn2.close(http3_code, &[]);
         });
 
         this
     }
 
-    // Keep reading from the control stream until it's closed.
-    async fn run_closed(&mut self, mut connect: Connected) -> (u32, String) {
+    // Keep reading capsules from the CONNECT recv stream until it's closed.
+    // Returns Some((code, reason)) if a CloseWebTransportSession capsule was received,
+    // or None if the stream closed without a capsule.
+    async fn run_closed(recv: quinn::RecvStream) -> Option<(u32, String)> {
+        let mut reader = web_transport_proto::Http3CapsuleReader::new(recv);
         loop {
-            match web_transport_proto::Capsule::read(&mut connect.recv).await {
+            match reader.read().await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
                     code,
                     reason,
-                })) => {
-                    return (code, reason);
-                }
+                })) => return Some((code, reason)),
                 Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
                 Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
                     tracing::warn!(%typ, size = payload.len(), "unknown capsule");
                 }
-                Ok(None) => {
-                    return (0, "stream closed".to_string());
-                }
-                Err(_) => {
-                    return (1, "capsule error".to_string());
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(?e, "failed to read capsule");
+                    return None;
                 }
             }
         }
@@ -256,26 +286,109 @@ impl Session {
         mtu.saturating_sub(self.header_datagram.len())
     }
 
-    /// Immediately close the connection with an error code and reason. See [`quinn::Connection::close`].
+    /// Close the session with an error code and reason.
+    ///
+    /// When there is a session ID (WebTransport over HTTP/3), a `CloseWebTransportSession`
+    /// capsule is written on the CONNECT stream before the QUIC connection is closed.
+    /// This allows browser clients to receive the close code and reason via `WebTransport.closed`.
+    ///
+    /// The capsule write and connection close happen asynchronously in a spawned task.
+    /// Callers should `await` [`Session::closed()`] if they need to ensure the capsule
+    /// has been delivered before proceeding.
     pub fn close(&self, code: u32, reason: &[u8]) {
-        let code = if self.session_id.is_some() {
-            web_transport_proto::error_to_http3(code)
-                .try_into()
-                .unwrap()
-        } else {
-            code.into()
-        };
+        if self.session_id.is_some() {
+            // Take the send stream. Only the first caller gets it.
+            let send = self.connect_send.lock().unwrap().take();
 
-        self.conn.close(code, reason)
+            if let Some(send) = send {
+                let conn = self.conn.clone();
+                let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason: String::from_utf8_lossy(reason).into_owned(),
+                };
+                let timeout = self.rtt() * 3;
+
+                tokio::spawn(async move {
+                    Self::close_with_capsule(conn, send, capsule, code, timeout).await;
+                });
+            } else {
+                // Send stream already taken — close() was already called.
+                // The first call is handling the capsule + connection close.
+                tracing::debug!("close() called more than once; ignoring duplicate");
+            }
+        } else {
+            // Raw QUIC mode: no capsule needed.
+            self.conn.close(code.into(), reason);
+        }
+    }
+
+    /// Write the CloseWebTransportSession capsule, finish the stream, wait for
+    /// the peer to close the connection (or timeout), then force-close.
+    async fn close_with_capsule(
+        conn: quinn::Connection,
+        mut send: quinn::SendStream,
+        capsule: web_transport_proto::Capsule,
+        code: u32,
+        timeout: std::time::Duration,
+    ) {
+        let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
+            .try_into()
+            .unwrap();
+
+        // Encode the capsule, then wrap it in an HTTP/3 DATA frame.
+        // In HTTP/3, capsule data is carried inside DATA frames on the CONNECT
+        // stream (RFC 9297 Section 3.2).
+        let mut capsule_bytes = Vec::new();
+        capsule.encode(&mut capsule_bytes);
+
+        let mut frame = Vec::new();
+        Frame::DATA.encode(&mut frame);
+        VarInt::from_u32(capsule_bytes.len() as u32).encode(&mut frame);
+        frame.extend_from_slice(&capsule_bytes);
+
+        // Write the DATA frame to the CONNECT send stream.
+        if let Err(e) = send.write_all(&frame).await {
+            tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
+            conn.close(http3_code, b"");
+            return;
+        }
+
+        // FIN the send stream so the peer knows no more capsules are coming.
+        if let Err(e) = send.finish() {
+            tracing::warn!(?e, "failed to finish CONNECT send stream");
+            conn.close(http3_code, b"");
+            return;
+        }
+
+        // Wait for the peer to close the CONNECT stream after receiving the capsule.
+        if tokio::time::timeout(timeout, conn.closed()).await.is_err() {
+            tracing::debug!("timeout waiting for peer to close; force-closing connection");
+            conn.close(http3_code, b"");
+        }
     }
 
     /// Wait until the session is closed, returning the error. See [`quinn::Connection::closed`].
+    ///
+    /// If the peer sent a `CloseWebTransportSession` capsule, the returned error will be
+    /// [`WebTransportError::Closed`] with the code and reason from the capsule.
     pub async fn closed(&self) -> SessionError {
-        self.conn.closed().await.into()
+        let err = self.conn.closed().await;
+
+        // Check if the background task received a CloseWebTransportSession capsule.
+        // The background task always sends the capsule info before calling conn.close(),
+        // so the value is guaranteed to be visible here when conn.closed() resolves.
+        if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
+            return WebTransportError::Closed(code, reason).into();
+        }
+
+        err.into()
     }
 
     /// Return why the session was closed, or None if it's not closed. See [`quinn::Connection::close_reason`].
     pub fn close_reason(&self) -> Option<SessionError> {
+        if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
+            return Some(WebTransportError::Closed(code, reason).into());
+        }
         self.conn.close_reason().map(Into::into)
     }
 
@@ -304,6 +417,8 @@ impl Session {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
+            connect_send: Arc::new(Mutex::new(None)),
+            close_capsule: Arc::new(Mutex::new(None)),
             request: request.into(),
             response: response.into(),
         }
