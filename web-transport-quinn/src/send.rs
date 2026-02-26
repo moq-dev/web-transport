@@ -6,7 +6,7 @@ use std::{
 
 use bytes::{Buf, Bytes};
 
-use crate::{ClosedStream, SessionError, WriteError};
+use crate::{session::CloseCapsule, ClosedStream, SessionError, WebTransportError, WriteError};
 
 /// A stream that can be used to send bytes. See [`quinn::SendStream`].
 ///
@@ -15,11 +15,28 @@ use crate::{ClosedStream, SessionError, WriteError};
 #[derive(Debug)]
 pub struct SendStream {
     stream: quinn::SendStream,
+    close_capsule: CloseCapsule,
 }
 
 impl SendStream {
-    pub(crate) fn new(stream: quinn::SendStream) -> Self {
-        Self { stream }
+    pub(crate) fn new(stream: quinn::SendStream, close_capsule: CloseCapsule) -> Self {
+        Self {
+            stream,
+            close_capsule,
+        }
+    }
+
+    fn map_write_error(&self, e: quinn::WriteError) -> WriteError {
+        if let quinn::WriteError::ConnectionLost(ref conn_err) = e {
+            if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
+                if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
+                    return WriteError::SessionError(
+                        WebTransportError::Closed(code, reason).into(),
+                    );
+                }
+            }
+        }
+        e.into()
     }
 
     /// Abruptly reset the stream with the provided error code. See [`quinn::SendStream::reset`].
@@ -38,7 +55,14 @@ impl SendStream {
         match self.stream.stopped().await {
             Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
             Ok(None) => Ok(None),
-            Err(quinn::StoppedError::ConnectionLost(e)) => Err(e.into()),
+            Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
+                if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
+                    if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
+                        return Err(WebTransportError::Closed(code, reason).into());
+                    }
+                }
+                Err(conn_err.into())
+            }
             Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
     }
@@ -47,27 +71,42 @@ impl SendStream {
 
     /// Write some data to the stream, returning the size written. See [`quinn::SendStream::write`].
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
-        self.stream.write(buf).await.map_err(Into::into)
+        self.stream
+            .write(buf)
+            .await
+            .map_err(|e| self.map_write_error(e))
     }
 
     /// Write all of the data to the stream. See [`quinn::SendStream::write_all`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
-        self.stream.write_all(buf).await.map_err(Into::into)
+        self.stream
+            .write_all(buf)
+            .await
+            .map_err(|e| self.map_write_error(e))
     }
 
     /// Write chunks of data to the stream. See [`quinn::SendStream::write_chunks`].
     pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<quinn::Written, WriteError> {
-        self.stream.write_chunks(bufs).await.map_err(Into::into)
+        self.stream
+            .write_chunks(bufs)
+            .await
+            .map_err(|e| self.map_write_error(e))
     }
 
     /// Write a chunk of data to the stream. See [`quinn::SendStream::write_chunk`].
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
-        self.stream.write_chunk(buf).await.map_err(Into::into)
+        self.stream
+            .write_chunk(buf)
+            .await
+            .map_err(|e| self.map_write_error(e))
     }
 
     /// Write all of the chunks of data to the stream. See [`quinn::SendStream::write_all_chunks`].
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        self.stream.write_all_chunks(bufs).await.map_err(Into::into)
+        self.stream
+            .write_all_chunks(bufs)
+            .await
+            .map_err(|e| self.map_write_error(e))
     }
 
     /// Mark the stream as finished, such that no more data can be written. See [`quinn::SendStream::finish`].
