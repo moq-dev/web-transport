@@ -502,14 +502,14 @@ async fn server_close_interrupts_client_write() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "flaky"]
 async fn client_close_interrupts_server_accept_bi() {
     init_tracing();
 
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             // First accept succeeds — client opened one stream before closing
-            session.accept_bi().await.expect("first accept_bi failed");
+            // Keep references to streams to avoid early cancellation
+            let _s1 = session.accept_bi().await.expect("first accept_bi failed");
             // Second accept should fail with a session close error
             let err = session.accept_bi().await.unwrap_err();
             assert!(
@@ -542,14 +542,14 @@ async fn client_close_interrupts_server_accept_bi() {
 }
 
 #[tokio::test]
-#[ignore = "flaky"]
 async fn client_close_interrupts_server_accept_uni() {
     init_tracing();
 
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             // First accept succeeds — client opened one stream before closing
-            session.accept_uni().await.expect("first accept_uni failed");
+            // Keep references to streams to avoid early cancellation
+            let _s1 = session.accept_uni().await.expect("first accept_uni failed");
             // Second accept should fail with a session close error
             let err = session.accept_uni().await.unwrap_err();
             assert!(
@@ -683,9 +683,7 @@ async fn stream_reset_does_not_affect_other_streams() {
                                     send.reset(33).expect("reset failed");
                                 }
                                 Ok(data) => {
-                                    send.write_all(&data)
-                                        .await
-                                        .expect("echo: write_all failed");
+                                    send.write_all(&data).await.expect("echo: write_all failed");
                                     send.finish().expect("echo: finish failed");
                                 }
                                 Err(web_transport_quinn::ReadToEndError::ReadError(

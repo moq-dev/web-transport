@@ -498,8 +498,7 @@ async fn bidirectional_open() {
                 match session.accept_bi().await {
                     Ok((mut send, mut recv)) => {
                         tasks.spawn(async move {
-                            let data =
-                                recv.read_to_end(1024).await.expect("read_to_end failed");
+                            let data = recv.read_to_end(1024).await.expect("read_to_end failed");
                             send.write_all(&data).await.expect("write_all failed");
                             send.finish().expect("finish failed");
                         });

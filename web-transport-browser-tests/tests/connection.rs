@@ -41,7 +41,6 @@ async fn close_client_server_sees_closed() {
 }
 
 #[tokio::test]
-#[ignore = "close code/reason don't round-trip: library uses QUIC CONNECTION_CLOSE instead of CLOSE_WEBTRANSPORT_SESSION capsule"]
 async fn close_client_with_code_and_reason() {
     init_tracing();
 
@@ -92,13 +91,7 @@ async fn close_server_client_sees_closed() {
         .run_js(
             r#"
         const wt = await connectWebTransport();
-        try {
-            await wt.closed;
-            // FIXME: this should not throw once proper close capsule is implemented
-            throw new Error("wt.closed should have rejected");
-        } catch (e) {
-            if (!(e instanceof WebTransportError) || e.source !== "session") throw e;
-        }
+        await wt.closed;
         return { success: true, message: "server closed session" };
     "#,
             TIMEOUT,
@@ -111,7 +104,6 @@ async fn close_server_client_sees_closed() {
 }
 
 #[tokio::test]
-#[ignore = "close code/reason don't round-trip: library uses QUIC CONNECTION_CLOSE instead of CLOSE_WEBTRANSPORT_SESSION capsule"]
 async fn connection_closed_resolves_on_server_close() {
     init_tracing();
     let harness = harness::setup(harness::immediate_close_handler(7, "server goodbye"))
@@ -148,6 +140,7 @@ async fn close_server_while_streaming() {
             session.accept_bi().await.expect("accept_bi failed");
             tokio::time::sleep(Duration::from_millis(200)).await;
             session.close(55, b"mid-stream");
+            session.closed().await;
         })
     });
 
@@ -164,13 +157,8 @@ async fn close_server_while_streaming() {
             // Start writing but don't close — server will close the session
             await writer.write(new TextEncoder().encode("streaming..."));
 
-            // Wait for the session to close
-            try {
-                await wt.closed;
-                return { success: false, message: "wt.closed should have rejected" };
-            } catch (e) {
-                if (!(e instanceof WebTransportError) || e.source !== "session") throw e;
-            }
+            // Wait for the session to close.
+            await wt.closed;
 
             // Verify we can't write anymore
             try {
