@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, ServerHandler};
-use web_transport_quinn::{ReadError, WriteError};
+use web_transport_browser_tests::server::ServerHandler;
+use web_transport_quinn::{ReadError, SessionError, WebTransportError, WriteError};
 
 mod common;
 use common::{init_tracing, TIMEOUT};
@@ -21,7 +21,13 @@ async fn stream_client_abort_sends_reset() {
                 "server should receive RESET_STREAM with code 42"
             );
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -63,7 +69,13 @@ async fn stream_client_cancel_sends_stop_sending() {
                 "server should receive STOP_SENDING with code 77"
             );
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -216,7 +228,13 @@ async fn stream_server_reset_client_reader_errors() {
             recv.read(&mut buf).await.expect("read failed");
             send.reset(33).expect("reset failed");
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -272,7 +290,13 @@ async fn stream_server_stop_client_writer_errors() {
             recv.stop(88).expect("stop failed");
             // small delay to make sure stop propagates
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -330,7 +354,9 @@ async fn client_close_interrupts_server_read() {
                 match recv.read(&mut buf).await {
                     Ok(Some(_)) => continue,
                     Ok(None) => panic!("expected connection error, got clean finish"),
-                    Err(ReadError::SessionError(ref e)) if is_session_closed(e) => break,
+                    Err(ReadError::SessionError(SessionError::WebTransportError(
+                        WebTransportError::Closed(_, _),
+                    ))) => break,
                     Err(e) => panic!("expected session closed, got {e}"),
                 }
             }
@@ -375,7 +401,9 @@ async fn client_close_interrupts_server_write() {
                     Ok(()) => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    Err(WriteError::SessionError(ref e)) if is_session_closed(e) => break,
+                    Err(WriteError::SessionError(SessionError::WebTransportError(
+                        WebTransportError::Closed(_, _),
+                    ))) => break,
                     Err(e) => panic!("expected session closed, got {e}"),
                 }
             }
@@ -513,8 +541,11 @@ async fn client_close_interrupts_server_accept_bi() {
             // Second accept should fail with a session close error
             let err = session.accept_bi().await.unwrap_err();
             assert!(
-                is_session_closed(&err),
-                "expected session closed, got {err}"
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
             );
         })
     });
@@ -553,8 +584,11 @@ async fn client_close_interrupts_server_accept_uni() {
             // Second accept should fail with a session close error
             let err = session.accept_uni().await.unwrap_err();
             assert!(
-                is_session_closed(&err),
-                "expected session closed, got {err}"
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
             );
         })
     });
@@ -695,7 +729,7 @@ async fn stream_reset_does_not_affect_other_streams() {
                             }
                         });
                     }
-                    Err(e) if is_session_closed(&e) => break,
+                    Err(SessionError::WebTransportError(WebTransportError::Closed(_, _))) => break,
                     Err(e) => panic!("accept_bi failed: {e}"),
                 }
             }

@@ -1,5 +1,6 @@
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, ServerHandler};
+use web_transport_browser_tests::server::ServerHandler;
+use web_transport_quinn::{SessionError, WebTransportError};
 
 mod common;
 use common::{init_tracing, TIMEOUT};
@@ -177,7 +178,10 @@ async fn bidi_stream_server_initiated() {
                 .expect("write_all failed");
             send.finish().expect("finish failed");
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -225,7 +229,10 @@ async fn bidi_stream_server_initiated_multiple() {
                 send.finish().expect("finish failed");
             }
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -274,7 +281,10 @@ async fn bidi_stream_server_initiated_bidirectional_exchange() {
                 "server should receive pong"
             );
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 

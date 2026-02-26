@@ -1,5 +1,6 @@
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, ServerHandler};
+use web_transport_browser_tests::server::ServerHandler;
+use web_transport_quinn::{SessionError, WebTransportError};
 
 mod common;
 use common::{init_tracing, LONG_TIMEOUT, TIMEOUT};
@@ -25,7 +26,10 @@ async fn uni_stream_client_to_server() {
                 "server should receive 'uni data'"
             );
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -67,7 +71,10 @@ async fn uni_stream_client_to_server_multiple() {
             collected.sort();
             assert_eq!(collected, vec!["msg0", "msg1", "msg2"]);
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -112,7 +119,10 @@ async fn uni_stream_client_large_payload() {
                 assert_eq!(data[i], (i % 251) as u8, "data mismatch at byte {i}");
             }
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -162,7 +172,10 @@ async fn uni_stream_server_to_client() {
                 .expect("write_all failed");
             send.finish().expect("finish failed");
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -209,7 +222,10 @@ async fn uni_stream_server_to_client_multiple() {
                 send.finish().expect("finish failed");
             }
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -254,7 +270,10 @@ async fn uni_stream_server_large_payload() {
             send.write_all(&data).await.expect("write_all failed");
             send.finish().expect("finish failed");
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
