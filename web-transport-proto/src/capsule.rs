@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
+use crate::{Frame, VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
 
 // The spec (draft-ietf-webtrans-http3-06) says the type is 0x2843, which would
 // varint-encode to 0x68 0x43. However, actual wire data shows 0x43 0x28 which
@@ -229,6 +229,84 @@ pub enum CapsuleError {
 impl From<std::io::Error> for CapsuleError {
     fn from(err: std::io::Error) -> Self {
         CapsuleError::Io(Arc::new(err))
+    }
+}
+
+/// Reads capsules from an HTTP/3 CONNECT stream where capsule protocol
+/// data is carried inside DATA frames (RFC 9297 Section 3.2).
+///
+/// Handles capsules split across multiple DATA frames and multiple
+/// capsules within a single DATA frame.
+pub struct Http3CapsuleReader<S> {
+    stream: S,
+    buf: BytesMut,
+}
+
+impl<S: AsyncRead + Unpin> Http3CapsuleReader<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::new(),
+        }
+    }
+
+    /// Read the next capsule. Returns `Ok(None)` on clean EOF.
+    pub async fn read(&mut self) -> Result<Option<Capsule>, CapsuleError> {
+        loop {
+            if !self.buf.is_empty() {
+                let mut slice = &self.buf[..];
+                match Capsule::decode(&mut slice) {
+                    Ok(capsule) => {
+                        self.buf.advance(self.buf.len() - slice.len());
+                        return Ok(Some(capsule));
+                    }
+                    Err(CapsuleError::UnexpectedEnd | CapsuleError::VarInt(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if !self.read_data_frame().await? {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(CapsuleError::UnexpectedEnd)
+                };
+            }
+        }
+    }
+
+    /// Read the next HTTP/3 DATA frame into the buffer, skipping non-DATA frames.
+    /// Returns `false` on EOF.
+    async fn read_data_frame(&mut self) -> Result<bool, CapsuleError> {
+        loop {
+            let frame_type = match VarInt::read(&mut self.stream).await {
+                Ok(v) => Frame(v),
+                Err(_) => return Ok(false),
+            };
+            let len = VarInt::read(&mut self.stream)
+                .await
+                .map_err(|_| CapsuleError::UnexpectedEnd)?
+                .into_inner() as usize;
+
+            if len > MAX_FRAME_SIZE as usize {
+                return Err(CapsuleError::MessageTooLong);
+            }
+
+            if frame_type != Frame::DATA {
+                if len > 0 {
+                    let mut skip = vec![0u8; len];
+                    self.stream.read_exact(&mut skip).await?;
+                }
+                continue;
+            }
+
+            if len > 0 {
+                let start = self.buf.len();
+                self.buf.resize(start + len, 0);
+                self.stream.read_exact(&mut self.buf[start..]).await?;
+            }
+            return Ok(true);
+        }
     }
 }
 
@@ -492,5 +570,110 @@ mod tests {
         let mut cursor = std::io::Cursor::new(wire);
         let err = Capsule::read(&mut cursor).await.unwrap_err();
         assert!(matches!(err, CapsuleError::UnexpectedEnd));
+    }
+
+    fn encode_capsule(c: &Capsule) -> Vec<u8> {
+        let mut buf = Vec::new();
+        c.encode(&mut buf);
+        buf
+    }
+
+    fn wrap_in_data_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        Frame::DATA.encode(&mut frame);
+        VarInt::from_u32(payload.len() as u32).encode(&mut frame);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Concatenate multiple DATA-framed chunks into a single wire buffer.
+    fn split_into_data_frames(capsule_bytes: &[u8], splits: &[usize]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut prev = 0;
+        for &s in splits {
+            wire.extend_from_slice(&wrap_in_data_frame(&capsule_bytes[prev..s]));
+            prev = s;
+        }
+        wire.extend_from_slice(&wrap_in_data_frame(&capsule_bytes[prev..]));
+        wire
+    }
+
+    fn reader_from(wire: Vec<u8>) -> Http3CapsuleReader<std::io::Cursor<Vec<u8>>> {
+        Http3CapsuleReader::new(std::io::Cursor::new(wire))
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_single_capsule_single_frame() {
+        let capsule = Capsule::CloseWebTransportSession { code: 42, reason: "bye".into() };
+        let mut reader = reader_from(wrap_in_data_frame(&encode_capsule(&capsule)));
+        assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
+        assert!(reader.read().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_capsule_split_across_frames() {
+        let capsule = Capsule::CloseWebTransportSession { code: 100, reason: "split".into() };
+        let bytes = encode_capsule(&capsule);
+        let mut reader = reader_from(split_into_data_frames(&bytes, &[bytes.len() / 2]));
+        assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_capsule_split_across_three_frames() {
+        let capsule = Capsule::CloseWebTransportSession { code: 200, reason: "three".into() };
+        let bytes = encode_capsule(&capsule);
+        let mut reader = reader_from(split_into_data_frames(&bytes, &[2, 5]));
+        assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_multiple_capsules_one_frame() {
+        let c1 = Capsule::Grease { num: 1 };
+        let c2 = Capsule::CloseWebTransportSession { code: 7, reason: "done".into() };
+        let mut bytes = encode_capsule(&c1);
+        bytes.extend_from_slice(&encode_capsule(&c2));
+
+        let mut reader = reader_from(wrap_in_data_frame(&bytes));
+        assert_eq!(reader.read().await.unwrap().unwrap(), c1);
+        assert_eq!(reader.read().await.unwrap().unwrap(), c2);
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_skips_non_data_frames() {
+        let capsule = Capsule::CloseWebTransportSession { code: 0, reason: String::new() };
+        let mut wire = Vec::new();
+        // HEADERS frame before the DATA frame.
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(5).encode(&mut wire);
+        wire.extend_from_slice(b"hello");
+        wire.extend_from_slice(&wrap_in_data_frame(&encode_capsule(&capsule)));
+
+        let mut reader = reader_from(wire);
+        assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_eof_returns_none() {
+        assert!(reader_from(vec![]).read().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_partial_capsule_at_eof() {
+        let mut partial = Vec::new();
+        VarInt::from_u64(0x2843).unwrap().encode(&mut partial);
+        // Missing: length + payload
+
+        let mut reader = reader_from(wrap_in_data_frame(&partial));
+        assert!(matches!(reader.read().await, Err(CapsuleError::UnexpectedEnd)));
+    }
+
+    #[tokio::test]
+    async fn test_http3_reader_empty_data_frame() {
+        let capsule = Capsule::CloseWebTransportSession { code: 1, reason: "ok".into() };
+        let mut wire = wrap_in_data_frame(&[]);
+        wire.extend_from_slice(&wrap_in_data_frame(&encode_capsule(&capsule)));
+
+        let mut reader = reader_from(wire);
+        assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
     }
 }
