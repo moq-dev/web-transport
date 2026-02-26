@@ -34,9 +34,10 @@ pub fn wrap_test_js(server_url: &str, certificate_hash: &[u8], user_code: &str) 
         }}
         return JSON.stringify(result);
     }} catch (e) {{
+        const msg = "JS exception: " + (e.stack ? e.stack : e.toString());
         return JSON.stringify({{
             success: false,
-            message: e.toString(),
+            message: msg,
             details: {{ name: e.name, stack: e.stack }}
         }});
     }}

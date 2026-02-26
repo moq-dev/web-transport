@@ -180,6 +180,7 @@ pub fn is_session_closed(e: &web_transport_quinn::SessionError) -> bool {
         e,
         ConnectionError(web_transport_quinn::quinn::ConnectionError::ApplicationClosed(_))
             | ConnectionError(web_transport_quinn::quinn::ConnectionError::LocallyClosed)
+            | WebTransportError(web_transport_quinn::WebTransportError::Closed(_, _))
     )
 }
 
@@ -187,7 +188,14 @@ pub fn is_session_closed(e: &web_transport_quinn::SessionError) -> bool {
 pub fn immediate_close_handler(code: u32, reason: &'static str) -> ServerHandler {
     Box::new(move |session| {
         Box::pin(async move {
+            // Give the browser a bit of time to finish establishing the session.
+            // Without this, browser sometimes throws WebTransportError instead of
+            // cleanly closing the session.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             session.close(code, reason.as_bytes());
+            // Wait for the connection to actually close.
+            // This ensures the CloseWebTransportSession capsule is delivered.
+            session.closed().await;
         })
     })
 }
