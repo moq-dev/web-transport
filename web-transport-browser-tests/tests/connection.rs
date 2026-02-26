@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, RequestHandler, ServerHandler};
+use web_transport_browser_tests::server::{RequestHandler, ServerHandler};
+use web_transport_quinn::{SessionError, WebTransportError};
 
 mod common;
 use common::{init_tracing, TIMEOUT};
@@ -17,7 +18,13 @@ async fn close_client_server_sees_closed() {
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -137,10 +144,17 @@ async fn close_server_while_streaming() {
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             // Accept a bidi stream to confirm the client started streaming
-            session.accept_bi().await.expect("accept_bi failed");
+            let _s1 = session.accept_bi().await.expect("accept_bi failed");
             tokio::time::sleep(Duration::from_millis(200)).await;
             session.close(55, b"mid-stream");
-            session.closed().await;
+            let err = session.closed().await;
+            assert!(
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 

@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, ServerHandler};
+use web_transport_browser_tests::server::ServerHandler;
+use web_transport_quinn::{SessionError, WebTransportError};
 
 mod common;
 use common::{init_tracing, TIMEOUT};
@@ -141,7 +142,10 @@ async fn datagram_server_initiated() {
                 .send_datagram(Bytes::from_static(b"server dgram"))
                 .expect("send_datagram failed");
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 

@@ -1,5 +1,6 @@
 use web_transport_browser_tests::harness;
-use web_transport_browser_tests::server::{is_session_closed, ServerHandler};
+use web_transport_browser_tests::server::ServerHandler;
+use web_transport_quinn::{SessionError, WebTransportError};
 
 mod common;
 use common::{init_tracing, LONG_TIMEOUT, TIMEOUT};
@@ -331,7 +332,10 @@ async fn large_uni_stream_client_to_server_1mb() {
                 assert_eq!(data[i], (i % 251) as u8, "data mismatch at byte {i}");
             }
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
@@ -517,7 +521,10 @@ async fn bidirectional_open() {
             }
 
             let err = session.closed().await;
-            assert!(is_session_closed(&err), "unexpected session error: {err}");
+            assert!(
+                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                "expected WebTransportError::Closed, got {err}"
+            );
         })
     });
 
