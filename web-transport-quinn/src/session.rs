@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     ops::Deref,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{ready, Context, Poll},
 };
 
@@ -15,10 +15,6 @@ use crate::{
     proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
-
-/// Shared close capsule info set by the background task when a
-/// `CloseWebTransportSession` capsule is received from the peer.
-pub(crate) type CloseCapsule = Arc<Mutex<Option<(u32, String)>>>;
 
 /// An established WebTransport session, acting like a full QUIC connection. See [`quinn::Connection`].
 ///
@@ -52,9 +48,10 @@ pub struct Session {
     // Wrapped in Arc<Mutex<Option<...>>> so close() can take it exactly once.
     connect_send: Arc<Mutex<Option<quinn::SendStream>>>,
 
-    // Close info received from the peer via a CloseWebTransportSession capsule.
-    // Set by the background task when a capsule is received.
-    close_capsule: Arc<Mutex<Option<(u32, String)>>>,
+    // Session error, set once by either local close() or the background task
+    // when a remote CloseWebTransportSession capsule is received.
+    // Uses OnceLock for set-once, first-writer-wins semantics with lock-free reads.
+    error: Arc<OnceLock<SessionError>>,
 
     // The request sent by the client.
     request: ConnectRequest,
@@ -80,10 +77,10 @@ impl Session {
         let mut header_datagram = Vec::new();
         session_id.encode(&mut header_datagram);
 
-        let close_capsule = Arc::new(Mutex::new(None));
+        let error: Arc<OnceLock<SessionError>> = Arc::new(OnceLock::new());
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
-        let accept = SessionAccept::new(conn.clone(), session_id, close_capsule.clone());
+        let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
 
         let this = Self {
             conn,
@@ -94,31 +91,27 @@ impl Session {
             header_datagram,
             settings: Some(Arc::new(settings)),
             connect_send: Arc::new(Mutex::new(Some(connect.send))),
-            close_capsule: close_capsule.clone(),
+            error: error.clone(),
             request: connect.request.clone(),
             response: connect.response.clone(),
         };
 
         // Run a background task to read capsules from the CONNECT recv stream.
         let conn2 = this.conn.clone();
-        let connect_send2 = this.connect_send.clone();
         tokio::spawn(async move {
             let close_info = Self::run_closed(connect.recv).await;
+            let code = close_info.as_ref().map_or(0, |(c, _)| *c);
 
-            // Send capsule close info (if any) for Session::closed() to consume.
-            // This MUST happen before conn.close() so the info is available
-            // when conn.closed() resolves on other tasks.
-            if let Some(ref info) = close_info {
-                *close_capsule.lock().unwrap() = Some(info.clone());
+            // Try to record the remote close error. If close() already set
+            // the error, it owns the connection teardown, so we bail out.
+            let err: SessionError = match close_info {
+                Some((code, reason)) => WebTransportError::Closed(code, reason).into(),
+                None => quinn::ConnectionError::LocallyClosed.into(),
+            };
+            if error.set(err).is_err() {
+                return;
             }
 
-            // Take the send stream so that any concurrent/future close() call
-            // sees None and doesn't try to write a capsule that can't be delivered
-            // (the peer already closed).
-            let _send = connect_send2.lock().unwrap().take();
-
-            // Close the QUIC connection.
-            let code = close_info.as_ref().map_or(0, |(c, _)| *c);
             let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
                 .try_into()
                 .unwrap();
@@ -178,13 +171,13 @@ impl Session {
         if let Some(accept) = &self.accept {
             poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx))
                 .await
-                .map_err(|e| self.map_session_error(e))
+                .map_err(|e| self.map_error(e))
         } else {
             self.conn
                 .accept_uni()
                 .await
-                .map(|recv| RecvStream::new(recv, self.close_capsule.clone()))
-                .map_err(|e| self.map_conn_error(e))
+                .map(|recv| RecvStream::new(recv, self.error.clone()))
+                .map_err(|e| self.map_error(e))
         }
     }
 
@@ -193,28 +186,24 @@ impl Session {
         if let Some(accept) = &self.accept {
             poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx))
                 .await
-                .map_err(|e| self.map_session_error(e))
+                .map_err(|e| self.map_error(e))
         } else {
             self.conn
                 .accept_bi()
                 .await
                 .map(|(send, recv)| {
                     (
-                        SendStream::new(send, self.close_capsule.clone()),
-                        RecvStream::new(recv, self.close_capsule.clone()),
+                        SendStream::new(send, self.error.clone()),
+                        RecvStream::new(recv, self.error.clone()),
                     )
                 })
-                .map_err(|e| self.map_conn_error(e))
+                .map_err(|e| self.map_error(e))
         }
     }
 
     /// Open a new unidirectional stream. See [`quinn::Connection::open_uni`].
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self
-            .conn
-            .open_uni()
-            .await
-            .map_err(|e| self.map_conn_error(e))?;
+        let mut send = self.conn.open_uni().await.map_err(|e| self.map_error(e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
@@ -222,20 +211,16 @@ impl Session {
         send.set_priority(i32::MAX).ok();
         Self::write_full(&mut send, &self.header_uni)
             .await
-            .map_err(|e| self.map_session_error(e))?;
+            .map_err(|e| self.map_error(e))?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
-        Ok(SendStream::new(send, self.close_capsule.clone()))
+        Ok(SendStream::new(send, self.error.clone()))
     }
 
     /// Open a new bidirectional stream. See [`quinn::Connection::open_bi`].
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| self.map_conn_error(e))?;
+        let (mut send, recv) = self.conn.open_bi().await.map_err(|e| self.map_error(e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
@@ -243,13 +228,13 @@ impl Session {
         send.set_priority(i32::MAX).ok();
         Self::write_full(&mut send, &self.header_bi)
             .await
-            .map_err(|e| self.map_session_error(e))?;
+            .map_err(|e| self.map_error(e))?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
         Ok((
-            SendStream::new(send, self.close_capsule.clone()),
-            RecvStream::new(recv, self.close_capsule.clone()),
+            SendStream::new(send, self.error.clone()),
+            RecvStream::new(recv, self.error.clone()),
         ))
     }
 
@@ -263,7 +248,7 @@ impl Session {
             .conn
             .read_datagram()
             .await
-            .map_err(|e| self.map_session_error(SessionError::from(e)))?;
+            .map_err(|e| self.map_error(e))?;
 
         let mut cursor = Cursor::new(&datagram);
 
@@ -301,7 +286,13 @@ impl Session {
             self.conn.send_datagram(data)
         };
 
-        result.map_err(|e| self.map_send_datagram_error(e))
+        result.map_err(|e| match self.error.get() {
+            Some(SessionError::ConnectionError(conn_err)) => {
+                quinn::SendDatagramError::ConnectionLost(conn_err.clone()).into()
+            }
+            Some(err) => err.clone(),
+            None => e.into(),
+        })
     }
 
     /// Computes the maximum size of datagrams that may be passed to
@@ -321,38 +312,31 @@ impl Session {
     /// This allows browser clients to receive the close code and reason via `WebTransport.closed`.
     ///
     /// The capsule write and connection close happen asynchronously in a spawned task.
-    /// Callers should `await` [`Session::closed()`] if they need to ensure the capsule
-    /// has been delivered before proceeding.
+    /// Callers should `await` [`Session::closed()`] to ensure the capsule has been
+    /// delivered. Session operations will fail once the QUIC connection is closed.
     pub fn close(&self, code: u32, reason: &[u8]) {
+        // Record the local close error. First writer wins — if the background
+        // task already set a remote close error, or close() was already called,
+        // this is a no-op.
+        let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
+        if self.error.set(err).is_err() {
+            return;
+        }
+
         if self.session_id.is_some() {
-            // Take the send stream. Only the first caller gets it.
+            // Take the send stream for the capsule write.
             let send = self.connect_send.lock().unwrap().take();
 
             if let Some(send) = send {
                 let reason = String::from_utf8_lossy(reason).into_owned();
-
-                // Store the local close info so closed()/map_conn_error() can
-                // return WebTransportError::Closed even for locally-initiated closes.
-                // Use get_or_insert to avoid overwriting a peer capsule that arrived first.
-                self.close_capsule
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(|| (code, reason.clone()));
-
                 let conn = self.conn.clone();
-                let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
-                    code,
-                    reason,
-                };
+                let capsule =
+                    web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
                 let timeout = self.rtt() * 3;
 
                 tokio::spawn(async move {
                     Self::close_with_capsule(conn, send, capsule, code, timeout).await;
                 });
-            } else {
-                // Send stream already taken — close() was already called.
-                // The first call is handling the capsule + connection close.
-                tracing::debug!("close() called more than once; ignoring duplicate");
             }
         } else {
             // Raw QUIC mode: no capsule needed.
@@ -409,47 +393,24 @@ impl Session {
     ///
     /// If the peer sent a `CloseWebTransportSession` capsule, the returned error will be
     /// [`WebTransportError::Closed`] with the code and reason from the capsule.
+    ///
+    /// Unlike [`quinn::Connection::closed`], this does **not** return early when
+    /// [`close()`](Self::close) has been called. It waits for the underlying QUIC
+    /// connection to shut down, ensuring the `CloseWebTransportSession` capsule has
+    /// been delivered. Use [`close_reason()`](Self::close_reason) for a non-blocking check.
     pub async fn closed(&self) -> SessionError {
-        self.map_conn_error(self.conn.closed().await)
+        self.map_error(self.conn.closed().await)
     }
 
     /// Return why the session was closed, or None if it's not closed. See [`quinn::Connection::close_reason`].
     pub fn close_reason(&self) -> Option<SessionError> {
-        self.conn.close_reason().map(|e| self.map_conn_error(e))
+        self.conn.close_reason().map(|e| self.map_error(e))
     }
 
-    /// Convert a `quinn::ConnectionError` to `SessionError`, checking the
-    /// close_capsule so that `LocallyClosed` becomes `WebTransportError::Closed`
-    /// when a close capsule was received from the peer.
-    fn map_conn_error(&self, e: quinn::ConnectionError) -> SessionError {
-        if matches!(e, quinn::ConnectionError::LocallyClosed) {
-            if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                return WebTransportError::Closed(code, reason).into();
-            }
-        }
-        e.into()
-    }
-
-    /// Convert a `SessionError` that wraps `LocallyClosed` into
-    /// `WebTransportError::Closed` when a close capsule was received.
-    fn map_session_error(&self, e: SessionError) -> SessionError {
-        if let SessionError::ConnectionError(ref conn_err) = e {
-            if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                    return WebTransportError::Closed(code, reason).into();
-                }
-            }
-        }
-        e
-    }
-
-    fn map_send_datagram_error(&self, e: quinn::SendDatagramError) -> SessionError {
-        if let quinn::SendDatagramError::ConnectionLost(ref conn_err) = e {
-            if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                    return WebTransportError::Closed(code, reason).into();
-                }
-            }
+    /// Convert an error to `SessionError`, using the stored session error if set.
+    fn map_error(&self, e: impl Into<SessionError>) -> SessionError {
+        if let Some(err) = self.error.get() {
+            return err.clone();
         }
         e.into()
     }
@@ -480,7 +441,7 @@ impl Session {
             accept: None,
             settings: None,
             connect_send: Arc::new(Mutex::new(None)),
-            close_capsule: Arc::new(Mutex::new(None)),
+            error: Arc::new(OnceLock::new()),
             request: request.into(),
             response: response.into(),
         }
@@ -549,15 +510,15 @@ pub struct SessionAccept {
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
 
-    // Close capsule info from the peer, shared with Session.
-    close_capsule: CloseCapsule,
+    // Session error, shared with Session.
+    error: Arc<OnceLock<SessionError>>,
 }
 
 impl SessionAccept {
     pub(crate) fn new(
         conn: quinn::Connection,
         session_id: VarInt,
-        close_capsule: CloseCapsule,
+        error: Arc<OnceLock<SessionError>>,
     ) -> Self {
         // Create a stream that just outputs new streams, so it's easy to call from poll.
         let accept_uni = Box::pin(futures::stream::unfold(conn.clone(), |conn| async {
@@ -580,15 +541,13 @@ impl SessionAccept {
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
 
-            close_capsule,
+            error,
         }
     }
 
-    fn map_conn_error(&self, e: quinn::ConnectionError) -> SessionError {
-        if matches!(e, quinn::ConnectionError::LocallyClosed) {
-            if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                return WebTransportError::Closed(code, reason).into();
-            }
+    fn map_error(&self, e: impl Into<SessionError>) -> SessionError {
+        if let Some(err) = self.error.get() {
+            return err.clone();
         }
         e.into()
     }
@@ -604,7 +563,7 @@ impl SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next_unpin(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let recv = res.map_err(|e| self.map_conn_error(e))?;
+                let recv = res.map_err(|e| self.map_error(e))?;
                 let pending = Self::decode_uni(recv, self.session_id);
                 self.pending_uni.push(Box::pin(pending));
 
@@ -625,7 +584,7 @@ impl SessionAccept {
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
-                    let recv = RecvStream::new(recv, self.close_capsule.clone());
+                    let recv = RecvStream::new(recv, self.error.clone());
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -675,7 +634,7 @@ impl SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next_unpin(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let (send, recv) = res.map_err(|e| self.map_conn_error(e))?;
+                let (send, recv) = res.map_err(|e| self.map_error(e))?;
                 let pending = Self::decode_bi(send, recv, self.session_id);
                 self.pending_bi.push(Box::pin(pending));
 
@@ -695,8 +654,8 @@ impl SessionAccept {
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
-                let send = SendStream::new(send, self.close_capsule.clone());
-                let recv = RecvStream::new(recv, self.close_capsule.clone());
+                let send = SendStream::new(send, self.error.clone());
+                let recv = RecvStream::new(recv, self.error.clone());
                 return Poll::Ready(Ok((send, recv)));
             }
 

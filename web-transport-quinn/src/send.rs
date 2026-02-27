@@ -1,12 +1,13 @@
 use std::{
     io,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
 
 use bytes::{Buf, Bytes};
 
-use crate::{session::CloseCapsule, ClosedStream, SessionError, WebTransportError, WriteError};
+use crate::{ClosedStream, SessionError, WriteError};
 
 /// A stream that can be used to send bytes. See [`quinn::SendStream`].
 ///
@@ -15,26 +16,17 @@ use crate::{session::CloseCapsule, ClosedStream, SessionError, WebTransportError
 #[derive(Debug)]
 pub struct SendStream {
     stream: quinn::SendStream,
-    close_capsule: CloseCapsule,
+    error: Arc<OnceLock<SessionError>>,
 }
 
 impl SendStream {
-    pub(crate) fn new(stream: quinn::SendStream, close_capsule: CloseCapsule) -> Self {
-        Self {
-            stream,
-            close_capsule,
-        }
+    pub(crate) fn new(stream: quinn::SendStream, error: Arc<OnceLock<SessionError>>) -> Self {
+        Self { stream, error }
     }
 
     fn map_write_error(&self, e: quinn::WriteError) -> WriteError {
-        if let quinn::WriteError::ConnectionLost(ref conn_err) = e {
-            if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                    return WriteError::SessionError(
-                        WebTransportError::Closed(code, reason).into(),
-                    );
-                }
-            }
+        if let Some(err) = self.error.get() {
+            return WriteError::SessionError(err.clone());
         }
         e.into()
     }
@@ -56,10 +48,8 @@ impl SendStream {
             Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
             Ok(None) => Ok(None),
             Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                    if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                        return Err(WebTransportError::Closed(code, reason).into());
-                    }
+                if let Some(err) = self.error.get() {
+                    return Err(err.clone());
                 }
                 Err(conn_err.into())
             }

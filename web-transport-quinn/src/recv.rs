@@ -1,52 +1,32 @@
 use std::{
     io,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
 
-use crate::{
-    session::CloseCapsule, ReadError, ReadExactError, ReadToEndError, SessionError,
-    WebTransportError,
-};
+use crate::{ReadError, ReadExactError, ReadToEndError, SessionError};
 
 /// A stream that can be used to recieve bytes. See [`quinn::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: quinn::RecvStream,
-    close_capsule: CloseCapsule,
+    error: Arc<OnceLock<SessionError>>,
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: quinn::RecvStream, close_capsule: CloseCapsule) -> Self {
+    pub(crate) fn new(stream: quinn::RecvStream, error: Arc<OnceLock<SessionError>>) -> Self {
         Self {
             inner: stream,
-            close_capsule,
+            error,
         }
     }
 
     fn map_read_error(&self, e: quinn::ReadError) -> ReadError {
-        if let quinn::ReadError::ConnectionLost(ref conn_err) = e {
-            if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                    return ReadError::SessionError(WebTransportError::Closed(code, reason).into());
-                }
-            }
-        }
-        e.into()
-    }
-
-    fn map_read_exact_error(&self, e: quinn::ReadExactError) -> ReadExactError {
-        if let quinn::ReadExactError::ReadError(read_err) = e {
-            return self.map_read_error(read_err).into();
-        }
-        e.into()
-    }
-
-    fn map_read_to_end_error(&self, e: quinn::ReadToEndError) -> ReadToEndError {
-        if let quinn::ReadToEndError::Read(read_err) = e {
-            return self.map_read_error(read_err).into();
+        if let Some(err) = self.error.get() {
+            return ReadError::SessionError(err.clone());
         }
         e.into()
     }
@@ -74,7 +54,10 @@ impl RecvStream {
         self.inner
             .read_exact(buf)
             .await
-            .map_err(|e| self.map_read_exact_error(e))
+            .map_err(|e| match e {
+                quinn::ReadExactError::ReadError(e) => self.map_read_error(e).into(),
+                e => e.into(),
+            })
     }
 
     /// Read a chunk of data from the stream. See [`quinn::RecvStream::read_chunk`].
@@ -102,7 +85,10 @@ impl RecvStream {
         self.inner
             .read_to_end(size_limit)
             .await
-            .map_err(|e| self.map_read_to_end_error(e))
+            .map_err(|e| match e {
+                quinn::ReadToEndError::Read(e) => self.map_read_error(e).into(),
+                e => e.into(),
+            })
     }
 
     /// Block until the stream has been reset and return the error code. See [`quinn::RecvStream::received_reset`].
@@ -115,10 +101,8 @@ impl RecvStream {
                 web_transport_proto::error_from_http3(code.into_inner()).unwrap(),
             )),
             Err(quinn::ResetError::ConnectionLost(conn_err)) => {
-                if matches!(conn_err, quinn::ConnectionError::LocallyClosed) {
-                    if let Some((code, reason)) = self.close_capsule.lock().unwrap().clone() {
-                        return Err(WebTransportError::Closed(code, reason).into());
-                    }
+                if let Some(err) = self.error.get() {
+                    return Err(err.clone());
                 }
                 Err(conn_err.into())
             }
