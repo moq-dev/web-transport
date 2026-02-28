@@ -123,6 +123,7 @@ async fn stream_client_reset_server_reader_errors() {
                 }
             }
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -138,13 +139,7 @@ async fn stream_client_reset_server_reader_errors() {
         await writer.write(new TextEncoder().encode("some data"));
         let err = new WebTransportError({ message: "abort", streamErrorCode: 42 });
         await writer.abort(err);
-        // Wait for the server to observe the reset and close the session
-        try {
-            await wt.closed;
-            throw new Error("wt.closed should have rejected");
-        } catch (e) {
-            if (!(e instanceof WebTransportError) || e.source !== "session") throw e;
-        }
+        await wt.closed;
         return { success: true, message: "writer aborted with code 42" };
     "#,
             TIMEOUT,
@@ -178,6 +173,7 @@ async fn stream_client_stop_server_writer_errors() {
                 }
             }
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -198,13 +194,7 @@ async fn stream_client_stop_server_writer_errors() {
 
         let err = new WebTransportError({ message: "cancel", streamErrorCode: 77 });
         await reader.cancel(err);
-        // Wait for the server to observe the stop and close the session
-        try {
-            await wt.closed;
-            throw new Error("wt.closed should have rejected");
-        } catch (e) {
-            if (!(e instanceof WebTransportError) || e.source !== "session") throw e;
-        }
+        await wt.closed;
         return { success: true, message: "reader cancelled with code 77" };
     "#,
             TIMEOUT,
@@ -446,6 +436,7 @@ async fn server_close_interrupts_client_read() {
             let mut buf = [0u8; 1024];
             recv.read(&mut buf).await.expect("read failed");
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -492,6 +483,7 @@ async fn server_close_interrupts_client_write() {
             let mut buf = [0u8; 1024];
             recv.read(&mut buf).await.expect("read failed");
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -625,6 +617,7 @@ async fn server_close_interrupts_client_accept_bi() {
             // Small delay so the client starts waiting on incomingBidirectionalStreams
             tokio::time::sleep(Duration::from_millis(100)).await;
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -664,6 +657,7 @@ async fn server_close_interrupts_client_accept_uni() {
             // Small delay so the client starts waiting on incomingUnidirectionalStreams
             tokio::time::sleep(Duration::from_millis(100)).await;
             session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
