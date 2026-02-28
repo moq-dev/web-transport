@@ -36,7 +36,7 @@ impl TestServer {
             tx.send(()).expect("shutdown receiver should be alive");
         }
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            task.await.expect("accept loop task panicked");
         }
         let handles: Vec<_> = self.handler_tasks.lock().unwrap().drain(..).collect();
         assert_eq!(
