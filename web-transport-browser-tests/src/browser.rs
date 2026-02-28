@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::js;
 
 struct SharedBrowser {
-    browser: Browser,
+    browser: tokio::sync::Mutex<Browser>,
     /// URL of the blank page server (http://localhost:{port}).
     page_url: String,
     // A dedicated Tokio runtime that owns the browser event handler and HTTP
@@ -31,12 +31,8 @@ struct SharedBrowser {
     // Holds the stdin pipe to the cleanup watchdog process.  When our process
     // exits (for any reason, including SIGKILL), the OS closes this FD,
     // unblocking the watchdog which then kills Chrome and removes the temp dir.
-    _watchdog_pipe: Option<std::process::ChildStdin>,
+    _watchdog_pipe: std::sync::Mutex<Option<std::process::ChildStdin>>,
 }
-
-// Safety: Browser and Page are Send + Sync; the runtime is only used to keep
-// background tasks alive and is never accessed from multiple threads.
-unsafe impl Sync for SharedBrowser {}
 
 static BROWSER: OnceLock<SharedBrowser> = OnceLock::new();
 
@@ -190,11 +186,11 @@ fn init_browser() -> SharedBrowser {
         let watchdog_pipe = spawn_cleanup_watchdog(chrome_pid, &data_dir);
 
         SharedBrowser {
-            browser,
+            browser: tokio::sync::Mutex::new(browser),
             page_url,
             _runtime: rt,
             _keepalive_page: keepalive_page,
-            _watchdog_pipe: watchdog_pipe,
+            _watchdog_pipe: std::sync::Mutex::new(watchdog_pipe),
         }
     })
     .join()
@@ -221,6 +217,8 @@ impl TestContext {
 
         let context_id = shared
             .browser
+            .lock()
+            .await
             .create_browser_context(CreateBrowserContextParams::default())
             .await
             .context("failed to create browser context")?;
@@ -229,6 +227,8 @@ impl TestContext {
         // origin with the WebTransport API available.
         let page = shared
             .browser
+            .lock()
+            .await
             .new_page(
                 CreateTargetParams::builder()
                     .url(&shared.page_url)
@@ -275,7 +275,7 @@ impl TestContext {
     pub async fn dispose(mut self) {
         if let Some(id) = self.context_id.take() {
             let shared = get_browser();
-            let _ = shared.browser.dispose_browser_context(id).await;
+            let _ = shared.browser.lock().await.dispose_browser_context(id).await;
         }
     }
 }
