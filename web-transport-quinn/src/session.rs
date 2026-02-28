@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{ready, Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -512,6 +512,12 @@ pub struct SessionAccept {
 
     // Session error, shared with Session.
     error: Arc<OnceLock<SessionError>>,
+
+    // Wakers from concurrent callers of accept_bi / accept_uni.
+    // When one caller gets a stream, all others are woken so they can retry.
+    // This fixes the lost-waker bug where the unfold stream only stores one waker.
+    bi_wakers: Vec<Waker>,
+    uni_wakers: Vec<Waker>,
 }
 
 impl SessionAccept {
@@ -542,6 +548,9 @@ impl SessionAccept {
             pending_bi: FuturesUnordered::new(),
 
             error,
+
+            bi_wakers: Vec::new(),
+            uni_wakers: Vec::new(),
         }
     }
 
@@ -563,7 +572,15 @@ impl SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next_unpin(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let recv = res.map_err(|e| self.map_error(e))?;
+                let recv = match res {
+                    Ok(recv) => recv,
+                    Err(e) => {
+                        for waker in self.uni_wakers.drain(..) {
+                            waker.wake();
+                        }
+                        return Poll::Ready(Err(self.map_error(e)));
+                    }
+                };
                 let pending = Self::decode_uni(recv, self.session_id);
                 self.pending_uni.push(Box::pin(pending));
 
@@ -571,20 +588,26 @@ impl SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let (typ, recv) = match ready!(self.pending_uni.poll_next_unpin(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let (typ, recv) = match self.pending_uni.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!(?err, "failed to decode unidirectional stream");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    self.uni_wakers.push(cx.waker().clone());
+                    return Poll::Pending;
+                }
             };
 
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv, self.error.clone());
+                    for waker in self.uni_wakers.drain(..) {
+                        waker.wake();
+                    }
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -634,7 +657,15 @@ impl SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next_unpin(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let (send, recv) = res.map_err(|e| self.map_error(e))?;
+                let (send, recv) = match res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        for waker in self.bi_wakers.drain(..) {
+                            waker.wake();
+                        }
+                        return Poll::Ready(Err(self.map_error(e)));
+                    }
+                };
                 let pending = Self::decode_bi(send, recv, self.session_id);
                 self.pending_bi.push(Box::pin(pending));
 
@@ -642,20 +673,26 @@ impl SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let res = match ready!(self.pending_bi.poll_next_unpin(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let res = match self.pending_bi.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!(?err, "failed to decode bidirectional stream");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    self.bi_wakers.push(cx.waker().clone());
+                    return Poll::Pending;
+                }
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send, self.error.clone());
                 let recv = RecvStream::new(recv, self.error.clone());
+                for waker in self.bi_wakers.drain(..) {
+                    waker.wake();
+                }
                 return Poll::Ready(Ok((send, recv)));
             }
 
