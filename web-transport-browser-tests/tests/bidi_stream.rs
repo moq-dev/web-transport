@@ -498,7 +498,6 @@ async fn bidi_stream_server_priority() {
             }
             messages.push(msg);
         }
-        messages.sort();
         const expected = ["prio0", "prio1", "prio2"];
         const ok = JSON.stringify(messages) === JSON.stringify(expected);
         wt.close();
