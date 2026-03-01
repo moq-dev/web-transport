@@ -48,7 +48,8 @@ impl ClientBuilder {
             })
             .collect();
 
-        self.options.set_server_certificate_hashes(hashes.as_slice());
+        self.options
+            .set_server_certificate_hashes(hashes.as_slice());
         Client {
             options: self.options,
         }
