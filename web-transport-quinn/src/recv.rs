@@ -58,10 +58,7 @@ impl RecvStream {
 
     /// Read until the end of the stream or the limit is hit. See [`quinn::RecvStream::read_to_end`].
     pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
-        self.inner
-            .read_to_end(size_limit)
-            .await
-            .map_err(Into::into)
+        self.inner.read_to_end(size_limit).await.map_err(Into::into)
     }
 
     /// Block until the stream has been reset and return the error code. See [`quinn::RecvStream::received_reset`].

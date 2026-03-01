@@ -598,7 +598,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http3_reader_single_capsule_single_frame() {
-        let capsule = Capsule::CloseWebTransportSession { code: 42, reason: "bye".into() };
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 42,
+            reason: "bye".into(),
+        };
         let mut reader = reader_from(wrap_in_data_frame(&encode_capsule(&capsule)));
         assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
         assert!(reader.read().await.unwrap().is_none());
@@ -606,7 +609,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http3_reader_capsule_split_across_frames() {
-        let capsule = Capsule::CloseWebTransportSession { code: 100, reason: "split".into() };
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 100,
+            reason: "split".into(),
+        };
         let bytes = encode_capsule(&capsule);
         let mut reader = reader_from(split_into_data_frames(&bytes, &[bytes.len() / 2]));
         assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
@@ -614,7 +620,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http3_reader_capsule_split_across_three_frames() {
-        let capsule = Capsule::CloseWebTransportSession { code: 200, reason: "three".into() };
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 200,
+            reason: "three".into(),
+        };
         let bytes = encode_capsule(&capsule);
         let mut reader = reader_from(split_into_data_frames(&bytes, &[2, 5]));
         assert_eq!(reader.read().await.unwrap().unwrap(), capsule);
@@ -623,7 +632,10 @@ mod tests {
     #[tokio::test]
     async fn test_http3_reader_multiple_capsules_one_frame() {
         let c1 = Capsule::Grease { num: 1 };
-        let c2 = Capsule::CloseWebTransportSession { code: 7, reason: "done".into() };
+        let c2 = Capsule::CloseWebTransportSession {
+            code: 7,
+            reason: "done".into(),
+        };
         let mut bytes = encode_capsule(&c1);
         bytes.extend_from_slice(&encode_capsule(&c2));
 
@@ -634,7 +646,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_http3_reader_skips_non_data_frames() {
-        let capsule = Capsule::CloseWebTransportSession { code: 0, reason: String::new() };
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 0,
+            reason: String::new(),
+        };
         let mut wire = Vec::new();
         // HEADERS frame before the DATA frame.
         Frame::HEADERS.encode(&mut wire);
@@ -658,12 +673,18 @@ mod tests {
         // Missing: length + payload
 
         let mut reader = reader_from(wrap_in_data_frame(&partial));
-        assert!(matches!(reader.read().await, Err(CapsuleError::UnexpectedEnd)));
+        assert!(matches!(
+            reader.read().await,
+            Err(CapsuleError::UnexpectedEnd)
+        ));
     }
 
     #[tokio::test]
     async fn test_http3_reader_empty_data_frame() {
-        let capsule = Capsule::CloseWebTransportSession { code: 1, reason: "ok".into() };
+        let capsule = Capsule::CloseWebTransportSession {
+            code: 1,
+            reason: "ok".into(),
+        };
         let mut wire = wrap_in_data_frame(&[]);
         wire.extend_from_slice(&wrap_in_data_frame(&encode_capsule(&capsule)));
 

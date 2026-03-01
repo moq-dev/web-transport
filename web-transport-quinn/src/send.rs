@@ -67,10 +67,7 @@ impl SendStream {
 
     /// Write all of the chunks of data to the stream. See [`quinn::SendStream::write_all_chunks`].
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        self.stream
-            .write_all_chunks(bufs)
-            .await
-            .map_err(Into::into)
+        self.stream.write_all_chunks(bufs).await.map_err(Into::into)
     }
 
     /// Mark the stream as finished, such that no more data can be written. See [`quinn::SendStream::finish`].
