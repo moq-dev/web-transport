@@ -1,7 +1,6 @@
-use js_sys::{Object, Reflect, Uint8Array};
 use url::Url;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{WebTransport, WebTransportOptions};
+use web_sys::{WebTransport, WebTransportHash, WebTransportOptions};
 
 use crate::{Error, Session};
 
@@ -39,17 +38,15 @@ impl ClientBuilder {
 
     /// Supply sha256 hashes for accepted certificates, instead of using a root CA
     pub fn with_server_certificate_hashes(self, hashes: Vec<Vec<u8>>) -> Client {
-        // expected: [ { algorithm: "sha-256", value: hashValue }, ... ]
-        let hashes = hashes
+        let hashes: Vec<WebTransportHash> = hashes
             .into_iter()
-            .map(|hash| {
-                let hash = Uint8Array::from(&hash[..]);
-                let obj = Object::new();
-                Reflect::set(&obj, &"algorithm".into(), &"sha-256".into()).unwrap();
-                Reflect::set(&obj, &"value".into(), &hash.into()).unwrap();
-                obj
+            .map(|mut hash| {
+                let entry = WebTransportHash::new();
+                entry.set_algorithm("sha-256");
+                entry.set_value_u8_slice(&mut hash);
+                entry
             })
-            .collect::<js_sys::Array>();
+            .collect();
 
         self.options.set_server_certificate_hashes(&hashes);
         Client {
