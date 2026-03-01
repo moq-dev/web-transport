@@ -99,40 +99,49 @@ impl Session {
 
         // Run a background task to read capsules from the CONNECT recv stream.
         let conn2 = this.conn.clone();
-        tokio::spawn(async move {
-            let close_info = Self::run_closed(connect.recv).await;
-            let code = close_info.as_ref().map_or(0, |(c, _)| *c);
-
-            let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
-                .try_into()
-                .unwrap();
-
-            // Try to record the remote close error. If close() already set
-            // the error, it owns the connection teardown, so we bail out.
-            let err: SessionError = match close_info {
-                Some((code, reason)) => {
-                    let err = WebTransportError::Closed(code, reason.clone());
-                    if error.set(err.into()).is_err() {
-                        return;
-                    }
-                    conn2.close(http3_code, reason.as_bytes());
-                    return;
-                }
-                None => quinn::ConnectionError::LocallyClosed.into(),
-            };
-            if error.set(err).is_err() {
-                return;
-            }
-            conn2.close(http3_code, b"");
-        });
+        tokio::spawn(Self::run_recv(conn2, connect.recv, error));
 
         this
+    }
+
+    // Read capsules from the CONNECT recv stream until it's closed,
+    // then record the close error and tear down the connection.
+    async fn run_recv(
+        conn: quinn::Connection,
+        recv: quinn::RecvStream,
+        error: Arc<OnceLock<SessionError>>,
+    ) {
+        let close_info = Self::read_capsules(recv).await;
+        let code = close_info.as_ref().map_or(0, |(c, _)| *c);
+
+        let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
+            .try_into()
+            .unwrap();
+
+        // Try to record the remote close error. If close() already set
+        // the error, it owns the connection teardown, so we bail out.
+        match close_info {
+            Some((code, reason)) => {
+                let err = WebTransportError::Closed(code, reason.clone());
+                if error.set(err.into()).is_err() {
+                    return;
+                }
+                conn.close(http3_code, reason.as_bytes());
+            }
+            None => {
+                let err = quinn::ConnectionError::LocallyClosed.into();
+                if error.set(err).is_err() {
+                    return;
+                }
+                conn.close(http3_code, b"");
+            }
+        };
     }
 
     // Keep reading capsules from the CONNECT recv stream until it's closed.
     // Returns Some((code, reason)) if a CloseWebTransportSession capsule was received,
     // or None if the stream closed without a capsule.
-    async fn run_closed(recv: quinn::RecvStream) -> Option<(u32, String)> {
+    async fn read_capsules(recv: quinn::RecvStream) -> Option<(u32, String)> {
         let mut reader = web_transport_proto::Http3CapsuleReader::new(recv);
         loop {
             match reader.read().await {
