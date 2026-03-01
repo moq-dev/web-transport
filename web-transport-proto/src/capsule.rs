@@ -5,10 +5,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{Frame, VarInt, VarIntUnexpectedEnd, MAX_FRAME_SIZE};
 
-// The spec (draft-ietf-webtrans-http3-06) says the type is 0x2843, which would
-// varint-encode to 0x68 0x43. However, actual wire data shows 0x43 0x28 which
-// decodes to 808. There may be a discrepancy in implementations or specs.
-// Using 0x2843 as specified in the standard.
+// CloseWebTransportSession capsule type (draft-ietf-webtrans-http3-06).
 const CLOSE_WEBTRANSPORT_SESSION_TYPE: u64 = 0x2843;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,9 +212,6 @@ pub enum CapsuleError {
 
     #[error("message too long")]
     MessageTooLong,
-
-    #[error("unknown capsule type: {0:?}")]
-    UnknownType(VarInt),
 
     #[error("varint decode error: {0:?}")]
     VarInt(#[from] VarIntUnexpectedEnd),

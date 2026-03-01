@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
@@ -80,7 +81,7 @@ impl Session {
         let error: Arc<OnceLock<SessionError>> = Arc::new(OnceLock::new());
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
-        let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
+        let accept = SessionAccept::new(conn.clone(), session_id);
 
         let this = Self {
             conn,
@@ -102,20 +103,27 @@ impl Session {
             let close_info = Self::run_closed(connect.recv).await;
             let code = close_info.as_ref().map_or(0, |(c, _)| *c);
 
+            let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
+                .try_into()
+                .unwrap();
+
             // Try to record the remote close error. If close() already set
             // the error, it owns the connection teardown, so we bail out.
             let err: SessionError = match close_info {
-                Some((code, reason)) => WebTransportError::Closed(code, reason).into(),
+                Some((code, reason)) => {
+                    let err = WebTransportError::Closed(code, reason.clone());
+                    if error.set(err.into()).is_err() {
+                        return;
+                    }
+                    conn2.close(http3_code, reason.as_bytes());
+                    return;
+                }
                 None => quinn::ConnectionError::LocallyClosed.into(),
             };
             if error.set(err).is_err() {
                 return;
             }
-
-            let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
-                .try_into()
-                .unwrap();
-            conn2.close(http3_code, &[]);
+            conn2.close(http3_code, b"");
         });
 
         this
@@ -169,73 +177,50 @@ impl Session {
     /// Accept a new unidirectional stream. See [`quinn::Connection::accept_uni`].
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx))
-                .await
-                .map_err(|e| self.map_error(e))
+            Ok(poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx)).await?)
         } else {
-            self.conn
-                .accept_uni()
-                .await
-                .map(|recv| RecvStream::new(recv, self.error.clone()))
-                .map_err(|e| self.map_error(e))
+            Ok(RecvStream::new(self.conn.accept_uni().await?))
         }
     }
 
     /// Accept a new bidirectional stream. See [`quinn::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx))
-                .await
-                .map_err(|e| self.map_error(e))
+            Ok(poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx)).await?)
         } else {
-            self.conn
-                .accept_bi()
-                .await
-                .map(|(send, recv)| {
-                    (
-                        SendStream::new(send, self.error.clone()),
-                        RecvStream::new(recv, self.error.clone()),
-                    )
-                })
-                .map_err(|e| self.map_error(e))
+            let (send, recv) = self.conn.accept_bi().await?;
+            Ok((SendStream::new(send), RecvStream::new(recv)))
         }
     }
 
     /// Open a new unidirectional stream. See [`quinn::Connection::open_uni`].
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self.conn.open_uni().await.map_err(|e| self.map_error(e))?;
+        let mut send = self.conn.open_uni().await?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
         // Also the header is very important for determining the session ID without reliable reset.
         send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_uni)
-            .await
-            .map_err(|e| self.map_error(e))?;
+        Self::write_full(&mut send, &self.header_uni).await?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
-        Ok(SendStream::new(send, self.error.clone()))
+        Ok(SendStream::new(send))
     }
 
     /// Open a new bidirectional stream. See [`quinn::Connection::open_bi`].
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self.conn.open_bi().await.map_err(|e| self.map_error(e))?;
+        let (mut send, recv) = self.conn.open_bi().await?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
         // Also the header is very important for determining the session ID without reliable reset.
         send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_bi)
-            .await
-            .map_err(|e| self.map_error(e))?;
+        Self::write_full(&mut send, &self.header_bi).await?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
-        Ok((
-            SendStream::new(send, self.error.clone()),
-            RecvStream::new(recv, self.error.clone()),
-        ))
+        Ok((SendStream::new(send), RecvStream::new(recv)))
     }
 
     /// Asynchronously receives an application datagram from the remote peer.
@@ -244,11 +229,7 @@ impl Session {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received bytes.
     pub async fn read_datagram(&self) -> Result<Bytes, SessionError> {
-        let mut datagram = self
-            .conn
-            .read_datagram()
-            .await
-            .map_err(|e| self.map_error(e))?;
+        let mut datagram = self.conn.read_datagram().await?;
 
         let mut cursor = Cursor::new(&datagram);
 
@@ -286,13 +267,8 @@ impl Session {
             self.conn.send_datagram(data)
         };
 
-        result.map_err(|e| match self.error.get() {
-            Some(SessionError::ConnectionError(conn_err)) => {
-                quinn::SendDatagramError::ConnectionLost(conn_err.clone()).into()
-            }
-            Some(err) => err.clone(),
-            None => e.into(),
-        })
+        result?;
+        Ok(())
     }
 
     /// Computes the maximum size of datagrams that may be passed to
@@ -332,7 +308,7 @@ impl Session {
                 let conn = self.conn.clone();
                 let capsule =
                     web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
-                let timeout = self.rtt() * 3;
+                let timeout = (self.rtt() * 3).max(Duration::from_millis(100));
 
                 tokio::spawn(async move {
                     Self::close_with_capsule(conn, send, capsule, code, timeout).await;
@@ -510,9 +486,6 @@ pub struct SessionAccept {
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
 
-    // Session error, shared with Session.
-    error: Arc<OnceLock<SessionError>>,
-
     // Wakers from concurrent callers of accept_bi / accept_uni.
     // When one caller gets a stream, all others are woken so they can retry.
     // This fixes the lost-waker bug where the unfold stream only stores one waker.
@@ -521,11 +494,7 @@ pub struct SessionAccept {
 }
 
 impl SessionAccept {
-    pub(crate) fn new(
-        conn: quinn::Connection,
-        session_id: VarInt,
-        error: Arc<OnceLock<SessionError>>,
-    ) -> Self {
+    pub(crate) fn new(conn: quinn::Connection, session_id: VarInt) -> Self {
         // Create a stream that just outputs new streams, so it's easy to call from poll.
         let accept_uni = Box::pin(futures::stream::unfold(conn.clone(), |conn| async {
             Some((conn.accept_uni().await, conn))
@@ -547,18 +516,9 @@ impl SessionAccept {
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
 
-            error,
-
             bi_wakers: Vec::new(),
             uni_wakers: Vec::new(),
         }
-    }
-
-    fn map_error(&self, e: impl Into<SessionError>) -> SessionError {
-        if let Some(err) = self.error.get() {
-            return err.clone();
-        }
-        e.into()
     }
 
     // This is poll-based because we accept and decode streams in parallel.
@@ -578,7 +538,7 @@ impl SessionAccept {
                         for waker in self.uni_wakers.drain(..) {
                             waker.wake();
                         }
-                        return Poll::Ready(Err(self.map_error(e)));
+                        return Poll::Ready(Err(e.into()));
                     }
                 };
                 let pending = Self::decode_uni(recv, self.session_id);
@@ -596,7 +556,9 @@ impl SessionAccept {
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {
-                    self.uni_wakers.push(cx.waker().clone());
+                    if !self.uni_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                        self.uni_wakers.push(cx.waker().clone());
+                    }
                     return Poll::Pending;
                 }
             };
@@ -604,7 +566,7 @@ impl SessionAccept {
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
-                    let recv = RecvStream::new(recv, self.error.clone());
+                    let recv = RecvStream::new(recv);
                     for waker in self.uni_wakers.drain(..) {
                         waker.wake();
                     }
@@ -663,7 +625,7 @@ impl SessionAccept {
                         for waker in self.bi_wakers.drain(..) {
                             waker.wake();
                         }
-                        return Poll::Ready(Err(self.map_error(e)));
+                        return Poll::Ready(Err(e.into()));
                     }
                 };
                 let pending = Self::decode_bi(send, recv, self.session_id);
@@ -681,15 +643,17 @@ impl SessionAccept {
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => {
-                    self.bi_wakers.push(cx.waker().clone());
+                    if !self.bi_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                        self.bi_wakers.push(cx.waker().clone());
+                    }
                     return Poll::Pending;
                 }
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
-                let send = SendStream::new(send, self.error.clone());
-                let recv = RecvStream::new(recv, self.error.clone());
+                let send = SendStream::new(send);
+                let recv = RecvStream::new(recv);
                 for waker in self.bi_wakers.drain(..) {
                     waker.wake();
                 }
