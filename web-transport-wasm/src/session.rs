@@ -66,9 +66,7 @@ impl Session {
     /// Creates a new bidirectional stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         let stream: WebTransportBidirectionalStream =
-            JsFuture::from(self.inner.create_bidirectional_stream())
-                .await?
-                .into();
+            JsFuture::from(self.inner.create_bidirectional_stream()).await?;
 
         let send = SendStream::new(stream.writable())?;
         let recv = RecvStream::new(stream.readable())?;
@@ -79,9 +77,7 @@ impl Session {
     /// Creates a new unidirectional stream.
     pub async fn open_uni(&self) -> Result<SendStream, Error> {
         let stream: WebTransportSendStream =
-            JsFuture::from(self.inner.create_unidirectional_stream())
-                .await?
-                .into();
+            JsFuture::from(self.inner.create_unidirectional_stream()).await?;
 
         let send = SendStream::new(stream)?;
         Ok(send)
@@ -115,7 +111,7 @@ impl Session {
     }
 
     async fn closed_inner(&self) -> Result<(), Error> {
-        let info: WebTransportCloseInfo = JsFuture::from(self.inner.closed()).await?.into();
+        let info: WebTransportCloseInfo = JsFuture::from(self.inner.closed()).await?;
         let reason = info.get_reason().unwrap_or_default();
 
         let options = web_sys::WebTransportErrorOptions::new();
