@@ -350,7 +350,12 @@ impl Session {
 
         let mut frame = Vec::new();
         Frame::DATA.encode(&mut frame);
-        VarInt::from_u32(capsule_bytes.len() as u32).encode(&mut frame);
+        let Ok(len) = VarInt::try_from(capsule_bytes.len()) else {
+            tracing::warn!("capsule too large to encode as DATA frame");
+            conn.close(http3_code, b"");
+            return;
+        };
+        len.encode(&mut frame);
         frame.extend_from_slice(&capsule_bytes);
 
         // Write the DATA frame to the CONNECT send stream.

@@ -78,9 +78,10 @@ impl Capsule {
     ///
     /// Returns `Ok(None)` if the stream is cleanly closed (EOF before any bytes).
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Option<Self>, CapsuleError> {
-        let typ = match VarInt::read(stream).await {
-            Ok(v) => v,
-            Err(_) => return Ok(None), // Clean EOF
+        let typ = match VarInt::read_optional(stream).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None), // Clean EOF
+            Err(_) => return Err(CapsuleError::UnexpectedEnd),
         };
         let length = VarInt::read(stream)
             .await
@@ -273,9 +274,10 @@ impl<S: AsyncRead + Unpin> Http3CapsuleReader<S> {
     /// Returns `false` on EOF.
     async fn read_data_frame(&mut self) -> Result<bool, CapsuleError> {
         loop {
-            let frame_type = match VarInt::read(&mut self.stream).await {
-                Ok(v) => Frame(v),
-                Err(_) => return Ok(false),
+            let frame_type = match VarInt::read_optional(&mut self.stream).await {
+                Ok(Some(v)) => Frame(v),
+                Ok(None) => return Ok(false),
+                Err(_) => return Err(CapsuleError::UnexpectedEnd),
             };
             let len = VarInt::read(&mut self.stream)
                 .await
@@ -287,9 +289,10 @@ impl<S: AsyncRead + Unpin> Http3CapsuleReader<S> {
             }
 
             if frame_type != Frame::DATA {
-                if len > 0 {
-                    let mut skip = vec![0u8; len];
-                    self.stream.read_exact(&mut skip).await?;
+                let mut limited = (&mut self.stream).take(len as u64);
+                let n = tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+                if (n as usize) < len {
+                    return Err(CapsuleError::UnexpectedEnd);
                 }
                 continue;
             }
