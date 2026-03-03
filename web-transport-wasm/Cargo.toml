@@ -16,6 +16,9 @@ targets = ["wasm32-unknown-unknown"]
 rustc-args = ["--cfg=web_sys_unstable_apis"]
 rustdoc-args = ["--cfg=web_sys_unstable_apis"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bytes = "1"
 js-sys = "0.3.91"
