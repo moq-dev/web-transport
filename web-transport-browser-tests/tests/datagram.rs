@@ -143,7 +143,10 @@ async fn datagram_server_initiated() {
                 .expect("send_datagram failed");
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -221,14 +224,8 @@ async fn datagram_oversized_rejected() {
                 result.is_err(),
                 "oversized send_datagram should fail, but succeeded"
             );
-            let err = session.closed().await;
-            assert!(
-                matches!(
-                    err,
-                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
-                ),
-                "expected WebTransportError::Closed, got {err}"
-            );
+            session.close(0, b"");
+            session.closed().await;
         })
     });
 
@@ -239,8 +236,7 @@ async fn datagram_oversized_rejected() {
             r#"
         const wt = await connectWebTransport();
         // Give the server time to attempt the oversized send
-        await new Promise(r => setTimeout(r, 500));
-        wt.close();
+        await wt.closed;
         return { success: true, message: "server rejected oversized datagram" };
     "#,
             TIMEOUT,

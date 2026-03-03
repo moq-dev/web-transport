@@ -225,8 +225,8 @@ async fn close_server_while_streaming() {
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             // Accept a bidi stream to confirm the client started streaming
-            let _s1 = session.accept_bi().await.expect("accept_bi failed");
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let (_send, mut recv) = session.accept_bi().await.expect("accept_bi failed");
+            recv.read(&mut [1]).await.expect("read failed");
             session.close(55, b"mid-stream");
             let err = session.closed().await;
             assert!(
@@ -250,7 +250,11 @@ async fn close_server_while_streaming() {
             const writer = stream.writable.getWriter();
 
             // Start writing but don't close — server will close the session
-            await writer.write(new TextEncoder().encode("streaming..."));
+            for (let i = 0; i < 10; i++) {
+                const chunk = new Uint8Array(1024).fill(i);
+                await writer.write(chunk);
+                await new Promise(r => setTimeout(r, 50));
+            }
 
             // Wait for the session to close.
             await wt.closed;
@@ -315,13 +319,10 @@ async fn close_client_while_streaming() {
             r#"
         const wt = await connectWebTransport();
         const stream = await wt.createBidirectionalStream();
-        const writer = stream.writable.getWriter();
-
-        // Send some data so the server accepts the stream
-        await writer.write(new TextEncoder().encode("hello"));
+        const reader = stream.readable.getReader();
 
         // Give the server a moment to start writing back
-        await new Promise(r => setTimeout(r, 200));
+        await reader.read();
 
         // Close the session from the client while the server is writing
         wt.close({ closeCode: 77, reason: "client mid-stream" });

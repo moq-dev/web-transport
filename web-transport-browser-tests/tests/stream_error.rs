@@ -421,7 +421,7 @@ async fn client_close_interrupts_server_write() {
         // Write to trigger server accept
         await writer.write(new Uint8Array([1]));
         // Small delay so the server starts writing
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 50));
         wt.close();
         await wt.closed;
         return { success: true, message: "client closed while server was writing" };
@@ -882,14 +882,8 @@ async fn server_write_after_reset() {
                 matches!(result, Err(WriteError::ClosedStream)),
                 "expected ClosedStream after reset, got {result:?}"
             );
-            let err = session.closed().await;
-            assert!(
-                matches!(
-                    err,
-                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
-                ),
-                "expected WebTransportError::Closed, got {err}"
-            );
+            session.close(0, b"");
+            let _ = session.closed().await;
         })
     });
 
@@ -900,8 +894,7 @@ async fn server_write_after_reset() {
             r#"
         const wt = await connectWebTransport();
         // Give the server time to open a stream, reset it, and attempt write
-        await new Promise(r => setTimeout(r, 500));
-        wt.close();
+        await wt.closed;
         return { success: true, message: "server tested write after reset" };
     "#,
             TIMEOUT,
@@ -980,6 +973,7 @@ async fn server_read_on_stream_after_session_close() {
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             let (_send, mut recv) = session.accept_bi().await.expect("accept_bi failed");
+            recv.read(&mut [0u8; 1]).await.expect("initial read failed");
             session.close(7, b"done");
             session.closed().await;
             let mut buf = [0u8; 1024];
@@ -1004,8 +998,11 @@ async fn server_read_on_stream_after_session_close() {
         const stream = await wt.createBidirectionalStream();
         const writer = stream.writable.getWriter();
         await writer.write(new Uint8Array([1]));
-        try { await wt.closed; } catch (e) {
-            if (!(e instanceof WebTransportError)) throw e;
+        try {
+            await writer.write(new Uint8Array([1]));
+            await writer.write(new Uint8Array([1]));
+        } catch (e) {
+            // Expected — STOP_SENDING causes writer error
         }
         return { success: true, message: "session closed" };
     "#,

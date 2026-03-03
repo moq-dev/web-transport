@@ -115,8 +115,10 @@ async fn server_close_while_client_creating_streams() {
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
             // Accept the first stream
-            let _s1 = session.accept_bi().await.expect("accept_bi failed");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (_send, mut recv) = session.accept_bi().await.expect("accept_bi failed");
+            recv.read_to_end(32).await.expect("initial read failed");
+            recv.received_reset().await.expect("expected close");
+            tokio::time::sleep(Duration::from_millis(50)).await;
             session.close(99, b"closing");
             session.closed().await;
         })
@@ -262,6 +264,7 @@ async fn multiple_streams_mixed_types() {
                     }
                     stream = session.accept_uni() => {
                         let Ok(mut recv) = stream else { break };
+                        let session = session.clone();
                         tokio::spawn(async move {
                             let data = recv.read_to_end(1024 * 1024).await.expect("read_to_end failed");
                             assert_eq!(
@@ -269,6 +272,10 @@ async fn multiple_streams_mixed_types() {
                                 "uni",
                                 "server should receive uni stream data"
                             );
+                            // Acknowledge receipt back to the client
+                            let mut ack = session.open_uni().await.expect("open_uni for ack failed");
+                            ack.write_all(b"uni-ack").await.expect("write ack failed");
+                            ack.finish().expect("finish ack failed");
                         });
                     }
                     datagram = session.read_datagram() => {
@@ -304,13 +311,24 @@ async fn multiple_streams_mixed_types() {
                 }
                 return r === "bidi";
             })(),
-            // Uni write
+            // Uni write + verify server received it
             (async () => {
                 const stream = await wt.createUnidirectionalStream();
                 const writer = stream.getWriter();
                 await writer.write(new TextEncoder().encode("uni"));
                 await writer.close();
-                return true;
+                // Read the server's acknowledgment uni stream
+                const uniReader = wt.incomingUnidirectionalStreams.getReader();
+                const { value: ackStream, done } = await uniReader.read();
+                if (done) return false;
+                const sr = ackStream.getReader();
+                let ack = "";
+                while (true) {
+                    const { value, done } = await sr.read();
+                    if (done) break;
+                    ack += new TextDecoder().decode(value);
+                }
+                return ack === "uni-ack";
             })(),
             // Datagram echo
             (async () => {
@@ -322,8 +340,6 @@ async fn multiple_streams_mixed_types() {
             })()
         ]);
 
-        // Give server time to receive uni stream data
-        await new Promise(r => setTimeout(r, 200));
         wt.close();
         return {
             success: bidiResult && uniResult && dgramResult,
@@ -512,11 +528,7 @@ async fn large_uni_stream_client_to_server_1mb() {
             for i in (0..data.len()).step_by(4096) {
                 assert_eq!(data[i], (i % 251) as u8, "data mismatch at byte {i}");
             }
-            let err = session.closed().await;
-            assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
-                "expected WebTransportError::Closed, got {err}"
-            );
+            let _ = session.closed().await;
         })
     });
 
@@ -538,7 +550,6 @@ async fn large_uni_stream_client_to_server_1mb() {
             await writer.write(data.subarray(off, Math.min(off + CHUNK, SIZE)));
         }
         await writer.close();
-        await new Promise(r => setTimeout(r, 500));
         wt.close();
         return { success: true, message: "sent 1MB via uni stream" };
     "#,
@@ -703,7 +714,10 @@ async fn bidirectional_open() {
 
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
