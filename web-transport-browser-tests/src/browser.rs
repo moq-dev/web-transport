@@ -272,7 +272,12 @@ impl TestContext {
     pub async fn dispose(mut self) {
         if let Some(id) = self.context_id.take() {
             let shared = get_browser();
-            let _ = shared.browser.lock().await.dispose_browser_context(id).await;
+            let _ = shared
+                .browser
+                .lock()
+                .await
+                .dispose_browser_context(id)
+                .await;
         }
     }
 }

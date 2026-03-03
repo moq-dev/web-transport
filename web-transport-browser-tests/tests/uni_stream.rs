@@ -27,7 +27,10 @@ async fn uni_stream_client_to_server() {
             );
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -72,7 +75,10 @@ async fn uni_stream_client_to_server_multiple() {
             assert_eq!(collected, vec!["msg0", "msg1", "msg2"]);
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -120,7 +126,10 @@ async fn uni_stream_client_large_payload() {
             }
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -173,7 +182,10 @@ async fn uni_stream_server_to_client() {
             send.finish().expect("finish failed");
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -223,7 +235,10 @@ async fn uni_stream_server_to_client_multiple() {
             }
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -271,7 +286,10 @@ async fn uni_stream_server_large_payload() {
             send.finish().expect("finish failed");
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })

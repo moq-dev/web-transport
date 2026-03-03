@@ -179,7 +179,10 @@ async fn bidi_stream_server_initiated() {
             send.finish().expect("finish failed");
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -230,7 +233,10 @@ async fn bidi_stream_server_initiated_multiple() {
             }
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -282,7 +288,10 @@ async fn bidi_stream_server_initiated_bidirectional_exchange() {
             );
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })

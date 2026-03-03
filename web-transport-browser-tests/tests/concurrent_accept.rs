@@ -49,7 +49,11 @@ async fn concurrent_accept_bi_from_multiple_tasks() {
             // N-1 tasks are stuck in accept_bi() with dead wakers.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut completed = 0;
-            while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next()).await.ok().flatten() {
+            while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next())
+                .await
+                .ok()
+                .flatten()
+            {
                 if let Err(e) = result {
                     if e.is_panic() {
                         std::panic::resume_unwind(e.into_panic());
@@ -65,7 +69,10 @@ async fn concurrent_accept_bi_from_multiple_tasks() {
             // Keep the session alive until the client closes.
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
@@ -173,11 +180,10 @@ async fn concurrent_accept_bi_and_uni_from_multiple_tasks() {
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut completed = 0;
-            while let Some(result) =
-                tokio::time::timeout_at(deadline, tasks.join_next())
-                    .await
-                    .ok()
-                    .flatten()
+            while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next())
+                .await
+                .ok()
+                .flatten()
             {
                 if let Err(e) = result {
                     if e.is_panic() {
@@ -306,13 +312,18 @@ async fn concurrent_accept_uni_from_multiple_tasks() {
                         .read_to_end(1024)
                         .await
                         .unwrap_or_else(|e| panic!("task {i}: read_to_end failed: {e}"));
-                    String::from_utf8(data).unwrap_or_else(|e| panic!("task {i}: invalid utf8: {e}"))
+                    String::from_utf8(data)
+                        .unwrap_or_else(|e| panic!("task {i}: invalid utf8: {e}"))
                 });
             }
 
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut received = Vec::new();
-            while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next()).await.ok().flatten() {
+            while let Some(result) = tokio::time::timeout_at(deadline, tasks.join_next())
+                .await
+                .ok()
+                .flatten()
+            {
                 match result {
                     Ok(s) => received.push(s),
                     Err(e) => {
@@ -341,7 +352,10 @@ async fn concurrent_accept_uni_from_multiple_tasks() {
             // Keep the session alive until the client closes.
             let err = session.closed().await;
             assert!(
-                matches!(err, SessionError::WebTransportError(WebTransportError::Closed(_, _))),
+                matches!(
+                    err,
+                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
+                ),
                 "expected WebTransportError::Closed, got {err}"
             );
         })
