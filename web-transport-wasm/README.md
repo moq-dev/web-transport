@@ -9,11 +9,11 @@ A wrapper around the WebTransport browser API.
 
 If `cargo` is not in `PATH`
 
-```
+```bash
 export PATH=$PATH:/media/user/path/to/rust/.cargo/bin
 ```
 
-```
+```bash
 RUSTFLAGS="--cfg=web_sys_unstable_apis" \
 CARGO_HOME=/media/user/path/to/rust/.cargo \
 RUSTUP_HOME=/media/user/path/to/rust/.rustup \
