@@ -206,11 +206,7 @@ impl Session {
                 .await
                 .map_err(|e| self.map_error(e))
         } else {
-            let (send, recv) = self
-                .conn
-                .accept_bi()
-                .await
-                .map_err(|e| self.map_error(e))?;
+            let (send, recv) = self.conn.accept_bi().await.map_err(|e| self.map_error(e))?;
             Ok((
                 SendStream::new(send, self.error.clone()),
                 RecvStream::new(recv, self.error.clone()),
@@ -220,11 +216,7 @@ impl Session {
 
     /// Open a new unidirectional stream. See [`quinn::Connection::open_uni`].
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self
-            .conn
-            .open_uni()
-            .await
-            .map_err(|e| self.map_error(e))?;
+        let mut send = self.conn.open_uni().await.map_err(|e| self.map_error(e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
@@ -241,11 +233,7 @@ impl Session {
 
     /// Open a new bidirectional stream. See [`quinn::Connection::open_bi`].
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| self.map_error(e))?;
+        let (mut send, recv) = self.conn.open_bi().await.map_err(|e| self.map_error(e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.

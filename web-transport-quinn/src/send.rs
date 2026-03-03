@@ -28,7 +28,10 @@ impl SendStream {
     /// Also replaces `InvalidStopped` which are HTTP/3 teardown codes, not real stream errors.
     fn map_error(&self, e: WriteError) -> WriteError {
         if let Some(err) = self.error.get() {
-            if matches!(&e, WriteError::SessionError(_) | WriteError::InvalidStopped(_)) {
+            if matches!(
+                &e,
+                WriteError::SessionError(_) | WriteError::InvalidStopped(_)
+            ) {
                 return WriteError::SessionError(err.clone());
             }
         }
