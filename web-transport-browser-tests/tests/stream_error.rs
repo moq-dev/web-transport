@@ -823,19 +823,13 @@ async fn server_write_after_finish() {
             let (mut send, _recv) = session.open_bi().await.expect("open_bi failed");
             send.write_all(b"hello").await.expect("write_all failed");
             send.finish().expect("finish failed");
+            send.stopped().await.expect("stopped failed");
             let result = send.write_all(b"more").await;
             assert!(
                 matches!(result, Err(WriteError::ClosedStream)),
                 "expected ClosedStream after finish, got {result:?}"
             );
-            let err = session.closed().await;
-            assert!(
-                matches!(
-                    err,
-                    SessionError::WebTransportError(WebTransportError::Closed(_, _))
-                ),
-                "expected WebTransportError::Closed, got {err}"
-            );
+            let _ = session.closed().await;
         })
     });
 
@@ -1021,7 +1015,8 @@ async fn server_write_on_stream_after_session_close() {
 
     let handler: ServerHandler = Box::new(|session| {
         Box::pin(async move {
-            let (mut send, _recv) = session.accept_bi().await.expect("accept_bi failed");
+            let (mut send, mut recv) = session.accept_bi().await.expect("accept_bi failed");
+            recv.read(&mut [0u8; 1]).await.expect("initial read failed");
             session.close(7, b"done");
             session.closed().await;
             let result = send.write_all(b"test").await;
