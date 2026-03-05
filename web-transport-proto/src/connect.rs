@@ -81,6 +81,9 @@ pub struct ConnectRequest {
 
     /// The subprotocols requested (if any).
     pub protocols: Vec<String>,
+
+    /// The raw HTTP/3 headers from the request.
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 impl ConnectRequest {
@@ -88,6 +91,7 @@ impl ConnectRequest {
         Self {
             url: url.into(),
             protocols: Vec::new(),
+            headers: std::collections::HashMap::new(),
         }
     }
 
@@ -148,7 +152,13 @@ impl ConnectRequest {
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
-        Ok(Self { url, protocols })
+        // Save all headers
+        let mut raw_headers = std::collections::HashMap::new();
+        for (name, value) in headers.fields.iter() {
+            raw_headers.insert(name.clone(), value.clone());
+        }
+
+        Ok(Self { url, protocols, headers: raw_headers })
     }
 
     /// Read a CONNECT request from a stream, consuming only the exact bytes of the frame.
@@ -159,6 +169,10 @@ impl ConnectRequest {
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
+        // Add all saved headers first
+        for (name, value) in self.headers.iter() {
+            headers.set(name, value);
+        }
         headers.set(":method", "CONNECT");
         headers.set(":scheme", self.url.scheme());
         headers.set(":authority", self.url.authority());
@@ -199,6 +213,7 @@ impl From<Url> for ConnectRequest {
         Self {
             url,
             protocols: Vec::new(),
+            headers: std::collections::HashMap::new(),
         }
     }
 }
