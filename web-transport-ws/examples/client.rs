@@ -1,12 +1,13 @@
 use web_transport_trait::{RecvStream, SendStream, Session as _};
-use web_transport_ws::Session;
+use web_transport_ws::Client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = "ws://127.0.0.1:3000";
     println!("Connecting to {url}");
 
-    let session = Session::connect(url).await?;
+    let client = Client::new();
+    let session = client.connect(url).await?;
     println!("WebSocket connection established");
 
     println!("\n=== Testing unidirectional stream ===");
