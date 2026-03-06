@@ -260,7 +260,146 @@ where
     }
 }
 
+/// A builder for configuring and establishing a WebTransport session over WebSocket.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Client
+/// let session = Session::builder()
+///     .with_protocol("moq-03")
+///     .with_protocol("moq-04")
+///     .connect("ws://localhost:4443")
+///     .await?;
+///
+/// // Server
+/// let session = Session::builder()
+///     .with_protocol("moq-03")
+///     .with_protocol("moq-04")
+///     .accept(socket)
+///     .await?;
+/// ```
+#[derive(Default, Clone)]
+pub struct SessionBuilder {
+    protocols: Vec<String>,
+}
+
+impl SessionBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a supported application-level subprotocol for negotiation.
+    pub fn with_protocol(mut self, protocol: &str) -> Self {
+        self.protocols.push(protocol.to_string());
+        self
+    }
+
+    /// Add multiple supported application-level subprotocols for negotiation.
+    pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
+        self.protocols.extend(protocols.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Accept a WebSocket connection as a server, negotiating the subprotocol.
+    ///
+    /// The first client-requested protocol that matches one of the builder's
+    /// protocols will be selected.
+    pub async fn accept<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        self,
+        socket: T,
+    ) -> Result<Session, Error> {
+        use std::sync::Mutex;
+
+        let negotiated = Arc::new(Mutex::new(None::<String>));
+        let negotiated_clone = negotiated.clone();
+        let supported = self.protocols;
+
+        let callback = move |req: &server::Request,
+                             mut response: server::Response|
+         -> Result<server::Response, server::ErrorResponse> {
+            let header_protocols: Vec<&str> = req
+                .headers()
+                .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .collect();
+
+            if !header_protocols.iter().any(|p| *p == ALPN) {
+                return Err(http::Response::builder()
+                    .status(http::StatusCode::BAD_REQUEST)
+                    .body(Some("'webtransport' protocol required".to_string()))
+                    .unwrap());
+            }
+
+            let selected = header_protocols
+                .iter()
+                .filter(|p| **p != ALPN)
+                .find(|p| supported.iter().any(|s| s == **p))
+                .map(|p| p.to_string());
+
+            let response_value = match &selected {
+                Some(proto) => format!("{}, {}", ALPN, proto),
+                None => ALPN.to_string(),
+            };
+
+            response.headers_mut().insert(
+                http::header::SEC_WEBSOCKET_PROTOCOL,
+                http::HeaderValue::from_str(&response_value).unwrap(),
+            );
+
+            *negotiated_clone.lock().unwrap() = selected;
+
+            Ok(response)
+        };
+
+        let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
+        let protocol = negotiated.lock().unwrap().take();
+        Ok(Session::with_protocol(ws, true, protocol))
+    }
+
+    /// Connect to a WebSocket server as a client, requesting the configured subprotocols.
+    pub async fn connect(self, url: &str) -> Result<Session, Error> {
+        let mut request = url.into_client_request()?;
+
+        let protocol_value = if self.protocols.is_empty() {
+            ALPN.to_string()
+        } else {
+            format!("{}, {}", ALPN, self.protocols.join(", "))
+        };
+
+        request.headers_mut().insert(
+            http::header::SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_str(&protocol_value).unwrap(),
+        );
+
+        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+
+        let negotiated = response
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| {
+                h.split(',')
+                    .map(|p| p.trim())
+                    .find(|p| *p != ALPN)
+                    .map(|p| p.to_string())
+            });
+
+        Ok(Session::with_protocol(ws_stream, false, negotiated))
+    }
+}
+
 impl Session {
+    /// Create a builder for configuring the session.
+    pub fn builder() -> SessionBuilder {
+        SessionBuilder::new()
+    }
+
+    /// Wrap an already-established WebSocket as a WebTransport session.
     pub fn new<T>(ws: T, is_server: bool) -> Self
     where
         T: futures::Stream<Item = Result<Message, tungstenite::Error>>
@@ -272,7 +411,7 @@ impl Session {
         Self::with_protocol(ws, is_server, None)
     }
 
-    pub fn with_protocol<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
+    fn with_protocol<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
     where
         T: futures::Stream<Item = Result<Message, tungstenite::Error>>
             + futures::Sink<Message, Error = tungstenite::Error>
@@ -324,120 +463,20 @@ impl Session {
         }
     }
 
+    /// Accept a WebSocket connection with no application subprotocol negotiation.
+    ///
+    /// For subprotocol support, use [`Session::builder()`] instead.
     pub async fn accept<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         socket: T,
     ) -> Result<Session, Error> {
-        Self::accept_with_protocols(socket, &[]).await
+        SessionBuilder::new().accept(socket).await
     }
 
-    /// Accept a WebSocket connection, optionally negotiating an application subprotocol.
+    /// Connect to a WebSocket server with no application subprotocol negotiation.
     ///
-    /// The `supported_protocols` list specifies which application-level subprotocols the server
-    /// supports (e.g., MoQ version strings). The first protocol in the client's request that
-    /// matches one of the supported protocols will be selected.
-    pub async fn accept_with_protocols<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-        socket: T,
-        supported_protocols: &[&str],
-    ) -> Result<Session, Error> {
-        use std::sync::Mutex;
-
-        let negotiated = Arc::new(Mutex::new(None::<String>));
-        let negotiated_clone = negotiated.clone();
-        let supported: Vec<String> = supported_protocols.iter().map(|s| s.to_string()).collect();
-
-        // Create callback to handle WebTransport protocol negotiation
-        let callback = move |req: &server::Request,
-                             mut response: server::Response|
-         -> Result<server::Response, server::ErrorResponse> {
-            // Parse the Sec-WebSocket-Protocol header into individual protocol tokens
-            let header_protocols: Vec<&str> = req
-                .headers()
-                .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or_default()
-                .split(',')
-                .map(|p| p.trim())
-                .filter(|p| !p.is_empty())
-                .collect();
-
-            if !header_protocols.iter().any(|p| *p == ALPN) {
-                return Err(http::Response::builder()
-                    .status(http::StatusCode::BAD_REQUEST)
-                    .body(Some("'webtransport' protocol required".to_string()))
-                    .unwrap());
-            }
-
-            // Find the first client-requested protocol that we support.
-            let selected = header_protocols
-                .iter()
-                .filter(|p| **p != ALPN)
-                .find(|p| supported.iter().any(|s| s == **p))
-                .map(|p| p.to_string());
-
-            // Build the response Sec-WebSocket-Protocol value.
-            let response_value = match &selected {
-                Some(proto) => format!("{}, {}", ALPN, proto),
-                None => ALPN.to_string(),
-            };
-
-            response.headers_mut().insert(
-                http::header::SEC_WEBSOCKET_PROTOCOL,
-                http::HeaderValue::from_str(&response_value).unwrap(),
-            );
-
-            *negotiated_clone.lock().unwrap() = selected;
-
-            Ok(response)
-        };
-
-        let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
-        let protocol = negotiated.lock().unwrap().take();
-        Ok(Session::with_protocol(ws, true, protocol))
-    }
-
+    /// For subprotocol support, use [`Session::builder()`] instead.
     pub async fn connect(url: &str) -> Result<Session, Error> {
-        Self::connect_with_protocols(url, &[]).await
-    }
-
-    /// Connect to a WebSocket server, optionally requesting application subprotocols.
-    ///
-    /// The `protocols` list specifies which application-level subprotocols the client
-    /// wishes to use (e.g., MoQ version strings). The server will select one (if any)
-    /// and include it in the response.
-    pub async fn connect_with_protocols(
-        url: &str,
-        protocols: &[&str],
-    ) -> Result<Session, Error> {
-        let mut request = url.into_client_request()?;
-
-        // Build the Sec-WebSocket-Protocol header with ALPN and any requested protocols.
-        let protocol_value = if protocols.is_empty() {
-            ALPN.to_string()
-        } else {
-            format!("{}, {}", ALPN, protocols.join(", "))
-        };
-
-        request.headers_mut().insert(
-            http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_str(&protocol_value).unwrap(),
-        );
-
-        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
-
-        // Extract the negotiated application protocol from the response.
-        let negotiated = response
-            .headers()
-            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|h| h.to_str().ok())
-            .map(|h| {
-                h.split(',')
-                    .map(|p| p.trim())
-                    .find(|p| *p != ALPN)
-                    .map(|p| p.to_string())
-            })
-            .flatten();
-
-        Ok(Session::with_protocol(ws_stream, false, negotiated))
+        SessionBuilder::new().connect(url).await
     }
 }
 
