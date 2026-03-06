@@ -23,6 +23,11 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 }
 
+export interface WebTransportWsOptions extends WebTransportOptions {
+	/** Application-level subprotocols to request during the WebSocket handshake. */
+	protocols?: string[];
+}
+
 export default class WebTransportWs implements WebTransport {
 	#ws: WebSocket;
 	#isServer = false;
@@ -34,6 +39,9 @@ export default class WebTransportWs implements WebTransport {
 
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
+
+	/** The negotiated application-level subprotocol, or empty string if none. */
+	readonly protocol: string;
 
 	readonly ready: Promise<void>;
 	#readyResolve!: () => void;
@@ -48,7 +56,7 @@ export default class WebTransportWs implements WebTransport {
 	// TODO: Implement datagrams
 	readonly datagrams = new Datagrams();
 
-	constructor(url: string | URL, options?: WebTransportOptions) {
+	constructor(url: string | URL, options?: WebTransportWsOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
@@ -59,7 +67,8 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		this.#ws = new WebSocket(url, ["webtransport"]);
+		const wsProtocols = ["webtransport", ...(options?.protocols ?? [])];
+		this.#ws = new WebSocket(url, wsProtocols);
 
 		this.ready = new Promise((resolve) => {
 			this.#readyResolve = resolve;
@@ -69,8 +78,19 @@ export default class WebTransportWs implements WebTransport {
 			this.#closedResolve = resolve;
 		});
 
+		// Extract the negotiated application subprotocol (everything other than "webtransport").
+		// The ws.protocol string may contain comma-separated values or a single value.
+		this.protocol = "";
+
 		this.#ws.binaryType = "arraybuffer";
-		this.#ws.onopen = () => this.#readyResolve();
+		this.#ws.onopen = () => {
+			const selected = this.#ws.protocol
+				.split(",")
+				.map((p) => p.trim())
+				.find((p) => p !== "" && p !== "webtransport");
+			(this as { protocol: string }).protocol = selected ?? "";
+			this.#readyResolve();
+		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);
 		this.#ws.onerror = (event) => this.#handleError(event);
 		this.#ws.onclose = (event) => this.#handleClose(event);

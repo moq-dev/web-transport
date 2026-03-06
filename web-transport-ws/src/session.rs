@@ -36,6 +36,9 @@ pub struct Session {
     create_bi_id: Arc<AtomicU64>,
 
     closed: watch::Sender<Option<Error>>,
+
+    /// The negotiated application-level subprotocol, if any.
+    protocol: Option<String>,
 }
 
 struct SessionState<T> {
@@ -266,6 +269,17 @@ impl Session {
             + Send
             + 'static,
     {
+        Self::with_protocol(ws, is_server, None)
+    }
+
+    pub fn with_protocol<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
+    where
+        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
+            + futures::Sink<Message, Error = tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
 
@@ -306,52 +320,124 @@ impl Session {
             create_uni_id: Default::default(),
             create_bi_id: Default::default(),
             closed,
+            protocol,
         }
     }
 
     pub async fn accept<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         socket: T,
     ) -> Result<Session, Error> {
+        Self::accept_with_protocols(socket, &[]).await
+    }
+
+    /// Accept a WebSocket connection, optionally negotiating an application subprotocol.
+    ///
+    /// The `supported_protocols` list specifies which application-level subprotocols the server
+    /// supports (e.g., MoQ version strings). The first protocol in the client's request that
+    /// matches one of the supported protocols will be selected.
+    pub async fn accept_with_protocols<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        socket: T,
+        supported_protocols: &[&str],
+    ) -> Result<Session, Error> {
+        use std::sync::Mutex;
+
+        let negotiated = Arc::new(Mutex::new(None::<String>));
+        let negotiated_clone = negotiated.clone();
+        let supported: Vec<String> = supported_protocols.iter().map(|s| s.to_string()).collect();
+
         // Create callback to handle WebTransport protocol negotiation
-        let callback = |req: &server::Request,
-                        mut response: server::Response|
+        let callback = move |req: &server::Request,
+                             mut response: server::Response|
          -> Result<server::Response, server::ErrorResponse> {
-            // Check for WebTransport subprotocol in Sec-WebSocket-Protocol header
-            let protocols = req
+            // Parse the Sec-WebSocket-Protocol header into individual protocol tokens
+            let header_protocols: Vec<&str> = req
                 .headers()
                 .get(http::header::SEC_WEBSOCKET_PROTOCOL)
                 .and_then(|h| h.to_str().ok())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .split(',')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .collect();
 
-            if !protocols.split(',').any(|p| p.trim() == ALPN) {
+            if !header_protocols.iter().any(|p| *p == ALPN) {
                 return Err(http::Response::builder()
                     .status(http::StatusCode::BAD_REQUEST)
-                    .body(Some("'web-transport' protocol required".to_string()))
+                    .body(Some("'webtransport' protocol required".to_string()))
                     .unwrap());
             }
 
-            // Add the selected protocol to the response
+            // Find the first client-requested protocol that we support.
+            let selected = header_protocols
+                .iter()
+                .filter(|p| **p != ALPN)
+                .find(|p| supported.iter().any(|s| s == **p))
+                .map(|p| p.to_string());
+
+            // Build the response Sec-WebSocket-Protocol value.
+            let response_value = match &selected {
+                Some(proto) => format!("{}, {}", ALPN, proto),
+                None => ALPN.to_string(),
+            };
+
             response.headers_mut().insert(
                 http::header::SEC_WEBSOCKET_PROTOCOL,
-                http::HeaderValue::from_str(ALPN).unwrap(),
+                http::HeaderValue::from_str(&response_value).unwrap(),
             );
+
+            *negotiated_clone.lock().unwrap() = selected;
 
             Ok(response)
         };
 
         let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
-        Ok(Session::new(ws, true))
+        let protocol = negotiated.lock().unwrap().take();
+        Ok(Session::with_protocol(ws, true, protocol))
     }
 
     pub async fn connect(url: &str) -> Result<Session, Error> {
+        Self::connect_with_protocols(url, &[]).await
+    }
+
+    /// Connect to a WebSocket server, optionally requesting application subprotocols.
+    ///
+    /// The `protocols` list specifies which application-level subprotocols the client
+    /// wishes to use (e.g., MoQ version strings). The server will select one (if any)
+    /// and include it in the response.
+    pub async fn connect_with_protocols(
+        url: &str,
+        protocols: &[&str],
+    ) -> Result<Session, Error> {
         let mut request = url.into_client_request()?;
+
+        // Build the Sec-WebSocket-Protocol header with ALPN and any requested protocols.
+        let protocol_value = if protocols.is_empty() {
+            ALPN.to_string()
+        } else {
+            format!("{}, {}", ALPN, protocols.join(", "))
+        };
+
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_str(ALPN).unwrap(),
+            http::HeaderValue::from_str(&protocol_value).unwrap(),
         );
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
-        Ok(Session::new(ws_stream, false))
+        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+
+        // Extract the negotiated application protocol from the response.
+        let negotiated = response
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|h| h.to_str().ok())
+            .map(|h| {
+                h.split(',')
+                    .map(|p| p.trim())
+                    .find(|p| *p != ALPN)
+                    .map(|p| p.to_string())
+            })
+            .flatten();
+
+        Ok(Session::with_protocol(ws_stream, false, negotiated))
     }
 }
 
@@ -485,7 +571,7 @@ impl generic::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        None
+        self.protocol.as_deref()
     }
 }
 
