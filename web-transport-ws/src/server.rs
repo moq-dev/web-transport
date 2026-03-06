@@ -6,12 +6,15 @@ use tungstenite::{handshake::server, http};
 
 use crate::Error;
 
+/// The prefix required for all application subprotocols over this WebSocket compatibility layer.
+const PREFIX: &str = "webtransport:";
+
 /// A WebTransport server that accepts WebSocket connections.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let server = Server::new()
+/// let server = Server::default()
 ///     .with_protocol("moq-03")
 ///     .with_protocol("moq-04");
 ///
@@ -23,17 +26,17 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Add a supported application-level subprotocol for negotiation.
+    ///
+    /// The protocol will be prefixed with `webtransport:` on the wire.
     pub fn with_protocol(mut self, protocol: &str) -> Self {
         self.protocols.push(protocol.to_string());
         self
     }
 
     /// Add multiple supported application-level subprotocols for negotiation.
+    ///
+    /// Each protocol will be prefixed with `webtransport:` on the wire.
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
@@ -74,14 +77,15 @@ impl Server {
                     .unwrap());
             }
 
+            // Match client-requested prefixed protocols against our supported list.
             let selected = header_protocols
                 .iter()
-                .filter(|p| **p != ALPN)
-                .find(|p| supported.iter().any(|s| s == **p))
+                .filter_map(|p| p.strip_prefix(PREFIX))
+                .find(|p| supported.iter().any(|s| s == p))
                 .map(|p| p.to_string());
 
             let response_value = match &selected {
-                Some(proto) => format!("{}, {}", ALPN, proto),
+                Some(proto) => format!("{}, {PREFIX}{proto}", ALPN),
                 None => ALPN.to_string(),
             };
 
@@ -97,6 +101,6 @@ impl Server {
 
         let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
         let protocol = negotiated.lock().unwrap().take();
-        Ok(Session::with_protocol(ws, true, protocol))
+        Ok(Session::new(ws, true, protocol))
     }
 }

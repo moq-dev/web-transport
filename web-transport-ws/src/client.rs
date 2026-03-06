@@ -3,12 +3,15 @@ use tungstenite::{client::IntoClientRequest, http};
 
 use crate::Error;
 
+/// The prefix required for all application subprotocols over this WebSocket compatibility layer.
+const PREFIX: &str = "webtransport:";
+
 /// A WebTransport client that connects over WebSocket.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let session = Client::new()
+/// let session = Client::default()
 ///     .with_protocol("moq-03")
 ///     .with_protocol("moq-04")
 ///     .connect("ws://localhost:4443")
@@ -20,17 +23,17 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Add a supported application-level subprotocol for negotiation.
+    ///
+    /// The protocol will be prefixed with `webtransport:` on the wire.
     pub fn with_protocol(mut self, protocol: &str) -> Self {
         self.protocols.push(protocol.to_string());
         self
     }
 
     /// Add multiple supported application-level subprotocols for negotiation.
+    ///
+    /// Each protocol will be prefixed with `webtransport:` on the wire.
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
@@ -44,7 +47,12 @@ impl Client {
         let protocol_value = if self.protocols.is_empty() {
             ALPN.to_string()
         } else {
-            format!("{}, {}", ALPN, self.protocols.join(", "))
+            let prefixed: Vec<String> = self
+                .protocols
+                .iter()
+                .map(|p| format!("{PREFIX}{p}"))
+                .collect();
+            format!("{}, {}", ALPN, prefixed.join(", "))
         };
 
         request.headers_mut().insert(
@@ -61,10 +69,10 @@ impl Client {
             .and_then(|h| {
                 h.split(',')
                     .map(|p| p.trim())
-                    .find(|p| *p != ALPN)
+                    .find_map(|p| p.strip_prefix(PREFIX))
                     .map(|p| p.to_string())
             });
 
-        Ok(Session::with_protocol(ws_stream, false, negotiated))
+        Ok(Session::new(ws_stream, false, negotiated))
     }
 }

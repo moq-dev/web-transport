@@ -23,10 +23,16 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 }
 
+/** Options for the WebTransport-over-WebSocket polyfill. */
 export interface WebTransportWsOptions extends WebTransportOptions {
-	/** Application-level subprotocols to request during the WebSocket handshake. */
+	/** Application-level subprotocols to request during the WebSocket handshake.
+	 *
+	 * Each protocol is prefixed with `webtransport:` on the wire.
+	 */
 	protocols?: string[];
 }
+
+const PREFIX = "webtransport:";
 
 export default class WebTransportWs implements WebTransport {
 	#ws: WebSocket;
@@ -40,7 +46,10 @@ export default class WebTransportWs implements WebTransport {
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
 
-	/** The negotiated application-level subprotocol, or empty string if none. */
+	/** The negotiated application-level subprotocol, or empty string if none.
+	 *
+	 * The `webtransport:` prefix is stripped; this returns only the application protocol name.
+	 */
 	readonly protocol: string;
 
 	readonly ready: Promise<void>;
@@ -67,7 +76,9 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		const wsProtocols = ["webtransport", ...(options?.protocols ?? [])];
+		// Prefix each application protocol with `webtransport:` on the wire.
+		const prefixed = (options?.protocols ?? []).map((p) => `${PREFIX}${p}`);
+		const wsProtocols = ["webtransport", ...prefixed];
 		this.#ws = new WebSocket(url, wsProtocols);
 
 		this.ready = new Promise((resolve) => {
@@ -78,17 +89,15 @@ export default class WebTransportWs implements WebTransport {
 			this.#closedResolve = resolve;
 		});
 
-		// Extract the negotiated application subprotocol (everything other than "webtransport").
-		// The ws.protocol string may contain comma-separated values or a single value.
 		this.protocol = "";
 
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
-			const selected = this.#ws.protocol
-				.split(",")
-				.map((p) => p.trim())
-				.find((p) => p !== "" && p !== "webtransport");
-			(this as { protocol: string }).protocol = selected ?? "";
+			// The browser returns the single selected subprotocol (no commas).
+			// Strip the `webtransport:` prefix to get the application protocol.
+			const raw = this.#ws.protocol;
+			const selected = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
+			(this as { protocol: string }).protocol = selected;
 			this.#readyResolve();
 		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);

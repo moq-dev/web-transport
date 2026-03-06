@@ -6,9 +6,12 @@ async fn main() -> anyhow::Result<()> {
     let url = "ws://127.0.0.1:3000";
     println!("Connecting to {url}");
 
-    let client = Client::new();
-    let session = client.connect(url).await?;
+    let session = Client::default()
+        .with_protocol("echo")
+        .connect(url)
+        .await?;
     println!("WebSocket connection established");
+    println!("Negotiated protocol: {:?}", session.protocol());
 
     println!("\n=== Testing unidirectional stream ===");
     let mut uni_stream = session.open_uni().await?;

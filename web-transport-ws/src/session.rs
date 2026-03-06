@@ -258,19 +258,7 @@ where
 }
 
 impl Session {
-    /// Wrap an already-established WebSocket as a WebTransport session.
-    pub fn new<T>(ws: T, is_server: bool) -> Self
-    where
-        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
-            + futures::Sink<Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        Self::with_protocol(ws, is_server, None)
-    }
-
-    pub(crate) fn with_protocol<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
+    pub(crate) fn new<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
     where
         T: futures::Stream<Item = Result<Message, tungstenite::Error>>
             + futures::Sink<Message, Error = tungstenite::Error>

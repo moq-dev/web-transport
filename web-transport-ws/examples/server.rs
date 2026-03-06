@@ -8,7 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     println!("WebSocket server listening on ws://{addr}");
 
-    let server = Server::new();
+    let server = Server::default().with_protocol("echo");
 
     while let Ok((stream, addr)) = listener.accept().await {
         let server = server.clone();
@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(server: &Server, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
     let session = server.accept(stream).await?;
     println!("WebSocket connection established");
+    println!("Negotiated protocol: {:?}", session.protocol());
 
     loop {
         tokio::select! {
