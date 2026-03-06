@@ -27,12 +27,12 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 export interface WebTransportWsOptions extends WebTransportOptions {
 	/** Application-level subprotocols to request during the WebSocket handshake.
 	 *
-	 * Each protocol is prefixed with `webtransport:` on the wire.
+	 * Each protocol is prefixed with `webtransport.` on the wire.
 	 */
 	protocols?: string[];
 }
 
-const PREFIX = "webtransport:";
+const PREFIX = "webtransport.";
 
 export default class WebTransportWs implements WebTransport {
 	#ws: WebSocket;
@@ -48,7 +48,7 @@ export default class WebTransportWs implements WebTransport {
 
 	/** The negotiated application-level subprotocol, or empty string if none.
 	 *
-	 * The `webtransport:` prefix is stripped; this returns only the application protocol name.
+	 * The `webtransport.` prefix is stripped; this returns only the application protocol name.
 	 */
 	readonly protocol: string;
 
@@ -76,9 +76,9 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		// Prefix each application protocol with `webtransport:` on the wire.
+		// Prefix each application protocol with `webtransport.` on the wire.
 		const prefixed = (options?.protocols ?? []).map((p) => `${PREFIX}${p}`);
-		const wsProtocols = ["webtransport", ...prefixed];
+		const wsProtocols = [...new Set(["webtransport", ...prefixed])];
 		this.#ws = new WebSocket(url, wsProtocols);
 
 		this.ready = new Promise((resolve) => {

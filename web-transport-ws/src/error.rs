@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("connection closed")]
     Closed,
+
+    #[error("invalid protocol token: {0:?}")]
+    InvalidProtocol(String),
 }
 
 impl From<VarIntUnexpectedEnd> for Error {

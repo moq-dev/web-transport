@@ -7,7 +7,7 @@ use tungstenite::{handshake::server, http};
 use crate::Error;
 
 /// The prefix required for all application subprotocols over this WebSocket compatibility layer.
-const PREFIX: &str = "webtransport:";
+const PREFIX: &str = "webtransport.";
 
 /// A WebTransport server that accepts WebSocket connections.
 ///
@@ -32,7 +32,7 @@ impl Server {
 
     /// Add a supported application-level subprotocol for negotiation.
     ///
-    /// The protocol will be prefixed with `webtransport:` on the wire.
+    /// The protocol will be prefixed with `webtransport.` on the wire.
     pub fn with_protocol(mut self, protocol: &str) -> Self {
         self.protocols.push(protocol.to_string());
         self
@@ -40,7 +40,7 @@ impl Server {
 
     /// Add multiple supported application-level subprotocols for negotiation.
     ///
-    /// Each protocol will be prefixed with `webtransport:` on the wire.
+    /// Each protocol will be prefixed with `webtransport.` on the wire.
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
@@ -64,17 +64,18 @@ impl Server {
         let callback = move |req: &server::Request,
                              mut response: server::Response|
               -> Result<server::Response, server::ErrorResponse> {
+            // Collect all Sec-WebSocket-Protocol values, handling multiple headers per RFC 6455.
             let header_protocols: Vec<&str> = req
                 .headers()
-                .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or_default()
-                .split(',')
+                .get_all(http::header::SEC_WEBSOCKET_PROTOCOL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|h| h.split(','))
                 .map(|p| p.trim())
                 .filter(|p| !p.is_empty())
                 .collect();
 
-            if !header_protocols.iter().any(|p| *p == ALPN) {
+            if !header_protocols.contains(&ALPN) {
                 return Err(http::Response::builder()
                     .status(http::StatusCode::BAD_REQUEST)
                     .body(Some("'webtransport' protocol required".to_string()))
@@ -88,8 +89,9 @@ impl Server {
                 .find(|p| supported.iter().any(|s| s == p))
                 .map(|p| p.to_string());
 
+            // Respond with exactly one subprotocol token per RFC 6455.
             let response_value = match &selected {
-                Some(proto) => format!("{}, {PREFIX}{proto}", ALPN),
+                Some(proto) => format!("{PREFIX}{proto}"),
                 None => ALPN.to_string(),
             };
 

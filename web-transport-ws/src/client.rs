@@ -4,7 +4,7 @@ use tungstenite::{client::IntoClientRequest, http};
 use crate::Error;
 
 /// The prefix required for all application subprotocols over this WebSocket compatibility layer.
-const PREFIX: &str = "webtransport:";
+const PREFIX: &str = "webtransport.";
 
 /// A WebTransport client that connects over WebSocket.
 ///
@@ -29,7 +29,7 @@ impl Client {
 
     /// Add a supported application-level subprotocol for negotiation.
     ///
-    /// The protocol will be prefixed with `webtransport:` on the wire.
+    /// The protocol will be prefixed with `webtransport.` on the wire.
     pub fn with_protocol(mut self, protocol: &str) -> Self {
         self.protocols.push(protocol.to_string());
         self
@@ -37,7 +37,7 @@ impl Client {
 
     /// Add multiple supported application-level subprotocols for negotiation.
     ///
-    /// Each protocol will be prefixed with `webtransport:` on the wire.
+    /// Each protocol will be prefixed with `webtransport.` on the wire.
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
@@ -46,6 +46,10 @@ impl Client {
 
     /// Connect to a WebSocket server, negotiating the configured subprotocols.
     pub async fn connect(&self, url: &str) -> Result<Session, Error> {
+        for p in &self.protocols {
+            validate_protocol(p)?;
+        }
+
         let mut request = url.into_client_request()?;
 
         let protocol_value = if self.protocols.is_empty() {
@@ -61,7 +65,9 @@ impl Client {
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_str(&protocol_value).unwrap(),
+            http::HeaderValue::from_str(&protocol_value).map_err(|_| {
+                Error::InvalidProtocol(protocol_value)
+            })?,
         );
 
         let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
@@ -79,4 +85,27 @@ impl Client {
 
         Ok(Session::new(ws_stream, false, negotiated))
     }
+}
+
+/// Validate that a protocol name contains only valid HTTP token characters (tchar).
+fn validate_protocol(protocol: &str) -> Result<(), Error> {
+    if protocol.is_empty() {
+        return Err(Error::InvalidProtocol(protocol.to_string()));
+    }
+
+    for c in protocol.chars() {
+        if !is_tchar(c) {
+            return Err(Error::InvalidProtocol(protocol.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a character is a valid HTTP token character per RFC 7230.
+fn is_tchar(c: char) -> bool {
+    matches!(c,
+        'a'..='z' | 'A'..='Z' | '0'..='9'
+        | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+    )
 }
