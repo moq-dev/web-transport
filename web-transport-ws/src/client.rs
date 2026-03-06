@@ -11,7 +11,7 @@ const PREFIX: &str = "webtransport:";
 /// # Example
 ///
 /// ```ignore
-/// let session = Client::default()
+/// let session = Client::new()
 ///     .with_protocol("moq-03")
 ///     .with_protocol("moq-04")
 ///     .connect("ws://localhost:4443")
@@ -23,6 +23,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Add a supported application-level subprotocol for negotiation.
     ///
     /// The protocol will be prefixed with `webtransport:` on the wire.
