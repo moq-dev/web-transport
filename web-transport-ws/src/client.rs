@@ -1,4 +1,4 @@
-use crate::{tungstenite, Session, ALPN};
+use crate::{tungstenite, validate_protocol, Session, ALPN};
 use tungstenite::{client::IntoClientRequest, http};
 
 use crate::Error;
@@ -65,9 +65,8 @@ impl Client {
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
-            http::HeaderValue::from_str(&protocol_value).map_err(|_| {
-                Error::InvalidProtocol(protocol_value)
-            })?,
+            http::HeaderValue::from_str(&protocol_value)
+                .map_err(|_| Error::InvalidProtocol(protocol_value))?,
         );
 
         let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
@@ -85,27 +84,4 @@ impl Client {
 
         Ok(Session::new(ws_stream, false, negotiated))
     }
-}
-
-/// Validate that a protocol name contains only valid HTTP token characters (tchar).
-fn validate_protocol(protocol: &str) -> Result<(), Error> {
-    if protocol.is_empty() {
-        return Err(Error::InvalidProtocol(protocol.to_string()));
-    }
-
-    for c in protocol.chars() {
-        if !is_tchar(c) {
-            return Err(Error::InvalidProtocol(protocol.to_string()));
-        }
-    }
-
-    Ok(())
-}
-
-/// Check if a character is a valid HTTP token character per RFC 7230.
-fn is_tchar(c: char) -> bool {
-    matches!(c,
-        'a'..='z' | 'A'..='Z' | '0'..='9'
-        | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
-    )
 }

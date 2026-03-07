@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{tungstenite, Session, ALPN};
+use crate::{tungstenite, validate_protocol, Session, ALPN};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tungstenite::{handshake::server, http};
 
@@ -55,6 +55,10 @@ impl Server {
         &self,
         socket: T,
     ) -> Result<Session, Error> {
+        for p in &self.protocols {
+            validate_protocol(p)?;
+        }
+
         use std::sync::Mutex;
 
         let negotiated = Arc::new(Mutex::new(None::<String>));

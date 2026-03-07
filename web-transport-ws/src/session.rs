@@ -309,7 +309,6 @@ impl Session {
             protocol,
         }
     }
-
 }
 
 impl generic::Session for Session {

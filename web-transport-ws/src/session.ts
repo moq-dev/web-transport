@@ -76,8 +76,11 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		// Prefix each application protocol with `webtransport.` on the wire.
-		const prefixed = (options?.protocols ?? []).map((p) => `${PREFIX}${p}`);
+		// Normalize and prefix each application protocol with `webtransport.` on the wire.
+		const prefixed = (options?.protocols ?? []).map((p) => {
+			const stripped = p.startsWith(PREFIX) ? p.slice(PREFIX.length) : p;
+			return `${PREFIX}${stripped}`;
+		});
 		const wsProtocols = [...new Set(["webtransport", ...prefixed])];
 		this.#ws = new WebSocket(url, wsProtocols);
 
@@ -94,7 +97,7 @@ export default class WebTransportWs implements WebTransport {
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
 			// The browser returns the single selected subprotocol (no commas).
-			// Strip the `webtransport:` prefix to get the application protocol.
+			// Strip the `webtransport.` prefix to get the application protocol.
 			const raw = this.#ws.protocol;
 			const selected = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
 			(this as { protocol: string }).protocol = selected;
