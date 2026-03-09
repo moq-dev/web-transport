@@ -58,6 +58,12 @@ pub enum ConnectError {
 
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
+
+    #[error("invalid http header value")]
+    InvalidHttpHeaderValue,
+
+    #[error("invalid http header name")]
+    InvalidHttpHeaderName,
 }
 
 impl From<std::io::Error> for ConnectError {
@@ -102,6 +108,20 @@ impl ConnectRequest {
 
     pub fn with_protocols(mut self, protocols: impl IntoIterator<Item = String>) -> Self {
         self.protocols.extend(protocols);
+        self
+    }
+
+    pub fn with_header<K: Into<http::HeaderName>, V: Into<http::HeaderValue>>(
+        mut self,
+        name: K,
+        value: V,
+    ) -> Self {
+        self.headers.append(name.into(), value.into());
+        self
+    }
+
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.headers.extend(headers);
         self
     }
 
@@ -154,15 +174,22 @@ impl ConnectRequest {
 
         // Save all headers
         let mut raw_headers = http::HeaderMap::new();
-        for (name, value) in headers.fields.iter() {
-            if let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) {
-                if let Ok(header_value) = http::HeaderValue::from_str(value) {
-                    raw_headers.append(header_name, header_value);
-                }
+        for (item_header_name, item_header_value) in headers.fields.iter() {
+            if item_header_name.starts_with(':') {
+                continue;
             }
+            let header_name = http::HeaderName::from_bytes(item_header_name.as_bytes())
+                .map_err(|_| ConnectError::InvalidHttpHeaderName)?;
+            let header_value = http::HeaderValue::from_str(item_header_value)
+                .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
+            raw_headers.append(header_name, header_value);
         }
 
-        Ok(Self { url, protocols, headers: raw_headers })
+        Ok(Self {
+            url,
+            protocols,
+            headers: raw_headers,
+        })
     }
 
     /// Read a CONNECT request from a stream, consuming only the exact bytes of the frame.
@@ -173,11 +200,13 @@ impl ConnectRequest {
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
-        // Add all saved headers first
-        for (name, value) in self.headers.iter() {
-            if let Ok(value_str) = value.to_str() {
-                headers.set(name.as_str(), value_str);
-            }
+        for (item_header_name, item_header_value) in self.headers.iter() {
+            // http::HeaderValue can contain arbitrary bytes (not just UTF-8).
+            // The to_str() method fails when the header value contains invalid UTF-8 bytes
+            let item_header_value_str = item_header_value
+                .to_str()
+                .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
+            headers.set(item_header_name.as_str(), item_header_value_str);
         }
         headers.set(":method", "CONNECT");
         headers.set(":scheme", self.url.scheme());
