@@ -1,7 +1,7 @@
 {
 	"name": "@moq/web-transport-ws",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.1.2",
+	"version": "0.3.0",
 	"description": "WebTransport polyfill using WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
