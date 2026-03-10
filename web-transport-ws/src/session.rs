@@ -258,7 +258,39 @@ where
 }
 
 impl Session {
-    pub(crate) fn new<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
+    /// Wrap a pre-upgraded WebSocket connection as a client-side WebTransport session.
+    ///
+    /// Use this when the WebSocket handshake was already performed by an
+    /// external framework. The `protocol` should be the negotiated
+    /// application-level subprotocol, if any.
+    pub fn connect<T>(ws: T, protocol: Option<String>) -> Self
+    where
+        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
+            + futures::Sink<Message, Error = tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        Self::new(ws, false, protocol)
+    }
+
+    /// Wrap a pre-upgraded WebSocket connection as a server-side WebTransport session.
+    ///
+    /// Use this when the WebSocket handshake was already performed by an
+    /// external framework (e.g. axum). The `protocol` should be the negotiated
+    /// application-level subprotocol, if any.
+    pub fn accept<T>(ws: T, protocol: Option<String>) -> Self
+    where
+        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
+            + futures::Sink<Message, Error = tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        Self::new(ws, true, protocol)
+    }
+
+    fn new<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
     where
         T: futures::Stream<Item = Result<Message, tungstenite::Error>>
             + futures::Sink<Message, Error = tungstenite::Error>

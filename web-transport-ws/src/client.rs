@@ -121,6 +121,6 @@ impl Client {
                     .map(|p| p.to_string())
             });
 
-        Ok(Session::new(ws_stream, false, negotiated))
+        Ok(Session::connect(ws_stream, negotiated))
     }
 }
