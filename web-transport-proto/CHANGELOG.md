@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.4...web-transport-proto-v0.5.5) - 2026-03-10
+
+### Other
+
+- Restore CapsuleError::UnknownType for semver compatibility
+- Fix close capsules ([#179](https://github.com/moq-dev/web-transport/pull/179))
+
 ## [0.5.4](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.3...web-transport-proto-v0.5.4) - 2026-02-20
 
 ### Other

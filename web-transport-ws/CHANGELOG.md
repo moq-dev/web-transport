@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.2.5...web-transport-ws-v0.3.0) - 2026-03-10
+
+### Other
+
+- Add application-level subprotocol negotiation support ([#184](https://github.com/moq-dev/web-transport/pull/184))
+
 ## [0.2.5](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.2.4...web-transport-ws-v0.2.5) - 2026-02-10
 
 ### Other
