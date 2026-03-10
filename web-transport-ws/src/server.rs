@@ -113,5 +113,4 @@ impl Server {
         let protocol = negotiated.lock().unwrap().take();
         Ok(Session::accept(ws, protocol))
     }
-
 }
