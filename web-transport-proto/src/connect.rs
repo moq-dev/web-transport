@@ -172,10 +172,14 @@ impl ConnectRequest {
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
-        // Save all headers
+        // Save all headers, excluding pseudo-headers and protocol negotiation headers
+        // (protocol negotiation is handled via the `protocols` field).
         let mut raw_headers = http::HeaderMap::new();
         for (item_header_name, item_header_value) in headers.fields.iter() {
             if item_header_name.starts_with(':') {
+                continue;
+            }
+            if item_header_name == protocol_negotiation::AVAILABLE_NAME {
                 continue;
             }
             let header_name = http::HeaderName::from_bytes(item_header_name.as_bytes())
@@ -201,6 +205,10 @@ impl ConnectRequest {
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
         for (item_header_name, item_header_value) in self.headers.iter() {
+            // Skip protocol negotiation headers; they are derived from `self.protocols`.
+            if item_header_name == protocol_negotiation::AVAILABLE_NAME {
+                continue;
+            }
             // http::HeaderValue can contain arbitrary bytes (not just UTF-8).
             // The to_str() method fails when the header value contains invalid UTF-8 bytes
             let item_header_value_str = item_header_value
