@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "web-transport",
+    "web-transport-browser-tests",
     "web-transport-proto",
     "web-transport-quiche",
     "web-transport-quinn",
