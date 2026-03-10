@@ -50,7 +50,10 @@ export default class WebTransportWs implements WebTransport {
 	 *
 	 * The `webtransport.` prefix is stripped; this returns only the application protocol name.
 	 */
-	readonly protocol: string;
+	#protocol = "";
+	get protocol(): string {
+		return this.#protocol;
+	}
 
 	readonly ready: Promise<void>;
 	#readyResolve!: () => void;
@@ -92,15 +95,12 @@ export default class WebTransportWs implements WebTransport {
 			this.#closedResolve = resolve;
 		});
 
-		this.protocol = "";
-
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
 			// The browser returns the single selected subprotocol (no commas).
 			// Strip the `webtransport.` prefix to get the application protocol.
 			const raw = this.#ws.protocol;
-			const selected = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
-			(this as { protocol: string }).protocol = selected;
+			this.#protocol = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
 			this.#readyResolve();
 		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);

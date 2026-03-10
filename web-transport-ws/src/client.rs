@@ -1,5 +1,4 @@
 use crate::{tungstenite, validate_protocol, Session, ALPN};
-use tokio_tungstenite::Connector;
 use tungstenite::{client::IntoClientRequest, http};
 
 use crate::Error;
@@ -22,7 +21,11 @@ const PREFIX: &str = "webtransport.";
 pub struct Client {
     protocols: Vec<String>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
-    connector: Option<Connector>,
+    #[cfg(any(
+        feature = "rustls-tls-native-roots",
+        feature = "rustls-tls-webpki-roots"
+    ))]
+    connector: Option<tokio_tungstenite::Connector>,
 }
 
 impl Client {
@@ -54,7 +57,11 @@ impl Client {
     }
 
     /// Set a custom TLS connector for secure connections.
-    pub fn with_connector(mut self, connector: Connector) -> Self {
+    #[cfg(any(
+        feature = "rustls-tls-native-roots",
+        feature = "rustls-tls-webpki-roots"
+    ))]
+    pub fn with_connector(mut self, connector: tokio_tungstenite::Connector) -> Self {
         self.connector = Some(connector);
         self
     }
@@ -84,6 +91,10 @@ impl Client {
                 .map_err(|_| Error::InvalidProtocol(protocol_value))?,
         );
 
+        #[cfg(any(
+            feature = "rustls-tls-native-roots",
+            feature = "rustls-tls-webpki-roots"
+        ))]
         let (ws_stream, response) = tokio_tungstenite::connect_async_tls_with_config(
             request,
             self.config,
@@ -91,6 +102,13 @@ impl Client {
             self.connector.clone(),
         )
         .await?;
+
+        #[cfg(not(any(
+            feature = "rustls-tls-native-roots",
+            feature = "rustls-tls-webpki-roots"
+        )))]
+        let (ws_stream, response) =
+            tokio_tungstenite::connect_async_with_config(request, self.config, false).await?;
 
         let negotiated = response
             .headers()
