@@ -14,5 +14,7 @@ pub use settings::*;
 pub use stream::*;
 pub use varint::*;
 
+pub use http;
+
 mod huffman;
 mod qpack;

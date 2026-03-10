@@ -111,12 +111,8 @@ impl ConnectRequest {
         self
     }
 
-    pub fn with_header<K: Into<http::HeaderName>, V: Into<http::HeaderValue>>(
-        mut self,
-        name: K,
-        value: V,
-    ) -> Self {
-        self.headers.append(name.into(), value.into());
+    pub fn with_header(mut self, name: http::HeaderName, value: http::HeaderValue) -> Self {
+        self.headers.append(name, value);
         self
     }
 
