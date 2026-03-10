@@ -1,4 +1,5 @@
 use crate::{tungstenite, validate_protocol, Session, ALPN};
+use tokio_tungstenite::Connector;
 use tungstenite::{client::IntoClientRequest, http};
 
 use crate::Error;
@@ -20,6 +21,8 @@ const PREFIX: &str = "webtransport.";
 #[derive(Default, Clone)]
 pub struct Client {
     protocols: Vec<String>,
+    config: Option<tungstenite::protocol::WebSocketConfig>,
+    connector: Option<Connector>,
 }
 
 impl Client {
@@ -41,6 +44,18 @@ impl Client {
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Set custom WebSocket configuration (max message size, frame size, etc).
+    pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Set a custom TLS connector for secure connections.
+    pub fn with_connector(mut self, connector: Connector) -> Self {
+        self.connector = Some(connector);
         self
     }
 
@@ -69,7 +84,13 @@ impl Client {
                 .map_err(|_| Error::InvalidProtocol(protocol_value))?,
         );
 
-        let (ws_stream, response) = tokio_tungstenite::connect_async(request).await?;
+        let (ws_stream, response) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            self.config,
+            false,
+            self.connector.clone(),
+        )
+        .await?;
 
         let negotiated = response
             .headers()

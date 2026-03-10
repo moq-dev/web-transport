@@ -113,4 +113,20 @@ impl Server {
         let protocol = negotiated.lock().unwrap().take();
         Ok(Session::new(ws, true, protocol))
     }
+
+    /// Wrap a pre-upgraded WebSocket connection as a WebTransport session.
+    ///
+    /// Use this when the WebSocket handshake was already performed by an
+    /// external framework (e.g. axum). The `protocol` should be the negotiated
+    /// application-level subprotocol, if any.
+    pub fn accept_ws<T>(&self, ws: T, protocol: Option<String>) -> Session
+    where
+        T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+            + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        Session::new(ws, true, protocol)
+    }
 }
