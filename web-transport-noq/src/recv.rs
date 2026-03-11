@@ -9,7 +9,7 @@ use bytes::Bytes;
 
 use crate::{ReadError, ReadExactError, ReadToEndError, SessionError};
 
-/// A stream that can be used to recieve bytes. See [`noq::RecvStream`].
+/// A stream that can be used to receive bytes. See [`noq::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: noq::RecvStream,

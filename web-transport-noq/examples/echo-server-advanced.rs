@@ -88,8 +88,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // TODO simple echo server
-
     Ok(())
 }
 

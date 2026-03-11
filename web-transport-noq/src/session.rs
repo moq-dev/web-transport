@@ -22,7 +22,7 @@ use crate::{
 /// It is important to remember that WebTransport is layered on top of QUIC:
 ///   1. Each stream starts with a few bytes identifying the stream type and session ID.
 ///   2. Errors codes are encoded with the session ID, so they aren't full QUIC error codes.
-///   3. Stream IDs may have gaps in them, used by HTTP/3 transparant to the application.
+///   3. Stream IDs may have gaps in them, used by HTTP/3 transparent to the application.
 ///
 /// Deref is used to expose non-overloaded methods on [`noq::Connection`].
 /// These should be safe to use with WebTransport, but file a PR if you find one that isn't.
@@ -170,7 +170,7 @@ impl Session {
     ) -> Result<Session, ClientError> {
         let request = request.into();
 
-        // Perform the H3 handshake by sending/reciving SETTINGS frames.
+        // Perform the H3 handshake by sending/receiving SETTINGS frames.
         let settings = Settings::connect(&conn).await?;
 
         // Send the HTTP/3 CONNECT request.
