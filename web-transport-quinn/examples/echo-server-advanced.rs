@@ -105,6 +105,16 @@ async fn run_conn(conn: quinn::Incoming) -> anyhow::Result<()> {
     let request = web_transport_quinn::Request::accept(conn).await?;
     tracing::info!(url = %request.url, "received WebTransport request");
 
+    // Log all HTTP3 headers
+    tracing::info!("HTTP3 headers:");
+    for (name, value) in request.headers.iter() {
+        let value = value.to_str().context("invalid header value")?;
+        tracing::info!("  {}: {}", name, value);
+    }
+    if request.headers.is_empty() {
+        tracing::info!("  (empty)");
+    }
+
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
 

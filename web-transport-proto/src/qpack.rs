@@ -39,7 +39,7 @@ const MAX_POWER: usize = 5 * 7;
 // Simple QPACK implementation that ONLY supports the static table and literals.
 #[derive(Debug, Default)]
 pub struct Headers {
-    fields: HashMap<String, String>,
+    pub fields: HashMap<String, String>,
 }
 
 impl Headers {
