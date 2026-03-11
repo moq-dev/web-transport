@@ -514,7 +514,10 @@ impl Session {
     /// Return connection-level statistics.
     pub fn stats(&self) -> SessionStats {
         let path = self.conn.path_stats(noq::PathId::ZERO);
-        let rtt = self.conn.rtt(noq::PathId::ZERO).or_else(|| path.map(|p| p.rtt));
+        let rtt = self
+            .conn
+            .rtt(noq::PathId::ZERO)
+            .or_else(|| path.map(|p| p.rtt));
         SessionStats {
             stats: self.conn.stats(),
             path,
@@ -547,11 +550,11 @@ impl Eq for Session {}
 
 // Type aliases just so clippy doesn't complain about the complexity.
 type AcceptUni = dyn Stream<Item = Result<noq::RecvStream, noq::ConnectionError>> + Send;
-type AcceptBi = dyn Stream<Item = Result<(noq::SendStream, noq::RecvStream), noq::ConnectionError>>
-    + Send;
+type AcceptBi =
+    dyn Stream<Item = Result<(noq::SendStream, noq::RecvStream), noq::ConnectionError>> + Send;
 type PendingUni = dyn Future<Output = Result<(StreamUni, noq::RecvStream), SessionError>> + Send;
-type PendingBi = dyn Future<Output = Result<Option<(noq::SendStream, noq::RecvStream)>, SessionError>>
-    + Send;
+type PendingBi =
+    dyn Future<Output = Result<Option<(noq::SendStream, noq::RecvStream)>, SessionError>> + Send;
 
 // Logic just for accepting streams, which is annoying because of the stream header.
 pub struct SessionAccept {

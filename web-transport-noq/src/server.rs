@@ -49,9 +49,7 @@ impl ServerBuilder {
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(noq::congestion::BbrConfig::default()))
-            }
+            CongestionControl::LowLatency => Some(Arc::new(noq::congestion::BbrConfig::default())),
             // TODO BBR is also higher throughput in theory.
             CongestionControl::Throughput => {
                 Some(Arc::new(noq::congestion::CubicConfig::default()))
@@ -80,8 +78,8 @@ impl ServerBuilder {
         let config: noq::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
         let config = noq::ServerConfig::with_crypto(Arc::new(config));
 
-        let server = noq::Endpoint::server(config, self.addr)
-            .map_err(|e| ServerError::IoError(e.into()))?;
+        let server =
+            noq::Endpoint::server(config, self.addr).map_err(|e| ServerError::IoError(e.into()))?;
 
         Ok(Server::new(server))
     }

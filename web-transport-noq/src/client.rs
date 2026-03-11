@@ -49,9 +49,7 @@ impl ClientBuilder {
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(noq::congestion::BbrConfig::default()))
-            }
+            CongestionControl::LowLatency => Some(Arc::new(noq::congestion::BbrConfig::default())),
             // TODO BBR is also higher throughput in theory.
             CongestionControl::Throughput => {
                 Some(Arc::new(noq::congestion::CubicConfig::default()))

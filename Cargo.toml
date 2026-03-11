@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "web-transport",
+    "web-transport-noq",
     "web-transport-proto",
     "web-transport-quiche",
-    "web-transport-noq",
     "web-transport-quinn",
     "web-transport-trait",
     "web-transport-wasm",

@@ -62,12 +62,11 @@ async fn main() -> anyhow::Result<()> {
         .context("missing private key")?;
 
     // Standard Noq setup
-    let mut config = rustls::ServerConfig::builder_with_provider(
-        web_transport_noq::crypto::default_provider(),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(chain, key)?;
+    let mut config =
+        rustls::ServerConfig::builder_with_provider(web_transport_noq::crypto::default_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?;
 
     config.max_early_data_size = u32::MAX;
     config.alpn_protocols = vec![web_transport_noq::ALPN.as_bytes().to_vec()]; // this one is important

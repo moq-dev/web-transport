@@ -129,7 +129,6 @@ pub enum ReadError {
 
     #[error("stream already closed")]
     ClosedStream,
-
 }
 
 impl From<noq::ReadError> for ReadError {

@@ -59,10 +59,7 @@ impl RecvStream {
     }
 
     /// Read a chunk of data from the stream. See [`noq::RecvStream::read_chunk`].
-    pub async fn read_chunk(
-        &mut self,
-        max_length: usize,
-    ) -> Result<Option<noq::Chunk>, ReadError> {
+    pub async fn read_chunk(&mut self, max_length: usize) -> Result<Option<noq::Chunk>, ReadError> {
         self.inner
             .read_chunk(max_length)
             .await
@@ -138,7 +135,9 @@ impl web_transport_trait::RecvStream for RecvStream {
     }
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        self.read_chunk(max).await.map(|r| r.map(|chunk| chunk.bytes))
+        self.read_chunk(max)
+            .await
+            .map(|r| r.map(|chunk| chunk.bytes))
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
