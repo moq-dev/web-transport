@@ -3,7 +3,7 @@
 [![discord](https://img.shields.io/discord/1124083992740761730)](https://discord.gg/FCYF3p99mr)
 
 # web-transport-noq
-A wrapper around the Noq API (a Noq fork), abstracting away the annoying HTTP/3 internals.
+A wrapper around the Noq API (a Quinn fork), abstracting away the annoying HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
 ## WebTransport
@@ -11,7 +11,7 @@ Provides a QUIC-like API but with web support!
 It's [available in the browser](https://caniuse.com/webtransport) as an alternative to HTTP and WebSockets.
 
 WebTransport is layered on top of HTTP/3 which itself is layered on top of QUIC.
-This library hides that detail and exposes only the QUIC API, delegating as much as possible to the underlying QUIC implementation (Noq, a Noq fork).
+This library hides that detail and exposes only the QUIC API, delegating as much as possible to the underlying QUIC implementation (Noq, a Quinn fork).
 
 QUIC provides two primary APIs:
 
@@ -56,5 +56,5 @@ The `web-transport-noq` API is almost identical to the Noq API, except that [Con
 
 When possible, `Deref` is used to expose the underlying Noq API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
-- Stream IDs are not avaialble.
+- Stream IDs are not available.
 - Error codes are not full VarInts (62-bits) and significantly smaller.

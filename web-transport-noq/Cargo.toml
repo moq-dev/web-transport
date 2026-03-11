@@ -1,6 +1,6 @@
 [package]
 name = "web-transport-noq"
-description = "WebTransport library for Noq (a Noq fork)"
+description = "WebTransport library for Noq (a Quinn fork)"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
