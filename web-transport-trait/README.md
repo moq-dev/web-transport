@@ -10,6 +10,7 @@ Most importantly, QUIC supports multiple independent data streams.
 This crate provides a WebTransport trait for Send runtimes.
 
 -   Quinn: [web-transport-quinn](../web-transport-quinn)
+-   Noq: [web-transport-noq](../web-transport-noq)
 -   WebSocket: [web-transport-ws](../web-transport-ws)
 - Quiche+Tokio: TODO
 
