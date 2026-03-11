@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.5...web-transport-proto-v0.6.0) - 2026-03-11
+
+### Added
+
+- *(web-transport-proto)* Add HTTP3 header to ConnectRequest ([#183](https://github.com/moq-dev/web-transport/pull/183))
+
+### Other
+
+- Add #[non_exhaustive] to error enums and restore FrameTooLarge ([#172](https://github.com/moq-dev/web-transport/pull/172))
+
 ## [0.5.5](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.4...web-transport-proto-v0.5.5) - 2026-03-10
 
 ### Other

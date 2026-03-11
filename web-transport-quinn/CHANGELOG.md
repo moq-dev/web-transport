@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.8](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.7...web-transport-quinn-v0.11.8) - 2026-03-11
+
+### Added
+
+- *(web-transport-proto)* Add HTTP3 header to ConnectRequest ([#183](https://github.com/moq-dev/web-transport/pull/183))
+
 ## [0.11.7](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.6...web-transport-quinn-v0.11.7) - 2026-03-10
 
 ### Other

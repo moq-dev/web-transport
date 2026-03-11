@@ -12,5 +12,5 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-web-transport-proto = { path = "web-transport-proto", version = "0.5" }
+web-transport-proto = { path = "web-transport-proto", version = "0.6" }
 web-transport-trait = { path = "web-transport-trait", version = "0.3" }
