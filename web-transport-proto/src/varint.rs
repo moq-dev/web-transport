@@ -163,16 +163,31 @@ impl VarInt {
         Ok(Self(x))
     }
 
-    // Read a varint from the stream.
+    /// Read a varint from the stream.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, VarIntUnexpectedEnd> {
+        Self::read_optional(stream)
+            .await?
+            .ok_or(VarIntUnexpectedEnd)
+    }
+
+    /// Read a varint from the stream, returning `Ok(None)` on clean EOF.
+    ///
+    /// Returns `Ok(None)` if EOF is encountered before any byte is read,
+    /// `Err(VarIntUnexpectedEnd)` if EOF occurs mid-varint, and
+    /// `Ok(Some(varint))` on success.
+    pub async fn read_optional<S: AsyncRead + Unpin>(
+        stream: &mut S,
+    ) -> Result<Option<Self>, VarIntUnexpectedEnd> {
         // 8 bytes is the max size of a varint
         let mut buf = [0; 8];
 
         // Read the first byte because it includes the length.
-        stream
-            .read_exact(&mut buf[0..1])
-            .await
-            .map_err(|_| VarIntUnexpectedEnd)?;
+        // EOF here means clean end-of-stream.
+        match stream.read_exact(&mut buf[0..1]).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(_) => return Err(VarIntUnexpectedEnd),
+        }
 
         // 0b00 = 1, 0b01 = 2, 0b10 = 4, 0b11 = 8
         let size = 1 << (buf[0] >> 6);
@@ -185,7 +200,7 @@ impl VarInt {
         let mut cursor = Cursor::new(&buf[..size]);
         let v = VarInt::decode(&mut cursor).unwrap();
 
-        Ok(v)
+        Ok(Some(v))
     }
 
     pub fn encode<B: BufMut>(&self, w: &mut B) {

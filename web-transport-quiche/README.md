@@ -8,7 +8,6 @@ Provides a QUIC-like API but with web support!
 
 ## Limitations
 This library builds on top of [tokio-quiche](https://docs.rs/tokio-quiche/latest/tokio_quiche/); the "official" Tokio runtime for [quiche](https://github.com/cloudflare/quiche).
-To be blunt, `tokio-quiche` is a mess.
 
 [quiche-ez](ez) is a wrapper around `tokio-quiche` that provides an async API.
 It tries to cover as many warts as possible but it's still limited by the poor `tokio_quiche` API.

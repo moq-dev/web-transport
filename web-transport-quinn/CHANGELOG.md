@@ -31,6 +31,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.7](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.6...web-transport-quinn-v0.11.7) - 2026-03-10
+
+### Other
+
+- Fix error propagation when connection is closed ([#181](https://github.com/moq-dev/web-transport/pull/181))
+- Expose connect::ConnectError (required to access http error for rejected session) ([#178](https://github.com/moq-dev/web-transport/pull/178))
+- Fix close capsules ([#179](https://github.com/moq-dev/web-transport/pull/179))
+
+## [0.11.6](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.5...web-transport-quinn-v0.11.6) - 2026-02-20
+
+### Other
+
+- release ([#171](https://github.com/moq-dev/web-transport/pull/171))
+
+## [0.11.5](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.4...web-transport-quinn-v0.11.5) - 2026-02-20
+
+### Other
+
+- release ([#167](https://github.com/moq-dev/web-transport/pull/167))
+- release ([#166](https://github.com/moq-dev/web-transport/pull/166))
+
 ## [0.11.5](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.4...web-transport-quinn-v0.11.5) - 2026-02-20
 
 ### Other

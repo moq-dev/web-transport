@@ -1,6 +1,6 @@
 use tokio::net::TcpListener;
 use web_transport_trait::{RecvStream, SendStream, Session as _};
-use web_transport_ws::Session;
+use web_transport_ws::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -8,10 +8,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     println!("WebSocket server listening on ws://{addr}");
 
+    let server = Server::default().with_protocol("echo");
+
     while let Ok((stream, addr)) = listener.accept().await {
+        let server = server.clone();
         tokio::spawn(async move {
             println!("New connection from: {addr}");
-            if let Err(e) = run(stream).await {
+            if let Err(e) = run(&server, stream).await {
                 println!("Connection error: {e}");
             } else {
                 println!("Connection ended");
@@ -22,9 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run(stream: tokio::net::TcpStream) -> anyhow::Result<()> {
-    let session = Session::accept(stream).await?;
+async fn run(server: &Server, stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+    let session = server.accept(stream).await?;
     println!("WebSocket connection established");
+    println!("Negotiated protocol: {:?}", session.protocol());
 
     loop {
         tokio::select! {

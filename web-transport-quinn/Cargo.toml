@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.11.5"
+version = "0.11.7"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -40,6 +40,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false, features = [
     "io-util",
     "macros",
+    "time",
 ] }
 tracing = "0.1"
 url = "2"

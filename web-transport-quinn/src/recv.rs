@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    sync::{Arc, OnceLock},
     task::{Context, Poll},
 };
 
@@ -12,11 +13,26 @@ use crate::{ReadError, ReadExactError, ReadToEndError, SessionError};
 #[derive(Debug)]
 pub struct RecvStream {
     inner: quinn::RecvStream,
+    error: Arc<OnceLock<SessionError>>,
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: quinn::RecvStream) -> Self {
-        Self { inner: stream }
+    pub(crate) fn new(stream: quinn::RecvStream, error: Arc<OnceLock<SessionError>>) -> Self {
+        Self {
+            inner: stream,
+            error,
+        }
+    }
+
+    /// Replace connection-level errors with the stored session error if available.
+    fn map_error(&self, e: impl Into<ReadError>) -> ReadError {
+        let e = e.into();
+        if let Some(err) = self.error.get() {
+            if matches!(&e, ReadError::SessionError(_)) {
+                return ReadError::SessionError(err.clone());
+            }
+        }
+        e
     }
 
     /// Tell the other end to stop sending data with the given error code. See [`quinn::RecvStream::stop`].
@@ -31,12 +47,15 @@ impl RecvStream {
 
     /// Read some data into the buffer and return the amount read. See [`quinn::RecvStream::read`].
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ReadError> {
-        self.inner.read(buf).await.map_err(Into::into)
+        self.inner.read(buf).await.map_err(|e| self.map_error(e))
     }
 
     /// Fill the entire buffer with data. See [`quinn::RecvStream::read_exact`].
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadExactError> {
-        self.inner.read_exact(buf).await.map_err(Into::into)
+        self.inner.read_exact(buf).await.map_err(|e| match e {
+            quinn::ReadExactError::ReadError(e) => self.map_error(e).into(),
+            e => e.into(),
+        })
     }
 
     /// Read a chunk of data from the stream. See [`quinn::RecvStream::read_chunk`].
@@ -48,17 +67,26 @@ impl RecvStream {
         self.inner
             .read_chunk(max_length, ordered)
             .await
-            .map_err(Into::into)
+            .map_err(|e| self.map_error(e))
     }
 
     /// Read chunks of data from the stream. See [`quinn::RecvStream::read_chunks`].
     pub async fn read_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Option<usize>, ReadError> {
-        self.inner.read_chunks(bufs).await.map_err(Into::into)
+        self.inner
+            .read_chunks(bufs)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Read until the end of the stream or the limit is hit. See [`quinn::RecvStream::read_to_end`].
     pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
-        self.inner.read_to_end(size_limit).await.map_err(Into::into)
+        self.inner
+            .read_to_end(size_limit)
+            .await
+            .map_err(|e| match e {
+                quinn::ReadToEndError::Read(e) => self.map_error(e).into(),
+                e => e.into(),
+            })
     }
 
     /// Block until the stream has been reset and return the error code. See [`quinn::RecvStream::received_reset`].
@@ -67,10 +95,10 @@ impl RecvStream {
     pub async fn received_reset(&mut self) -> Result<Option<u32>, SessionError> {
         match self.inner.received_reset().await {
             Ok(None) => Ok(None),
-            Ok(Some(code)) => Ok(Some(
-                web_transport_proto::error_from_http3(code.into_inner()).unwrap(),
-            )),
-            Err(quinn::ResetError::ConnectionLost(e)) => Err(e.into()),
+            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
+            Err(quinn::ResetError::ConnectionLost(conn_err)) => {
+                Err(self.error.get().cloned().unwrap_or_else(|| conn_err.into()))
+            }
             Err(quinn::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
     }

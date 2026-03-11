@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.6](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.5...web-transport-wasm-v0.5.6) - 2026-03-10
+
+### Other
+
+- Use WebTransportHash type instead of manual object construction ([#180](https://github.com/moq-dev/web-transport/pull/180))
+
 ## [0.5.5](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.4...web-transport-wasm-v0.5.5) - 2026-01-23
 
 ### Other

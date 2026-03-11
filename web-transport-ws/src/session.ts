@@ -23,6 +23,17 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 }
 
+/** Options for the WebTransport-over-WebSocket polyfill. */
+export interface WebTransportWsOptions extends WebTransportOptions {
+	/** Application-level subprotocols to request during the WebSocket handshake.
+	 *
+	 * Each protocol is prefixed with `webtransport.` on the wire.
+	 */
+	protocols?: string[];
+}
+
+const PREFIX = "webtransport.";
+
 export default class WebTransportWs implements WebTransport {
 	#ws: WebSocket;
 	#isServer = false;
@@ -34,6 +45,15 @@ export default class WebTransportWs implements WebTransport {
 
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
+
+	/** The negotiated application-level subprotocol, or empty string if none.
+	 *
+	 * The `webtransport.` prefix is stripped; this returns only the application protocol name.
+	 */
+	#protocol = "";
+	get protocol(): string {
+		return this.#protocol;
+	}
 
 	readonly ready: Promise<void>;
 	#readyResolve!: () => void;
@@ -48,7 +68,7 @@ export default class WebTransportWs implements WebTransport {
 	// TODO: Implement datagrams
 	readonly datagrams = new Datagrams();
 
-	constructor(url: string | URL, options?: WebTransportOptions) {
+	constructor(url: string | URL, options?: WebTransportWsOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
@@ -59,7 +79,13 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		this.#ws = new WebSocket(url, ["webtransport"]);
+		// Normalize and prefix each application protocol with `webtransport.` on the wire.
+		const prefixed = (options?.protocols ?? []).map((p) => {
+			const stripped = p.startsWith(PREFIX) ? p.slice(PREFIX.length) : p;
+			return `${PREFIX}${stripped}`;
+		});
+		const wsProtocols = [...new Set(["webtransport", ...prefixed])];
+		this.#ws = new WebSocket(url, wsProtocols);
 
 		this.ready = new Promise((resolve) => {
 			this.#readyResolve = resolve;
@@ -70,7 +96,13 @@ export default class WebTransportWs implements WebTransport {
 		});
 
 		this.#ws.binaryType = "arraybuffer";
-		this.#ws.onopen = () => this.#readyResolve();
+		this.#ws.onopen = () => {
+			// The browser returns the single selected subprotocol (no commas).
+			// Strip the `webtransport.` prefix to get the application protocol.
+			const raw = this.#ws.protocol;
+			this.#protocol = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
+			this.#readyResolve();
+		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);
 		this.#ws.onerror = (event) => this.#handleError(event);
 		this.#ws.onclose = (event) => this.#handleClose(event);
