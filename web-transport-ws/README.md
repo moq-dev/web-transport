@@ -21,7 +21,7 @@ All Rust types in this crate are thin wrappers or re-exports from `qmux`. Please
 
 ## JavaScript/TypeScript Polyfill
 
-The TypeScript polyfill in `src/` is still maintained here and supports both the legacy `webtransport` wire format and the new `qmux-00` wire format. Check if WebTransport is available, otherwise install the polyfill:
+Although the Rust crate is deprecated, the TypeScript polyfill in `src/` is actively maintained here and supports both the legacy `webtransport` and the new `qmux-00` wire formats. Check if WebTransport is available, otherwise install the polyfill:
 
 ```javascript
 import { install } from "@moq/web-transport-ws"

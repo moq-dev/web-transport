@@ -31,6 +31,9 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(String),
+
+    #[error("datagrams not supported")]
+    DatagramsUnsupported,
 }
 
 impl From<VarIntUnexpectedEnd> for Error {
@@ -45,7 +48,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-#[cfg(feature = "websocket")]
+#[cfg(feature = "ws")]
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
     fn from(_err: tokio_tungstenite::tungstenite::Error) -> Self {
         Self::Closed

@@ -4,33 +4,33 @@ use web_transport_proto::VarInt;
 use crate::{Error, StreamId, Version};
 
 #[derive(Debug, Clone)]
-pub struct Stream {
+pub(crate) struct Stream {
     pub id: StreamId,
     pub data: Bytes,
     pub fin: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct ResetStream {
+pub(crate) struct ResetStream {
     pub id: StreamId,
     pub code: VarInt,
 }
 
 #[derive(Debug, Clone)]
-pub struct StopSending {
+pub(crate) struct StopSending {
     pub id: StreamId,
     pub code: VarInt,
 }
 
 #[derive(Debug, Clone)]
-pub struct ConnectionClose {
+pub(crate) struct ConnectionClose {
     pub code: VarInt,
     pub reason: String,
 }
 
 /// QUIC-compatible frames for multiplexed transport
 #[derive(Debug)]
-pub enum Frame {
+pub(crate) enum Frame {
     ResetStream(ResetStream),
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
@@ -241,12 +241,30 @@ impl Frame {
                 let _limit = VarInt::decode(&mut data)?;
                 Ok(None)
             }
-            // DATAGRAM / DATAGRAM with length
-            0x30 | 0x31 => Ok(None),
+            // DATAGRAM without length — rest of message is payload
+            0x30 => {
+                let _payload = data.split_to(data.remaining());
+                Ok(None)
+            }
+            // DATAGRAM with length
+            0x31 => {
+                let len = VarInt::decode(&mut data)?.into_inner() as usize;
+                if data.remaining() < len {
+                    return Err(Error::Short);
+                }
+                let _payload = data.split_to(len);
+                Ok(None)
+            }
             // QX_TRANSPORT_PARAMETERS
-            0x3f5153300d0a0d0a => Ok(None),
-            // Unknown — ignore
-            _ => Ok(None),
+            0x3f5153300d0a0d0a => {
+                let len = VarInt::decode(&mut data)?.into_inner() as usize;
+                if data.remaining() < len {
+                    return Err(Error::Short);
+                }
+                let _payload = data.split_to(len);
+                Ok(None)
+            }
+            _ => Err(Error::InvalidFrameType(frame_type)),
         }
     }
 }

@@ -277,41 +277,6 @@ impl Session {
         }
     }
 
-    /// Wrap a pre-upgraded WebSocket connection as a client-side session.
-    ///
-    /// Use this when the WebSocket handshake was already performed by an
-    /// external framework. The `version` determines the wire format and
-    /// `protocol` should be the negotiated application-level subprotocol, if any.
-    #[cfg(feature = "websocket")]
-    pub fn connect<T>(ws: T, version: Version, protocol: Option<String>) -> Self
-    where
-        T: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
-            + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        let transport = crate::transport::WsTransport::new(ws);
-        Self::new(transport, version, false, protocol)
-    }
-
-    /// Wrap a pre-upgraded WebSocket connection as a server-side session.
-    ///
-    /// Use this when the WebSocket handshake was already performed by an
-    /// external framework (e.g. axum). The `version` determines the wire format
-    /// and `protocol` should be the negotiated application-level subprotocol, if any.
-    #[cfg(feature = "websocket")]
-    pub fn accept<T>(ws: T, version: Version, protocol: Option<String>) -> Self
-    where
-        T: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
-            + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        let transport = crate::transport::WsTransport::new(ws);
-        Self::new(transport, version, true, protocol)
-    }
 }
 
 impl generic::Session for Session {
@@ -431,15 +396,15 @@ impl generic::Session for Session {
     }
 
     fn send_datagram(&self, _payload: Bytes) -> Result<(), Self::Error> {
-        todo!()
+        Err(Error::DatagramsUnsupported)
     }
 
     fn max_datagram_size(&self) -> usize {
-        todo!()
+        0
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        todo!()
+        Err(Error::DatagramsUnsupported)
     }
 
     fn protocol(&self) -> Option<&str> {
@@ -528,6 +493,7 @@ impl generic::SendStream for SendStream {
         }
     }
 
+    /// No-op: QMux does not support stream prioritization.
     fn set_priority(&mut self, _priority: u8) {}
 
     fn reset(&mut self, code: u32) {

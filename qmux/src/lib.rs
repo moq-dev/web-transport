@@ -1,21 +1,22 @@
-mod client;
 mod error;
 mod frame;
 mod protocol;
-mod server;
 mod session;
 mod stream;
 mod transport;
 mod version;
 
+#[cfg(feature = "tcp")]
+pub mod tcp;
+#[cfg(feature = "tls")]
+pub mod tls;
+#[cfg(feature = "ws")]
+pub mod ws;
+
 pub(crate) use frame::*;
-#[cfg(feature = "websocket")]
-pub(crate) use protocol::validate_protocol;
 pub use version::*;
 
-pub use client::*;
 pub use error::Error;
-pub use server::*;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
 

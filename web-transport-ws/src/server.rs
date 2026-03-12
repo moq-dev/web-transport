@@ -4,11 +4,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 ///
 /// # Deprecated
 ///
-/// Use [`qmux::Server`] instead, which supports TCP, TLS, and WebSocket.
-#[deprecated(note = "use qmux::Server instead")]
+/// Use [`qmux::ws::Server`] instead.
+#[deprecated(note = "use qmux::ws::Server instead")]
 #[derive(Default, Clone)]
 pub struct Server {
-    inner: qmux::Server,
+    inner: qmux::ws::Server,
 }
 
 #[allow(deprecated)]
@@ -34,6 +34,6 @@ impl Server {
         &self,
         socket: T,
     ) -> Result<qmux::Session, qmux::Error> {
-        self.inner.accept_ws(socket).await
+        self.inner.accept(socket).await
     }
 }
