@@ -3,10 +3,7 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{Error, Session, Version};
-
-const PREFIX_WEBTRANSPORT: &str = "webtransport.";
-const PREFIX_QMUX: &str = "qmux-00.";
+use crate::{Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
 
 /// Wrap a pre-upgraded WebSocket connection as a client-side session.
 ///
@@ -120,7 +117,7 @@ impl Client {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
-        let (version, protocol) = parse_negotiated_protocol(negotiated_header);
+        let (version, protocol) = parse_negotiated_protocol(negotiated_header)?;
 
         let transport = WsTransport::new(ws_stream);
         Ok(Session::new(transport, version, false, protocol))
@@ -201,9 +198,8 @@ impl Server {
                 return Ok(response);
             }
 
-            // Accept bare qmux-00 (no subprotocol) regardless of configured protocols.
-            // A client offering plain "qmux-00" is connecting without subprotocol negotiation.
-            if header_protocols.contains(&crate::ALPN_QMUX) {
+            // Accept bare qmux-00 only when no specific protocols are configured.
+            if supported.is_empty() && header_protocols.contains(&crate::ALPN_QMUX) {
                 response.headers_mut().insert(
                     http::header::SEC_WEBSOCKET_PROTOCOL,
                     http::HeaderValue::from_str(crate::ALPN_QMUX).unwrap(),
@@ -230,8 +226,8 @@ impl Server {
                 return Ok(response);
             }
 
-            // Check for bare webtransport
-            if header_protocols.contains(&crate::ALPN_WEBTRANSPORT) {
+            // Check for bare webtransport only when no specific protocols are configured.
+            if supported.is_empty() && header_protocols.contains(&crate::ALPN_WEBTRANSPORT) {
                 response.headers_mut().insert(
                     http::header::SEC_WEBSOCKET_PROTOCOL,
                     http::HeaderValue::from_str(crate::ALPN_WEBTRANSPORT).unwrap(),
@@ -260,21 +256,26 @@ impl Server {
 }
 
 /// Parse the negotiated WebSocket protocol header to determine version and app protocol.
-fn parse_negotiated_protocol(header: &str) -> (Version, Option<String>) {
+fn parse_negotiated_protocol(header: &str) -> Result<(Version, Option<String>), Error> {
     for token in header.split(',').map(|p| p.trim()) {
         if let Some(proto) = token.strip_prefix(PREFIX_QMUX) {
-            return (Version::QMux00, Some(proto.to_string()));
+            return Ok((Version::QMux00, Some(proto.to_string())));
         }
         if token == crate::ALPN_QMUX {
-            return (Version::QMux00, None);
+            return Ok((Version::QMux00, None));
         }
         if let Some(proto) = token.strip_prefix(PREFIX_WEBTRANSPORT) {
-            return (Version::WebTransport, Some(proto.to_string()));
+            return Ok((Version::WebTransport, Some(proto.to_string())));
         }
         if token == crate::ALPN_WEBTRANSPORT {
-            return (Version::WebTransport, None);
+            return Ok((Version::WebTransport, None));
         }
     }
-    // Default to QMux if nothing recognized
-    (Version::QMux00, None)
+
+    if header.trim().is_empty() {
+        // No protocol header — default to QMux
+        Ok((Version::QMux00, None))
+    } else {
+        Err(Error::InvalidProtocol(header.to_string()))
+    }
 }

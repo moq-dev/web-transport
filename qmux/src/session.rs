@@ -654,13 +654,6 @@ impl generic::RecvStream for RecvStream {
                 return Ok(());
             }
 
-            if !self.buffer.is_empty() {
-                return Err(match self.inbound_reset.recv().await {
-                    Some(reset) => self.recv_reset(reset.code),
-                    None => Error::Closed,
-                });
-            }
-
             tokio::select! {
                 Some(reset) = self.inbound_reset.recv() => {
                     return Err(self.recv_reset(reset.code));

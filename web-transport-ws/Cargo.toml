@@ -13,11 +13,11 @@ categories = ["network-programming", "web-programming"]
 
 [features]
 default = []
-rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
-rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots", "qmux/wss"]
+rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots", "qmux/wss"]
 
 [dependencies]
-qmux = { path = "../qmux", features = ["ws"] }
+qmux = { path = "../qmux", default-features = false, features = ["ws"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tokio-tungstenite = "0.24"
 web-transport-trait = { workspace = true }

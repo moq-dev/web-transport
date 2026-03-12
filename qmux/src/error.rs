@@ -50,8 +50,8 @@ impl From<std::io::Error> for Error {
 
 #[cfg(feature = "ws")]
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
-    fn from(_err: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Closed
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Io(err.to_string())
     }
 }
 

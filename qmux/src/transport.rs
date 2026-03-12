@@ -177,8 +177,8 @@ mod stream_transport {
                     let _limit = self.read_varint().await?;
                     Ok(None)
                 }
-                // DATAGRAM without length — cannot determine payload on a stream
-                0x30 => Ok(None),
+                // DATAGRAM without length — cannot determine payload boundary on a stream
+                0x30 => Err(Error::InvalidFrameType(frame_type)),
                 // DATAGRAM with length
                 0x31 => {
                     let len = self.read_varint().await?.into_inner() as usize;
