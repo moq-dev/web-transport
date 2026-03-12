@@ -74,7 +74,9 @@ impl Client {
             validate_protocol(p)?;
         }
 
-        let mut request = url.into_client_request().map_err(|_| Error::Closed)?;
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| Error::Io(e.to_string()))?;
 
         // Offer both prefix families, preferring qmux-00
         let protocol_value = if self.protocols.is_empty() {
@@ -108,7 +110,7 @@ impl Client {
         let (ws_stream, response) =
             tokio_tungstenite::connect_async_with_config(request, None, false)
                 .await
-                .map_err(|_| Error::Closed)?;
+                .map_err(|e| Error::Io(e.to_string()))?;
 
         // Determine version and protocol from response
         let negotiated_header = response

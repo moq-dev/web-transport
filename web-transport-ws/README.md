@@ -10,15 +10,9 @@ All Rust types in this crate are thin wrappers or re-exports from `qmux`. Please
 -use web_transport_ws::{Client, Server, Session};
 +use qmux::ws::{Client, Server};
 +use qmux::Session;
-
- // Client
--let session = Client::new().with_protocol("moq-03").connect("ws://localhost:4443").await?;
-+let session = Client::new().with_protocol("moq-03").connect("ws://localhost:4443").await?;
-
- // Server
--let session = server.accept(socket).await?;
-+let session = server.accept(socket).await?;
 ```
+
+The `Client`, `Server`, and `Session` APIs are otherwise unchanged.
 
 ## JavaScript/TypeScript Polyfill
 

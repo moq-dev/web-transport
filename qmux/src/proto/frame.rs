@@ -271,7 +271,10 @@ impl Frame {
                 let _payload = data.split_to(len);
                 Ok(None)
             }
-            // QX_TRANSPORT_PARAMETERS
+            // QX_TRANSPORT_PARAMETERS frame type.
+            // Raw bytes: 0x3f 0x51 0x53 0x30 0x0d 0x0a 0x0d 0x0a
+            // This is the VarInt encoding of the magic value used by QMux peers
+            // to exchange transport parameters on connection setup.
             0x3f5153300d0a0d0a => {
                 let len = VarInt::decode(&mut data)?.into_inner() as usize;
                 if data.remaining() < len {
