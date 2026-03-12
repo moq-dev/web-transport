@@ -1,7 +1,7 @@
 use crate::{Error, Frame, Version};
 
 /// Abstracts frame I/O over different transports.
-pub(crate) trait FrameTransport: Send + 'static {
+pub trait Transport: Send + 'static {
     fn send_frame(
         &mut self,
         frame: Frame,
@@ -13,7 +13,6 @@ pub(crate) trait FrameTransport: Send + 'static {
         version: Version,
     ) -> impl std::future::Future<Output = Result<Option<Frame>, Error>> + Send;
 
-    #[allow(dead_code)]
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
@@ -24,8 +23,8 @@ mod stream_transport {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
     use web_transport_proto::VarInt;
 
+    use super::Transport;
     use crate::{Error, Frame, Version};
-    use super::FrameTransport;
 
     pub(crate) struct StreamTransport<T> {
         reader: BufReader<tokio::io::ReadHalf<T>>,
@@ -71,7 +70,7 @@ mod stream_transport {
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Send + 'static> FrameTransport for StreamTransport<T> {
+    impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for StreamTransport<T> {
         async fn send_frame(&mut self, frame: Frame, version: Version) -> Result<(), Error> {
             let data = frame.encode(version);
             self.writer.write_all(&data).await?;
@@ -118,7 +117,7 @@ mod stream_transport {
                     return Err(Error::Short);
                 };
 
-                return Ok(Some(Frame::Stream(crate::Stream {
+                return Ok(Some(Frame::Stream(crate::proto::Stream {
                     id,
                     data,
                     fin: has_fin,
@@ -131,13 +130,13 @@ mod stream_transport {
                     let id = crate::StreamId(self.read_varint().await?);
                     let code = self.read_varint().await?;
                     let _final_size = self.read_varint().await?;
-                    Ok(Some(Frame::ResetStream(crate::ResetStream { id, code })))
+                    Ok(Some(Frame::ResetStream(crate::proto::ResetStream { id, code })))
                 }
                 // STOP_SENDING
                 0x05 => {
                     let id = crate::StreamId(self.read_varint().await?);
                     let code = self.read_varint().await?;
-                    Ok(Some(Frame::StopSending(crate::StopSending { id, code })))
+                    Ok(Some(Frame::StopSending(crate::proto::StopSending { id, code })))
                 }
                 // CONNECTION_CLOSE / APPLICATION_CLOSE
                 0x1c | 0x1d => {
@@ -146,7 +145,7 @@ mod stream_transport {
                     let reason_len = self.read_varint().await?.into_inner() as usize;
                     let reason_bytes = self.read_bytes(reason_len).await?;
                     let reason = String::from_utf8_lossy(&reason_bytes).into_owned();
-                    Ok(Some(Frame::ConnectionClose(crate::ConnectionClose {
+                    Ok(Some(Frame::ConnectionClose(crate::proto::ConnectionClose {
                         code,
                         reason,
                     })))
@@ -207,8 +206,8 @@ pub(crate) use stream_transport::StreamTransport;
 mod ws_transport {
     use tokio_tungstenite::tungstenite;
 
+    use super::Transport;
     use crate::{Error, Frame, Version};
-    use super::FrameTransport;
 
     pub(crate) struct WsTransport<T> {
         ws: T,
@@ -227,7 +226,7 @@ mod ws_transport {
         }
     }
 
-    impl<T> FrameTransport for WsTransport<T>
+    impl<T> Transport for WsTransport<T>
     where
         T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
             + futures::Sink<tungstenite::Message, Error = tungstenite::Error>

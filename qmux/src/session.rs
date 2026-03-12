@@ -6,8 +6,8 @@ use std::{
     },
 };
 
+use crate::transport::Transport;
 use crate::{ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version};
-use crate::transport::FrameTransport;
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
@@ -36,7 +36,7 @@ pub struct Session {
     protocol: Option<String>,
 }
 
-struct SessionState<T: FrameTransport> {
+struct SessionState<T: Transport> {
     transport: T,
     version: Version,
     is_server: bool,
@@ -56,7 +56,7 @@ struct SessionState<T: FrameTransport> {
     closed: watch::Sender<Option<Error>>,
 }
 
-impl<T: FrameTransport> SessionState<T> {
+impl<T: Transport> SessionState<T> {
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
@@ -226,7 +226,7 @@ impl<T: FrameTransport> SessionState<T> {
 }
 
 impl Session {
-    pub(crate) fn new<T: FrameTransport>(
+    pub fn new<T: Transport>(
         transport: T,
         version: Version,
         is_server: bool,

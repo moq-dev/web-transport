@@ -1,10 +1,9 @@
 mod error;
-mod frame;
 mod protocol;
+pub mod proto;
 mod session;
 mod stream;
 mod transport;
-mod version;
 
 #[cfg(feature = "tcp")]
 pub mod tcp;
@@ -13,10 +12,10 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
-pub(crate) use frame::*;
-pub use version::*;
+use proto::*;
 
 pub use error::Error;
+pub use transport::Transport;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
 

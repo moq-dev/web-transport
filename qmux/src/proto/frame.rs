@@ -4,33 +4,33 @@ use web_transport_proto::VarInt;
 use crate::{Error, StreamId, Version};
 
 #[derive(Debug, Clone)]
-pub(crate) struct Stream {
+pub struct Stream {
     pub id: StreamId,
     pub data: Bytes,
     pub fin: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResetStream {
+pub struct ResetStream {
     pub id: StreamId,
     pub code: VarInt,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StopSending {
+pub struct StopSending {
     pub id: StreamId,
     pub code: VarInt,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ConnectionClose {
+pub struct ConnectionClose {
     pub code: VarInt,
     pub reason: String,
 }
 
 /// QUIC-compatible frames for multiplexed transport
 #[derive(Debug)]
-pub(crate) enum Frame {
+pub enum Frame {
     ResetStream(ResetStream),
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
@@ -109,7 +109,6 @@ impl Frame {
         }
     }
 
-    #[allow(dead_code)]
     pub fn decode(data: Bytes, version: Version) -> Result<Option<Self>, Error> {
         if data.is_empty() {
             return Err(Error::Short);
