@@ -12,12 +12,11 @@ keywords = ["quic", "qmux", "webtransport", "multiplexing"]
 categories = ["network-programming"]
 
 [features]
-default = ["tls", "ws"]
+default = ["tls", "wss"]
 tcp = ["tokio/net", "tokio/io-util"]
 tls = ["tcp", "dep:tokio-rustls", "dep:rustls"]
 ws = ["dep:tokio-tungstenite", "dep:futures"]
-wss-native-roots = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]
-wss-webpki-roots = ["ws", "tokio-tungstenite/rustls-tls-webpki-roots"]
+wss = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]
 
 [dependencies]
 bytes = "1"
