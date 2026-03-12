@@ -78,9 +78,8 @@ impl<T: Transport> SessionState<T> {
             tokio::select! {
                 biased;
                 result = self.transport.recv_frame(self.version) => {
-                    match result? {
-                        Some(frame) => self.recv_frame(frame).await?,
-                        None => {} // Ignored frame type (flow control, etc.)
+                    if let Some(frame) = result? {
+                        self.recv_frame(frame).await?;
                     }
                 }
                 Some((id, send)) = self.create_uni.recv() => {
