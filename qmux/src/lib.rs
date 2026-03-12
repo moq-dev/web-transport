@@ -22,6 +22,12 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+#[cfg(feature = "ws")]
+pub use tokio_tungstenite;
+
+#[cfg(feature = "ws")]
+pub use tokio_tungstenite::tungstenite;
+
 use proto::*;
 
 pub use error::Error;
