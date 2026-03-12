@@ -57,6 +57,20 @@ struct SessionState<T: Transport> {
 }
 
 impl<T: Transport> SessionState<T> {
+    // WARNING: Cancellation safety issue!
+    //
+    // self.transport.recv_frame() is NOT cancellation-safe for StreamTransport
+    // (TCP/TLS) because it performs multi-step reads (read_u8, read_exact, etc.).
+    // If another select! branch fires while recv_frame is mid-parse, the future
+    // is dropped and restarted on the next iteration, desynchronizing the stream.
+    //
+    // This is mitigated by `biased` (recv_frame is polled first), but not fully
+    // fixed — other branches can still win when recv_frame is pending on I/O.
+    //
+    // WsTransport is unaffected since each WebSocket message is atomic.
+    //
+    // A proper fix requires splitting Transport into separate read/write halves
+    // or moving recv_frame into a dedicated task that never gets cancelled.
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
