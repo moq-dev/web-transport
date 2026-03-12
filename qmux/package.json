@@ -1,8 +1,8 @@
 {
-	"name": "@moq/web-transport-ws",
+	"name": "@moq/qmux",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.3.0",
-	"description": "Deprecated: use @moq/qmux instead",
+	"version": "0.0.1",
+	"description": "QMux protocol (draft-ietf-quic-qmux-00) over WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": "github:moq-dev/web-transport",
@@ -20,9 +20,6 @@
 		"example": "tsx examples/client.ts",
 		"release": "tsx scripts/release.ts"
 	},
-	"dependencies": {
-		"@moq/qmux": "workspace:*"
-	},
 	"devDependencies": {
 		"typescript": "^5.9.2",
 		"rimraf": "^6.0.1",
@@ -30,6 +27,7 @@
 		"tsx": "^4.20.5"
 	},
 	"keywords": [
+		"qmux",
 		"webtransport",
 		"websocket",
 		"polyfill",
