@@ -1,4 +1,5 @@
 import * as Frame from "./frame.ts";
+import type { Version } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
@@ -27,12 +28,13 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 export interface WebTransportWsOptions extends WebTransportOptions {
 	/** Application-level subprotocols to request during the WebSocket handshake.
 	 *
-	 * Each protocol is prefixed with `webtransport.` on the wire.
+	 * Each protocol is prefixed with `webtransport.` and `qmux-00.` on the wire.
 	 */
 	protocols?: string[];
 }
 
-const PREFIX = "webtransport.";
+const PREFIX_WEBTRANSPORT = "webtransport.";
+const PREFIX_QMUX = "qmux-00.";
 
 export default class WebTransportWs implements WebTransport {
 	#ws: WebSocket;
@@ -46,9 +48,11 @@ export default class WebTransportWs implements WebTransport {
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
 
+	#version: Version = "webtransport";
+
 	/** The negotiated application-level subprotocol, or empty string if none.
 	 *
-	 * The `webtransport.` prefix is stripped; this returns only the application protocol name.
+	 * The prefix is stripped; this returns only the application protocol name.
 	 */
 	#protocol = "";
 	get protocol(): string {
@@ -79,13 +83,19 @@ export default class WebTransportWs implements WebTransport {
 
 		url = WebTransportWs.#convertToWebSocketUrl(url);
 
-		// Normalize and prefix each application protocol with `webtransport.` on the wire.
-		const prefixed = (options?.protocols ?? []).map((p) => {
-			const stripped = p.startsWith(PREFIX) ? p.slice(PREFIX.length) : p;
-			return `${PREFIX}${stripped}`;
-		});
-		const wsProtocols = [...new Set(["webtransport", ...prefixed])];
-		this.#ws = new WebSocket(url, wsProtocols);
+		// Offer both qmux-00 and webtransport prefixed protocols, preferring qmux-00
+		const appProtocols = options?.protocols ?? [];
+		const prefixed = new Set<string>(["qmux-00", "webtransport"]);
+		for (const p of appProtocols) {
+			const stripped = p.startsWith(PREFIX_WEBTRANSPORT)
+				? p.slice(PREFIX_WEBTRANSPORT.length)
+				: p.startsWith(PREFIX_QMUX)
+					? p.slice(PREFIX_QMUX.length)
+					: p;
+			prefixed.add(`${PREFIX_QMUX}${stripped}`);
+			prefixed.add(`${PREFIX_WEBTRANSPORT}${stripped}`);
+		}
+		this.#ws = new WebSocket(url, [...prefixed]);
 
 		this.ready = new Promise((resolve) => {
 			this.#readyResolve = resolve;
@@ -97,10 +107,21 @@ export default class WebTransportWs implements WebTransport {
 
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
-			// The browser returns the single selected subprotocol (no commas).
-			// Strip the `webtransport.` prefix to get the application protocol.
+			// Detect version from the negotiated subprotocol
 			const raw = this.#ws.protocol;
-			this.#protocol = raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : "";
+			if (raw.startsWith(PREFIX_QMUX)) {
+				this.#version = "qmux-00";
+				this.#protocol = raw.slice(PREFIX_QMUX.length);
+			} else if (raw.startsWith(PREFIX_WEBTRANSPORT)) {
+				this.#version = "webtransport";
+				this.#protocol = raw.slice(PREFIX_WEBTRANSPORT.length);
+			} else if (raw === "qmux-00") {
+				this.#version = "qmux-00";
+				this.#protocol = "";
+			} else {
+				this.#version = "webtransport";
+				this.#protocol = "";
+			}
 			this.#readyResolve();
 		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);
@@ -146,8 +167,10 @@ export default class WebTransportWs implements WebTransport {
 
 		const data = new Uint8Array(event.data);
 		try {
-			const frame = Frame.decode(data);
-			this.#recvFrame(frame);
+			const frame = Frame.decode(data, this.#version);
+			if (frame !== null) {
+				this.#recvFrame(frame);
+			}
 		} catch (error) {
 			console.error("Failed to decode frame:", error);
 			this.close({ closeCode: 1002, reason: "Protocol violation" });
@@ -309,12 +332,12 @@ export default class WebTransportWs implements WebTransport {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 
-		const chunk = Frame.encode(frame);
+		const chunk = Frame.encode(frame, this.#version);
 		this.#ws.send(chunk);
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
-		const chunk = Frame.encode(frame);
+		const chunk = Frame.encode(frame, this.#version);
 		this.#ws.send(chunk);
 	}
 

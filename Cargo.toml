@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "qmux",
     "web-transport",
     "web-transport-noq",
     "web-transport-proto",

@@ -6,16 +6,14 @@ use std::{
     },
 };
 
-use crate::{tungstenite, ConnectionClose, ResetStream, StopSending, Stream, StreamDir};
-use crate::{Error, Frame, StreamId};
+use crate::{ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version};
+use crate::transport::FrameTransport;
 use bytes::{Buf, BufMut, Bytes};
-use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
-use tungstenite::Message;
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
-/// Emulates a WebTransport session over a WebSocket connection.
+/// A multiplexed session over a reliable transport.
 #[derive(Clone)]
 pub struct Session {
     is_server: bool,
@@ -38,8 +36,9 @@ pub struct Session {
     protocol: Option<String>,
 }
 
-struct SessionState<T> {
-    ws: T,
+struct SessionState<T: FrameTransport> {
+    transport: T,
+    version: Version,
     is_server: bool,
 
     outbound: (mpsc::Sender<Frame>, mpsc::Receiver<Frame>),
@@ -57,43 +56,18 @@ struct SessionState<T> {
     closed: watch::Sender<Option<Error>>,
 }
 
-impl<T> SessionState<T>
-where
-    T: futures::Stream<Item = Result<Message, tungstenite::Error>>
-        + futures::Sink<Message, Error = tungstenite::Error>
-        + Unpin,
-{
+impl<T: FrameTransport> SessionState<T> {
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
         loop {
             tokio::select! {
                 biased;
-                message = self.ws.next() => {
-                    match message.ok_or(Error::Closed)?? {
-                        Message::Binary(data) => {
-                            let frame = Frame::decode(data.into())?;
-                            self.recv_frame(frame).await?;
-                        },
-                        Message::Close(_) => {
-                            self.closed
-                                .send(Some(Error::Closed))
-                                .ok();
-                            return Ok(());
-                        },
-                        Message::Text(_) => {
-                            return Err(Error::NoText);
-                        },
-                        Message::Ping(data) => {
-                            self.ws.send(Message::Pong(data)).await?;
-                        },
-                        Message::Pong(_) => {
-                            return Err(Error::NoPong);
-                        },
-                        Message::Frame(_) => {
-                            return Err(Error::NoGenericFrames);
-                        }
-                    };
+                result = self.transport.recv_frame(self.version) => {
+                    match result? {
+                        Some(frame) => self.recv_frame(frame).await?,
+                        None => {} // Ignored frame type (flow control, etc.)
+                    }
                 }
                 Some((id, send)) = self.create_uni.recv() => {
                     self.send_streams.insert(id, send);
@@ -136,13 +110,7 @@ where
             _ => {}
         };
 
-        let data = frame.encode();
-        self.ws
-            .send(Message::Binary(data.to_vec()))
-            .await
-            .map_err(|_| Error::Closed)?;
-
-        Ok(())
+        self.transport.send_frame(frame, self.version).await
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -155,7 +123,7 @@ where
                 match self.recv_streams.entry(stream.id) {
                     hash_map::Entry::Vacant(e) => {
                         if self.is_server == stream.id.server_initiated() {
-                            // Already closed, ignore it. TODO slightly wrong
+                            // Already closed, ignore it.
                             return Ok(());
                         }
 
@@ -258,46 +226,12 @@ where
 }
 
 impl Session {
-    /// Wrap a pre-upgraded WebSocket connection as a client-side WebTransport session.
-    ///
-    /// Use this when the WebSocket handshake was already performed by an
-    /// external framework. The `protocol` should be the negotiated
-    /// application-level subprotocol, if any.
-    pub fn connect<T>(ws: T, protocol: Option<String>) -> Self
-    where
-        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
-            + futures::Sink<Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        Self::new(ws, false, protocol)
-    }
-
-    /// Wrap a pre-upgraded WebSocket connection as a server-side WebTransport session.
-    ///
-    /// Use this when the WebSocket handshake was already performed by an
-    /// external framework (e.g. axum). The `protocol` should be the negotiated
-    /// application-level subprotocol, if any.
-    pub fn accept<T>(ws: T, protocol: Option<String>) -> Self
-    where
-        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
-            + futures::Sink<Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        Self::new(ws, true, protocol)
-    }
-
-    fn new<T>(ws: T, is_server: bool, protocol: Option<String>) -> Self
-    where
-        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
-            + futures::Sink<Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
+    pub(crate) fn new<T: FrameTransport>(
+        transport: T,
+        version: Version,
+        is_server: bool,
+        protocol: Option<String>,
+    ) -> Self {
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
 
@@ -310,7 +244,8 @@ impl Session {
         let closed = watch::Sender::new(None);
 
         let mut backend = SessionState {
-            ws,
+            transport,
+            version,
             outbound: (outbound_tx.clone(), outbound_rx),
             outbound_priority: (outbound_priority_tx.clone(), outbound_priority_rx),
             accept_bi: accept_bi_tx,
@@ -340,6 +275,42 @@ impl Session {
             closed,
             protocol,
         }
+    }
+
+    /// Wrap a pre-upgraded WebSocket connection as a client-side session.
+    ///
+    /// Use this when the WebSocket handshake was already performed by an
+    /// external framework. The `version` determines the wire format and
+    /// `protocol` should be the negotiated application-level subprotocol, if any.
+    #[cfg(feature = "websocket")]
+    pub fn connect<T>(ws: T, version: Version, protocol: Option<String>) -> Self
+    where
+        T: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
+            + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let transport = crate::transport::WsTransport::new(ws);
+        Self::new(transport, version, false, protocol)
+    }
+
+    /// Wrap a pre-upgraded WebSocket connection as a server-side session.
+    ///
+    /// Use this when the WebSocket handshake was already performed by an
+    /// external framework (e.g. axum). The `version` determines the wire format
+    /// and `protocol` should be the negotiated application-level subprotocol, if any.
+    #[cfg(feature = "websocket")]
+    pub fn accept<T>(ws: T, version: Version, protocol: Option<String>) -> Self
+    where
+        T: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
+            + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let transport = crate::transport::WsTransport::new(ws);
+        Self::new(transport, version, true, protocol)
     }
 }
 
@@ -436,7 +407,6 @@ impl generic::Session for Session {
     }
 
     fn close(&self, code: u32, reason: &str) {
-        // Notify peer first
         let frame = ConnectionClose {
             code: VarInt::from(code),
             reason: reason.to_string(),
@@ -558,9 +528,7 @@ impl generic::SendStream for SendStream {
         }
     }
 
-    fn set_priority(&mut self, _priority: u8) {
-        // Priority not implemented in this version
-    }
+    fn set_priority(&mut self, _priority: u8) {}
 
     fn reset(&mut self, code: u32) {
         if self.fin || self.closed.is_some() {
@@ -586,8 +554,6 @@ impl generic::SendStream for SendStream {
         };
 
         if let Err(e) = self.outbound.try_send(frame.into()) {
-            // This is a sync function so we need to spawn a task if we're blocked on sending the frame.
-            // Thanks, I hate it.
             let outbound = self.outbound.clone();
             tokio::spawn(async move {
                 outbound.send(e.into_inner()).await.ok();
@@ -604,8 +570,6 @@ impl generic::SendStream for SendStream {
             return Err(error.clone());
         }
 
-        // NOTE: will be racey if this is not &mut
-
         match self.inbound_stopped.recv().await {
             Some(stop) => Err(self.recv_stop(stop.code)),
             None => Err(Error::Closed),
@@ -613,7 +577,7 @@ impl generic::SendStream for SendStream {
     }
 }
 
-struct RecvState {
+pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
 }
@@ -725,7 +689,6 @@ impl generic::RecvStream for RecvStream {
             }
 
             if !self.buffer.is_empty() {
-                // We have buffered data, so there's no point waiting for more.
                 return Err(match self.inbound_reset.recv().await {
                     Some(reset) => self.recv_reset(reset.code),
                     None => Error::Closed,
