@@ -1,5 +1,6 @@
 use web_transport_proto::{VarInt, VarIntUnexpectedEnd};
 
+/// Errors that can occur during QMux session and stream operations.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum Error {
     #[error("invalid frame type: {0}")]

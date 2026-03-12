@@ -12,7 +12,7 @@ keywords = ["quic", "qmux", "webtransport", "multiplexing"]
 categories = ["network-programming"]
 
 [features]
-default = ["tcp"]
+default = ["tls", "wss"]
 tcp = ["tokio/net", "tokio/io-util"]
 tls = ["tcp", "dep:tokio-rustls", "dep:rustls"]
 ws = ["dep:tokio-tungstenite", "dep:futures"]

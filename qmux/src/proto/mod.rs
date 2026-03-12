@@ -1,3 +1,5 @@
+//! Wire format types for QMux frame encoding and decoding.
+
 mod frame;
 mod version;
 

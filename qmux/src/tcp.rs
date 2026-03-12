@@ -7,11 +7,11 @@ use crate::{Error, Session, Version};
 pub async fn connect(addr: impl ToSocketAddrs) -> Result<Session, Error> {
     let stream = TcpStream::connect(addr).await?;
     let transport = StreamTransport::new(stream);
-    Ok(Session::new(transport, Version::QMux00, false, None))
+    Ok(Session::connect(transport, Version::QMux00, None))
 }
 
 /// Accept a TCP connection. Always uses the QMux wire format.
 pub async fn accept(stream: TcpStream) -> Result<Session, Error> {
     let transport = StreamTransport::new(stream);
-    Ok(Session::new(transport, Version::QMux00, true, None))
+    Ok(Session::accept(transport, Version::QMux00, None))
 }

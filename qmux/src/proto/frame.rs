@@ -3,32 +3,45 @@ use web_transport_proto::VarInt;
 
 use crate::{Error, StreamId, Version};
 
+/// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
 pub struct Stream {
+    /// The stream this data belongs to.
     pub id: StreamId,
+    /// The payload bytes.
     pub data: Bytes,
+    /// Whether this is the final frame on the stream.
     pub fin: bool,
 }
 
+/// Abruptly terminates the sending side of a stream with an error code.
 #[derive(Debug, Clone)]
 pub struct ResetStream {
+    /// The stream being reset.
     pub id: StreamId,
+    /// Application-defined error code.
     pub code: VarInt,
 }
 
+/// Requests that the peer stop sending on a stream.
 #[derive(Debug, Clone)]
 pub struct StopSending {
+    /// The stream to stop.
     pub id: StreamId,
+    /// Application-defined error code.
     pub code: VarInt,
 }
 
+/// Closes the entire connection with an error code and reason.
 #[derive(Debug, Clone)]
 pub struct ConnectionClose {
+    /// Application-defined error code.
     pub code: VarInt,
+    /// Human-readable reason for closing.
     pub reason: String,
 }
 
-/// QUIC-compatible frames for multiplexed transport
+/// A QUIC-compatible frame for multiplexed transport.
 #[derive(Debug)]
 pub enum Frame {
     ResetStream(ResetStream),
@@ -38,6 +51,7 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// Encode the frame into bytes using the given wire format version.
     pub fn encode(&self, version: Version) -> Bytes {
         let mut buf = BytesMut::new();
 
@@ -109,6 +123,9 @@ impl Frame {
         }
     }
 
+    /// Decode a frame from bytes using the given wire format version.
+    ///
+    /// Returns `Ok(None)` for recognized but ignored frame types (e.g. flow control).
     pub fn decode(data: Bytes, version: Version) -> Result<Option<Self>, Error> {
         if data.is_empty() {
             return Err(Error::Short);

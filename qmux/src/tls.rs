@@ -23,7 +23,7 @@ pub async fn connect(
     let tls_stream = connector.connect(server_name, stream).await?;
 
     let transport = StreamTransport::new(tls_stream);
-    Ok(Session::new(transport, Version::QMux00, false, None))
+    Ok(Session::connect(transport, Version::QMux00, None))
 }
 
 /// Accept a TLS connection. Always uses the QMux wire format.
@@ -35,5 +35,5 @@ pub async fn accept(
     let tls_stream = acceptor.accept(stream).await?;
 
     let transport = StreamTransport::new(tls_stream);
-    Ok(Session::new(transport, Version::QMux00, true, None))
+    Ok(Session::accept(transport, Version::QMux00, None))
 }

@@ -1,3 +1,4 @@
+/// The wire format version used for frame encoding/decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Version {

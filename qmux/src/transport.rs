@@ -1,18 +1,30 @@
 use crate::{Error, Frame, Version};
 
-/// Abstracts frame I/O over different transports.
+/// Abstracts frame I/O over a reliable transport.
+///
+/// Implement this trait to add QMux support for a custom transport.
+/// Use [`Session::connect`] or [`Session::accept`] to create a session
+/// from your implementation.
+///
+/// [`Session::connect`]: crate::Session::connect
+/// [`Session::accept`]: crate::Session::accept
 pub trait Transport: Send + 'static {
+    /// Send a frame over the transport.
     fn send_frame(
         &mut self,
         frame: Frame,
         version: Version,
     ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
+    /// Receive the next frame from the transport.
+    ///
+    /// Returns `Ok(None)` for recognized but ignored frame types (e.g. flow control).
     fn recv_frame(
         &mut self,
         version: Version,
     ) -> impl std::future::Future<Output = Result<Option<Frame>, Error>> + Send;
 
+    /// Gracefully close the transport.
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 

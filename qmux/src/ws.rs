@@ -19,7 +19,7 @@ where
         + 'static,
 {
     let transport = WsTransport::new(ws);
-    Session::new(transport, version, false, protocol)
+    Session::connect(transport, version, protocol)
 }
 
 /// Wrap a pre-upgraded WebSocket connection as a server-side session.
@@ -36,7 +36,7 @@ where
         + 'static,
 {
     let transport = WsTransport::new(ws);
-    Session::new(transport, version, true, protocol)
+    Session::accept(transport, version, protocol)
 }
 
 /// A QMux client that connects over WebSocket.
@@ -120,7 +120,7 @@ impl Client {
         let (version, protocol) = parse_negotiated_protocol(negotiated_header)?;
 
         let transport = WsTransport::new(ws_stream);
-        Ok(Session::new(transport, version, false, protocol))
+        Ok(Session::connect(transport, version, protocol))
     }
 }
 
@@ -251,7 +251,7 @@ impl Server {
             .expect("negotiated must be set after successful handshake");
 
         let transport = WsTransport::new(ws);
-        Ok(Session::new(transport, version, true, protocol))
+        Ok(Session::accept(transport, version, protocol))
     }
 }
 

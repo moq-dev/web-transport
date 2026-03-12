@@ -30,5 +30,5 @@ pub use tokio_tungstenite;
 pub use tokio_tungstenite::tungstenite;
 
 /// Legacy ALPN identifier.
-#[deprecated(note = "use qmux::ALPN_WEBTRANSPORT instead")]
-pub const ALPN: &str = qmux::ALPN_WEBTRANSPORT;
+#[deprecated(note = "use qmux::ALPNS instead")]
+pub const ALPN: &str = "webtransport";

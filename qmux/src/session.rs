@@ -240,7 +240,25 @@ impl<T: Transport> SessionState<T> {
 }
 
 impl Session {
-    pub fn new<T: Transport>(
+    /// Create a client-side session over the given transport.
+    pub fn connect<T: Transport>(
+        transport: T,
+        version: Version,
+        protocol: Option<String>,
+    ) -> Self {
+        Self::new(transport, version, false, protocol)
+    }
+
+    /// Create a server-side session over the given transport.
+    pub fn accept<T: Transport>(
+        transport: T,
+        version: Version,
+        protocol: Option<String>,
+    ) -> Self {
+        Self::new(transport, version, true, protocol)
+    }
+
+    fn new<T: Transport>(
         transport: T,
         version: Version,
         is_server: bool,
@@ -430,6 +448,7 @@ struct SendState {
     inbound_stopped: mpsc::UnboundedSender<StopSending>,
 }
 
+/// The send half of a multiplexed stream.
 pub struct SendStream {
     id: StreamId,
 
@@ -562,6 +581,7 @@ pub(crate) struct RecvState {
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
 }
 
+/// The receive half of a multiplexed stream.
 pub struct RecvStream {
     id: StreamId,
 
