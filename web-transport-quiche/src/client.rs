@@ -12,6 +12,9 @@ pub enum ClientError {
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
 
+    #[error("connection error: {0}")]
+    Connection(#[from] ez::ConnectionError),
+
     #[error("settings error: {0}")]
     Settings(#[from] h3::SettingsError),
 
@@ -82,11 +85,15 @@ impl<M: Metrics> ClientBuilder<M> {
 
     /// Connect to the WebTransport server at the given URL.
     ///
+    /// DNS resolution and socket setup happen eagerly. The returned [Connecting]
+    /// has an [established](Connecting::established) method to complete the full handshake
+    /// (TLS + SETTINGS + CONNECT).
+    ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
     pub async fn connect(
         self,
         request: impl Into<ConnectRequest>,
-    ) -> Result<Connection, ClientError> {
+    ) -> Result<Connecting, ClientError> {
         let request = request.into();
 
         let port = request.url.port().unwrap_or(443);
@@ -96,8 +103,28 @@ impl<M: Metrics> ClientBuilder<M> {
             None => return Err(ClientError::InvalidUrl(request.url.to_string())),
         };
 
-        let conn = self.0.connect(&host, port).await?;
+        let connecting = self.0.connect(&host, port).await?;
 
-        Connection::connect(conn, request).await
+        Ok(Connecting {
+            connecting,
+            request,
+        })
+    }
+}
+
+/// A WebTransport connection that is still completing the handshake.
+///
+/// Call [Connecting::established] to wait for the full handshake to complete
+/// (TLS + SETTINGS + CONNECT).
+pub struct Connecting {
+    connecting: ez::Connecting,
+    request: ConnectRequest,
+}
+
+impl Connecting {
+    /// Wait for the full handshake to complete (TLS + SETTINGS + CONNECT).
+    pub async fn established(self) -> Result<Connection, ClientError> {
+        let conn = self.connecting.established().await?;
+        Connection::connect(conn, self.request).await
     }
 }

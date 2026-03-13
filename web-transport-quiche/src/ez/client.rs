@@ -7,7 +7,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use crate::ez::tls::StaticCertHook;
 use crate::ez::DriverState;
 
-use super::{Connection, DefaultMetrics, Driver, Lock, Metrics, Settings};
+use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
 /// Construct a QUIC client using sane defaults.
 pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
@@ -95,7 +95,7 @@ impl<M: Metrics> ClientBuilder<M> {
     /// Connect to the QUIC server at the given host and port.
     ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connection> {
+    pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connecting> {
         if self.socket.is_none() {
             self = self.with_bind("[::]:0")?;
         }
@@ -169,7 +169,33 @@ impl<M: Metrics> ClientBuilder<M> {
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let conn = Connection::new(conn, driver, accept_bi.1, accept_uni.1);
-        Ok(conn)
+        let conn = Connection::new(conn, driver.clone(), accept_bi.1, accept_uni.1);
+        Ok(Connecting {
+            connection: conn,
+            driver,
+        })
+    }
+}
+
+/// A QUIC connection that is still completing the TLS handshake.
+///
+/// This is the client-side equivalent of [super::Incoming] on the server side.
+/// Call [Connecting::established] to wait for the handshake to complete.
+pub struct Connecting {
+    connection: Connection,
+    driver: Lock<DriverState>,
+}
+
+impl Connecting {
+    /// Wait for the TLS handshake to complete.
+    ///
+    /// Returns the connection once the handshake is complete, or an error if the connection
+    /// is closed before the handshake finishes.
+    pub async fn established(self) -> Result<Connection, ConnectionError> {
+        use std::future::poll_fn;
+
+        poll_fn(|cx| self.driver.lock().poll_handshake(cx.waker())).await?;
+
+        Ok(self.connection)
     }
 }
