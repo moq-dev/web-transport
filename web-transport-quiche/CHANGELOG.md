@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.2.3...web-transport-quiche-v0.3.0) - 2026-03-13
+
+### Other
+
+- Add Connecting type to web-transport-quiche ([#193](https://github.com/moq-dev/web-transport/pull/193))
+
 ## [0.2.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.2.2...web-transport-quiche-v0.2.3) - 2026-03-11
 
 ### Other
