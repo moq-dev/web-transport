@@ -21,6 +21,9 @@ pub enum Error {
     #[error("stream stop: {0}")]
     StreamStop(VarInt),
 
+    #[error("frame too large")]
+    FrameTooLarge,
+
     #[error("short frame")]
     Short,
 
