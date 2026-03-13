@@ -7,7 +7,9 @@ use std::{
 };
 
 use crate::transport::Transport;
-use crate::{ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version};
+use crate::{
+    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version,
+};
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
@@ -120,7 +122,9 @@ impl<T: Transport> SessionState<T> {
 
         let mut buf = BytesMut::new();
         // Frame type: 0x3f5153300d0a0d0a (QX_TRANSPORT_PARAMETERS)
-        VarInt::try_from(0x3f5153300d0a0d0au64).unwrap().encode(&mut buf);
+        VarInt::try_from(0x3f5153300d0a0d0au64)
+            .unwrap()
+            .encode(&mut buf);
         // Length: 0 (no transport parameters)
         VarInt::from(0u32).encode(&mut buf);
 
@@ -259,20 +263,12 @@ impl<T: Transport> SessionState<T> {
 
 impl Session {
     /// Create a client-side session over the given transport.
-    pub fn connect<T: Transport>(
-        transport: T,
-        version: Version,
-        protocol: Option<String>,
-    ) -> Self {
+    pub fn connect<T: Transport>(transport: T, version: Version, protocol: Option<String>) -> Self {
         Self::new(transport, version, false, protocol)
     }
 
     /// Create a server-side session over the given transport.
-    pub fn accept<T: Transport>(
-        transport: T,
-        version: Version,
-        protocol: Option<String>,
-    ) -> Self {
+    pub fn accept<T: Transport>(transport: T, version: Version, protocol: Option<String>) -> Self {
         Self::new(transport, version, true, protocol)
     }
 
@@ -326,7 +322,6 @@ impl Session {
             protocol,
         }
     }
-
 }
 
 impl generic::Session for Session {

@@ -9,10 +9,7 @@ use crate::Error;
 /// For TCP/TLS byte streams, the transport handles frame delimiting.
 pub trait Transport: Send + 'static {
     /// Send a message.
-    fn send(
-        &mut self,
-        data: Bytes,
-    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
+    fn send(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Receive the next complete message.
     fn recv(&mut self) -> impl std::future::Future<Output = Result<Bytes, Error>> + Send;

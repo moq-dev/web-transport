@@ -11,9 +11,9 @@ mod client;
 mod server;
 mod session;
 
-pub use qmux::SendStream;
-pub use qmux::RecvStream;
 pub use qmux::Error;
+pub use qmux::RecvStream;
+pub use qmux::SendStream;
 
 #[allow(deprecated)]
 pub use client::Client;

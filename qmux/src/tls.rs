@@ -4,7 +4,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::transport::StreamTransport;
-use crate::{Error, Session, Version, alpn};
+use crate::{alpn, Error, Session, Version};
 
 /// Parse a TLS ALPN into a version and app protocol.
 ///

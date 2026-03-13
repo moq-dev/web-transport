@@ -5,8 +5,8 @@
 
 mod alpn;
 mod error;
-mod protocol;
 pub mod proto;
+mod protocol;
 mod session;
 mod stream;
 mod transport;
@@ -36,9 +36,9 @@ use proto::*;
 
 pub use error::Error;
 pub use proto::Version;
-pub use transport::Transport;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
+pub use transport::Transport;
 
 /// All supported ALPN identifiers, in preference order.
 ///

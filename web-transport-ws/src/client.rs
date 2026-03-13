@@ -34,7 +34,10 @@ impl Client {
     }
 
     /// Set the TLS connector for secure WebSocket connections.
-    #[cfg(any(feature = "rustls-tls-native-roots", feature = "rustls-tls-webpki-roots"))]
+    #[cfg(any(
+        feature = "rustls-tls-native-roots",
+        feature = "rustls-tls-webpki-roots"
+    ))]
     pub fn with_connector(mut self, connector: qmux::tokio_tungstenite::Connector) -> Self {
         self.inner = self.inner.with_connector(connector);
         self

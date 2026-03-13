@@ -3,7 +3,7 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT, alpn};
+use crate::{alpn, Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
 
 /// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
 ///
@@ -17,14 +17,22 @@ fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
     };
 
     if let Some(proto) = alpn.strip_prefix(PREFIX_QMUX) {
-        let proto = if proto.is_empty() { None } else { Some(proto.to_string()) };
+        let proto = if proto.is_empty() {
+            None
+        } else {
+            Some(proto.to_string())
+        };
         return (Version::QMux00, proto);
     }
     if alpn == crate::ALPN_QMUX {
         return (Version::QMux00, None);
     }
     if let Some(proto) = alpn.strip_prefix(PREFIX_WEBTRANSPORT) {
-        let proto = if proto.is_empty() { None } else { Some(proto.to_string()) };
+        let proto = if proto.is_empty() {
+            None
+        } else {
+            Some(proto.to_string())
+        };
         return (Version::WebTransport, proto);
     }
 
@@ -232,8 +240,7 @@ impl Server {
                     http::header::SEC_WEBSOCKET_PROTOCOL,
                     http::HeaderValue::from_str(&response_value).unwrap(),
                 );
-                *negotiated_clone.lock().unwrap() =
-                    Some((Version::QMux00, Some(proto.clone())));
+                *negotiated_clone.lock().unwrap() = Some((Version::QMux00, Some(proto.clone())));
                 return Ok(response);
             }
 
@@ -293,4 +300,3 @@ impl Server {
         Ok(Session::accept(transport, version, protocol))
     }
 }
-

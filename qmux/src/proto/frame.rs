@@ -3,7 +3,6 @@ use web_transport_proto::VarInt;
 
 use crate::{Error, StreamId, Version};
 
-
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -118,7 +117,9 @@ impl Frame {
                 // frame_type = 0 (application close)
                 VarInt::from(0u32).encode(buf);
                 let reason_bytes = c.reason.as_bytes();
-                VarInt::try_from(reason_bytes.len() as u64).unwrap().encode(buf);
+                VarInt::try_from(reason_bytes.len() as u64)
+                    .unwrap()
+                    .encode(buf);
                 buf.put_slice(reason_bytes);
             }
         }
@@ -154,11 +155,19 @@ impl Frame {
             }
             0x08 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
-                Ok(Frame::Stream(Stream { id, data, fin: false }))
+                Ok(Frame::Stream(Stream {
+                    id,
+                    data,
+                    fin: false,
+                }))
             }
             0x09 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
-                Ok(Frame::Stream(Stream { id, data, fin: true }))
+                Ok(Frame::Stream(Stream {
+                    id,
+                    data,
+                    fin: true,
+                }))
             }
             0x1d => {
                 let code = VarInt::decode(&mut data)?;
@@ -223,8 +232,12 @@ impl Frame {
                 if (data.remaining() as u64) < reason_len {
                     return Err(Error::Short);
                 }
-                let reason = String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
-                Ok(Some(Frame::ConnectionClose(ConnectionClose { code, reason })))
+                let reason =
+                    String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
+                Ok(Some(Frame::ConnectionClose(ConnectionClose {
+                    code,
+                    reason,
+                })))
             }
             // MAX_DATA
             0x10 => {

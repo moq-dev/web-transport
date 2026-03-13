@@ -1,5 +1,5 @@
-import * as Frame from "./frame.ts";
 import type { Version } from "./frame.ts";
+import * as Frame from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 

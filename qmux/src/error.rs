@@ -69,9 +69,7 @@ impl web_transport_trait::Error for Error {
 
     fn stream_error(&self) -> Option<u32> {
         match self {
-            Error::StreamReset(code) | Error::StreamStop(code) => {
-                code.into_inner().try_into().ok()
-            }
+            Error::StreamReset(code) | Error::StreamStop(code) => code.into_inner().try_into().ok(),
             _ => None,
         }
     }
