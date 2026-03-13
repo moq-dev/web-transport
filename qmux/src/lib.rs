@@ -28,9 +28,13 @@ pub use tokio_tungstenite;
 #[cfg(feature = "ws")]
 pub use tokio_tungstenite::tungstenite;
 
+#[cfg(feature = "ws")]
+pub use ws::{Client, Server};
+
 use proto::*;
 
 pub use error::Error;
+pub use proto::Version;
 pub use transport::Transport;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};

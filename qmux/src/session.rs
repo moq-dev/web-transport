@@ -72,13 +72,19 @@ impl<T: Transport> SessionState<T> {
     // A proper fix requires splitting Transport into separate read/write halves
     // or moving recv_frame into a dedicated task that never gets cancelled.
     async fn run(&mut self) -> Result<(), Error> {
+        // QMux requires TRANSPORT_PARAMETERS as the first frame on the connection.
+        if self.version == Version::QMux00 {
+            self.send_transport_parameters().await?;
+        }
+
         let mut closed = self.closed.subscribe();
 
         loop {
             tokio::select! {
                 biased;
-                result = self.transport.recv_frame(self.version) => {
-                    if let Some(frame) = result? {
+                result = self.transport.recv() => {
+                    let data = result?;
+                    if let Some(frame) = Frame::decode(data, self.version)? {
                         self.recv_frame(frame).await?;
                     }
                 }
@@ -108,6 +114,19 @@ impl<T: Transport> SessionState<T> {
         }
     }
 
+    /// Send a QX_TRANSPORT_PARAMETERS frame with default (empty) parameters.
+    async fn send_transport_parameters(&mut self) -> Result<(), Error> {
+        use bytes::BytesMut;
+
+        let mut buf = BytesMut::new();
+        // Frame type: 0x3f5153300d0a0d0a (QX_TRANSPORT_PARAMETERS)
+        VarInt::try_from(0x3f5153300d0a0d0au64).unwrap().encode(&mut buf);
+        // Length: 0 (no transport parameters)
+        VarInt::from(0u32).encode(&mut buf);
+
+        self.transport.send(buf.freeze()).await
+    }
+
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
         // Update our state first.
         match &frame {
@@ -123,7 +142,7 @@ impl<T: Transport> SessionState<T> {
             _ => {}
         };
 
-        self.transport.send_frame(frame, self.version).await
+        self.transport.send(frame.encode(self.version)).await
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {

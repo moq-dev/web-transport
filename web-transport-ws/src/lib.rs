@@ -9,23 +9,18 @@
 
 mod client;
 mod server;
+mod session;
 
-#[deprecated(note = "use qmux::Session instead")]
-pub type Session = qmux::Session;
-
-#[deprecated(note = "use qmux::SendStream instead")]
-pub type SendStream = qmux::SendStream;
-
-#[deprecated(note = "use qmux::RecvStream instead")]
-pub type RecvStream = qmux::RecvStream;
-
-#[deprecated(note = "use qmux::Error instead")]
-pub type Error = qmux::Error;
+pub use qmux::SendStream;
+pub use qmux::RecvStream;
+pub use qmux::Error;
 
 #[allow(deprecated)]
 pub use client::Client;
 #[allow(deprecated)]
 pub use server::Server;
+#[allow(deprecated)]
+pub use session::Session;
 pub use tokio_tungstenite;
 pub use tokio_tungstenite::tungstenite;
 

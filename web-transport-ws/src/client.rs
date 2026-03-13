@@ -27,6 +27,19 @@ impl Client {
         self
     }
 
+    /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    pub fn with_config(mut self, config: qmux::tungstenite::protocol::WebSocketConfig) -> Self {
+        self.inner = self.inner.with_config(config);
+        self
+    }
+
+    /// Set the TLS connector for secure WebSocket connections.
+    #[cfg(any(feature = "rustls-tls-native-roots", feature = "rustls-tls-webpki-roots"))]
+    pub fn with_connector(mut self, connector: qmux::tokio_tungstenite::Connector) -> Self {
+        self.inner = self.inner.with_connector(connector);
+        self
+    }
+
     /// Connect to a WebSocket server, negotiating the configured subprotocols.
     pub async fn connect(&self, url: &str) -> Result<qmux::Session, qmux::Error> {
         self.inner.connect(url).await

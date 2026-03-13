@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
@@ -16,7 +16,7 @@ default = ["tls", "wss"]
 tcp = ["tokio/net", "tokio/io-util"]
 tls = ["tcp", "dep:tokio-rustls", "dep:rustls"]
 ws = ["dep:tokio-tungstenite", "dep:futures"]
-wss = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]
+wss = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-native-roots"]
 
 [dependencies]
 bytes = "1"

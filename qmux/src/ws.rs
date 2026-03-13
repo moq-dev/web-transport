@@ -5,12 +5,39 @@ use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
 use crate::{Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
 
+/// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
+///
+/// Supports both bare ALPNs (`"qmux-00"`, `"webtransport"`) and
+/// prefixed variants (`"qmux-00.moq-03"`, `"webtransport.moq-03"`).
+/// Defaults to `WebTransport` when `None` or empty.
+fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
+    let alpn = match alpn {
+        Some(s) if !s.is_empty() => s,
+        _ => return (Version::WebTransport, None),
+    };
+
+    if let Some(proto) = alpn.strip_prefix(PREFIX_QMUX) {
+        let proto = if proto.is_empty() { None } else { Some(proto.to_string()) };
+        return (Version::QMux00, proto);
+    }
+    if alpn == crate::ALPN_QMUX {
+        return (Version::QMux00, None);
+    }
+    if let Some(proto) = alpn.strip_prefix(PREFIX_WEBTRANSPORT) {
+        let proto = if proto.is_empty() { None } else { Some(proto.to_string()) };
+        return (Version::WebTransport, proto);
+    }
+
+    // Unknown or bare "webtransport"
+    (Version::WebTransport, None)
+}
+
 /// Wrap a pre-upgraded WebSocket connection as a client-side session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework. The `version` determines the wire format and
-/// `protocol` should be the negotiated application-level subprotocol, if any.
-pub fn connect<T>(ws: T, version: Version, protocol: Option<String>) -> Session
+/// external framework. Pass the negotiated `sec-websocket-protocol`
+/// header value (or `None` to default to the WebTransport wire format).
+pub fn connect<T>(ws: T, alpn: Option<&str>) -> Session
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -18,6 +45,7 @@ where
         + Send
         + 'static,
 {
+    let (version, protocol) = parse_alpn(alpn);
     let transport = WsTransport::new(ws);
     Session::connect(transport, version, protocol)
 }
@@ -25,9 +53,9 @@ where
 /// Wrap a pre-upgraded WebSocket connection as a server-side session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). The `version` determines the wire format
-/// and `protocol` should be the negotiated application-level subprotocol, if any.
-pub fn accept<T>(ws: T, version: Version, protocol: Option<String>) -> Session
+/// external framework (e.g. axum). Pass the negotiated `sec-websocket-protocol`
+/// header value (or `None` to default to the WebTransport wire format).
+pub fn accept<T>(ws: T, alpn: Option<&str>) -> Session
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -35,6 +63,7 @@ where
         + Send
         + 'static,
 {
+    let (version, protocol) = parse_alpn(alpn);
     let transport = WsTransport::new(ws);
     Session::accept(transport, version, protocol)
 }
@@ -46,6 +75,9 @@ where
 #[derive(Default, Clone)]
 pub struct Client {
     protocols: Vec<String>,
+    config: Option<tungstenite::protocol::WebSocketConfig>,
+    #[cfg(feature = "wss")]
+    connector: Option<tokio_tungstenite::Connector>,
 }
 
 impl Client {
@@ -63,6 +95,19 @@ impl Client {
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Set the TLS connector for secure WebSocket connections.
+    #[cfg(feature = "wss")]
+    pub fn with_connector(mut self, connector: tokio_tungstenite::Connector) -> Self {
+        self.connector = Some(connector);
         self
     }
 
@@ -107,19 +152,31 @@ impl Client {
                 .map_err(|_| Error::InvalidProtocol(protocol_value))?,
         );
 
+        #[cfg(feature = "wss")]
+        let (ws_stream, response) = {
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                self.config,
+                false,
+                self.connector.clone(),
+            )
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?
+        };
+
+        #[cfg(not(feature = "wss"))]
         let (ws_stream, response) =
-            tokio_tungstenite::connect_async_with_config(request, None, false)
+            tokio_tungstenite::connect_async_with_config(request, self.config, false)
                 .await
                 .map_err(|e| Error::Io(e.to_string()))?;
 
         // Determine version and protocol from response
-        let negotiated_header = response
+        let negotiated = response
             .headers()
             .get(http::header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+            .and_then(|h| h.to_str().ok());
 
-        let (version, protocol) = parse_negotiated_protocol(negotiated_header)?;
+        let (version, protocol) = parse_alpn(negotiated);
 
         let transport = WsTransport::new(ws_stream);
         Ok(Session::connect(transport, version, protocol))
@@ -257,27 +314,3 @@ impl Server {
     }
 }
 
-/// Parse the negotiated WebSocket protocol header to determine version and app protocol.
-fn parse_negotiated_protocol(header: &str) -> Result<(Version, Option<String>), Error> {
-    for token in header.split(',').map(|p| p.trim()) {
-        if let Some(proto) = token.strip_prefix(PREFIX_QMUX) {
-            return Ok((Version::QMux00, Some(proto.to_string())));
-        }
-        if token == crate::ALPN_QMUX {
-            return Ok((Version::QMux00, None));
-        }
-        if let Some(proto) = token.strip_prefix(PREFIX_WEBTRANSPORT) {
-            return Ok((Version::WebTransport, Some(proto.to_string())));
-        }
-        if token == crate::ALPN_WEBTRANSPORT {
-            return Ok((Version::WebTransport, None));
-        }
-    }
-
-    if header.trim().is_empty() {
-        // No protocol header — default to QMux
-        Ok((Version::QMux00, None))
-    } else {
-        Err(Error::InvalidProtocol(header.to_string()))
-    }
-}
