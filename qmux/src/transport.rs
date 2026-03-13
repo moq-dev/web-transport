@@ -233,7 +233,7 @@ mod ws_transport {
             use futures::SinkExt;
 
             self.ws
-                .send(tungstenite::Message::Binary(data.to_vec()))
+                .send(tungstenite::Message::Binary(data))
                 .await
                 .map_err(|_| Error::Closed)?;
             Ok(())
@@ -246,7 +246,7 @@ mod ws_transport {
                 let message = self.ws.next().await.ok_or(Error::Closed)??;
                 match message {
                     tungstenite::Message::Binary(data) => {
-                        return Ok(Bytes::from(data));
+                        return Ok(data);
                     }
                     tungstenite::Message::Close(_) => {
                         return Err(Error::Closed);

@@ -3,6 +3,7 @@
 //! Provides QUIC-style multiplexed streams over TCP, TLS, and WebSocket,
 //! with backwards compatibility for the legacy `webtransport` wire format.
 
+mod alpn;
 mod error;
 mod protocol;
 pub mod proto;

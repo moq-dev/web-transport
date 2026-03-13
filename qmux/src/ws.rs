@@ -3,7 +3,7 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
+use crate::{Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT, alpn};
 
 /// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
 ///
@@ -124,27 +124,7 @@ impl Client {
             .map_err(|e| Error::Io(e.to_string()))?;
 
         // Offer both prefix families, preferring qmux-00
-        let protocol_value = if self.protocols.is_empty() {
-            format!("{}, {}", crate::ALPN_QMUX, crate::ALPN_WEBTRANSPORT)
-        } else {
-            let qmux_prefixed: Vec<String> = self
-                .protocols
-                .iter()
-                .map(|p| format!("{PREFIX_QMUX}{p}"))
-                .collect();
-            let wt_prefixed: Vec<String> = self
-                .protocols
-                .iter()
-                .map(|p| format!("{PREFIX_WEBTRANSPORT}{p}"))
-                .collect();
-            format!(
-                "{}, {}, {}, {}",
-                crate::ALPN_QMUX,
-                qmux_prefixed.join(", "),
-                crate::ALPN_WEBTRANSPORT,
-                wt_prefixed.join(", "),
-            )
-        };
+        let protocol_value = alpn::build(&self.protocols).join(", ");
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,

@@ -3,6 +3,7 @@ use web_transport_proto::VarInt;
 
 use crate::{Error, StreamId, Version};
 
+
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -42,7 +43,7 @@ pub struct ConnectionClose {
 }
 
 /// A QUIC-compatible frame for multiplexed transport.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Frame {
     ResetStream(ResetStream),
     StopSending(StopSending),
@@ -184,11 +185,11 @@ impl Frame {
             }
 
             let stream_data = if has_len {
-                let len = VarInt::decode(&mut data)?.into_inner() as usize;
-                if data.remaining() < len {
+                let len = VarInt::decode(&mut data)?.into_inner();
+                if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                data.split_to(len)
+                data.split_to(len as usize)
             } else {
                 data.split_to(data.remaining())
             };
@@ -218,11 +219,11 @@ impl Frame {
             0x1c | 0x1d => {
                 let code = VarInt::decode(&mut data)?;
                 let _frame_type = VarInt::decode(&mut data)?;
-                let reason_len = VarInt::decode(&mut data)?.into_inner() as usize;
-                if data.remaining() < reason_len {
+                let reason_len = VarInt::decode(&mut data)?.into_inner();
+                if (data.remaining() as u64) < reason_len {
                     return Err(Error::Short);
                 }
-                let reason = String::from_utf8_lossy(&data.split_to(reason_len)).into_owned();
+                let reason = String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
                 Ok(Some(Frame::ConnectionClose(ConnectionClose { code, reason })))
             }
             // MAX_DATA
@@ -264,11 +265,11 @@ impl Frame {
             }
             // DATAGRAM with length
             0x31 => {
-                let len = VarInt::decode(&mut data)?.into_inner() as usize;
-                if data.remaining() < len {
+                let len = VarInt::decode(&mut data)?.into_inner();
+                if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                let _payload = data.split_to(len);
+                let _payload = data.split_to(len as usize);
                 Ok(None)
             }
             // QX_TRANSPORT_PARAMETERS frame type.
@@ -276,11 +277,11 @@ impl Frame {
             // This is the VarInt encoding of the magic value used by QMux peers
             // to exchange transport parameters on connection setup.
             0x3f5153300d0a0d0a => {
-                let len = VarInt::decode(&mut data)?.into_inner() as usize;
-                if data.remaining() < len {
+                let len = VarInt::decode(&mut data)?.into_inner();
+                if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                let _payload = data.split_to(len);
+                let _payload = data.split_to(len as usize);
                 Ok(None)
             }
             _ => Err(Error::InvalidFrameType(frame_type)),

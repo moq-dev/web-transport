@@ -4,16 +4,16 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::transport::StreamTransport;
-use crate::{Error, Session, Version};
+use crate::{Error, Session, Version, alpn};
 
 /// Parse a TLS ALPN into a version and app protocol.
 ///
-/// Falls back to `QMux00` when the ALPN is missing or unrecognized,
-/// since TLS always uses the QMux wire format.
-fn parse_alpn(alpn: Option<&[u8]>) -> (Version, Option<String>) {
+/// Strips the qmux/webtransport prefix (e.g. `qmux-00.moqt-16` → `moqt-16`).
+/// TLS always uses the QMux wire format regardless of prefix.
+fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
     let alpn = match alpn {
-        Some(a) => std::str::from_utf8(a).unwrap_or(""),
-        None => return (Version::QMux00, None),
+        Some(s) if !s.is_empty() => s,
+        _ => return (Version::QMux00, None),
     };
 
     for &known in crate::ALPNS {
@@ -27,13 +27,17 @@ fn parse_alpn(alpn: Option<&[u8]>) -> (Version, Option<String>) {
         }
     }
 
+    tracing::warn!(?alpn, "unrecognized TLS ALPN");
     (Version::QMux00, None)
 }
 
 /// Connect over TLS. Always uses the QMux wire format.
 ///
+/// The caller's `alpn_protocols` are treated as application-level protocols
+/// and automatically wrapped with `qmux-00.` and `webtransport.` prefixes.
+/// The prefix is stripped from the negotiated result.
+///
 /// The `server_name` is used for SNI and certificate verification.
-/// The ALPN is extracted from the negotiated TLS connection.
 pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
@@ -45,11 +49,28 @@ pub async fn connect(
         .map_err(|e| Error::Io(e.to_string()))?
         .to_owned();
 
-    let connector = TlsConnector::from(config);
+    // Convert caller's raw ALPNs to prefixed qmux/webtransport ALPNs.
+    let app_protocols: Vec<String> = config
+        .alpn_protocols
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).to_string())
+        .collect();
+    let prefixed = alpn::build(&app_protocols);
+
+    let mut config = (*config).clone();
+    config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
+
+    tracing::debug!(?prefixed, "TLS connecting");
+
+    let connector = TlsConnector::from(Arc::new(config));
     let tls_stream = connector.connect(server_name, stream).await?;
 
-    let alpn = tls_stream.get_ref().1.alpn_protocol();
-    let (version, protocol) = parse_alpn(alpn);
+    let negotiated = tls_stream.get_ref().1.alpn_protocol();
+    let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
+    tracing::debug!(?negotiated_str, "TLS negotiated ALPN");
+
+    let (version, protocol) = parse_alpn(negotiated_str);
+    tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let transport = StreamTransport::new(tls_stream);
     Ok(Session::connect(transport, version, protocol))
@@ -65,8 +86,12 @@ pub async fn accept(
     let acceptor = TlsAcceptor::from(config);
     let tls_stream = acceptor.accept(stream).await?;
 
-    let alpn = tls_stream.get_ref().1.alpn_protocol();
-    let (version, protocol) = parse_alpn(alpn);
+    let negotiated = tls_stream.get_ref().1.alpn_protocol();
+    let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
+    tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
+
+    let (version, protocol) = parse_alpn(negotiated_str);
+    tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let transport = StreamTransport::new(tls_stream);
     Ok(Session::accept(transport, version, protocol))

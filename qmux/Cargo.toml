@@ -23,6 +23,7 @@ bytes = "1"
 futures = { version = "0.3", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tracing = "0.1"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
@@ -31,7 +32,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true }
 
 # Optional: WebSocket
-tokio-tungstenite = { version = "0.24", optional = true }
+tokio-tungstenite = { version = "0.28", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
