@@ -1,5 +1,6 @@
 import type { Version } from "./frame.ts";
 import * as Frame from "./frame.ts";
+import { MAX_FRAME_SIZE, MAX_FRAME_PAYLOAD } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
@@ -214,6 +215,11 @@ export default class Session implements WebTransport {
 	}
 
 	async #handleStreamFrame(frame: Frame.Data) {
+		if (frame.data.byteLength > MAX_FRAME_SIZE) {
+			this.close({ closeCode: 1002, reason: "frame too large" });
+			return;
+		}
+
 		const streamId = frame.id.value.value;
 
 		if (!frame.id.canRecv(this.#isServer)) {
@@ -258,12 +264,7 @@ export default class Session implements WebTransport {
 					},
 					write: async (chunk) => {
 						await Promise.race([
-							this.#sendFrame({
-								type: "stream",
-								id: frame.id,
-								data: chunk,
-								fin: false,
-							}),
+							this.#sendStreamData(frame.id, chunk),
 							this.closed,
 						]);
 					},
@@ -344,6 +345,19 @@ export default class Session implements WebTransport {
 		this.#ws.send(buffer);
 	}
 
+	async #sendStreamData(id: Stream.Id, data: Uint8Array) {
+		for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
+			const end = Math.min(offset + MAX_FRAME_PAYLOAD, data.byteLength);
+			const chunk = data.subarray(offset, end);
+			await this.#sendFrame({
+				type: "stream",
+				id,
+				data: chunk,
+				fin: false,
+			});
+		}
+	}
+
 	async #sendFrame(frame: Frame.Any) {
 		// Add some backpressure so we don't saturate the connection
 		while (this.#ws.bufferedAmount > 64 * 1024) {
@@ -374,12 +388,7 @@ export default class Session implements WebTransport {
 			},
 			write: async (chunk) => {
 				await Promise.race([
-					this.#sendFrame({
-						type: "stream",
-						id: streamId,
-						data: chunk,
-						fin: false,
-					}),
+					this.#sendStreamData(streamId, chunk),
 					this.closed,
 				]);
 			},
@@ -443,12 +452,7 @@ export default class Session implements WebTransport {
 			},
 			async write(chunk) {
 				await Promise.race([
-					session.#sendFrame({
-						type: "stream",
-						id: streamId,
-						data: chunk,
-						fin: false,
-					}),
+					session.#sendStreamData(streamId, chunk),
 					session.closed,
 				]);
 			},

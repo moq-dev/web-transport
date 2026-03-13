@@ -9,6 +9,7 @@ use std::{
 use crate::transport::Transport;
 use crate::{
     ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version,
+    MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -152,6 +153,10 @@ impl<T: Transport> SessionState<T> {
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
         match frame {
             Frame::Stream(stream) => {
+                if stream.data.len() > MAX_FRAME_SIZE {
+                    return Err(Error::FrameTooLarge);
+                }
+
                 if !stream.id.can_recv(self.is_server) {
                     return Err(Error::InvalidStreamId);
                 }
@@ -518,25 +523,31 @@ impl generic::SendStream for SendStream {
             return Err(Error::StreamClosed);
         }
 
-        let size = buf.chunk().len();
-        let frame = Stream {
-            id: self.id,
-            data: buf.copy_to_bytes(size),
-            fin: false,
-        };
+        let mut total = 0;
 
-        tokio::select! {
-            result = self.outbound.send(frame.into()) => {
-                if result.is_err() {
-                    return Err(Error::Closed);
+        while buf.has_remaining() {
+            let chunk_size = buf.chunk().len().min(MAX_FRAME_PAYLOAD);
+            let frame = Stream {
+                id: self.id,
+                data: buf.copy_to_bytes(chunk_size),
+                fin: false,
+            };
+
+            tokio::select! {
+                result = self.outbound.send(frame.into()) => {
+                    if result.is_err() {
+                        return Err(Error::Closed);
+                    }
+                    self.offset += chunk_size as u64;
+                    total += chunk_size;
                 }
-                self.offset += size as u64;
-                Ok(size)
-            }
-            Some(stop) = self.inbound_stopped.recv() => {
-                Err(self.recv_stop(stop.code))
+                Some(stop) = self.inbound_stopped.recv() => {
+                    return Err(self.recv_stop(stop.code));
+                }
             }
         }
+
+        Ok(total)
     }
 
     /// No-op: QMux does not support stream prioritization.
