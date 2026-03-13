@@ -122,6 +122,12 @@ export default class WebTransportWs implements WebTransport {
 				this.#version = "webtransport";
 				this.#protocol = "";
 			}
+
+			// QMux requires TRANSPORT_PARAMETERS as the first frame.
+			if (this.#version === "qmux-00") {
+				this.#sendTransportParameters();
+			}
+
 			this.#readyResolve();
 		};
 		this.#ws.onmessage = (event) => this.#handleMessage(event);
@@ -324,6 +330,18 @@ export default class WebTransportWs implements WebTransport {
 			id: frame.id,
 			code: frame.code,
 		});
+	}
+
+	#sendTransportParameters() {
+		// QX_TRANSPORT_PARAMETERS frame: type (0x3f5153300d0a0d0a) + length (0)
+		const frameType = VarInt.from(0x3f5153300d0a0d0an);
+		const length = VarInt.from(0);
+
+		let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+		buffer = frameType.encode(buffer);
+		buffer = length.encode(buffer);
+
+		this.#ws.send(buffer);
 	}
 
 	async #sendFrame(frame: Frame.Any) {
