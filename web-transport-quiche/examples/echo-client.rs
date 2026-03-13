@@ -30,7 +30,12 @@ async fn main() -> anyhow::Result<()> {
     settings.verify_peer = !args.tls_disable_verify;
 
     tracing::info!("connecting to {}", args.url);
-    let session = client.with_settings(settings).connect(args.url).await?.established().await?;
+    let session = client
+        .with_settings(settings)
+        .connect(args.url)
+        .await?
+        .established()
+        .await?;
 
     tracing::info!("connected");
 
