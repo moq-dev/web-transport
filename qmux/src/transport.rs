@@ -27,7 +27,7 @@ mod stream_transport {
     use web_transport_proto::VarInt;
 
     use super::Transport;
-    use crate::Error;
+    use crate::{Error, MAX_FRAME_SIZE};
 
     pub(crate) struct StreamTransport<T> {
         reader: BufReader<tokio::io::ReadHalf<T>>,
@@ -99,6 +99,9 @@ mod stream_transport {
 
                 if has_len {
                     let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    if len > MAX_FRAME_SIZE {
+                        return Err(Error::FrameTooLarge);
+                    }
                     self.read_bytes(len, &mut buf).await?;
                 } else {
                     return Err(Error::Short);
@@ -124,6 +127,9 @@ mod stream_transport {
                     self.read_varint(&mut buf).await?; // code
                     self.read_varint(&mut buf).await?; // frame_type
                     let reason_len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    if reason_len > MAX_FRAME_SIZE {
+                        return Err(Error::FrameTooLarge);
+                    }
                     self.read_bytes(reason_len, &mut buf).await?;
                 }
                 // MAX_DATA
@@ -157,11 +163,17 @@ mod stream_transport {
                 // DATAGRAM with length
                 0x31 => {
                     let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    if len > MAX_FRAME_SIZE {
+                        return Err(Error::FrameTooLarge);
+                    }
                     self.read_bytes(len, &mut buf).await?;
                 }
                 // QX_TRANSPORT_PARAMETERS
                 0x3f5153300d0a0d0a => {
                     let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    if len > MAX_FRAME_SIZE {
+                        return Err(Error::FrameTooLarge);
+                    }
                     self.read_bytes(len, &mut buf).await?;
                 }
                 _ => return Err(Error::InvalidFrameType(frame_type)),

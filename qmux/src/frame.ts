@@ -3,6 +3,12 @@ import { VarInt } from "./varint.ts";
 
 export type Version = "webtransport" | "qmux-00";
 
+/** Maximum size of a single QMux frame on the wire. */
+export const MAX_FRAME_SIZE = 16384;
+
+/** Maximum payload per STREAM frame, accounting for frame overhead (24 bytes). */
+export const MAX_FRAME_PAYLOAD = MAX_FRAME_SIZE - 24;
+
 export interface Data {
 	type: "stream";
 	id: Stream.Id;
