@@ -25,7 +25,7 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 }
 
 /** Options for the WebTransport-over-WebSocket polyfill. */
-export interface WebTransportWsOptions extends WebTransportOptions {
+export interface SessionOptions extends WebTransportOptions {
 	/** Application-level subprotocols to request during the WebSocket handshake.
 	 *
 	 * Each protocol is prefixed with `webtransport.` and `qmux-00.` on the wire.
@@ -36,7 +36,7 @@ export interface WebTransportWsOptions extends WebTransportOptions {
 const PREFIX_WEBTRANSPORT = "webtransport.";
 const PREFIX_QMUX = "qmux-00.";
 
-export default class WebTransportWs implements WebTransport {
+export default class Session implements WebTransport {
 	#ws: WebSocket;
 	#isServer = false;
 	#closed?: Error;
@@ -72,7 +72,7 @@ export default class WebTransportWs implements WebTransport {
 	// TODO: Implement datagrams
 	readonly datagrams = new Datagrams();
 
-	constructor(url: string | URL, options?: WebTransportWsOptions) {
+	constructor(url: string | URL, options?: SessionOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
@@ -81,7 +81,7 @@ export default class WebTransportWs implements WebTransport {
 			console.warn("serverCertificateHashes is not supported; trying anyway");
 		}
 
-		url = WebTransportWs.#convertToWebSocketUrl(url);
+		url = Session.#convertToWebSocketUrl(url);
 
 		// Offer both qmux-00 and webtransport prefixed protocols, preferring qmux-00
 		const appProtocols = options?.protocols ?? [];
