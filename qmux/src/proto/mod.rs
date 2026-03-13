@@ -1,9 +1,11 @@
 //! Wire format types for QMux frame encoding and decoding.
 
 mod frame;
+mod params;
 mod version;
 
 pub use frame::*;
+pub use params::*;
 pub use version::*;
 
 /// Maximum size of a single QMux frame on the wire (type + fields + payload).

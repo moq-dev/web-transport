@@ -24,6 +24,12 @@ pub enum Error {
     #[error("frame too large")]
     FrameTooLarge,
 
+    #[error("flow control error")]
+    FlowControlError,
+
+    #[error("stream limit exceeded")]
+    StreamLimitExceeded,
+
     #[error("short frame")]
     Short,
 

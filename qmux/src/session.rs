@@ -6,13 +6,14 @@ use std::{
     },
 };
 
+use crate::credit::Credit;
 use crate::transport::Transport;
 use crate::{
-    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId, Version,
-    MAX_FRAME_PAYLOAD,
+    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
+    TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
@@ -20,6 +21,7 @@ use web_transport_trait as generic;
 #[derive(Clone)]
 pub struct Session {
     is_server: bool,
+    version: Version,
 
     outbound: mpsc::Sender<Frame>,
     outbound_priority: mpsc::UnboundedSender<Frame>,
@@ -37,6 +39,13 @@ pub struct Session {
 
     /// The negotiated application-level subprotocol, if any.
     protocol: Option<String>,
+
+    // Flow control: stream count semaphores (permits added when peer params arrive / MAX_STREAMS)
+    open_bi_semaphore: Arc<Semaphore>,
+    open_uni_semaphore: Arc<Semaphore>,
+
+    // Shared connection-level send credit (shared with SendStreams)
+    conn_credit: Credit,
 }
 
 struct SessionState<T: Transport> {
@@ -57,6 +66,28 @@ struct SessionState<T: Transport> {
     recv_streams: HashMap<StreamId, RecvState>,
 
     closed: watch::Sender<Option<Error>>,
+
+    // Flow control state
+    conn_credit: Credit,
+    our_params: TransportParams,
+    peer_params: TransportParams,
+    params_received: bool,
+
+    // Receive-side connection-level tracking
+    recv_data_offset: u64,
+    recv_data_max: u64,
+
+    // Stream count tracking
+    open_bi_semaphore: Arc<Semaphore>,
+    open_uni_semaphore: Arc<Semaphore>,
+    recv_streams_bidi_max: u64,
+    recv_streams_uni_max: u64,
+    recv_streams_bidi_opened: u64,
+    recv_streams_uni_opened: u64,
+
+    // Channel for consumption notifications from RecvStreams
+    consumed_tx: mpsc::UnboundedSender<(StreamId, u64)>,
+    consumed_rx: mpsc::UnboundedReceiver<(StreamId, u64)>,
 }
 
 impl<T: Transport> SessionState<T> {
@@ -91,6 +122,9 @@ impl<T: Transport> SessionState<T> {
                         self.recv_frame(frame).await?;
                     }
                 }
+                Some((id, consumed)) = self.consumed_rx.recv() => {
+                    self.handle_consumed(id, consumed).await?;
+                }
                 Some((id, send)) = self.create_uni.recv() => {
                     self.send_streams.insert(id, send);
                 }
@@ -117,19 +151,10 @@ impl<T: Transport> SessionState<T> {
         }
     }
 
-    /// Send a QX_TRANSPORT_PARAMETERS frame with default (empty) parameters.
+    /// Send a QX_TRANSPORT_PARAMETERS frame with our defaults.
     async fn send_transport_parameters(&mut self) -> Result<(), Error> {
-        use bytes::BytesMut;
-
-        let mut buf = BytesMut::new();
-        // Frame type: 0x3f5153300d0a0d0a (QX_TRANSPORT_PARAMETERS)
-        VarInt::try_from(0x3f5153300d0a0d0au64)
-            .unwrap()
-            .encode(&mut buf);
-        // Length: 0 (no transport parameters)
-        VarInt::from(0u32).encode(&mut buf);
-
-        self.transport.send(buf.freeze()).await
+        let frame = Frame::TransportParameters(self.our_params.clone());
+        self.transport.send(frame.encode(self.version)).await
     }
 
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -152,6 +177,9 @@ impl<T: Transport> SessionState<T> {
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
         match frame {
+            Frame::TransportParameters(params) => {
+                self.recv_transport_parameters(params)?;
+            }
             Frame::Stream(stream) => {
                 if stream.data.len() > MAX_FRAME_PAYLOAD {
                     return Err(Error::FrameTooLarge);
@@ -161,6 +189,25 @@ impl<T: Transport> SessionState<T> {
                     return Err(Error::InvalidStreamId);
                 }
 
+                // Validate receive-side flow control (QMux only)
+                if self.version == Version::QMux00 && self.params_received {
+                    let data_len = stream.data.len() as u64;
+
+                    // Connection-level check
+                    if self.recv_data_offset + data_len > self.recv_data_max {
+                        return Err(Error::FlowControlError);
+                    }
+                    self.recv_data_offset += data_len;
+
+                    // Stream-level check
+                    if let Some(recv) = self.recv_streams.get(&stream.id) {
+                        if recv.recv_offset + data_len > recv.recv_max {
+                            return Err(Error::FlowControlError);
+                        }
+                    }
+                    // For new streams, we check after creation below
+                }
+
                 match self.recv_streams.entry(stream.id) {
                     hash_map::Entry::Vacant(e) => {
                         if self.is_server == stream.id.server_initiated() {
@@ -168,12 +215,57 @@ impl<T: Transport> SessionState<T> {
                             return Ok(());
                         }
 
+                        // Validate stream count limits (QMux only)
+                        if self.version == Version::QMux00 {
+                            match stream.id.dir() {
+                                StreamDir::Bi => {
+                                    self.recv_streams_bidi_opened += 1;
+                                    if self.recv_streams_bidi_opened
+                                        > self.recv_streams_bidi_max
+                                    {
+                                        return Err(Error::StreamLimitExceeded);
+                                    }
+                                }
+                                StreamDir::Uni => {
+                                    self.recv_streams_uni_opened += 1;
+                                    if self.recv_streams_uni_opened
+                                        > self.recv_streams_uni_max
+                                    {
+                                        return Err(Error::StreamLimitExceeded);
+                                    }
+                                }
+                            }
+                        }
+
+                        let data_len = stream.data.len() as u64;
+
                         let (tx, rx) = mpsc::unbounded_channel();
                         let (tx2, rx2) = mpsc::unbounded_channel();
+
+                        // Determine initial stream recv max
+                        let recv_max = if self.version == Version::QMux00 {
+                            match stream.id.dir() {
+                                // Remote opened this stream, so use bidi_remote
+                                StreamDir::Bi => {
+                                    self.our_params.initial_max_stream_data_bidi_remote
+                                }
+                                StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
+                            }
+                        } else {
+                            u64::MAX
+                        };
+
+                        // Validate stream-level for new stream
+                        if self.version == Version::QMux00 && data_len > recv_max {
+                            return Err(Error::FlowControlError);
+                        }
 
                         let recv_backend = RecvState {
                             inbound_data: tx,
                             inbound_reset: tx2,
+                            recv_max,
+                            recv_offset: data_len,
+                            recv_consumed: 0,
                         };
 
                         let recv_frontend = RecvStream {
@@ -184,6 +276,11 @@ impl<T: Transport> SessionState<T> {
                             buffer: Bytes::new(),
                             closed: None,
                             fin: false,
+                            consumed_tx: if self.version == Version::QMux00 {
+                                Some(self.consumed_tx.clone())
+                            } else {
+                                None
+                            },
                         };
 
                         match stream.id.dir() {
@@ -197,6 +294,16 @@ impl<T: Transport> SessionState<T> {
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let send_backend = SendState {
                                     inbound_stopped: tx,
+                                    stream_credit: if self.version == Version::QMux00 {
+                                        // Peer opened this bidi stream, so our send limit
+                                        // is their bidi_local (they are local to this stream)
+                                        Some(Credit::new(
+                                            self.peer_params
+                                                .initial_max_stream_data_bidi_local,
+                                        ))
+                                    } else {
+                                        None
+                                    },
                                 };
 
                                 let send_frontend = SendStream {
@@ -207,6 +314,12 @@ impl<T: Transport> SessionState<T> {
                                     offset: 0,
                                     closed: None,
                                     fin: false,
+                                    stream_credit: send_backend.stream_credit.clone(),
+                                    conn_credit: if self.version == Version::QMux00 {
+                                        Some(self.conn_credit.clone())
+                                    } else {
+                                        None
+                                    },
                                 };
 
                                 self.send_streams.insert(stream.id, send_backend);
@@ -225,6 +338,16 @@ impl<T: Transport> SessionState<T> {
                         }
                     }
                     hash_map::Entry::Occupied(mut e) => {
+                        // Update stream-level recv offset
+                        if self.version == Version::QMux00 {
+                            let recv = e.get_mut();
+                            let data_len = stream.data.len() as u64;
+                            recv.recv_offset += data_len;
+                            if recv.recv_offset > recv.recv_max {
+                                return Err(Error::FlowControlError);
+                            }
+                        }
+
                         let fin = stream.fin;
                         e.get_mut().inbound_data.send(stream).ok();
                         if fin {
@@ -260,6 +383,132 @@ impl<T: Transport> SessionState<T> {
                     }))
                     .ok();
             }
+            // Flow control frames
+            Frame::MaxData(max) => {
+                self.conn_credit.increase_max(max)?;
+            }
+            Frame::MaxStreamData { id, max } => {
+                if let Some(send) = self.send_streams.get(&id) {
+                    if let Some(credit) = &send.stream_credit {
+                        credit.increase_max(max)?;
+                    }
+                }
+            }
+            Frame::MaxStreamsBidi(max) => {
+                // Add new permits (max is absolute, not delta)
+                let current = self.open_bi_semaphore.available_permits() as u64;
+                if max > current {
+                    self.open_bi_semaphore
+                        .add_permits((max - current) as usize);
+                }
+            }
+            Frame::MaxStreamsUni(max) => {
+                let current = self.open_uni_semaphore.available_permits() as u64;
+                if max > current {
+                    self.open_uni_semaphore
+                        .add_permits((max - current) as usize);
+                }
+            }
+            // Informational frames — peer is telling us they're blocked.
+            // We don't need to act on these since we auto-tune windows.
+            Frame::DataBlocked(_)
+            | Frame::StreamDataBlocked { .. }
+            | Frame::StreamsBlockedBidi(_)
+            | Frame::StreamsBlockedUni(_) => {}
+        }
+
+        Ok(())
+    }
+
+    fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
+        if self.params_received {
+            // Duplicate transport parameters
+            return Err(Error::FlowControlError);
+        }
+        self.params_received = true;
+
+        // Set connection-level send credit from peer's initial_max_data
+        self.conn_credit
+            .increase_max(params.initial_max_data)
+            .ok();
+
+        // Add stream count permits
+        self.open_bi_semaphore
+            .add_permits(params.initial_max_streams_bidi as usize);
+        self.open_uni_semaphore
+            .add_permits(params.initial_max_streams_uni as usize);
+
+        self.peer_params = params;
+
+        Ok(())
+    }
+
+    async fn handle_consumed(&mut self, id: StreamId, consumed: u64) -> Result<(), Error> {
+        // Update per-stream consumed
+        if let Some(recv) = self.recv_streams.get_mut(&id) {
+            recv.recv_consumed += consumed;
+            self.maybe_send_max_stream_data(id).await?;
+        }
+
+        // Update connection-level consumed and maybe send MAX_DATA
+        self.maybe_send_max_data().await
+    }
+
+    async fn maybe_send_max_data(&mut self) -> Result<(), Error> {
+        // Sum consumed across all recv streams
+        let total_consumed: u64 = self
+            .recv_streams
+            .values()
+            .map(|r| r.recv_consumed)
+            .sum();
+
+        // Send MAX_DATA when consumed reaches half of our initial window
+        let window = self.our_params.initial_max_data;
+        if window == 0 {
+            return Ok(());
+        }
+
+        let threshold = window / 2;
+        let consumed_since_last = total_consumed;
+
+        if consumed_since_last >= threshold {
+            let new_max = self.recv_data_offset + window;
+            if new_max > self.recv_data_max {
+                self.recv_data_max = new_max;
+                let frame = Frame::MaxData(new_max);
+                self.transport.send(frame.encode(self.version)).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn maybe_send_max_stream_data(&mut self, id: StreamId) -> Result<(), Error> {
+        let recv = match self.recv_streams.get(&id) {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let initial_window = match id.dir() {
+            StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
+            StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
+        };
+
+        if initial_window == 0 {
+            return Ok(());
+        }
+
+        let threshold = initial_window / 2;
+        if recv.recv_consumed >= threshold {
+            let new_max = recv.recv_offset + initial_window;
+            if new_max > recv.recv_max {
+                // Need to get mutable ref again
+                let recv = self.recv_streams.get_mut(&id).unwrap();
+                recv.recv_max = new_max;
+                recv.recv_consumed = 0;
+                let frame = Frame::MaxStreamData { id, max: new_max };
+                self.transport.send(frame.encode(self.version)).await?;
+            }
         }
 
         Ok(())
@@ -294,6 +543,25 @@ impl Session {
 
         let closed = watch::Sender::new(None);
 
+        let open_bi_semaphore = Arc::new(Semaphore::new(
+            if version == Version::QMux00 { 0 } else { usize::MAX >> 4 },
+        ));
+        let open_uni_semaphore = Arc::new(Semaphore::new(
+            if version == Version::QMux00 { 0 } else { usize::MAX >> 4 },
+        ));
+
+        let conn_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
+
+        let our_params = if version == Version::QMux00 {
+            TransportParams::recommended()
+        } else {
+            TransportParams::default()
+        };
+
+        let (consumed_tx, consumed_rx) = mpsc::unbounded_channel();
+
+        let recv_data_max = our_params.initial_max_data;
+
         let mut backend = SessionState {
             transport,
             version,
@@ -307,6 +575,20 @@ impl Session {
             send_streams: HashMap::new(),
             recv_streams: HashMap::new(),
             closed: closed.clone(),
+            conn_credit: conn_credit.clone(),
+            our_params: our_params.clone(),
+            peer_params: TransportParams::default(),
+            params_received: false,
+            recv_data_offset: 0,
+            recv_data_max,
+            open_bi_semaphore: open_bi_semaphore.clone(),
+            open_uni_semaphore: open_uni_semaphore.clone(),
+            recv_streams_bidi_max: our_params.initial_max_streams_bidi,
+            recv_streams_uni_max: our_params.initial_max_streams_uni,
+            recv_streams_bidi_opened: 0,
+            recv_streams_uni_opened: 0,
+            consumed_tx,
+            consumed_rx,
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
@@ -315,6 +597,7 @@ impl Session {
 
         Session {
             is_server,
+            version,
             outbound: outbound_tx,
             outbound_priority: outbound_priority_tx,
             accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
@@ -325,6 +608,9 @@ impl Session {
             create_bi_id: Default::default(),
             closed,
             protocol,
+            open_bi_semaphore,
+            open_uni_semaphore,
+            conn_credit,
         }
     }
 }
@@ -353,12 +639,28 @@ impl generic::Session for Session {
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
+        // Wait for stream count permit (QMux flow control)
+        self.open_uni_semaphore
+            .acquire()
+            .await
+            .map_err(|_| Error::Closed)?
+            .forget();
+
         let id = self.create_uni_id.fetch_add(1, Ordering::Relaxed);
         let id = StreamId::new(id, StreamDir::Uni, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
+
+        let stream_credit = if self.version == Version::QMux00 {
+            // For uni streams we initiate, peer's uni limit applies
+            Some(Credit::new(0)) // Will be set when peer params arrive
+        } else {
+            None
+        };
+
         let send_backend = SendState {
             inbound_stopped: tx,
+            stream_credit: stream_credit.clone(),
         };
         let send_frontend = SendStream {
             id,
@@ -368,6 +670,12 @@ impl generic::Session for Session {
             offset: 0,
             closed: None,
             fin: false,
+            stream_credit,
+            conn_credit: if self.version == Version::QMux00 {
+                Some(self.conn_credit.clone())
+            } else {
+                None
+            },
         };
 
         self.create_uni
@@ -379,14 +687,29 @@ impl generic::Session for Session {
     }
 
     async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+        // Wait for stream count permit (QMux flow control)
+        self.open_bi_semaphore
+            .acquire()
+            .await
+            .map_err(|_| Error::Closed)?
+            .forget();
+
         let id = self.create_bi_id.fetch_add(1, Ordering::Relaxed);
         let id = StreamId::new(id, StreamDir::Bi, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();
 
+        let stream_credit = if self.version == Version::QMux00 {
+            // For bidi streams we initiate, peer's bidi_remote applies to our sends
+            Some(Credit::new(0)) // Will be set when peer params arrive
+        } else {
+            None
+        };
+
         let send_backend = SendState {
             inbound_stopped: tx,
+            stream_credit: stream_credit.clone(),
         };
         let send_frontend = SendStream {
             id,
@@ -396,12 +719,25 @@ impl generic::Session for Session {
             offset: 0,
             closed: None,
             fin: false,
+            stream_credit,
+            conn_credit: if self.version == Version::QMux00 {
+                Some(self.conn_credit.clone())
+            } else {
+                None
+            },
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
         let recv_backend = RecvState {
             inbound_data: tx,
             inbound_reset: tx2,
+            recv_max: if self.version == Version::QMux00 {
+                0 // Will be set from our_params when peer sends data
+            } else {
+                u64::MAX
+            },
+            recv_offset: 0,
+            recv_consumed: 0,
         };
         let recv_frontend = RecvStream {
             id,
@@ -411,6 +747,7 @@ impl generic::Session for Session {
             buffer: Bytes::new(),
             closed: None,
             fin: false,
+            consumed_tx: None, // Recv on our own bidi doesn't need consumed tracking yet
         };
 
         self.create_bi
@@ -464,6 +801,7 @@ impl generic::Session for Session {
 
 struct SendState {
     inbound_stopped: mpsc::UnboundedSender<StopSending>,
+    stream_credit: Option<Credit>,
 }
 
 /// The send half of a multiplexed stream.
@@ -477,6 +815,10 @@ pub struct SendStream {
     offset: u64,
     closed: Option<Error>,
     fin: bool,
+
+    // Flow control (None for WebTransport version)
+    stream_credit: Option<Credit>,
+    conn_credit: Option<Credit>,
 }
 
 impl SendStream {
@@ -493,6 +835,57 @@ impl SendStream {
         self.closed = Some(error.clone());
 
         error
+    }
+
+    /// Try to claim flow control credit for sending `desired` bytes.
+    /// Returns the number of bytes we're allowed to send.
+    async fn claim_credit(&mut self, desired: u64) -> Result<u64, Error> {
+        let (stream_credit, conn_credit) = match (&self.stream_credit, &self.conn_credit) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return Ok(desired), // No flow control
+        };
+
+        loop {
+            // 1. Try to claim stream credit
+            let stream_claimed = stream_credit.try_claim(desired);
+            if stream_claimed == 0 {
+                // Wait for stream credit or stop_sending
+                tokio::select! {
+                    result = stream_credit.claim(desired) => {
+                        let claimed = result?;
+                        // Release and retry the full loop to coordinate with conn credit
+                        stream_credit.release(claimed);
+                    }
+                    Some(stop) = self.inbound_stopped.recv() => {
+                        return Err(self.recv_stop(stop.code));
+                    }
+                }
+                continue;
+            }
+
+            // 2. Try to claim connection credit (may get less than stream_claimed)
+            let conn_claimed = conn_credit.try_claim(stream_claimed);
+            if conn_claimed == 0 {
+                stream_credit.release(stream_claimed);
+                tokio::select! {
+                    result = conn_credit.claim(1) => {
+                        let claimed = result?;
+                        conn_credit.release(claimed); // Release, retry full loop
+                    }
+                    Some(stop) = self.inbound_stopped.recv() => {
+                        return Err(self.recv_stop(stop.code));
+                    }
+                }
+                continue;
+            }
+
+            // Return excess stream credit if connection had less
+            if conn_claimed < stream_claimed {
+                stream_credit.release(stream_claimed - conn_claimed);
+            }
+
+            return Ok(conn_claimed);
+        }
     }
 }
 
@@ -526,10 +919,15 @@ impl generic::SendStream for SendStream {
         let mut total = 0;
 
         while buf.has_remaining() {
-            let chunk_size = buf.chunk().len().min(MAX_FRAME_PAYLOAD);
+            let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
+
+            // Claim flow control credit
+            let allowed = self.claim_credit(chunk_len).await?;
+            let to_send = allowed as usize;
+
             let frame = Stream {
                 id: self.id,
-                data: buf.copy_to_bytes(chunk_size),
+                data: buf.copy_to_bytes(to_send),
                 fin: false,
             };
 
@@ -538,8 +936,8 @@ impl generic::SendStream for SendStream {
                     if result.is_err() {
                         return Err(Error::Closed);
                     }
-                    self.offset += chunk_size as u64;
-                    total += chunk_size;
+                    self.offset += to_send as u64;
+                    total += to_send;
                 }
                 Some(stop) = self.inbound_stopped.recv() => {
                     return Err(self.recv_stop(stop.code));
@@ -603,6 +1001,9 @@ impl generic::SendStream for SendStream {
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
+    recv_max: u64,
+    recv_offset: u64,
+    recv_consumed: u64,
 }
 
 /// The receive half of a multiplexed stream.
@@ -617,6 +1018,9 @@ pub struct RecvStream {
 
     closed: Option<Error>,
     fin: bool,
+
+    // Flow control: notify backend of consumed bytes
+    consumed_tx: Option<mpsc::UnboundedSender<(StreamId, u64)>>,
 }
 
 impl RecvStream {
@@ -645,7 +1049,14 @@ impl generic::RecvStream for RecvStream {
         loop {
             if !self.buffer.is_empty() {
                 let to_read = max.min(self.buffer.len());
-                return Ok(Some(self.buffer.split_to(to_read)));
+                let data = self.buffer.split_to(to_read);
+
+                // Notify backend of consumed bytes
+                if let Some(tx) = &self.consumed_tx {
+                    tx.send((self.id, to_read as u64)).ok();
+                }
+
+                return Ok(Some(data));
             }
 
             if self.fin {
@@ -677,6 +1088,11 @@ impl generic::RecvStream for RecvStream {
         if !self.buffer.is_empty() {
             let to_read = buf.remaining_mut().min(self.buffer.len());
             buf.put(self.buffer.split_to(to_read));
+
+            if let Some(tx) = &self.consumed_tx {
+                tx.send((self.id, to_read as u64)).ok();
+            }
+
             return Ok(Some(to_read));
         }
 

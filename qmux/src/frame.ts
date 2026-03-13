@@ -34,6 +34,80 @@ export interface ConnectionClose {
 	reason: string;
 }
 
+export interface MaxData {
+	type: "max_data";
+	max: bigint;
+}
+
+export interface MaxStreamData {
+	type: "max_stream_data";
+	id: Stream.Id;
+	max: bigint;
+}
+
+export interface MaxStreamsBidi {
+	type: "max_streams_bidi";
+	max: bigint;
+}
+
+export interface MaxStreamsUni {
+	type: "max_streams_uni";
+	max: bigint;
+}
+
+export interface DataBlocked {
+	type: "data_blocked";
+	limit: bigint;
+}
+
+export interface StreamDataBlocked {
+	type: "stream_data_blocked";
+	id: Stream.Id;
+	limit: bigint;
+}
+
+export interface StreamsBlockedBidi {
+	type: "streams_blocked_bidi";
+	limit: bigint;
+}
+
+export interface StreamsBlockedUni {
+	type: "streams_blocked_uni";
+	limit: bigint;
+}
+
+export interface TransportParameters {
+	type: "transport_parameters";
+	params: TransportParams;
+}
+
+export interface TransportParams {
+	initialMaxData: bigint;
+	initialMaxStreamDataBidiLocal: bigint;
+	initialMaxStreamDataBidiRemote: bigint;
+	initialMaxStreamDataUni: bigint;
+	initialMaxStreamsBidi: bigint;
+	initialMaxStreamsUni: bigint;
+}
+
+export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
+	initialMaxData: 0n,
+	initialMaxStreamDataBidiLocal: 0n,
+	initialMaxStreamDataBidiRemote: 0n,
+	initialMaxStreamDataUni: 0n,
+	initialMaxStreamsBidi: 0n,
+	initialMaxStreamsUni: 0n,
+};
+
+export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
+	initialMaxData: 1_048_576n,
+	initialMaxStreamDataBidiLocal: 262_144n,
+	initialMaxStreamDataBidiRemote: 262_144n,
+	initialMaxStreamDataUni: 262_144n,
+	initialMaxStreamsBidi: 100n,
+	initialMaxStreamsUni: 100n,
+};
+
 export interface Padding {
 	type: "padding";
 }
@@ -42,7 +116,20 @@ export interface Ping {
 	type: "ping";
 }
 
-export type Any = Data | ResetStream | StopSending | ConnectionClose;
+export type Any =
+	| Data
+	| ResetStream
+	| StopSending
+	| ConnectionClose
+	| MaxData
+	| MaxStreamData
+	| MaxStreamsBidi
+	| MaxStreamsUni
+	| DataBlocked
+	| StreamDataBlocked
+	| StreamsBlockedBidi
+	| StreamsBlockedUni
+	| TransportParameters;
 
 export function encode(frame: Any, version: Version = "webtransport"): Uint8Array {
 	if (version === "webtransport") {
@@ -95,6 +182,9 @@ function encodeWebTransport(frame: Any): Uint8Array {
 
 			return buffer;
 		}
+
+		default:
+			throw new Error("flow control frames are not supported in WebTransport version");
 	}
 }
 
@@ -161,7 +251,143 @@ function encodeQMux(frame: Any): Uint8Array {
 
 			return buffer;
 		}
+
+		case "max_data": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x10).encode(buffer);
+			buffer = VarInt.from(frame.max).encode(buffer);
+			return buffer;
+		}
+
+		case "max_stream_data": {
+			let buffer = new Uint8Array(new ArrayBuffer(24), 0, 0);
+			buffer = VarInt.from(0x11).encode(buffer);
+			buffer = frame.id.value.encode(buffer);
+			buffer = VarInt.from(frame.max).encode(buffer);
+			return buffer;
+		}
+
+		case "max_streams_bidi": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x12).encode(buffer);
+			buffer = VarInt.from(frame.max).encode(buffer);
+			return buffer;
+		}
+
+		case "max_streams_uni": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x13).encode(buffer);
+			buffer = VarInt.from(frame.max).encode(buffer);
+			return buffer;
+		}
+
+		case "data_blocked": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x14).encode(buffer);
+			buffer = VarInt.from(frame.limit).encode(buffer);
+			return buffer;
+		}
+
+		case "stream_data_blocked": {
+			let buffer = new Uint8Array(new ArrayBuffer(24), 0, 0);
+			buffer = VarInt.from(0x15).encode(buffer);
+			buffer = frame.id.value.encode(buffer);
+			buffer = VarInt.from(frame.limit).encode(buffer);
+			return buffer;
+		}
+
+		case "streams_blocked_bidi": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x16).encode(buffer);
+			buffer = VarInt.from(frame.limit).encode(buffer);
+			return buffer;
+		}
+
+		case "streams_blocked_uni": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(0x17).encode(buffer);
+			buffer = VarInt.from(frame.limit).encode(buffer);
+			return buffer;
+		}
+
+		case "transport_parameters": {
+			const payload = encodeTransportParams(frame.params);
+			let buffer = new Uint8Array(new ArrayBuffer(8 + 8 + payload.byteLength), 0, 0);
+			buffer = VarInt.from(0x3f5153300d0a0d0an).encode(buffer);
+			buffer = VarInt.from(payload.byteLength).encode(buffer);
+			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + payload.byteLength);
+			buffer.set(payload, buffer.byteLength - payload.byteLength);
+			return buffer;
+		}
 	}
+}
+
+function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
+	// Each param: id(varint) + length(varint) + value(varint)
+	// Max 6 params * 24 bytes each
+	let buffer = new Uint8Array(new ArrayBuffer(144), 0, 0);
+
+	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number, value: bigint): Uint8Array<ArrayBuffer> {
+		if (value === 0n) return buf;
+		const valVi = VarInt.from(value);
+		buf = VarInt.from(id).encode(buf);
+		buf = VarInt.from(valVi.size()).encode(buf);
+		buf = valVi.encode(buf);
+		return buf;
+	}
+
+	buffer = writeParam(buffer, 0x04, params.initialMaxData);
+	buffer = writeParam(buffer, 0x05, params.initialMaxStreamDataBidiLocal);
+	buffer = writeParam(buffer, 0x06, params.initialMaxStreamDataBidiRemote);
+	buffer = writeParam(buffer, 0x07, params.initialMaxStreamDataUni);
+	buffer = writeParam(buffer, 0x08, params.initialMaxStreamsBidi);
+	buffer = writeParam(buffer, 0x09, params.initialMaxStreamsUni);
+
+	return buffer;
+}
+
+function decodeTransportParams(buffer: Uint8Array): TransportParams {
+	const params = { ...DEFAULT_TRANSPORT_PARAMS };
+	let v: VarInt;
+
+	while (buffer.byteLength > 0) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = v.value;
+
+		[v, buffer] = VarInt.decode(buffer);
+		const len = Number(v.value);
+
+		const paramData = buffer.slice(0, len);
+		buffer = buffer.slice(len);
+
+		let paramValue: bigint;
+		[v] = VarInt.decode(paramData);
+		paramValue = v.value;
+
+		switch (id) {
+			case 0x04n:
+				params.initialMaxData = paramValue;
+				break;
+			case 0x05n:
+				params.initialMaxStreamDataBidiLocal = paramValue;
+				break;
+			case 0x06n:
+				params.initialMaxStreamDataBidiRemote = paramValue;
+				break;
+			case 0x07n:
+				params.initialMaxStreamDataUni = paramValue;
+				break;
+			case 0x08n:
+				params.initialMaxStreamsBidi = paramValue;
+				break;
+			case 0x09n:
+				params.initialMaxStreamsUni = paramValue;
+				break;
+			// Unknown params: skip
+		}
+	}
+
+	return params;
 }
 
 export function decode(buffer: Uint8Array, version: Version = "webtransport"): Any | null {
@@ -299,7 +525,78 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "connection_close", code, reason };
 	}
 
-	// Flow control and other frames — ignore
-	// MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS, DATA_BLOCKED, etc.
+	// MAX_DATA
+	if (frameType === 0x10n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "max_data", max: v.value };
+	}
+
+	// MAX_STREAM_DATA
+	if (frameType === 0x11n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "max_stream_data", id, max: v.value };
+	}
+
+	// MAX_STREAMS (bidi)
+	if (frameType === 0x12n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "max_streams_bidi", max: v.value };
+	}
+
+	// MAX_STREAMS (uni)
+	if (frameType === 0x13n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "max_streams_uni", max: v.value };
+	}
+
+	// DATA_BLOCKED
+	if (frameType === 0x14n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "data_blocked", limit: v.value };
+	}
+
+	// STREAM_DATA_BLOCKED
+	if (frameType === 0x15n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "stream_data_blocked", id, limit: v.value };
+	}
+
+	// STREAMS_BLOCKED (bidi)
+	if (frameType === 0x16n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "streams_blocked_bidi", limit: v.value };
+	}
+
+	// STREAMS_BLOCKED (uni)
+	if (frameType === 0x17n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "streams_blocked_uni", limit: v.value };
+	}
+
+	// QX_TRANSPORT_PARAMETERS
+	if (frameType === 0x3f5153300d0a0d0an) {
+		[v, buffer] = VarInt.decode(buffer);
+		const len = Number(v.value);
+		const payload = buffer.slice(0, len);
+		const params = decodeTransportParams(payload);
+		return { type: "transport_parameters", params };
+	}
+
+	// DATAGRAM without length
+	if (frameType === 0x30n) {
+		return null;
+	}
+
+	// DATAGRAM with length
+	if (frameType === 0x31n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return null;
+	}
+
+	// Unknown frame type
 	return null;
 }
