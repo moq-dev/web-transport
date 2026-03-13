@@ -1,11 +1,11 @@
 [package]
 name = "web-transport-ws"
-description = "WebTransport polyfill using WebSockets"
+description = "Deprecated: use the `qmux` crate instead"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "websocket", "polyfill"]
@@ -13,18 +13,16 @@ categories = ["network-programming", "web-programming"]
 
 [features]
 default = []
-rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
-rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots", "qmux/wss"]
+rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots", "qmux/wss"]
 
 [dependencies]
 bytes = "1"
 futures = "0.3"
-thiserror = "2"
+qmux = { path = "../qmux", default-features = false, features = ["ws"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
-tokio-tungstenite = "0.24"
-web-transport-proto = { workspace = true }
+tokio-tungstenite = "0.28"
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
-anyhow = "1"
 tokio = { version = "1", features = ["full"] }

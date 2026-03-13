@@ -1,19 +1,22 @@
-# WebTransport Polyfill
+# web-transport-ws (Deprecated)
 
-A WebTransport polyfill that uses WebSocket as the underlying transport, with implementations in both Rust and TypeScript/JavaScript.
+**This crate has been moved to [`qmux`](../qmux/).** The `qmux` crate implements the QMux protocol (draft-ietf-quic-qmux-00) over reliable transports including TCP, TLS, and WebSocket, with backwards compatibility for the legacy `webtransport` wire format.
 
-## Wire Protocol
+All Rust types in this crate are thin wrappers or re-exports from `qmux`. Please migrate to `qmux` directly.
 
-Both implementations use the same QUIC-like frame encoding over WebSocket:
-- Variable-length integer encoding (VarInt)
-- Stream multiplexing with bidirectional and unidirectional streams
-- Frame types: STREAM, RESET_STREAM, STOP_SENDING, etc.
+## Migration
 
-This is a simplified version of [QMux](https://datatracker.ietf.org/doc/draft-opik-quic-qmux/), which might be used in the future.
+```diff
+-use web_transport_ws::{Client, Server, Session};
++use qmux::ws::{Client, Server};
++use qmux::Session;
+```
 
-## JavaScript/TypeScript Usage
+The `Client`, `Server`, and `Session` APIs are otherwise unchanged.
 
-Check if WebTransport is available, otherwise install the polyfill:
+## JavaScript/TypeScript Polyfill
+
+Although the Rust crate is deprecated, the TypeScript polyfill in `src/` is actively maintained here and supports both the legacy `webtransport` and the new `qmux-00` wire formats. Check if WebTransport is available, otherwise install the polyfill:
 
 ```javascript
 import { install } from "@moq/web-transport-ws"
@@ -24,45 +27,6 @@ install();
 // Now WebTransport is available even in Safari
 const transport = new WebTransport("https://example.com/path")
 ```
-
-URLs are automatically rewritten with the WebSocket protocol:
-- `https://example.com/path` → `wss://example.com/path`
-
-## Building
-
-### Rust
-```bash
-cargo build
-```
-
-### TypeScript/JavaScript
-```bash
-npm install
-npm run build
-```
-
-### Usage
-```bash
-cargo run --example server
-```
-
-```bash
-bun examples/client.ts
-```
-
-```bash
-deno -A --sloppy-imports examples/client.ts
-```
-
-#### Bundle TypeScript source to single JavaScript file
-```bash
-bun build --target=node --outfile=examples/client.js examples/client.ts 
-```
-
-```bash
-node examples/client.js
-```
-
 
 ## License
 

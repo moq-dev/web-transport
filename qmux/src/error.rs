@@ -1,18 +1,10 @@
 use web_transport_proto::{VarInt, VarIntUnexpectedEnd};
 
+/// Errors that can occur during QMux session and stream operations.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum Error {
     #[error("invalid frame type: {0}")]
-    InvalidFrameType(u8),
-
-    #[error("text messages not allowed")]
-    NoText,
-
-    #[error("pong messages not allowed")]
-    NoPong,
-
-    #[error("generic frames not allowed")]
-    NoGenericFrames,
+    InvalidFrameType(u64),
 
     #[error("invalid stream id")]
     InvalidStreamId,
@@ -37,6 +29,12 @@ pub enum Error {
 
     #[error("invalid protocol token: {0:?}")]
     InvalidProtocol(String),
+
+    #[error("io error: {0}")]
+    Io(String),
+
+    #[error("datagrams not supported")]
+    DatagramsUnsupported,
 }
 
 impl From<VarIntUnexpectedEnd> for Error {
@@ -45,16 +43,22 @@ impl From<VarIntUnexpectedEnd> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err.to_string())
+    }
+}
+
+#[cfg(feature = "ws")]
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
-    fn from(_err: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Closed
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Io(err.to_string())
     }
 }
 
 impl web_transport_trait::Error for Error {
     fn session_error(&self) -> Option<(u32, String)> {
         match self {
-            // TODO We should only support u32 on the wire?
             Error::ConnectionClosed { code, reason } => match code.into_inner().try_into() {
                 Ok(code) => Some((code, reason.clone())),
                 Err(_) => None,
@@ -65,7 +69,6 @@ impl web_transport_trait::Error for Error {
 
     fn stream_error(&self) -> Option<u32> {
         match self {
-            // TODO We should only support u32 on the wire?
             Error::StreamReset(code) | Error::StreamStop(code) => code.into_inner().try_into().ok(),
             _ => None,
         }

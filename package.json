@@ -3,6 +3,7 @@
 	"private": true,
 	"type": "module",
 	"workspaces": [
+		"qmux",
 		"web-demo",
 		"web-transport-ws"
 	],

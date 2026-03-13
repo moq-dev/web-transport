@@ -1,0 +1,38 @@
+[package]
+name = "qmux"
+description = "QMux protocol (draft-ietf-quic-qmux-00) over reliable transports"
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+
+version = "0.0.3"
+edition = "2021"
+
+keywords = ["quic", "qmux", "webtransport", "multiplexing"]
+categories = ["network-programming"]
+
+[features]
+default = ["tls", "wss"]
+tcp = ["tokio/net", "tokio/io-util"]
+tls = ["tcp", "dep:tokio-rustls", "dep:rustls"]
+ws = ["dep:tokio-tungstenite", "dep:futures"]
+wss = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-native-roots"]
+
+[dependencies]
+bytes = "1"
+futures = { version = "0.3", optional = true }
+rustls = { version = "0.23", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+
+# Optional: TLS
+tokio-rustls = { version = "0.26", optional = true }
+
+# Optional: WebSocket
+tokio-tungstenite = { version = "0.28", optional = true }
+tracing = "0.1"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

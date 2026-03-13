@@ -1,21 +1,29 @@
+//! # Deprecated
+//!
+//! This crate has been superseded by the [`qmux`] crate, which supports
+//! TCP, TLS, and WebSocket transports with both the legacy `webtransport`
+//! wire format and the new QMux (draft-ietf-quic-qmux-00) protocol.
+//!
+//! All Rust types in this crate are thin wrappers or re-exports from `qmux`.
+//! Please migrate to `qmux` directly.
+
 mod client;
-mod error;
-mod frame;
-mod protocol;
 mod server;
 mod session;
-mod stream;
 
-pub(crate) use error::*;
-pub(crate) use frame::*;
-pub(crate) use protocol::*;
-pub(crate) use stream::*;
+pub use qmux::Error;
+pub use qmux::RecvStream;
+pub use qmux::SendStream;
 
-pub use client::*;
-pub use server::*;
-pub use session::*;
+#[allow(deprecated)]
+pub use client::Client;
+#[allow(deprecated)]
+pub use server::Server;
+#[allow(deprecated)]
+pub use session::Session;
 pub use tokio_tungstenite;
 pub use tokio_tungstenite::tungstenite;
 
-// We use this ALPN to identify our WebTransport compatibility layer.
+/// Legacy ALPN identifier.
+#[deprecated(note = "use qmux::ALPNS instead")]
 pub const ALPN: &str = "webtransport";
