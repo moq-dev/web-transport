@@ -49,6 +49,9 @@ pub struct Session {
 
     // Consumed bytes notification channel (shared with RecvStreams for flow control)
     consumed_tx: Option<mpsc::UnboundedSender<(StreamId, u64)>>,
+
+    // Our initial recv window for locally-initiated bidi streams
+    initial_max_stream_data_bidi_local: u64,
 }
 
 struct SessionState<T: Transport> {
@@ -79,6 +82,7 @@ struct SessionState<T: Transport> {
     // Receive-side connection-level tracking
     recv_data_offset: u64,
     recv_data_max: u64,
+    recv_data_consumed: u64,
 
     // Stream count tracking
     open_bi_semaphore: Arc<Semaphore>,
@@ -206,7 +210,7 @@ impl<T: Transport> SessionState<T> {
                 }
 
                 // Validate receive-side flow control (QMux only)
-                if self.version == Version::QMux00 && self.params_received {
+                if self.version == Version::QMux00 {
                     let data_len = stream.data.len() as u64;
 
                     // Connection-level check
@@ -232,23 +236,25 @@ impl<T: Transport> SessionState<T> {
                         }
 
                         // Validate stream count limits (QMux only)
+                        // Per QUIC RFC 9000 §4.6, the limit applies to the stream index,
+                        // not the count of seen streams. A peer opening stream index N
+                        // implicitly opens all streams 0..N.
                         if self.version == Version::QMux00 {
+                            let stream_index = stream.id.index();
                             match stream.id.dir() {
                                 StreamDir::Bi => {
-                                    self.recv_streams_bidi_opened += 1;
-                                    if self.recv_streams_bidi_opened
-                                        > self.recv_streams_bidi_max
-                                    {
+                                    if stream_index + 1 > self.recv_streams_bidi_max {
                                         return Err(Error::StreamLimitExceeded);
                                     }
+                                    self.recv_streams_bidi_opened =
+                                        self.recv_streams_bidi_opened.max(stream_index + 1);
                                 }
                                 StreamDir::Uni => {
-                                    self.recv_streams_uni_opened += 1;
-                                    if self.recv_streams_uni_opened
-                                        > self.recv_streams_uni_max
-                                    {
+                                    if stream_index + 1 > self.recv_streams_uni_max {
                                         return Err(Error::StreamLimitExceeded);
                                     }
+                                    self.recv_streams_uni_opened =
+                                        self.recv_streams_uni_opened.max(stream_index + 1);
                                 }
                             }
                         }
@@ -473,6 +479,9 @@ impl<T: Transport> SessionState<T> {
     }
 
     async fn handle_consumed(&mut self, id: StreamId, consumed: u64) -> Result<(), Error> {
+        // Track connection-level consumed (stable, never reset)
+        self.recv_data_consumed += consumed;
+
         // Update per-stream consumed
         if let Some(recv) = self.recv_streams.get_mut(&id) {
             recv.recv_consumed += consumed;
@@ -489,19 +498,13 @@ impl<T: Transport> SessionState<T> {
             return Ok(());
         }
 
-        // Sum consumed across all recv streams
-        let total_consumed: u64 = self
-            .recv_streams
-            .values()
-            .map(|r| r.recv_consumed)
-            .sum();
-
-        // Send MAX_DATA when total consumed reaches half of our initial window
+        // Send MAX_DATA when connection-level consumed reaches half of our initial window
         let threshold = window / 2;
-        if total_consumed >= threshold {
+        if self.recv_data_consumed >= threshold {
             let new_max = self.recv_data_offset + window;
             if new_max > self.recv_data_max {
                 self.recv_data_max = new_max;
+                self.recv_data_consumed = 0;
                 let frame = Frame::MaxData(new_max);
                 self.transport.send(frame.encode(self.version)).await?;
             }
@@ -517,7 +520,15 @@ impl<T: Transport> SessionState<T> {
         };
 
         let initial_window = match id.dir() {
-            StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
+            StreamDir::Bi => {
+                if id.server_initiated() == self.is_server {
+                    // We initiated this bidi stream
+                    self.our_params.initial_max_stream_data_bidi_local
+                } else {
+                    // Peer initiated this bidi stream
+                    self.our_params.initial_max_stream_data_bidi_remote
+                }
+            }
             StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
         };
 
@@ -613,6 +624,7 @@ impl Session {
             params_received: false,
             recv_data_offset: 0,
             recv_data_max,
+            recv_data_consumed: 0,
             open_bi_semaphore: open_bi_semaphore.clone(),
             open_uni_semaphore: open_uni_semaphore.clone(),
             send_streams_bidi_max: 0,
@@ -646,6 +658,7 @@ impl Session {
             open_uni_semaphore,
             conn_credit,
             consumed_tx: consumed_tx_frontend,
+            initial_max_stream_data_bidi_local: our_params.initial_max_stream_data_bidi_local,
         }
     }
 }
@@ -767,7 +780,7 @@ impl generic::Session for Session {
             inbound_data: tx,
             inbound_reset: tx2,
             recv_max: if self.version == Version::QMux00 {
-                0 // Will be set from our_params when peer sends data
+                self.initial_max_stream_data_bidi_local
             } else {
                 u64::MAX
             },
@@ -872,6 +885,16 @@ impl SendStream {
         error
     }
 
+    /// Release previously claimed credit (on send failure).
+    fn release_credit(&self, amount: u64) {
+        if let Some(s) = &self.stream_credit {
+            s.release(amount);
+        }
+        if let Some(c) = &self.conn_credit {
+            c.release(amount);
+        }
+    }
+
     /// Try to claim flow control credit for sending `desired` bytes.
     /// Returns the number of bytes we're allowed to send.
     async fn claim_credit(&mut self, desired: u64) -> Result<u64, Error> {
@@ -969,12 +992,16 @@ impl generic::SendStream for SendStream {
             tokio::select! {
                 result = self.outbound.send(frame.into()) => {
                     if result.is_err() {
+                        // Release credit since data was never sent
+                        self.release_credit(to_send as u64);
                         return Err(Error::Closed);
                     }
                     self.offset += to_send as u64;
                     total += to_send;
                 }
                 Some(stop) = self.inbound_stopped.recv() => {
+                    // Release credit since data was never sent
+                    self.release_credit(to_send as u64);
                     return Err(self.recv_stop(stop.code));
                 }
             }

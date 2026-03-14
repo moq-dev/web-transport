@@ -93,6 +93,7 @@ export default class Session implements WebTransport {
 	// Connection-level recv flow control
 	#recvDataOffset = 0n;
 	#recvDataMax = 0n;
+	#recvDataConsumed = 0n;
 
 	// Per-stream flow control
 	#streamFlow = new Map<bigint, StreamFlowState>();
@@ -339,6 +340,9 @@ export default class Session implements WebTransport {
 	#accountConsumed(streamId: bigint, bytes: number) {
 		if (this.#version !== "qmux-00" || bytes === 0) return;
 
+		// Track connection-level consumed (stable, not reset by per-stream updates)
+		this.#recvDataConsumed += BigInt(bytes);
+
 		const flow = this.#streamFlow.get(streamId);
 		if (flow) {
 			flow.recvConsumed += BigInt(bytes);
@@ -352,15 +356,11 @@ export default class Session implements WebTransport {
 		if (window === 0n) return;
 
 		const threshold = window / 2n;
-		let totalConsumed = 0n;
-		for (const flow of this.#streamFlow.values()) {
-			totalConsumed += flow.recvConsumed;
-		}
-
-		if (totalConsumed >= threshold) {
+		if (this.#recvDataConsumed >= threshold) {
 			const newMax = this.#recvDataOffset + window;
 			if (newMax > this.#recvDataMax) {
 				this.#recvDataMax = newMax;
+				this.#recvDataConsumed = 0n;
 				this.#sendPriorityFrame({ type: "max_data", max: newMax });
 			}
 		}
@@ -369,10 +369,16 @@ export default class Session implements WebTransport {
 	#maybeSendMaxStreamData(streamId: bigint, flow: StreamFlowState) {
 		const id = new Stream.Id(VarInt.from(streamId));
 
-		const initialWindow =
-			id.dir === Stream.Dir.Bi
-				? this.#ourParams.initialMaxStreamDataBidiRemote
-				: this.#ourParams.initialMaxStreamDataUni;
+		let initialWindow: bigint;
+		if (id.dir === Stream.Dir.Bi) {
+			// Check if we initiated this stream
+			initialWindow =
+				id.serverInitiated === this.#isServer
+					? this.#ourParams.initialMaxStreamDataBidiLocal
+					: this.#ourParams.initialMaxStreamDataBidiRemote;
+		} else {
+			initialWindow = this.#ourParams.initialMaxStreamDataUni;
+		}
 
 		if (initialWindow === 0n) return;
 
@@ -421,18 +427,25 @@ export default class Session implements WebTransport {
 			}
 
 			// Validate stream count limits (QMux only)
+			// Per QUIC RFC 9000 §4.6, the limit applies to the stream index.
+			// A peer opening stream index N implicitly opens all streams 0..N.
 			if (this.#version === "qmux-00") {
+				const streamIndex = frame.id.index;
 				if (frame.id.dir === Stream.Dir.Bi) {
-					this.#recvBidiOpened += 1n;
-					if (this.#recvBidiOpened > this.#ourParams.initialMaxStreamsBidi) {
+					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsBidi) {
 						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
 						return;
 					}
+					if (streamIndex + 1n > this.#recvBidiOpened) {
+						this.#recvBidiOpened = streamIndex + 1n;
+					}
 				} else {
-					this.#recvUniOpened += 1n;
-					if (this.#recvUniOpened > this.#ourParams.initialMaxStreamsUni) {
+					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsUni) {
 						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
 						return;
+					}
+					if (streamIndex + 1n > this.#recvUniOpened) {
+						this.#recvUniOpened = streamIndex + 1n;
 					}
 				}
 			}

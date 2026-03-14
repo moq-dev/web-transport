@@ -357,8 +357,16 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
 
+		if (buffer.byteLength < len) {
+			throw new Error("transport parameter truncated");
+		}
+
 		const paramData = buffer.slice(0, len);
 		buffer = buffer.slice(len);
+
+		if (paramData.byteLength < 1) {
+			continue; // Empty param, skip
+		}
 
 		let paramValue: bigint;
 		[v] = VarInt.decode(paramData);
@@ -581,6 +589,9 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 	if (frameType === 0x3f5153300d0a0d0an) {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
+		if (buffer.byteLength < len) {
+			throw new Error("transport parameters frame truncated");
+		}
 		const payload = buffer.slice(0, len);
 		const params = decodeTransportParams(payload);
 		return { type: "transport_parameters", params };
