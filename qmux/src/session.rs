@@ -46,6 +46,9 @@ pub struct Session {
 
     // Shared connection-level send credit (shared with SendStreams)
     conn_credit: Credit,
+
+    // Consumed bytes notification channel (shared with RecvStreams for flow control)
+    consumed_tx: Option<mpsc::UnboundedSender<(StreamId, u64)>>,
 }
 
 struct SessionState<T: Transport> {
@@ -80,6 +83,8 @@ struct SessionState<T: Transport> {
     // Stream count tracking
     open_bi_semaphore: Arc<Semaphore>,
     open_uni_semaphore: Arc<Semaphore>,
+    send_streams_bidi_max: u64, // last MAX_STREAMS value applied for outgoing bidi
+    send_streams_uni_max: u64,  // last MAX_STREAMS value applied for outgoing uni
     recv_streams_bidi_max: u64,
     recv_streams_uni_max: u64,
     recv_streams_bidi_opened: u64,
@@ -126,9 +131,20 @@ impl<T: Transport> SessionState<T> {
                     self.handle_consumed(id, consumed).await?;
                 }
                 Some((id, send)) = self.create_uni.recv() => {
+                    // Apply peer's stream credit if transport params already received
+                    if self.params_received {
+                        if let Some(credit) = &send.stream_credit {
+                            credit.increase_max(self.peer_params.initial_max_stream_data_uni).ok();
+                        }
+                    }
                     self.send_streams.insert(id, send);
                 }
                 Some((id, send, recv)) = self.create_bi.recv() => {
+                    if self.params_received {
+                        if let Some(credit) = &send.stream_credit {
+                            credit.increase_max(self.peer_params.initial_max_stream_data_bidi_remote).ok();
+                        }
+                    }
                     self.send_streams.insert(id, send);
                     self.recv_streams.insert(id, recv);
                 }
@@ -395,18 +411,18 @@ impl<T: Transport> SessionState<T> {
                 }
             }
             Frame::MaxStreamsBidi(max) => {
-                // Add new permits (max is absolute, not delta)
-                let current = self.open_bi_semaphore.available_permits() as u64;
-                if max > current {
-                    self.open_bi_semaphore
-                        .add_permits((max - current) as usize);
+                // max is absolute; compute delta from previously applied value
+                if max > self.send_streams_bidi_max {
+                    let delta = max - self.send_streams_bidi_max;
+                    self.open_bi_semaphore.add_permits(delta as usize);
+                    self.send_streams_bidi_max = max;
                 }
             }
             Frame::MaxStreamsUni(max) => {
-                let current = self.open_uni_semaphore.available_permits() as u64;
-                if max > current {
-                    self.open_uni_semaphore
-                        .add_permits((max - current) as usize);
+                if max > self.send_streams_uni_max {
+                    let delta = max - self.send_streams_uni_max;
+                    self.open_uni_semaphore.add_permits(delta as usize);
+                    self.send_streams_uni_max = max;
                 }
             }
             // Informational frames — peer is telling us they're blocked.
@@ -435,8 +451,21 @@ impl<T: Transport> SessionState<T> {
         // Add stream count permits
         self.open_bi_semaphore
             .add_permits(params.initial_max_streams_bidi as usize);
+        self.send_streams_bidi_max = params.initial_max_streams_bidi;
         self.open_uni_semaphore
             .add_permits(params.initial_max_streams_uni as usize);
+        self.send_streams_uni_max = params.initial_max_streams_uni;
+
+        // Update per-stream send credits for already-opened streams
+        for (id, send) in &self.send_streams {
+            if let Some(credit) = &send.stream_credit {
+                let initial = match id.dir() {
+                    StreamDir::Bi => params.initial_max_stream_data_bidi_remote,
+                    StreamDir::Uni => params.initial_max_stream_data_uni,
+                };
+                credit.increase_max(initial).ok();
+            }
+        }
 
         self.peer_params = params;
 
@@ -455,6 +484,11 @@ impl<T: Transport> SessionState<T> {
     }
 
     async fn maybe_send_max_data(&mut self) -> Result<(), Error> {
+        let window = self.our_params.initial_max_data;
+        if window == 0 {
+            return Ok(());
+        }
+
         // Sum consumed across all recv streams
         let total_consumed: u64 = self
             .recv_streams
@@ -462,16 +496,9 @@ impl<T: Transport> SessionState<T> {
             .map(|r| r.recv_consumed)
             .sum();
 
-        // Send MAX_DATA when consumed reaches half of our initial window
-        let window = self.our_params.initial_max_data;
-        if window == 0 {
-            return Ok(());
-        }
-
+        // Send MAX_DATA when total consumed reaches half of our initial window
         let threshold = window / 2;
-        let consumed_since_last = total_consumed;
-
-        if consumed_since_last >= threshold {
+        if total_consumed >= threshold {
             let new_max = self.recv_data_offset + window;
             if new_max > self.recv_data_max {
                 self.recv_data_max = new_max;
@@ -559,6 +586,11 @@ impl Session {
         };
 
         let (consumed_tx, consumed_rx) = mpsc::unbounded_channel();
+        let consumed_tx_frontend = if version == Version::QMux00 {
+            Some(consumed_tx.clone())
+        } else {
+            None
+        };
 
         let recv_data_max = our_params.initial_max_data;
 
@@ -583,6 +615,8 @@ impl Session {
             recv_data_max,
             open_bi_semaphore: open_bi_semaphore.clone(),
             open_uni_semaphore: open_uni_semaphore.clone(),
+            send_streams_bidi_max: 0,
+            send_streams_uni_max: 0,
             recv_streams_bidi_max: our_params.initial_max_streams_bidi,
             recv_streams_uni_max: our_params.initial_max_streams_uni,
             recv_streams_bidi_opened: 0,
@@ -611,6 +645,7 @@ impl Session {
             open_bi_semaphore,
             open_uni_semaphore,
             conn_credit,
+            consumed_tx: consumed_tx_frontend,
         }
     }
 }
@@ -747,7 +782,7 @@ impl generic::Session for Session {
             buffer: Bytes::new(),
             closed: None,
             fin: false,
-            consumed_tx: None, // Recv on our own bidi doesn't need consumed tracking yet
+            consumed_tx: self.consumed_tx.clone(),
         };
 
         self.create_bi

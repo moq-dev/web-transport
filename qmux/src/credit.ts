@@ -17,6 +17,7 @@ export class Credit {
 
 	/** Try to claim up to `limit` units. Returns amount claimed (0n if none available). */
 	tryClaim(limit: bigint): bigint {
+		if (limit === 0n) return 0n;
 		const available = this.#max - this.#used;
 		if (available <= 0n) return 0n;
 		const claimed = limit < available ? limit : available;
@@ -25,8 +26,10 @@ export class Credit {
 	}
 
 	/** Claim up to `limit` units, waiting until credit is available.
-	 *  Rejects if the credit has been closed. */
+	 *  Rejects if the credit has been closed. Returns 0n for zero-limit requests. */
 	async claim(limit: bigint): Promise<bigint> {
+		if (limit === 0n) return 0n;
+
 		while (true) {
 			if (this.#closed) throw new Error("closed");
 

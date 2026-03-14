@@ -8,6 +8,7 @@ use crate::Error;
 struct CreditState {
     used: u64,
     max: u64,
+    closed: bool,
 }
 
 /// Tracks used/max credit for flow control.
@@ -23,7 +24,11 @@ impl Credit {
     /// Create with initial max (used starts at 0).
     pub fn new(max: u64) -> Self {
         Self {
-            inner: Arc::new(watch::Sender::new(CreditState { used: 0, max })),
+            inner: Arc::new(watch::Sender::new(CreditState {
+                used: 0,
+                max,
+                closed: false,
+            })),
         }
     }
 
@@ -44,7 +49,7 @@ impl Credit {
     }
 
     /// Claim up to `limit` units, waiting until credit is available.
-    /// Returns amount claimed (always > 0 unless the sender is dropped).
+    /// Returns amount claimed (always > 0 unless closed).
     pub async fn claim(&self, limit: u64) -> Result<u64, Error> {
         loop {
             let claimed = self.try_claim(limit);
@@ -52,12 +57,20 @@ impl Credit {
                 return Ok(claimed);
             }
 
-            // Wait until state changes (max increases or used decreases)
+            // Check if closed before waiting
+            if self.inner.borrow().closed {
+                return Err(Error::Closed);
+            }
+
+            // Wait until state changes (max increases, used decreases, or closed)
             let mut rx = self.inner.subscribe();
-            // Wait for a state where credit is available
-            rx.wait_for(|state| state.used < state.max)
+            rx.wait_for(|state| state.closed || state.used < state.max)
                 .await
                 .map_err(|_| Error::Closed)?;
+
+            if self.inner.borrow().closed {
+                return Err(Error::Closed);
+            }
         }
     }
 
@@ -88,6 +101,18 @@ impl Credit {
         } else {
             Err(Error::FlowControlError)
         }
+    }
+
+    /// Close the credit, causing pending and future `claim()` calls to return `Err`.
+    #[allow(dead_code)]
+    pub fn close(&self) {
+        self.inner.send_if_modified(|state| {
+            if state.closed {
+                return false;
+            }
+            state.closed = true;
+            true
+        });
     }
 
     /// Get current available credit (max - used).
