@@ -263,10 +263,7 @@ export default class Session implements WebTransport {
 						this.#sendStreams.set(streamId, controller);
 					},
 					write: async (chunk) => {
-						await Promise.race([
-							this.#sendStreamData(frame.id, chunk),
-							this.closed,
-						]);
+						await Promise.race([this.#sendStreamData(frame.id, chunk), this.closed]);
 					},
 					abort: (e) => {
 						console.warn("abort", e);
@@ -387,10 +384,7 @@ export default class Session implements WebTransport {
 				this.#sendStreams.set(streamId.value.value, controller);
 			},
 			write: async (chunk) => {
-				await Promise.race([
-					this.#sendStreamData(streamId, chunk),
-					this.closed,
-				]);
+				await Promise.race([this.#sendStreamData(streamId, chunk), this.closed]);
 			},
 			abort: (e) => {
 				console.warn("abort", e);
@@ -451,10 +445,7 @@ export default class Session implements WebTransport {
 				session.#sendStreams.set(streamId.value.value, controller);
 			},
 			async write(chunk) {
-				await Promise.race([
-					session.#sendStreamData(streamId, chunk),
-					session.closed,
-				]);
+				await Promise.race([session.#sendStreamData(streamId, chunk), session.closed]);
 			},
 			abort(e) {
 				console.warn("abort", e);
