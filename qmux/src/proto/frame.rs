@@ -3,6 +3,25 @@ use web_transport_proto::VarInt;
 
 use crate::{Error, StreamId, TransportParams, Version};
 
+// QMux frame type IDs (QUIC v1 compatible)
+const RESET_STREAM: VarInt = VarInt::from_u32(0x04);
+const STOP_SENDING: VarInt = VarInt::from_u32(0x05);
+const STREAM_BASE: u32 = 0x08;
+const MAX_DATA: VarInt = VarInt::from_u32(0x10);
+const MAX_STREAM_DATA: VarInt = VarInt::from_u32(0x11);
+const MAX_STREAMS_BIDI: VarInt = VarInt::from_u32(0x12);
+const MAX_STREAMS_UNI: VarInt = VarInt::from_u32(0x13);
+const DATA_BLOCKED: VarInt = VarInt::from_u32(0x14);
+const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
+const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
+const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
+const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
+
+// QX_TRANSPORT_PARAMETERS magic: "\xffQMX\r\n\r\n"
+// This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
+const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
+const QX_TRANSPORT_PARAMETERS_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_TRANSPORT_PARAMETERS) };
+
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
 pub struct Stream {
@@ -61,16 +80,15 @@ pub enum Frame {
 
 impl Frame {
     /// Encode the frame into bytes using the given wire format version.
-    pub fn encode(&self, version: Version) -> Bytes {
+    pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
 
         match version {
             Version::WebTransport => self.encode_wt(&mut buf),
-            // Flow control frames are only used with QMux
-            Version::QMux00 => self.encode_qmux(&mut buf),
+            Version::QMux00 => self.encode_qmux(&mut buf)?,
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     fn encode_wt(&self, buf: &mut BytesMut) {
@@ -100,85 +118,80 @@ impl Frame {
         }
     }
 
-    fn encode_qmux(&self, buf: &mut BytesMut) {
+    fn encode_qmux(&self, buf: &mut BytesMut) -> Result<(), Error> {
         match self {
             Frame::Stream(s) => {
                 // Always LEN bit (0x02), never OFF bit. Type = 0x0a | fin_bit
-                let frame_type = 0x08u64 | 0x02 | if s.fin { 0x01 } else { 0 };
-                VarInt::try_from(frame_type).unwrap().encode(buf);
+                let frame_type = VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
+                frame_type.encode(buf);
                 s.id.0.encode(buf);
-                VarInt::try_from(s.data.len() as u64).unwrap().encode(buf);
+                VarInt::try_from(s.data.len())?.encode(buf);
                 buf.put_slice(&s.data);
             }
             Frame::ResetStream(r) => {
-                VarInt::try_from(0x04u64).unwrap().encode(buf);
+                RESET_STREAM.encode(buf);
                 r.id.0.encode(buf);
                 r.code.encode(buf);
                 // final_size = 0 (no flow control tracking yet)
                 VarInt::from(0u32).encode(buf);
             }
             Frame::StopSending(s) => {
-                VarInt::try_from(0x05u64).unwrap().encode(buf);
+                STOP_SENDING.encode(buf);
                 s.id.0.encode(buf);
                 s.code.encode(buf);
             }
             Frame::ConnectionClose(c) => {
-                // APPLICATION_CLOSE (0x1d)
-                VarInt::try_from(0x1du64).unwrap().encode(buf);
+                APPLICATION_CLOSE.encode(buf);
                 c.code.encode(buf);
                 // frame_type = 0 (application close)
                 VarInt::from(0u32).encode(buf);
                 let reason_bytes = c.reason.as_bytes();
-                VarInt::try_from(reason_bytes.len() as u64)
-                    .unwrap()
-                    .encode(buf);
+                VarInt::try_from(reason_bytes.len())?.encode(buf);
                 buf.put_slice(reason_bytes);
             }
             Frame::MaxData(max) => {
-                VarInt::try_from(0x10u64).unwrap().encode(buf);
-                VarInt::try_from(*max).unwrap().encode(buf);
+                MAX_DATA.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
             }
             Frame::MaxStreamData { id, max } => {
-                VarInt::try_from(0x11u64).unwrap().encode(buf);
+                MAX_STREAM_DATA.encode(buf);
                 id.0.encode(buf);
-                VarInt::try_from(*max).unwrap().encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
             }
             Frame::MaxStreamsBidi(max) => {
-                VarInt::try_from(0x12u64).unwrap().encode(buf);
-                VarInt::try_from(*max).unwrap().encode(buf);
+                MAX_STREAMS_BIDI.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
             }
             Frame::MaxStreamsUni(max) => {
-                VarInt::try_from(0x13u64).unwrap().encode(buf);
-                VarInt::try_from(*max).unwrap().encode(buf);
+                MAX_STREAMS_UNI.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
             }
             Frame::DataBlocked(limit) => {
-                VarInt::try_from(0x14u64).unwrap().encode(buf);
-                VarInt::try_from(*limit).unwrap().encode(buf);
+                DATA_BLOCKED.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
             }
             Frame::StreamDataBlocked { id, limit } => {
-                VarInt::try_from(0x15u64).unwrap().encode(buf);
+                STREAM_DATA_BLOCKED.encode(buf);
                 id.0.encode(buf);
-                VarInt::try_from(*limit).unwrap().encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
             }
             Frame::StreamsBlockedBidi(limit) => {
-                VarInt::try_from(0x16u64).unwrap().encode(buf);
-                VarInt::try_from(*limit).unwrap().encode(buf);
+                STREAMS_BLOCKED_BIDI.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
             }
             Frame::StreamsBlockedUni(limit) => {
-                VarInt::try_from(0x17u64).unwrap().encode(buf);
-                VarInt::try_from(*limit).unwrap().encode(buf);
+                STREAMS_BLOCKED_UNI.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
             }
             Frame::TransportParameters(params) => {
-                VarInt::try_from(0x3f5153300d0a0d0au64)
-                    .unwrap()
-                    .encode(buf);
-                let payload = params.encode();
-                VarInt::try_from(payload.len() as u64)
-                    .unwrap()
-                    .encode(buf);
+                QX_TRANSPORT_PARAMETERS_VI.encode(buf);
+                let payload = params.encode()?;
+                VarInt::try_from(payload.len())?.encode(buf);
                 buf.put_slice(&payload);
             }
         }
+
+        Ok(())
     }
 
     /// Decode a frame from bytes using the given wire format version.

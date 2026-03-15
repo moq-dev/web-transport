@@ -1,9 +1,6 @@
 use std::{
     collections::{hash_map, HashMap},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use crate::credit::Credit;
@@ -13,7 +10,7 @@ use crate::{
     TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
@@ -32,17 +29,14 @@ pub struct Session {
     create_uni: mpsc::Sender<(StreamId, SendState)>,
     create_bi: mpsc::Sender<(StreamId, SendState, RecvState)>,
 
-    create_uni_id: Arc<AtomicU64>,
-    create_bi_id: Arc<AtomicU64>,
-
     closed: watch::Sender<Option<Error>>,
 
     /// The negotiated application-level subprotocol, if any.
     protocol: Option<String>,
 
-    // Flow control: stream count semaphores (permits added when peer params arrive / MAX_STREAMS)
-    open_bi_semaphore: Arc<Semaphore>,
-    open_uni_semaphore: Arc<Semaphore>,
+    // Flow control: stream count credits (claim_index returns stream sequence number)
+    open_bi_credit: Credit,
+    open_uni_credit: Credit,
 
     // Shared connection-level send credit (shared with SendStreams)
     conn_credit: Credit,
@@ -85,10 +79,8 @@ struct SessionState<T: Transport> {
     recv_data_consumed: u64,
 
     // Stream count tracking
-    open_bi_semaphore: Arc<Semaphore>,
-    open_uni_semaphore: Arc<Semaphore>,
-    send_streams_bidi_max: u64, // last MAX_STREAMS value applied for outgoing bidi
-    send_streams_uni_max: u64,  // last MAX_STREAMS value applied for outgoing uni
+    open_bi_credit: Credit,
+    open_uni_credit: Credit,
     recv_streams_bidi_max: u64,
     recv_streams_uni_max: u64,
     recv_streams_bidi_opened: u64,
@@ -174,7 +166,7 @@ impl<T: Transport> SessionState<T> {
     /// Send a QX_TRANSPORT_PARAMETERS frame with our defaults.
     async fn send_transport_parameters(&mut self) -> Result<(), Error> {
         let frame = Frame::TransportParameters(self.our_params.clone());
-        self.transport.send(frame.encode(self.version)).await
+        self.transport.send(frame.encode(self.version)?).await
     }
 
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -192,7 +184,7 @@ impl<T: Transport> SessionState<T> {
             _ => {}
         };
 
-        self.transport.send(frame.encode(self.version)).await
+        self.transport.send(frame.encode(self.version)?).await
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -417,19 +409,10 @@ impl<T: Transport> SessionState<T> {
                 }
             }
             Frame::MaxStreamsBidi(max) => {
-                // max is absolute; compute delta from previously applied value
-                if max > self.send_streams_bidi_max {
-                    let delta = max - self.send_streams_bidi_max;
-                    self.open_bi_semaphore.add_permits(delta as usize);
-                    self.send_streams_bidi_max = max;
-                }
+                self.open_bi_credit.increase_max(max)?;
             }
             Frame::MaxStreamsUni(max) => {
-                if max > self.send_streams_uni_max {
-                    let delta = max - self.send_streams_uni_max;
-                    self.open_uni_semaphore.add_permits(delta as usize);
-                    self.send_streams_uni_max = max;
-                }
+                self.open_uni_credit.increase_max(max)?;
             }
             // Informational frames — peer is telling us they're blocked.
             // We don't need to act on these since we auto-tune windows.
@@ -454,13 +437,13 @@ impl<T: Transport> SessionState<T> {
             .increase_max(params.initial_max_data)
             .ok();
 
-        // Add stream count permits
-        self.open_bi_semaphore
-            .add_permits(params.initial_max_streams_bidi as usize);
-        self.send_streams_bidi_max = params.initial_max_streams_bidi;
-        self.open_uni_semaphore
-            .add_permits(params.initial_max_streams_uni as usize);
-        self.send_streams_uni_max = params.initial_max_streams_uni;
+        // Set stream count limits from peer's params
+        self.open_bi_credit
+            .increase_max(params.initial_max_streams_bidi)
+            .ok();
+        self.open_uni_credit
+            .increase_max(params.initial_max_streams_uni)
+            .ok();
 
         // Update per-stream send credits for already-opened streams
         for (id, send) in &self.send_streams {
@@ -506,7 +489,7 @@ impl<T: Transport> SessionState<T> {
                 self.recv_data_max = new_max;
                 self.recv_data_consumed = 0;
                 let frame = Frame::MaxData(new_max);
-                self.transport.send(frame.encode(self.version)).await?;
+                self.transport.send(frame.encode(self.version)?).await?;
             }
         }
 
@@ -545,7 +528,7 @@ impl<T: Transport> SessionState<T> {
                 recv.recv_max = new_max;
                 recv.recv_consumed = 0;
                 let frame = Frame::MaxStreamData { id, max: new_max };
-                self.transport.send(frame.encode(self.version)).await?;
+                self.transport.send(frame.encode(self.version)?).await?;
             }
         }
 
@@ -581,12 +564,8 @@ impl Session {
 
         let closed = watch::Sender::new(None);
 
-        let open_bi_semaphore = Arc::new(Semaphore::new(
-            if version == Version::QMux00 { 0 } else { usize::MAX >> 4 },
-        ));
-        let open_uni_semaphore = Arc::new(Semaphore::new(
-            if version == Version::QMux00 { 0 } else { usize::MAX >> 4 },
-        ));
+        let open_bi_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
+        let open_uni_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
 
         let conn_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
 
@@ -625,10 +604,8 @@ impl Session {
             recv_data_offset: 0,
             recv_data_max,
             recv_data_consumed: 0,
-            open_bi_semaphore: open_bi_semaphore.clone(),
-            open_uni_semaphore: open_uni_semaphore.clone(),
-            send_streams_bidi_max: 0,
-            send_streams_uni_max: 0,
+            open_bi_credit: open_bi_credit.clone(),
+            open_uni_credit: open_uni_credit.clone(),
             recv_streams_bidi_max: our_params.initial_max_streams_bidi,
             recv_streams_uni_max: our_params.initial_max_streams_uni,
             recv_streams_bidi_opened: 0,
@@ -650,12 +627,10 @@ impl Session {
             accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
             create_uni: create_uni_tx,
             create_bi: create_bi_tx,
-            create_uni_id: Default::default(),
-            create_bi_id: Default::default(),
             closed,
             protocol,
-            open_bi_semaphore,
-            open_uni_semaphore,
+            open_bi_credit,
+            open_uni_credit,
             conn_credit,
             consumed_tx: consumed_tx_frontend,
             initial_max_stream_data_bidi_local: our_params.initial_max_stream_data_bidi_local,
@@ -687,15 +662,9 @@ impl generic::Session for Session {
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-        // Wait for stream count permit (QMux flow control)
-        self.open_uni_semaphore
-            .acquire()
-            .await
-            .map_err(|_| Error::Closed)?
-            .forget();
-
-        let id = self.create_uni_id.fetch_add(1, Ordering::Relaxed);
-        let id = StreamId::new(id, StreamDir::Uni, self.is_server);
+        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
+        let index = self.open_uni_credit.claim_index().await?;
+        let id = StreamId::new(index, StreamDir::Uni, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -735,15 +704,9 @@ impl generic::Session for Session {
     }
 
     async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        // Wait for stream count permit (QMux flow control)
-        self.open_bi_semaphore
-            .acquire()
-            .await
-            .map_err(|_| Error::Closed)?
-            .forget();
-
-        let id = self.create_bi_id.fetch_add(1, Ordering::Relaxed);
-        let id = StreamId::new(id, StreamDir::Bi, self.is_server);
+        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
+        let index = self.open_bi_credit.claim_index().await?;
+        let id = StreamId::new(index, StreamDir::Bi, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();

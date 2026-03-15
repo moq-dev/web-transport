@@ -31,33 +31,39 @@ impl TransportParams {
         }
     }
 
+    // Transport parameter IDs (all fit in u8)
+    const INITIAL_MAX_DATA: VarInt = VarInt::from_u32(0x04);
+    const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: VarInt = VarInt::from_u32(0x05);
+    const INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: VarInt = VarInt::from_u32(0x06);
+    const INITIAL_MAX_STREAM_DATA_UNI: VarInt = VarInt::from_u32(0x07);
+    const INITIAL_MAX_STREAMS_BIDI: VarInt = VarInt::from_u32(0x08);
+    const INITIAL_MAX_STREAMS_UNI: VarInt = VarInt::from_u32(0x09);
+
     /// Encode transport parameters as a series of ID-length-value tuples.
-    pub fn encode(&self) -> Bytes {
+    pub fn encode(&self) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
 
-        fn write_param(buf: &mut BytesMut, id: u64, value: u64) {
+        fn write_param(buf: &mut BytesMut, id: VarInt, value: u64) -> Result<(), Error> {
             if value == 0 {
-                return;
+                return Ok(());
             }
-            let id_vi = VarInt::try_from(id).unwrap();
-            let val_vi = VarInt::try_from(value).unwrap();
-
-            // Compute encoded size of the value varint
+            let val_vi = VarInt::try_from(value)?;
             let val_size = varint_size(value);
 
-            id_vi.encode(buf);
-            VarInt::try_from(val_size as u64).unwrap().encode(buf);
+            id.encode(buf);
+            VarInt::from_u32(val_size as u32).encode(buf);
             val_vi.encode(buf);
+            Ok(())
         }
 
-        write_param(&mut buf, 0x04, self.initial_max_data);
-        write_param(&mut buf, 0x05, self.initial_max_stream_data_bidi_local);
-        write_param(&mut buf, 0x06, self.initial_max_stream_data_bidi_remote);
-        write_param(&mut buf, 0x07, self.initial_max_stream_data_uni);
-        write_param(&mut buf, 0x08, self.initial_max_streams_bidi);
-        write_param(&mut buf, 0x09, self.initial_max_streams_uni);
+        write_param(&mut buf, Self::INITIAL_MAX_DATA, self.initial_max_data)?;
+        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, self.initial_max_stream_data_bidi_local)?;
+        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, self.initial_max_stream_data_bidi_remote)?;
+        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_UNI, self.initial_max_stream_data_uni)?;
+        write_param(&mut buf, Self::INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi)?;
+        write_param(&mut buf, Self::INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni)?;
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     /// Decode transport parameters from bytes.

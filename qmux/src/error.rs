@@ -1,4 +1,4 @@
-use web_transport_proto::{VarInt, VarIntUnexpectedEnd};
+use web_transport_proto::{VarInt, VarIntBoundsExceeded, VarIntUnexpectedEnd};
 
 /// Errors that can occur during QMux session and stream operations.
 #[derive(Debug, thiserror::Error, Clone)]
@@ -49,6 +49,12 @@ pub enum Error {
 impl From<VarIntUnexpectedEnd> for Error {
     fn from(_: VarIntUnexpectedEnd) -> Self {
         Self::Short
+    }
+}
+
+impl From<VarIntBoundsExceeded> for Error {
+    fn from(_: VarIntBoundsExceeded) -> Self {
+        Self::FlowControlError
     }
 }
 
