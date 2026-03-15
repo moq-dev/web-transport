@@ -502,10 +502,7 @@ export default class Session implements WebTransport {
 						this.#sendStreams.set(streamId, controller);
 					},
 					write: async (chunk) => {
-						await Promise.race([
-							this.#sendStreamDataWithFlowControl(frame.id, streamId, chunk),
-							this.closed,
-						]);
+						await Promise.race([this.#sendStreamData(frame.id, chunk), this.closed]);
 					},
 					abort: (e) => {
 						console.warn("abort", e);

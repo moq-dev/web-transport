@@ -5,10 +5,10 @@
 import { execSync } from "node:child_process";
 
 console.log("📦 Building package...");
-execSync("pnpm build", { stdio: "inherit" });
+execSync("bun run build", { stdio: "inherit" });
 
 console.log("🚀 Publishing...");
-execSync("pnpm publish --access=public", {
+execSync("bunx npm publish --access=public", {
 	stdio: "inherit",
 	cwd: "dist",
 });
