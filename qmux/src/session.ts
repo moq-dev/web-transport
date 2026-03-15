@@ -1,6 +1,7 @@
-import type { Version } from "./frame.ts";
+import { Credit } from "./credit.ts";
+import type { TransportParams, Version } from "./frame.ts";
 import * as Frame from "./frame.ts";
-import { MAX_FRAME_PAYLOAD } from "./frame.ts";
+import { DEFAULT_TRANSPORT_PARAMS, MAX_FRAME_PAYLOAD, RECOMMENDED_TRANSPORT_PARAMS } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
@@ -36,6 +37,14 @@ export interface SessionOptions extends WebTransportOptions {
 
 const PREFIX_WEBTRANSPORT = "webtransport.";
 const PREFIX_QMUX = "qmux-00.";
+
+/** Per-stream flow control state. */
+interface StreamFlowState {
+	sendCredit: Credit;
+	recvMax: bigint;
+	recvOffset: bigint;
+	recvConsumed: bigint;
+}
 
 export default class Session implements WebTransport {
 	#ws: WebSocket;
@@ -73,6 +82,28 @@ export default class Session implements WebTransport {
 	// TODO: Implement datagrams
 	readonly datagrams = new Datagrams();
 
+	// Flow control state
+	#ourParams: TransportParams = { ...RECOMMENDED_TRANSPORT_PARAMS };
+	#peerParams: TransportParams = { ...DEFAULT_TRANSPORT_PARAMS };
+	#paramsReceived = false;
+
+	// Connection-level send credit
+	#connCredit: Credit;
+
+	// Connection-level recv flow control
+	#recvDataOffset = 0n;
+	#recvDataMax = 0n;
+	#recvDataConsumed = 0n;
+
+	// Per-stream flow control
+	#streamFlow = new Map<bigint, StreamFlowState>();
+
+	// Stream count tracking via Credit
+	#bidiStreamCredit: Credit;
+	#uniStreamCredit: Credit;
+	#recvBidiOpened = 0n;
+	#recvUniOpened = 0n;
+
 	constructor(url: string | URL, options?: SessionOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
@@ -97,6 +128,11 @@ export default class Session implements WebTransport {
 			prefixed.add(`${PREFIX_WEBTRANSPORT}${stripped}`);
 		}
 		this.#ws = new WebSocket(url, [...prefixed]);
+
+		// Initialize credits — will be adjusted when version is detected
+		this.#connCredit = new Credit(0n);
+		this.#bidiStreamCredit = new Credit(0n);
+		this.#uniStreamCredit = new Credit(0n);
 
 		this.ready = new Promise((resolve) => {
 			this.#readyResolve = resolve;
@@ -124,9 +160,14 @@ export default class Session implements WebTransport {
 				this.#protocol = "";
 			}
 
-			// QMux requires TRANSPORT_PARAMETERS as the first frame.
 			if (this.#version === "qmux-00") {
+				this.#recvDataMax = this.#ourParams.initialMaxData;
 				this.#sendTransportParameters();
+			} else {
+				// No flow control for WebTransport — set unlimited
+				this.#connCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+				this.#bidiStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+				this.#uniStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
 			}
 
 			this.#readyResolve();
@@ -208,9 +249,158 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "connection_close") {
 			this.#closeReason = new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
 			this.#ws.close();
+		} else if (frame.type === "transport_parameters") {
+			this.#handleTransportParameters(frame.params);
+		} else if (frame.type === "max_data") {
+			this.#connCredit.increaseMax(frame.max);
+		} else if (frame.type === "max_stream_data") {
+			const flow = this.#streamFlow.get(frame.id.value.value);
+			if (flow) flow.sendCredit.increaseMax(frame.max);
+		} else if (frame.type === "max_streams_bidi") {
+			this.#bidiStreamCredit.increaseMax(frame.max);
+		} else if (frame.type === "max_streams_uni") {
+			this.#uniStreamCredit.increaseMax(frame.max);
+		} else if (
+			frame.type === "data_blocked" ||
+			frame.type === "stream_data_blocked" ||
+			frame.type === "streams_blocked_bidi" ||
+			frame.type === "streams_blocked_uni"
+		) {
+			// Informational, no action needed
+		}
+	}
+
+	#handleTransportParameters(params: TransportParams) {
+		if (this.#paramsReceived) return;
+		this.#paramsReceived = true;
+		this.#peerParams = params;
+
+		this.#connCredit.increaseMax(params.initialMaxData);
+		this.#bidiStreamCredit.increaseMax(params.initialMaxStreamsBidi);
+		this.#uniStreamCredit.increaseMax(params.initialMaxStreamsUni);
+	}
+
+	async #claimSendCredit(streamId: bigint, desired: bigint): Promise<bigint> {
+		const flow = this.#streamFlow.get(streamId);
+		if (!flow) return desired;
+
+		while (true) {
+			// 1. Try stream credit
+			const streamClaimed = flow.sendCredit.tryClaim(desired);
+			if (streamClaimed === 0n) {
+				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				// Wait for stream credit, then release and retry to coordinate with conn credit
+				const claimed = await flow.sendCredit.claim(desired);
+				flow.sendCredit.release(claimed);
+				continue;
+			}
+
+			// 2. Try connection credit
+			const connClaimed = this.#connCredit.tryClaim(streamClaimed);
+			if (connClaimed === 0n) {
+				flow.sendCredit.release(streamClaimed);
+				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				const claimed = await this.#connCredit.claim(1n);
+				this.#connCredit.release(claimed);
+				continue;
+			}
+
+			// Return excess stream credit if connection had less
+			if (connClaimed < streamClaimed) {
+				flow.sendCredit.release(streamClaimed - connClaimed);
+			}
+
+			return connClaimed;
+		}
+	}
+
+	#accountRecv(streamId: bigint, bytes: number): boolean {
+		if (this.#version !== "qmux-00" || bytes === 0) return true;
+
+		const bytesN = BigInt(bytes);
+
+		// Connection-level check
+		if (this.#recvDataOffset + bytesN > this.#recvDataMax) {
+			return false;
+		}
+		this.#recvDataOffset += bytesN;
+
+		// Stream-level check
+		const flow = this.#streamFlow.get(streamId);
+		if (flow) {
+			if (flow.recvOffset + bytesN > flow.recvMax) {
+				return false;
+			}
+			flow.recvOffset += bytesN;
+		}
+
+		return true;
+	}
+
+	#accountConsumed(streamId: bigint, bytes: number) {
+		if (this.#version !== "qmux-00" || bytes === 0) return;
+
+		// Track connection-level consumed (stable, not reset by per-stream updates)
+		this.#recvDataConsumed += BigInt(bytes);
+
+		const flow = this.#streamFlow.get(streamId);
+		if (flow) {
+			flow.recvConsumed += BigInt(bytes);
+			this.#maybeSendMaxStreamData(streamId, flow);
+		}
+		this.#maybeSendMaxData();
+	}
+
+	#maybeSendMaxData() {
+		const window = this.#ourParams.initialMaxData;
+		if (window === 0n) return;
+
+		const threshold = window / 2n;
+		if (this.#recvDataConsumed >= threshold) {
+			const newMax = this.#recvDataOffset + window;
+			if (newMax > this.#recvDataMax) {
+				this.#recvDataMax = newMax;
+				this.#recvDataConsumed = 0n;
+				this.#sendPriorityFrame({ type: "max_data", max: newMax });
+			}
+		}
+	}
+
+	#maybeSendMaxStreamData(streamId: bigint, flow: StreamFlowState) {
+		const id = new Stream.Id(VarInt.from(streamId));
+
+		let initialWindow: bigint;
+		if (id.dir === Stream.Dir.Bi) {
+			// Check if we initiated this stream
+			initialWindow =
+				id.serverInitiated === this.#isServer
+					? this.#ourParams.initialMaxStreamDataBidiLocal
+					: this.#ourParams.initialMaxStreamDataBidiRemote;
 		} else {
-			const exhaustive: never = frame;
-			throw new Error(`Unknown frame type: ${exhaustive}`);
+			initialWindow = this.#ourParams.initialMaxStreamDataUni;
+		}
+
+		if (initialWindow === 0n) return;
+
+		const threshold = initialWindow / 2n;
+		if (flow.recvConsumed >= threshold) {
+			const newMax = flow.recvOffset + initialWindow;
+			if (newMax > flow.recvMax) {
+				flow.recvMax = newMax;
+				flow.recvConsumed = 0n;
+				this.#sendPriorityFrame({ type: "max_stream_data", id, max: newMax });
+			}
+		}
+	}
+
+	/** Delete stream flow state only when both send and recv sides are gone. */
+	#maybeDeleteStreamFlow(streamId: bigint) {
+		if (!this.#sendStreams.has(streamId) && !this.#recvStreams.has(streamId)) {
+			const flow = this.#streamFlow.get(streamId);
+			if (flow) {
+				flow.sendCredit.close();
+				this.#streamFlow.delete(streamId);
+			}
 		}
 	}
 
@@ -236,6 +426,54 @@ export default class Session implements WebTransport {
 				throw new Error("received write-only stream");
 			}
 
+			// Validate stream count limits (QMux only)
+			// Per QUIC RFC 9000 §4.6, the limit applies to the stream index.
+			// A peer opening stream index N implicitly opens all streams 0..N.
+			if (this.#version === "qmux-00") {
+				const streamIndex = frame.id.index;
+				if (frame.id.dir === Stream.Dir.Bi) {
+					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsBidi) {
+						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
+						return;
+					}
+					if (streamIndex + 1n > this.#recvBidiOpened) {
+						this.#recvBidiOpened = streamIndex + 1n;
+					}
+				} else {
+					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsUni) {
+						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
+						return;
+					}
+					if (streamIndex + 1n > this.#recvUniOpened) {
+						this.#recvUniOpened = streamIndex + 1n;
+					}
+				}
+			}
+
+			// Initialize flow control state for new stream
+			if (this.#version === "qmux-00") {
+				const recvMax =
+					frame.id.dir === Stream.Dir.Bi
+						? this.#ourParams.initialMaxStreamDataBidiRemote
+						: this.#ourParams.initialMaxStreamDataUni;
+
+				// For send side on bidi: peer's bidi_local is our send limit
+				const sendMax = frame.id.dir === Stream.Dir.Bi ? this.#peerParams.initialMaxStreamDataBidiLocal : 0n;
+
+				this.#streamFlow.set(streamId, {
+					sendCredit: new Credit(sendMax),
+					recvMax,
+					recvOffset: 0n,
+					recvConsumed: 0n,
+				});
+			}
+
+			// Validate recv flow control before accepting
+			if (!this.#accountRecv(streamId, frame.data.byteLength)) {
+				this.close({ closeCode: 1002, reason: "flow control error" });
+				return;
+			}
+
 			const reader = new ReadableStream<Uint8Array>({
 				start: (controller) => {
 					stream = controller;
@@ -249,6 +487,7 @@ export default class Session implements WebTransport {
 					});
 
 					this.#recvStreams.delete(streamId);
+					this.#maybeDeleteStreamFlow(streamId);
 				},
 			});
 
@@ -274,6 +513,7 @@ export default class Session implements WebTransport {
 						});
 
 						this.#sendStreams.delete(streamId);
+						this.#maybeDeleteStreamFlow(streamId);
 					},
 					close: async () => {
 						await Promise.race([
@@ -287,6 +527,7 @@ export default class Session implements WebTransport {
 						]);
 
 						this.#sendStreams.delete(streamId);
+						this.#maybeDeleteStreamFlow(streamId);
 					},
 				});
 
@@ -294,15 +535,24 @@ export default class Session implements WebTransport {
 			} else {
 				this.#incomingUnidirectionalStreams.enqueue(reader);
 			}
+		} else {
+			// Existing stream — validate recv flow control
+			if (!this.#accountRecv(streamId, frame.data.byteLength)) {
+				this.close({ closeCode: 1002, reason: "flow control error" });
+				return;
+			}
 		}
 
 		if (frame.data.byteLength > 0) {
 			stream.enqueue(frame.data);
+			// Account consumed when data is enqueued to the reader
+			this.#accountConsumed(streamId, frame.data.byteLength);
 		}
 
 		if (frame.fin) {
 			stream.close();
 			this.#recvStreams.delete(streamId);
+			this.#maybeDeleteStreamFlow(streamId);
 		}
 	}
 
@@ -313,6 +563,7 @@ export default class Session implements WebTransport {
 
 		stream.error(new Error(`RESET_STREAM: ${frame.code.value}`));
 		this.#recvStreams.delete(streamId);
+		this.#maybeDeleteStreamFlow(streamId);
 	}
 
 	#handleStopSending(frame: Frame.StopSending) {
@@ -328,30 +579,66 @@ export default class Session implements WebTransport {
 			id: frame.id,
 			code: frame.code,
 		});
+
+		this.#maybeDeleteStreamFlow(streamId);
 	}
 
 	#sendTransportParameters() {
-		// QX_TRANSPORT_PARAMETERS frame: type (0x3f5153300d0a0d0a) + length (0)
-		const frameType = VarInt.from(0x3f5153300d0a0d0an);
-		const length = VarInt.from(0);
+		const frame: Frame.TransportParameters = {
+			type: "transport_parameters",
+			params: this.#ourParams,
+		};
+		const encoded = Frame.encode(frame, this.#version);
+		this.#ws.send(encoded);
+	}
 
-		let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
-		buffer = frameType.encode(buffer);
-		buffer = length.encode(buffer);
+	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
+		for (let offset = 0; offset < data.byteLength; ) {
+			const remaining = data.byteLength - offset;
+			const chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
 
-		this.#ws.send(buffer);
+			// Claim flow control credit (stream + connection)
+			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax));
+			const sendable = Number(allowed);
+
+			const chunk = data.subarray(offset, offset + sendable);
+
+			try {
+				await this.#sendFrame({
+					type: "stream",
+					id,
+					data: chunk,
+					fin: false,
+				});
+			} catch (e) {
+				// Return claimed credits on send failure
+				if (sendable > 0) {
+					const flow = this.#streamFlow.get(streamId);
+					if (flow) flow.sendCredit.release(BigInt(sendable));
+					this.#connCredit.release(BigInt(sendable));
+				}
+				throw e;
+			}
+
+			offset += sendable;
+		}
 	}
 
 	async #sendStreamData(id: Stream.Id, data: Uint8Array) {
-		for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
-			const end = Math.min(offset + MAX_FRAME_PAYLOAD, data.byteLength);
-			const chunk = data.subarray(offset, end);
-			await this.#sendFrame({
-				type: "stream",
-				id,
-				data: chunk,
-				fin: false,
-			});
+		const streamId = id.value.value;
+		if (this.#version === "qmux-00") {
+			await this.#sendStreamDataWithFlowControl(id, streamId, data);
+		} else {
+			for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
+				const end = Math.min(offset + MAX_FRAME_PAYLOAD, data.byteLength);
+				const chunk = data.subarray(offset, end);
+				await this.#sendFrame({
+					type: "stream",
+					id,
+					data: chunk,
+					fin: false,
+				});
+			}
 		}
 	}
 
@@ -377,11 +664,25 @@ export default class Session implements WebTransport {
 			throw this.#closeReason || new Error("Connection closed");
 		}
 
+		// Wait for stream count permit
+		await this.#bidiStreamCredit.claim(1n);
+
 		const streamId = Stream.Id.create(this.#nextBiStreamId++, Stream.Dir.Bi, this.#isServer);
+		const streamIdVal = streamId.value.value;
+
+		// Initialize flow control for this stream
+		if (this.#version === "qmux-00") {
+			this.#streamFlow.set(streamIdVal, {
+				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataBidiRemote),
+				recvMax: this.#ourParams.initialMaxStreamDataBidiLocal,
+				recvOffset: 0n,
+				recvConsumed: 0n,
+			});
+		}
 
 		const writer = new WritableStream<Uint8Array>({
 			start: (controller) => {
-				this.#sendStreams.set(streamId.value.value, controller);
+				this.#sendStreams.set(streamIdVal, controller);
 			},
 			write: async (chunk) => {
 				await Promise.race([this.#sendStreamData(streamId, chunk), this.closed]);
@@ -394,7 +695,8 @@ export default class Session implements WebTransport {
 					code: VarInt.from(0),
 				});
 
-				this.#sendStreams.delete(streamId.value.value);
+				this.#sendStreams.delete(streamIdVal);
+				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			close: async () => {
 				await Promise.race([
@@ -407,13 +709,14 @@ export default class Session implements WebTransport {
 					this.closed,
 				]);
 
-				this.#sendStreams.delete(streamId.value.value);
+				this.#sendStreams.delete(streamIdVal);
+				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		});
 
 		const reader = new ReadableStream<Uint8Array>({
 			start: (controller) => {
-				this.#recvStreams.set(streamId.value.value, controller);
+				this.#recvStreams.set(streamIdVal, controller);
 			},
 			cancel: async () => {
 				this.#sendPriorityFrame({
@@ -422,7 +725,8 @@ export default class Session implements WebTransport {
 					code: VarInt.from(0),
 				});
 
-				this.#recvStreams.delete(streamId.value.value);
+				this.#recvStreams.delete(streamIdVal);
+				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		});
 
@@ -436,13 +740,27 @@ export default class Session implements WebTransport {
 			throw this.#closed;
 		}
 
+		// Wait for stream count permit
+		await this.#uniStreamCredit.claim(1n);
+
 		const streamId = Stream.Id.create(this.#nextUniStreamId++, Stream.Dir.Uni, this.#isServer);
+		const streamIdVal = streamId.value.value;
+
+		// Initialize flow control for this stream
+		if (this.#version === "qmux-00") {
+			this.#streamFlow.set(streamIdVal, {
+				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataUni),
+				recvMax: 0n,
+				recvOffset: 0n,
+				recvConsumed: 0n,
+			});
+		}
 
 		const session = this;
 
 		const writer = new WritableStream<Uint8Array>({
 			start: (controller) => {
-				session.#sendStreams.set(streamId.value.value, controller);
+				session.#sendStreams.set(streamIdVal, controller);
 			},
 			async write(chunk) {
 				await Promise.race([session.#sendStreamData(streamId, chunk), session.closed]);
@@ -455,7 +773,8 @@ export default class Session implements WebTransport {
 					code: VarInt.from(0),
 				});
 
-				session.#sendStreams.delete(streamId.value.value);
+				session.#sendStreams.delete(streamIdVal);
+				session.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			async close() {
 				await Promise.race([
@@ -468,7 +787,8 @@ export default class Session implements WebTransport {
 					session.closed,
 				]);
 
-				session.#sendStreams.delete(streamId.value.value);
+				session.#sendStreams.delete(streamIdVal);
+				session.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		});
 
@@ -500,6 +820,17 @@ export default class Session implements WebTransport {
 		}
 		this.#sendStreams.clear();
 		this.#recvStreams.clear();
+
+		// Close per-stream credits before clearing the map
+		for (const flow of this.#streamFlow.values()) {
+			flow.sendCredit.close();
+		}
+		this.#streamFlow.clear();
+
+		// Close global credits so blocked claim() calls reject
+		this.#connCredit.close();
+		this.#bidiStreamCredit.close();
+		this.#uniStreamCredit.close();
 	}
 
 	close(info?: { closeCode?: number; reason?: string }) {

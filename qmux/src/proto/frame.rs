@@ -1,7 +1,26 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use web_transport_proto::VarInt;
 
-use crate::{Error, StreamId, Version};
+use crate::{Error, StreamId, TransportParams, Version};
+
+// QMux frame type IDs (QUIC v1 compatible)
+const RESET_STREAM: VarInt = VarInt::from_u32(0x04);
+const STOP_SENDING: VarInt = VarInt::from_u32(0x05);
+const STREAM_BASE: u32 = 0x08;
+const MAX_DATA: VarInt = VarInt::from_u32(0x10);
+const MAX_STREAM_DATA: VarInt = VarInt::from_u32(0x11);
+const MAX_STREAMS_BIDI: VarInt = VarInt::from_u32(0x12);
+const MAX_STREAMS_UNI: VarInt = VarInt::from_u32(0x13);
+const DATA_BLOCKED: VarInt = VarInt::from_u32(0x14);
+const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
+const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
+const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
+const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
+
+// QX_TRANSPORT_PARAMETERS magic: "\xffQMX\r\n\r\n"
+// This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
+const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
+const QX_TRANSPORT_PARAMETERS_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_TRANSPORT_PARAMETERS) };
 
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
@@ -48,19 +67,28 @@ pub enum Frame {
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
     Stream(Stream),
+    MaxData(u64),
+    MaxStreamData { id: StreamId, max: u64 },
+    MaxStreamsBidi(u64),
+    MaxStreamsUni(u64),
+    DataBlocked(u64),
+    StreamDataBlocked { id: StreamId, limit: u64 },
+    StreamsBlockedBidi(u64),
+    StreamsBlockedUni(u64),
+    TransportParameters(TransportParams),
 }
 
 impl Frame {
     /// Encode the frame into bytes using the given wire format version.
-    pub fn encode(&self, version: Version) -> Bytes {
+    pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
 
         match version {
             Version::WebTransport => self.encode_wt(&mut buf),
-            Version::QMux00 => self.encode_qmux(&mut buf),
+            Version::QMux00 => self.encode_qmux(&mut buf)?,
         }
 
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     fn encode_wt(&self, buf: &mut BytesMut) {
@@ -85,44 +113,85 @@ impl Frame {
                 c.code.encode(buf);
                 buf.put_slice(c.reason.as_bytes());
             }
+            // Flow control frames are QMux-only
+            _ => unreachable!("flow control frames are not supported in WebTransport version"),
         }
     }
 
-    fn encode_qmux(&self, buf: &mut BytesMut) {
+    fn encode_qmux(&self, buf: &mut BytesMut) -> Result<(), Error> {
         match self {
             Frame::Stream(s) => {
                 // Always LEN bit (0x02), never OFF bit. Type = 0x0a | fin_bit
-                let frame_type = 0x08u64 | 0x02 | if s.fin { 0x01 } else { 0 };
-                VarInt::try_from(frame_type).unwrap().encode(buf);
+                let frame_type = VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
+                frame_type.encode(buf);
                 s.id.0.encode(buf);
-                VarInt::try_from(s.data.len() as u64).unwrap().encode(buf);
+                VarInt::try_from(s.data.len())?.encode(buf);
                 buf.put_slice(&s.data);
             }
             Frame::ResetStream(r) => {
-                VarInt::try_from(0x04u64).unwrap().encode(buf);
+                RESET_STREAM.encode(buf);
                 r.id.0.encode(buf);
                 r.code.encode(buf);
-                // final_size = 0 (no flow control tracking)
+                // final_size = 0 (no flow control tracking yet)
                 VarInt::from(0u32).encode(buf);
             }
             Frame::StopSending(s) => {
-                VarInt::try_from(0x05u64).unwrap().encode(buf);
+                STOP_SENDING.encode(buf);
                 s.id.0.encode(buf);
                 s.code.encode(buf);
             }
             Frame::ConnectionClose(c) => {
-                // APPLICATION_CLOSE (0x1d)
-                VarInt::try_from(0x1du64).unwrap().encode(buf);
+                APPLICATION_CLOSE.encode(buf);
                 c.code.encode(buf);
                 // frame_type = 0 (application close)
                 VarInt::from(0u32).encode(buf);
                 let reason_bytes = c.reason.as_bytes();
-                VarInt::try_from(reason_bytes.len() as u64)
-                    .unwrap()
-                    .encode(buf);
+                VarInt::try_from(reason_bytes.len())?.encode(buf);
                 buf.put_slice(reason_bytes);
             }
+            Frame::MaxData(max) => {
+                MAX_DATA.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
+            }
+            Frame::MaxStreamData { id, max } => {
+                MAX_STREAM_DATA.encode(buf);
+                id.0.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
+            }
+            Frame::MaxStreamsBidi(max) => {
+                MAX_STREAMS_BIDI.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
+            }
+            Frame::MaxStreamsUni(max) => {
+                MAX_STREAMS_UNI.encode(buf);
+                VarInt::try_from(*max)?.encode(buf);
+            }
+            Frame::DataBlocked(limit) => {
+                DATA_BLOCKED.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
+            }
+            Frame::StreamDataBlocked { id, limit } => {
+                STREAM_DATA_BLOCKED.encode(buf);
+                id.0.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
+            }
+            Frame::StreamsBlockedBidi(limit) => {
+                STREAMS_BLOCKED_BIDI.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
+            }
+            Frame::StreamsBlockedUni(limit) => {
+                STREAMS_BLOCKED_UNI.encode(buf);
+                VarInt::try_from(*limit)?.encode(buf);
+            }
+            Frame::TransportParameters(params) => {
+                QX_TRANSPORT_PARAMETERS_VI.encode(buf);
+                let payload = params.encode()?;
+                VarInt::try_from(payload.len())?.encode(buf);
+                buf.put_slice(&payload);
+            }
         }
+
+        Ok(())
     }
 
     /// Decode a frame from bytes using the given wire format version.
@@ -241,35 +310,45 @@ impl Frame {
             }
             // MAX_DATA
             0x10 => {
-                let _max = VarInt::decode(&mut data)?;
-                Ok(None)
+                let max = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::MaxData(max)))
             }
             // MAX_STREAM_DATA
             0x11 => {
-                let _id = VarInt::decode(&mut data)?;
-                let _max = VarInt::decode(&mut data)?;
-                Ok(None)
+                let id = StreamId(VarInt::decode(&mut data)?);
+                let max = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::MaxStreamData { id, max }))
             }
-            // MAX_STREAMS (bidi/uni)
-            0x12 | 0x13 => {
-                let _max = VarInt::decode(&mut data)?;
-                Ok(None)
+            // MAX_STREAMS (bidi)
+            0x12 => {
+                let max = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::MaxStreamsBidi(max)))
+            }
+            // MAX_STREAMS (uni)
+            0x13 => {
+                let max = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::MaxStreamsUni(max)))
             }
             // DATA_BLOCKED
             0x14 => {
-                let _limit = VarInt::decode(&mut data)?;
-                Ok(None)
+                let limit = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::DataBlocked(limit)))
             }
             // STREAM_DATA_BLOCKED
             0x15 => {
-                let _id = VarInt::decode(&mut data)?;
-                let _limit = VarInt::decode(&mut data)?;
-                Ok(None)
+                let id = StreamId(VarInt::decode(&mut data)?);
+                let limit = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::StreamDataBlocked { id, limit }))
             }
-            // STREAMS_BLOCKED (bidi/uni)
-            0x16 | 0x17 => {
-                let _limit = VarInt::decode(&mut data)?;
-                Ok(None)
+            // STREAMS_BLOCKED (bidi)
+            0x16 => {
+                let limit = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::StreamsBlockedBidi(limit)))
+            }
+            // STREAMS_BLOCKED (uni)
+            0x17 => {
+                let limit = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::StreamsBlockedUni(limit)))
             }
             // DATAGRAM without length — rest of message is payload
             0x30 => {
@@ -285,17 +364,15 @@ impl Frame {
                 let _payload = data.split_to(len as usize);
                 Ok(None)
             }
-            // QX_TRANSPORT_PARAMETERS frame type.
-            // Raw bytes: 0x3f 0x51 0x53 0x30 0x0d 0x0a 0x0d 0x0a
-            // This is the VarInt encoding of the magic value used by QMux peers
-            // to exchange transport parameters on connection setup.
+            // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {
                 let len = VarInt::decode(&mut data)?.into_inner();
                 if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                let _payload = data.split_to(len as usize);
-                Ok(None)
+                let payload = data.split_to(len as usize);
+                let params = TransportParams::decode(payload)?;
+                Ok(Some(Frame::TransportParameters(params)))
             }
             _ => Err(Error::InvalidFrameType(frame_type)),
         }

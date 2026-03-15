@@ -4,6 +4,7 @@
 //! with backwards compatibility for the legacy `webtransport` wire format.
 
 mod alpn;
+mod credit;
 mod error;
 pub mod proto;
 mod protocol;
