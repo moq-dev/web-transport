@@ -603,12 +603,22 @@ export default class Session implements WebTransport {
 
 			const chunk = data.subarray(offset, offset + sendable);
 
-			await this.#sendFrame({
-				type: "stream",
-				id,
-				data: chunk,
-				fin: false,
-			});
+			try {
+				await this.#sendFrame({
+					type: "stream",
+					id,
+					data: chunk,
+					fin: false,
+				});
+			} catch (e) {
+				// Return claimed credits on send failure
+				if (sendable > 0) {
+					const flow = this.#streamFlow.get(streamId);
+					if (flow) flow.sendCredit.release(BigInt(sendable));
+					this.#connCredit.release(BigInt(sendable));
+				}
+				throw e;
+			}
 
 			offset += sendable;
 		}
