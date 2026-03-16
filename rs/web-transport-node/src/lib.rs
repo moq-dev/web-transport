@@ -29,20 +29,37 @@ impl NapiClient {
     /// Create a client that validates server certificates against system root CAs.
     #[napi(factory)]
     pub fn with_system_roots() -> Result<Self> {
-        let client = web_transport_quinn::ClientBuilder::new()
-            .with_system_roots()
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(Self { inner: client })
+        napi::bindgen_prelude::within_runtime_if_available(|| {
+            let client = web_transport_quinn::ClientBuilder::new()
+                .with_system_roots()
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(Self { inner: client })
+        })
+    }
+
+    /// Create a client that skips certificate verification entirely.
+    /// WARNING: Only use for testing with self-signed certificates.
+    #[napi(factory)]
+    pub fn disable_verify() -> Result<Self> {
+        napi::bindgen_prelude::within_runtime_if_available(|| {
+            let client = web_transport_quinn::ClientBuilder::new()
+                .dangerous()
+                .with_no_certificate_verification()
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(Self { inner: client })
+        })
     }
 
     /// Create a client that validates server certificates by SHA-256 hash.
     #[napi(factory)]
     pub fn with_certificate_hashes(hashes: Vec<Buffer>) -> Result<Self> {
-        let hashes: Vec<Vec<u8>> = hashes.into_iter().map(|b| b.to_vec()).collect();
-        let client = web_transport_quinn::ClientBuilder::new()
-            .with_server_certificate_hashes(hashes)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(Self { inner: client })
+        napi::bindgen_prelude::within_runtime_if_available(|| {
+            let hashes: Vec<Vec<u8>> = hashes.into_iter().map(|b| b.to_vec()).collect();
+            let client = web_transport_quinn::ClientBuilder::new()
+                .with_server_certificate_hashes(hashes)
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(Self { inner: client })
+        })
     }
 
     /// Connect to a WebTransport server at the given URL.
@@ -74,24 +91,26 @@ impl NapiServer {
     /// Create a server bound to the given address with the given TLS certificate.
     #[napi(factory)]
     pub fn bind(addr: String, cert_pem: Buffer, key_pem: Buffer) -> Result<Self> {
-        let certs = rustls_pemfile::certs(&mut &cert_pem[..])
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::from_reason(format!("invalid certificate PEM: {e}")))?;
-        let key = rustls_pemfile::private_key(&mut &key_pem[..])
-            .map_err(|e| Error::from_reason(format!("invalid private key PEM: {e}")))?
-            .ok_or_else(|| Error::from_reason("no private key found in PEM"))?;
+        napi::bindgen_prelude::within_runtime_if_available(|| {
+            let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| Error::from_reason(format!("invalid certificate PEM: {e}")))?;
+            let key = rustls_pemfile::private_key(&mut &key_pem[..])
+                .map_err(|e| Error::from_reason(format!("invalid private key PEM: {e}")))?
+                .ok_or_else(|| Error::from_reason("no private key found in PEM"))?;
 
-        let addr: std::net::SocketAddr = addr
-            .parse()
-            .map_err(|e: std::net::AddrParseError| Error::from_reason(e.to_string()))?;
+            let addr: std::net::SocketAddr = addr
+                .parse()
+                .map_err(|e: std::net::AddrParseError| Error::from_reason(e.to_string()))?;
 
-        let server = web_transport_quinn::ServerBuilder::new()
-            .with_addr(addr)
-            .with_certificate(certs, key)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+            let server = web_transport_quinn::ServerBuilder::new()
+                .with_addr(addr)
+                .with_certificate(certs, key)
+                .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        Ok(Self {
-            inner: Mutex::new(server),
+            Ok(Self {
+                inner: Mutex::new(server),
+            })
         })
     }
 
@@ -274,9 +293,11 @@ impl NapiSession {
     /// Send a datagram.
     #[napi]
     pub fn send_datagram(&self, data: Buffer) -> Result<()> {
-        self.inner
-            .send_datagram(bytes::Bytes::from(data.to_vec()))
-            .map_err(|e| Error::from_reason(e.to_string()))
+        within_runtime_if_available(|| {
+            self.inner
+                .send_datagram(bytes::Bytes::from(data.to_vec()))
+                .map_err(|e| Error::from_reason(e.to_string()))
+        })
     }
 
     /// Receive a datagram.
@@ -293,13 +314,15 @@ impl NapiSession {
     /// Get the maximum datagram size.
     #[napi]
     pub fn max_datagram_size(&self) -> u32 {
-        self.inner.max_datagram_size() as u32
+        within_runtime_if_available(|| self.inner.max_datagram_size() as u32)
     }
 
     /// Close the session with a code and reason.
     #[napi]
     pub fn close(&self, code: u32, reason: String) {
-        self.inner.close(code, reason.as_bytes());
+        within_runtime_if_available(|| {
+            self.inner.close(code, reason.as_bytes());
+        });
     }
 
     /// Wait for the session to close, returning close info matching W3C WebTransportCloseInfo.

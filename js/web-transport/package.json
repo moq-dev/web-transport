@@ -12,17 +12,17 @@
 		}
 	},
 	"exports": {
-		".": "./ts/index.ts"
+		".": "./src/index.ts"
 	},
-	"types": "./ts/index.ts",
+	"types": "./src/index.ts",
 	"files": [
-		"./ts",
+		"./src",
 		"index.js",
 		"index.d.ts",
 		"*.node"
 	],
 	"scripts": {
-		"build": "napi build --platform --release --cargo-cwd ../../rs/web-transport-node",
+		"build": "napi build --platform --release --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir .",
 		"check": "tsc --noEmit"
 	},
 	"devDependencies": {

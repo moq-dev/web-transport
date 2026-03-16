@@ -31,6 +31,11 @@ function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 	});
 }
 
+export interface SessionOptions extends WebTransportOptions {
+	/** Skip all certificate verification. Only use for testing. */
+	serverCertificateDisableVerify?: boolean;
+}
+
 export default class Session implements WebTransport {
 	readonly ready: Promise<void>;
 	readonly closed: Promise<WebTransportCloseInfo>;
@@ -71,7 +76,9 @@ export default class Session implements WebTransport {
 
 			const hashes = options?.serverCertificateHashes;
 			let client: NapiClient;
-			if (hashes && hashes.length > 0) {
+			if ((options as SessionOptions)?.serverCertificateDisableVerify) {
+				client = NapiClient.disableVerify();
+			} else if (hashes && hashes.length > 0) {
 				const buffers = hashes
 					.filter((h): h is WebTransportHash & { value: BufferSource } => h.value != null)
 					.map((h) => Buffer.from(h.value as ArrayBuffer));

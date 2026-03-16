@@ -11,5 +11,5 @@
 		"skipLibCheck": true,
 		"rewriteRelativeImportExtensions": true
 	},
-	"include": ["ts/**/*"]
+	"include": ["src/**/*"]
 }
