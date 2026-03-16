@@ -4,7 +4,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::transport::StreamTransport;
-use crate::{alpn, Error, Session, Version};
+use crate::{alpn, Config, Error, Session, Version};
 
 /// Parse a TLS ALPN into a version and app protocol.
 ///
@@ -73,7 +73,7 @@ pub async fn connect(
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let transport = StreamTransport::new(tls_stream);
-    Ok(Session::connect(transport, version, protocol))
+    Ok(Session::connect(transport, Config::new(version, protocol)))
 }
 
 /// Accept a TLS connection. Always uses the QMux wire format.
@@ -94,5 +94,5 @@ pub async fn accept(
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let transport = StreamTransport::new(tls_stream);
-    Ok(Session::accept(transport, version, protocol))
+    Ok(Session::accept(transport, Config::new(version, protocol)))
 }

@@ -3,7 +3,7 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{alpn, Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
+use crate::{alpn, Config, Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSPORT};
 
 /// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
 ///
@@ -55,7 +55,7 @@ where
 {
     let (version, protocol) = parse_alpn(alpn);
     let transport = WsTransport::new(ws);
-    Session::connect(transport, version, protocol)
+    Session::connect(transport, Config::new(version, protocol))
 }
 
 /// Wrap a pre-upgraded WebSocket connection as a server-side session.
@@ -73,7 +73,7 @@ where
 {
     let (version, protocol) = parse_alpn(alpn);
     let transport = WsTransport::new(ws);
-    Session::accept(transport, version, protocol)
+    Session::accept(transport, Config::new(version, protocol))
 }
 
 /// A QMux client that connects over WebSocket.
@@ -167,7 +167,7 @@ impl Client {
         let (version, protocol) = parse_alpn(negotiated);
 
         let transport = WsTransport::new(ws_stream);
-        Ok(Session::connect(transport, version, protocol))
+        Ok(Session::connect(transport, Config::new(version, protocol)))
     }
 }
 
@@ -297,6 +297,6 @@ impl Server {
             .expect("negotiated must be set after successful handshake");
 
         let transport = WsTransport::new(ws);
-        Ok(Session::accept(transport, version, protocol))
+        Ok(Session::accept(transport, Config::new(version, protocol)))
     }
 }

@@ -27,7 +27,7 @@ mod stream_transport {
     use web_transport_proto::VarInt;
 
     use super::Transport;
-    use crate::{Error, MAX_FRAME_SIZE};
+    use crate::{Error, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
 
     pub(crate) struct StreamTransport<T> {
         reader: BufReader<tokio::io::ReadHalf<T>>,
@@ -99,7 +99,7 @@ mod stream_transport {
 
                 if has_len {
                     let len = self.read_varint(&mut buf).await?.into_inner() as usize;
-                    if len > MAX_FRAME_SIZE {
+                    if len > MAX_FRAME_PAYLOAD {
                         return Err(Error::FrameTooLarge);
                     }
                     self.read_bytes(len, &mut buf).await?;
