@@ -1,27 +1,27 @@
 {
-  "name": "@moq/web-transport-linux-arm64-gnu",
-  "version": "0.0.1",
-  "cpu": [
-    "arm64"
-  ],
-  "main": "web-transport.linux-arm64-gnu.node",
-  "files": [
-    "web-transport.linux-arm64-gnu.node"
-  ],
-  "description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
-  "keywords": [
-    "webtransport",
-    "quic",
-    "http3",
-    "polyfill",
-    "napi"
-  ],
-  "license": "(MIT OR Apache-2.0)",
-  "repository": "github:moq-dev/web-transport",
-  "os": [
-    "linux"
-  ],
-  "libc": [
-    "glibc"
-  ]
+	"name": "@moq/web-transport-linux-arm64-gnu",
+	"version": "0.0.1",
+	"cpu": [
+		"arm64"
+	],
+	"main": "web-transport.linux-arm64-gnu.node",
+	"files": [
+		"web-transport.linux-arm64-gnu.node"
+	],
+	"description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
+	"keywords": [
+		"webtransport",
+		"quic",
+		"http3",
+		"polyfill",
+		"napi"
+	],
+	"license": "(MIT OR Apache-2.0)",
+	"repository": "github:moq-dev/web-transport",
+	"os": [
+		"linux"
+	],
+	"libc": [
+		"glibc"
+	]
 }

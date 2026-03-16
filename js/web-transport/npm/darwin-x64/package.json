@@ -1,24 +1,24 @@
 {
-  "name": "@moq/web-transport-darwin-x64",
-  "version": "0.0.1",
-  "cpu": [
-    "x64"
-  ],
-  "main": "web-transport.darwin-x64.node",
-  "files": [
-    "web-transport.darwin-x64.node"
-  ],
-  "description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
-  "keywords": [
-    "webtransport",
-    "quic",
-    "http3",
-    "polyfill",
-    "napi"
-  ],
-  "license": "(MIT OR Apache-2.0)",
-  "repository": "github:moq-dev/web-transport",
-  "os": [
-    "darwin"
-  ]
+	"name": "@moq/web-transport-darwin-x64",
+	"version": "0.0.1",
+	"cpu": [
+		"x64"
+	],
+	"main": "web-transport.darwin-x64.node",
+	"files": [
+		"web-transport.darwin-x64.node"
+	],
+	"description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
+	"keywords": [
+		"webtransport",
+		"quic",
+		"http3",
+		"polyfill",
+		"napi"
+	],
+	"license": "(MIT OR Apache-2.0)",
+	"repository": "github:moq-dev/web-transport",
+	"os": [
+		"darwin"
+	]
 }
