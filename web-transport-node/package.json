@@ -15,7 +15,7 @@
 		".": "./ts/index.ts"
 	},
 	"types": "./ts/index.ts",
-	"files": ["./ts"],
+	"files": ["./ts", "index.js", "index.d.ts", "*.node"],
 	"scripts": {
 		"build": "napi build --platform --release",
 		"check": "tsc --noEmit"

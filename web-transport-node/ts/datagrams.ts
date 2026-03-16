@@ -10,7 +10,11 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	outgoingHighWaterMark = 1;
 	outgoingMaxAge: number | null = null;
 
+	#session: NapiSession;
+
 	constructor(session: NapiSession) {
+		this.#session = session;
+
 		this.readable = new ReadableStream({
 			async pull(controller) {
 				try {
@@ -30,8 +34,6 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 
 	get maxDatagramSize(): number {
-		// This is a getter on the interface but we can't easily get the session ref here
-		// after construction, so return a conservative default.
-		return 1200;
+		return this.#session.maxDatagramSize();
 	}
 }

@@ -3,6 +3,24 @@ use napi_derive::napi;
 
 use tokio::sync::Mutex;
 
+/// Max buffer size for read() to prevent OOM from JS-provided values.
+const MAX_READ_SIZE: u32 = 1024 * 1024; // 1 MiB
+
+fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiCloseInfo {
+    match err {
+        web_transport_quinn::SessionError::WebTransportError(
+            web_transport_quinn::WebTransportError::Closed(code, reason),
+        ) => NapiCloseInfo {
+            close_code: *code,
+            reason: reason.clone(),
+        },
+        other => NapiCloseInfo {
+            close_code: 0,
+            reason: other.to_string(),
+        },
+    }
+}
+
 /// A WebTransport client that can connect to servers.
 #[napi]
 pub struct NapiClient {
@@ -155,13 +173,14 @@ impl NapiRequest {
 pub struct NapiSession {
     inner: web_transport_quinn::Session,
     // Cache the closed future result so multiple callers can await it.
-    closed: Mutex<Option<String>>,
+    closed: Mutex<Option<NapiCloseInfo>>,
 }
 
-/// Info about why a session was closed.
+/// Info about why a session was closed, matching W3C WebTransportCloseInfo.
+#[derive(Clone)]
 #[napi(object)]
 pub struct NapiCloseInfo {
-    pub code: u32,
+    pub close_code: u32,
     pub reason: String,
 }
 
@@ -286,27 +305,27 @@ impl NapiSession {
         self.inner.close(code, reason.as_bytes());
     }
 
-    /// Wait for the session to close, returning the error reason.
+    /// Wait for the session to close, returning close info matching W3C WebTransportCloseInfo.
     #[napi]
-    pub async fn closed(&self) -> Result<String> {
+    pub async fn closed(&self) -> Result<NapiCloseInfo> {
         // Check if we already have a cached result.
         {
             let cached = self.closed.lock().await;
-            if let Some(reason) = cached.as_ref() {
-                return Ok(reason.clone());
+            if let Some(info) = cached.as_ref() {
+                return Ok(info.clone());
             }
         }
 
         let err = self.inner.closed().await;
-        let reason = err.to_string();
+        let info = session_error_to_close_info(&err);
 
         // Cache the result.
         {
             let mut cached = self.closed.lock().await;
-            *cached = Some(reason.clone());
+            *cached = Some(info.clone());
         }
 
-        Ok(reason)
+        Ok(info)
     }
 }
 
@@ -367,6 +386,7 @@ impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN.
     #[napi]
     pub async fn read(&self, max_size: u32) -> Result<Option<Buffer>> {
+        let max_size = max_size.min(MAX_READ_SIZE);
         let mut stream = self.inner.lock().await;
         let mut buf = vec![0u8; max_size as usize];
         match stream

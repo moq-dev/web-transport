@@ -31,12 +31,13 @@ function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 	});
 }
 
-export default class Session {
+export default class Session implements WebTransport {
 	readonly ready: Promise<void>;
 	readonly closed: Promise<WebTransportCloseInfo>;
 	readonly datagrams: WebTransportDatagramDuplexStream;
 
 	#session: NapiSession | undefined;
+	#pendingClose: { closeCode: number; reason: string } | undefined;
 	#incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream> | undefined;
 	#incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>> | undefined;
 
@@ -65,15 +66,17 @@ export default class Session {
 			// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
 			readyResolve!();
 
-			urlOrSession.closed().then((reason) => {
+			urlOrSession.closed().then((info) => {
 				// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-				closedResolve!({ closeCode: 0, reason });
+				closedResolve!({ closeCode: info.closeCode, reason: info.reason });
 			});
 		} else {
 			// Client-side: create NapiClient and connect
 			const url = typeof urlOrSession === "string" ? urlOrSession : urlOrSession.toString();
 
-			this.datagrams = undefined as unknown as WebTransportDatagramDuplexStream;
+			// Provide a deferred Datagrams that works before connect resolves.
+			// The real session will be bound once connect succeeds.
+			this.datagrams = new DeferredDatagrams();
 
 			const hashes = options?.serverCertificateHashes;
 			let client: NapiClient;
@@ -89,14 +92,24 @@ export default class Session {
 			client
 				.connect(url)
 				.then((session) => {
+					// Check if close() was called before connect completed.
+					if (this.#pendingClose) {
+						session.close(this.#pendingClose.closeCode, this.#pendingClose.reason);
+						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
+						closedResolve!(this.#pendingClose);
+						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
+						readyReject!(new Error("session closed before connect"));
+						return;
+					}
+
 					this.#session = session;
-					(this as { datagrams: WebTransportDatagramDuplexStream }).datagrams = new Datagrams(session);
+					(this.datagrams as DeferredDatagrams).bind(session);
 					// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
 					readyResolve!();
 
-					session.closed().then((reason) => {
+					session.closed().then((info) => {
 						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-						closedResolve!({ closeCode: 0, reason });
+						closedResolve!({ closeCode: info.closeCode, reason: info.reason });
 					});
 				})
 				.catch((err) => {
@@ -174,10 +187,73 @@ export default class Session {
 	}
 
 	close(info?: { closeCode?: number; reason?: string }): void {
-		this.#session?.close(info?.closeCode ?? 0, info?.reason ?? "");
+		const closeCode = info?.closeCode ?? 0;
+		const reason = info?.reason ?? "";
+		if (this.#session) {
+			this.#session.close(closeCode, reason);
+		} else {
+			// Connect hasn't completed yet — flag for when it does.
+			this.#pendingClose = { closeCode, reason };
+		}
 	}
 
-	get congestionControl(): string {
+	get congestionControl(): WebTransportCongestionControl {
 		return "default";
+	}
+}
+
+/**
+ * A WebTransportDatagramDuplexStream that works before the session is connected.
+ * Readable/writable block until bind() is called with the real session.
+ */
+class DeferredDatagrams implements WebTransportDatagramDuplexStream {
+	readonly readable: ReadableStream<Uint8Array>;
+	readonly writable: WritableStream<Uint8Array>;
+
+	incomingHighWaterMark = 1;
+	incomingMaxAge: number | null = null;
+	outgoingHighWaterMark = 1;
+	outgoingMaxAge: number | null = null;
+
+	#session: NapiSession | undefined;
+	#readResolve: (() => void) | undefined;
+
+	constructor() {
+		this.readable = new ReadableStream({
+			pull: async (controller) => {
+				// Wait for session to be bound
+				if (!this.#session) {
+					await new Promise<void>((resolve) => {
+						this.#readResolve = resolve;
+					});
+				}
+				if (!this.#session) {
+					controller.close();
+					return;
+				}
+				try {
+					const data = await this.#session.recvDatagram();
+					controller.enqueue(new Uint8Array(data));
+				} catch {
+					controller.close();
+				}
+			},
+		});
+
+		this.writable = new WritableStream({
+			write: (chunk) => {
+				if (!this.#session) throw new Error("session not connected");
+				this.#session.sendDatagram(Buffer.from(chunk));
+			},
+		});
+	}
+
+	bind(session: NapiSession) {
+		this.#session = session;
+		this.#readResolve?.();
+	}
+
+	get maxDatagramSize(): number {
+		return this.#session?.maxDatagramSize() ?? 0;
 	}
 }
