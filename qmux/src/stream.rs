@@ -48,6 +48,11 @@ impl StreamId {
         }
     }
 
+    /// Returns the sequence index (0-based) of this stream.
+    pub fn index(&self) -> u64 {
+        self.0.into_inner() >> 2
+    }
+
     /// Returns true if the given endpoint can send on this stream.
     pub fn can_send(&self, is_server: bool) -> bool {
         match self.dir() {

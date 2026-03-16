@@ -33,6 +33,11 @@ export class Id {
 		return (this.value.value & 0x01n) !== 0n;
 	}
 
+	/** Returns the 0-based sequence index of this stream. */
+	get index(): bigint {
+		return this.value.value >> 2n;
+	}
+
 	canRecv(isServer: boolean): boolean {
 		if (this.dir === Dir.Uni) {
 			return this.serverInitiated !== isServer;

@@ -86,6 +86,7 @@ export default class Session implements WebTransport {
 					// Check if close() was called before connect completed.
 					if (this.#pendingClose) {
 						session.close(this.#pendingClose.closeCode, this.#pendingClose.reason);
+						(this.datagrams as DeferredDatagrams).fail(new Error("session closed before connect"));
 						closed.resolve(this.#pendingClose);
 						ready.reject(new Error("session closed before connect"));
 						return;
@@ -100,6 +101,7 @@ export default class Session implements WebTransport {
 					});
 				})
 				.catch((err) => {
+					(this.datagrams as DeferredDatagrams).fail(err instanceof Error ? err : new Error(String(err)));
 					ready.reject(err instanceof Error ? err : new Error(String(err)));
 					closed.resolve({ closeCode: 0, reason: String(err) });
 				});
@@ -208,7 +210,12 @@ class DeferredDatagrams implements WebTransportDatagramDuplexStream {
 			pull: async (controller) => {
 				// Wait for session to be bound
 				if (!this.#session) {
-					await this.#bound.promise;
+					try {
+						await this.#bound.promise;
+					} catch {
+						controller.close();
+						return;
+					}
 				}
 				if (!this.#session) {
 					controller.close();
@@ -234,6 +241,10 @@ class DeferredDatagrams implements WebTransportDatagramDuplexStream {
 	bind(session: NapiSession) {
 		this.#session = session;
 		this.#bound.resolve();
+	}
+
+	fail(_error: Error) {
+		this.#bound.reject(_error);
 	}
 
 	get maxDatagramSize(): number {

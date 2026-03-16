@@ -4,6 +4,8 @@
 //! with backwards compatibility for the legacy `webtransport` wire format.
 
 mod alpn;
+mod config;
+mod credit;
 mod error;
 pub mod proto;
 mod protocol;
@@ -34,6 +36,7 @@ pub use ws::{Client, Server};
 
 use proto::*;
 
+pub use config::Config;
 pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
