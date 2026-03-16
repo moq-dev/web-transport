@@ -26,3 +26,4 @@ jobs:
 
       # Make sure u guys don't write bad code
       - run: nix develop --command just check
+      - run: nix develop --command just test
