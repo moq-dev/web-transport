@@ -46,29 +46,20 @@ export default class Session implements WebTransport {
 	// Construct from existing NapiSession (server-side)
 	constructor(session: NapiSession);
 	constructor(urlOrSession: string | URL | NapiSession, options?: WebTransportOptions) {
-		let readyResolve: () => void;
-		let readyReject: (err: Error) => void;
-		this.ready = new Promise<void>((resolve, reject) => {
-			readyResolve = resolve;
-			readyReject = reject;
-		});
-
-		let closedResolve: (info: WebTransportCloseInfo) => void;
-		this.closed = new Promise<WebTransportCloseInfo>((resolve) => {
-			closedResolve = resolve;
-		});
+		const ready = Promise.withResolvers<void>();
+		const closed = Promise.withResolvers<WebTransportCloseInfo>();
+		this.ready = ready.promise;
+		this.closed = closed.promise;
 
 		// Check if we got an existing NapiSession (server-side path)
 		if (typeof urlOrSession === "object" && !(urlOrSession instanceof URL)) {
 			this.#session = urlOrSession;
 			this.datagrams = new Datagrams(urlOrSession);
 
-			// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-			readyResolve!();
+			ready.resolve();
 
 			urlOrSession.closed().then((info) => {
-				// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-				closedResolve!({ closeCode: info.closeCode, reason: info.reason });
+				closed.resolve({ closeCode: info.closeCode, reason: info.reason });
 			});
 		} else {
 			// Client-side: create NapiClient and connect
@@ -95,28 +86,22 @@ export default class Session implements WebTransport {
 					// Check if close() was called before connect completed.
 					if (this.#pendingClose) {
 						session.close(this.#pendingClose.closeCode, this.#pendingClose.reason);
-						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-						closedResolve!(this.#pendingClose);
-						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-						readyReject!(new Error("session closed before connect"));
+						closed.resolve(this.#pendingClose);
+						ready.reject(new Error("session closed before connect"));
 						return;
 					}
 
 					this.#session = session;
 					(this.datagrams as DeferredDatagrams).bind(session);
-					// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-					readyResolve!();
+					ready.resolve();
 
 					session.closed().then((info) => {
-						// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-						closedResolve!({ closeCode: info.closeCode, reason: info.reason });
+						closed.resolve({ closeCode: info.closeCode, reason: info.reason });
 					});
 				})
 				.catch((err) => {
-					// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-					readyReject!(err instanceof Error ? err : new Error(String(err)));
-					// biome-ignore lint/style/noNonNullAssertion: assigned synchronously in Promise constructor
-					closedResolve!({ closeCode: 0, reason: String(err) });
+					ready.reject(err instanceof Error ? err : new Error(String(err)));
+					closed.resolve({ closeCode: 0, reason: String(err) });
 				});
 		}
 	}

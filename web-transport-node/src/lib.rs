@@ -3,9 +3,6 @@ use napi_derive::napi;
 
 use tokio::sync::Mutex;
 
-/// Max buffer size for read() to prevent OOM from JS-provided values.
-const MAX_READ_SIZE: u32 = 1024 * 1024; // 1 MiB
-
 fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiCloseInfo {
     match err {
         web_transport_quinn::SessionError::WebTransportError(
@@ -386,20 +383,16 @@ impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN.
     #[napi]
     pub async fn read(&self, max_size: u32) -> Result<Option<Buffer>> {
-        let max_size = max_size.min(MAX_READ_SIZE);
         let mut stream = self.inner.lock().await;
-        let mut buf = vec![0u8; max_size as usize];
-        match stream
-            .read(&mut buf)
+        let Some(chunk) = stream
+            .read_chunk(max_size as usize, true)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?
-        {
-            Some(n) => {
-                buf.truncate(n);
-                Ok(Some(Buffer::from(buf)))
-            }
-            None => Ok(None),
-        }
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(Buffer::from(chunk.bytes.to_vec())))
     }
 
     /// Tell the peer to stop sending with the given error code.
