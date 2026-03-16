@@ -201,16 +201,14 @@ class DeferredDatagrams implements WebTransportDatagramDuplexStream {
 	outgoingMaxAge: number | null = null;
 
 	#session: NapiSession | undefined;
-	#readResolve: (() => void) | undefined;
+	#bound = Promise.withResolvers<void>();
 
 	constructor() {
 		this.readable = new ReadableStream({
 			pull: async (controller) => {
 				// Wait for session to be bound
 				if (!this.#session) {
-					await new Promise<void>((resolve) => {
-						this.#readResolve = resolve;
-					});
+					await this.#bound.promise;
 				}
 				if (!this.#session) {
 					controller.close();
@@ -235,7 +233,7 @@ class DeferredDatagrams implements WebTransportDatagramDuplexStream {
 
 	bind(session: NapiSession) {
 		this.#session = session;
-		this.#readResolve?.();
+		this.#bound.resolve();
 	}
 
 	get maxDatagramSize(): number {

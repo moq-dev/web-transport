@@ -15,7 +15,12 @@
 		".": "./ts/index.ts"
 	},
 	"types": "./ts/index.ts",
-	"files": ["./ts", "index.js", "index.d.ts", "*.node"],
+	"files": [
+		"./ts",
+		"index.js",
+		"index.d.ts",
+		"*.node"
+	],
 	"scripts": {
 		"build": "napi build --platform --release",
 		"check": "tsc --noEmit"
@@ -25,5 +30,11 @@
 		"typescript": "^5.9.2",
 		"@types/node": "^24.3.0"
 	},
-	"keywords": ["webtransport", "quic", "http3", "polyfill", "napi"]
+	"keywords": [
+		"webtransport",
+		"quic",
+		"http3",
+		"polyfill",
+		"napi"
+	]
 }

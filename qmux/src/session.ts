@@ -61,9 +61,9 @@ export default class Session implements WebTransport {
 	}
 
 	readonly ready: Promise<void>;
-	#readyResolve!: () => void;
+	#readyResolve: () => void;
 	readonly closed: Promise<WebTransportCloseInfo>;
-	#closedResolve!: (info: WebTransportCloseInfo) => void;
+	#closedResolve: (info: WebTransportCloseInfo) => void;
 
 	readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
 	#incomingBidirectionalStreams!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
@@ -98,13 +98,13 @@ export default class Session implements WebTransport {
 		}
 		this.#ws = new WebSocket(url, [...prefixed]);
 
-		this.ready = new Promise((resolve) => {
-			this.#readyResolve = resolve;
-		});
+		const ready = Promise.withResolvers<void>();
+		this.ready = ready.promise;
+		this.#readyResolve = ready.resolve;
 
-		this.closed = new Promise((resolve) => {
-			this.#closedResolve = resolve;
-		});
+		const closed = Promise.withResolvers<WebTransportCloseInfo>();
+		this.closed = closed.promise;
+		this.#closedResolve = closed.resolve;
 
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {

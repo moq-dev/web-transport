@@ -57,6 +57,10 @@ web-transport  web-transport  web-transport  web-transport
 
 WASM targets require `RUSTFLAGS=--cfg=web_sys_unstable_apis` (set in `.cargo/config.toml`). The `web-transport` crate uses conditional compilation (`target_arch = "wasm32"`) to route between native and WASM implementations.
 
+## Workflow
+
+- Always run `just fix` before committing to auto-fix formatting, linting, and sorting issues.
+
 ## Formatting & Style
 
 - **Rust**: `cargo fmt`, standard rustfmt
