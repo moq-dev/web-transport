@@ -12,7 +12,6 @@ categories = ["network-programming", "web-programming"]
 
 [dependencies]
 bytes = "1"
-derive_more = { version = "2.1.1", features = ["debug"] }
 http = "1"
 iroh = "0.97.0"
 n0-error = "0.1.2"
@@ -27,6 +26,5 @@ web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
-clap = { version = "4", features = ["derive"] }
 n0-tracing-test = "0.3.0"
 tokio = { version = "1", features = ["full"] }
