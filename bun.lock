@@ -7,9 +7,9 @@
         "@biomejs/biome": "^2.2.2",
       },
     },
-    "qmux": {
+    "js/qmux": {
       "name": "@moq/qmux",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "devDependencies": {
         "@types/node": "^24.3.0",
         "rimraf": "^6.0.1",
@@ -17,14 +17,14 @@
         "typescript": "^5.9.2",
       },
     },
-    "web-demo": {
+    "js/web-demo": {
       "name": "web-demo",
       "devDependencies": {
         "@parcel/transformer-inline-string": "^2.10.3",
         "parcel": "^2.10.3",
       },
     },
-    "web-transport-node": {
+    "js/web-transport": {
       "name": "@moq/web-transport",
       "version": "0.0.1",
       "devDependencies": {
@@ -33,7 +33,7 @@
         "typescript": "^5.9.2",
       },
     },
-    "web-transport-ws": {
+    "js/web-transport-ws": {
       "name": "@moq/web-transport-ws",
       "version": "0.3.0",
       "dependencies": {
@@ -180,11 +180,11 @@
 
     "@mischnic/json-sourcemap": ["@mischnic/json-sourcemap@0.1.1", "", { "dependencies": { "@lezer/common": "^1.0.0", "@lezer/lr": "^1.0.0", "json5": "^2.2.1" } }, "sha512-iA7+tyVqfrATAIsIRWQG+a7ZLLD0VaOCKV2Wd/v4mqIU3J9c4jx9p7S0nw1XH3gJCKNBOOwACOPYYSUu9pgT+w=="],
 
-    "@moq/qmux": ["@moq/qmux@workspace:qmux"],
+    "@moq/qmux": ["@moq/qmux@workspace:js/qmux"],
 
-    "@moq/web-transport": ["@moq/web-transport@workspace:web-transport-node"],
+    "@moq/web-transport": ["@moq/web-transport@workspace:js/web-transport"],
 
-    "@moq/web-transport-ws": ["@moq/web-transport-ws@workspace:web-transport-ws"],
+    "@moq/web-transport-ws": ["@moq/web-transport-ws@workspace:js/web-transport-ws"],
 
     "@msgpackr-extract/msgpackr-extract-darwin-arm64": ["@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.3", "", { "os": "darwin", "cpu": "arm64" }, "sha512-QZHtlVgbAdy2zAqNA9Gu1UpIuI8Xvsd1v8ic6B2pZmeFnFcMWiPLfWXh7TVw4eGEZ/C9TH281KwhVoeQUKbyjw=="],
 
@@ -744,7 +744,7 @@
 
     "weak-lru-cache": ["weak-lru-cache@1.2.2", "", {}, "sha512-DEAoo25RfSYMuTGc9vPJzZcZullwIqRDSI9LOy+fkCJPi6hykCnfKaXTuPBDuXAUcqHXyOgFtHNp/kB2FjYHbw=="],
 
-    "web-demo": ["web-demo@workspace:web-demo"],
+    "web-demo": ["web-demo@workspace:js/web-demo"],
 
     "which": ["which@2.0.2", "", { "dependencies": { "isexe": "^2.0.0" }, "bin": { "node-which": "./bin/node-which" } }, "sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA=="],
 

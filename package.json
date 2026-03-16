@@ -3,10 +3,10 @@
 	"private": true,
 	"type": "module",
 	"workspaces": [
-		"qmux",
-		"web-demo",
-		"web-transport-node",
-		"web-transport-ws"
+		"js/qmux",
+		"js/web-demo",
+		"js/web-transport",
+		"js/web-transport-ws"
 	],
 	"scripts": {
 		"check": "biome check",

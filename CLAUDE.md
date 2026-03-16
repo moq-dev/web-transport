@@ -24,9 +24,9 @@ bun run fix          # Biome auto-fix
 
 ## Architecture
 
-Rust/TypeScript monorepo implementing WebTransport (bidirectional streams + datagrams over HTTP/3 + QUIC) with multiple backend adapters.
+Rust/TypeScript monorepo implementing WebTransport (bidirectional streams + datagrams over HTTP/3 + QUIC) with multiple backend adapters. Organized into `rs/` (Rust crates) and `js/` (TypeScript packages).
 
-### Layered Crate Structure
+### Rust Crates (`rs/`)
 
 ```
                         web-transport
@@ -45,13 +45,21 @@ web-transport  web-transport  web-transport  web-transport
         (HTTP/3 frame parsing)    (async trait interface)
 ```
 
-- **`web-transport`** — Platform router: compiles to quinn on native, wasm bindings in browser. Start here for consumers.
-- **`web-transport-trait`** — Shared async trait that all backends implement.
-- **`web-transport-proto`** — Low-level HTTP/3 protocol (frame encoding/decoding). Used by all native backends.
-- **`web-transport-quinn`** / **`web-transport-noq`** / **`web-transport-quiche`** — Backend adapters for different QUIC libraries.
-- **`web-transport-wasm`** — WASM bindings to the browser's native WebTransport API via `wasm-bindgen`.
-- **`qmux`** — QMux protocol (draft-ietf-quic-qmux) over TCP/TLS/WebSocket. Has both a Rust crate and an NPM package (`@moq/qmux`).
-- **`web-transport-ws`** — **Deprecated**, thin wrapper around qmux.
+- **`rs/web-transport`** — Platform router: compiles to quinn on native, wasm bindings in browser. Start here for consumers.
+- **`rs/web-transport-trait`** — Shared async trait that all backends implement.
+- **`rs/web-transport-proto`** — Low-level HTTP/3 protocol (frame encoding/decoding). Used by all native backends.
+- **`rs/web-transport-quinn`** / **`rs/web-transport-noq`** / **`rs/web-transport-quiche`** — Backend adapters for different QUIC libraries.
+- **`rs/web-transport-wasm`** — WASM bindings to the browser's native WebTransport API via `wasm-bindgen`.
+- **`rs/web-transport-node`** — NAPI-RS bridge: compiles Rust to `.node` binary for Node.js.
+- **`rs/qmux`** — QMux protocol (draft-ietf-quic-qmux) over TCP/TLS/WebSocket (Rust implementation).
+- **`rs/web-transport-ws`** — **Deprecated**, thin wrapper around qmux.
+
+### TypeScript Packages (`js/`)
+
+- **`js/qmux`** (`@moq/qmux`) — QMux protocol over WebSocket (TypeScript implementation).
+- **`js/web-transport`** (`@moq/web-transport`) — Node.js WebTransport via NAPI-RS (TS wrapper around `rs/web-transport-node`).
+- **`js/web-transport-ws`** (`@moq/web-transport-ws`) — **Deprecated**, thin wrapper around `@moq/qmux`.
+- **`js/web-demo`** — Browser demo app.
 
 ### WASM Considerations
 
