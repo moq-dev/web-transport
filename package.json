@@ -5,6 +5,7 @@
 	"workspaces": [
 		"qmux",
 		"web-demo",
+		"web-transport-node",
 		"web-transport-ws"
 	],
 	"scripts": {

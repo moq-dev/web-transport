@@ -1,0 +1,20 @@
+[package]
+name = "web-transport-node"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bytes = "1"
+http = "1"
+napi = { version = "3", features = ["async", "napi8"] }
+napi-derive = "3"
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["sync"] }
+url = "2"
+web-transport-quinn = { path = "../web-transport-quinn" }
+
+[build-dependencies]
+napi-build = "2"

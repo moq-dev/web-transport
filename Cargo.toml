@@ -2,6 +2,7 @@
 members = [
     "qmux",
     "web-transport",
+    "web-transport-node",
     "web-transport-noq",
     "web-transport-proto",
     "web-transport-quiche",

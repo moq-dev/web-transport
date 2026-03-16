@@ -1,0 +1,29 @@
+{
+	"name": "@moq/web-transport",
+	"version": "0.0.1",
+	"description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
+	"type": "module",
+	"license": "(MIT OR Apache-2.0)",
+	"repository": "github:moq-dev/web-transport",
+	"napi": {
+		"name": "web-transport",
+		"triples": {
+			"defaults": true
+		}
+	},
+	"exports": {
+		".": "./ts/index.ts"
+	},
+	"types": "./ts/index.ts",
+	"files": ["./ts"],
+	"scripts": {
+		"build": "napi build --platform --release",
+		"check": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@napi-rs/cli": "^3",
+		"typescript": "^5.9.2",
+		"@types/node": "^24.3.0"
+	},
+	"keywords": ["webtransport", "quic", "http3", "polyfill", "napi"]
+}
