@@ -81,26 +81,23 @@ impl TransportParams {
             let mut param_data = data.split_to(len);
 
             match id {
-                0x04 => params.initial_max_data = VarInt::decode(&mut param_data)?.into_inner(),
+                0x04 => params.initial_max_data = decode_varint_param(&mut param_data)?,
                 0x05 => {
                     params.initial_max_stream_data_bidi_local =
-                        VarInt::decode(&mut param_data)?.into_inner()
+                        decode_varint_param(&mut param_data)?
                 }
                 0x06 => {
                     params.initial_max_stream_data_bidi_remote =
-                        VarInt::decode(&mut param_data)?.into_inner()
+                        decode_varint_param(&mut param_data)?
                 }
                 0x07 => {
-                    params.initial_max_stream_data_uni =
-                        VarInt::decode(&mut param_data)?.into_inner()
+                    params.initial_max_stream_data_uni = decode_varint_param(&mut param_data)?
                 }
                 0x08 => {
-                    params.initial_max_streams_bidi =
-                        VarInt::decode(&mut param_data)?.into_inner()
+                    params.initial_max_streams_bidi = decode_varint_param(&mut param_data)?
                 }
                 0x09 => {
-                    params.initial_max_streams_uni =
-                        VarInt::decode(&mut param_data)?.into_inner()
+                    params.initial_max_streams_uni = decode_varint_param(&mut param_data)?
                 }
                 _ => {
                     // Unknown parameter, skip (already split off)
@@ -110,6 +107,15 @@ impl TransportParams {
 
         Ok(params)
     }
+}
+
+/// Decode a single VarInt parameter, validating that the entire payload is consumed.
+fn decode_varint_param(data: &mut Bytes) -> Result<u64, Error> {
+    let value = VarInt::decode(data)?.into_inner();
+    if data.has_remaining() {
+        return Err(Error::Short);
+    }
+    Ok(value)
 }
 
 /// Returns the encoded size of a varint value.

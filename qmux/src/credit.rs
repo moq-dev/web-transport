@@ -94,8 +94,13 @@ impl Credit {
     /// Return previously claimed credit (rollback on failed send).
     pub fn release(&self, amount: u64) {
         self.inner.send_if_modified(|state| {
-            state.used = state.used.saturating_sub(amount);
-            true
+            let new = state.used.saturating_sub(amount);
+            if new != state.used {
+                state.used = new;
+                true
+            } else {
+                false
+            }
         });
     }
 

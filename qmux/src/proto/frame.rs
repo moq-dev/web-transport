@@ -20,7 +20,9 @@ const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 // QX_TRANSPORT_PARAMETERS magic: "\xffQMX\r\n\r\n"
 // This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
 const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
+// SAFETY: 0x3f5153300d0a0d0a < 2^62 (VarInt max), verified by the assertion below.
 const QX_TRANSPORT_PARAMETERS_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_TRANSPORT_PARAMETERS) };
+const _: () = assert!(QX_TRANSPORT_PARAMETERS < (1 << 62), "QX_TRANSPORT_PARAMETERS must fit in VarInt");
 
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct ResetStream {
     pub id: StreamId,
     /// Application-defined error code.
     pub code: VarInt,
+    /// Total bytes sent on the stream before the reset (for flow control accounting).
+    pub final_size: u64,
 }
 
 /// Requests that the peer stop sending on a stream.
@@ -84,14 +88,14 @@ impl Frame {
         let mut buf = BytesMut::new();
 
         match version {
-            Version::WebTransport => self.encode_wt(&mut buf),
+            Version::WebTransport => self.encode_wt(&mut buf)?,
             Version::QMux00 => self.encode_qmux(&mut buf)?,
         }
 
         Ok(buf.freeze())
     }
 
-    fn encode_wt(&self, buf: &mut BytesMut) {
+    fn encode_wt(&self, buf: &mut BytesMut) -> Result<(), Error> {
         match self {
             Frame::Stream(s) => {
                 buf.put_u8(if s.fin { 0x09 } else { 0x08 });
@@ -113,9 +117,10 @@ impl Frame {
                 c.code.encode(buf);
                 buf.put_slice(c.reason.as_bytes());
             }
-            // Flow control frames are QMux-only
-            _ => unreachable!("flow control frames are not supported in WebTransport version"),
+            // Flow control frames are QMux-only, not valid for WebTransport version
+            _ => return Err(Error::InvalidFrameType(0)),
         }
+        Ok(())
     }
 
     fn encode_qmux(&self, buf: &mut BytesMut) -> Result<(), Error> {
@@ -132,8 +137,7 @@ impl Frame {
                 RESET_STREAM.encode(buf);
                 r.id.0.encode(buf);
                 r.code.encode(buf);
-                // final_size = 0 (no flow control tracking yet)
-                VarInt::from(0u32).encode(buf);
+                VarInt::try_from(r.final_size)?.encode(buf);
             }
             Frame::StopSending(s) => {
                 STOP_SENDING.encode(buf);
@@ -215,7 +219,7 @@ impl Frame {
             0x04 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
-                Ok(Frame::ResetStream(ResetStream { id, code }))
+                Ok(Frame::ResetStream(ResetStream { id, code, final_size: 0 }))
             }
             0x05 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
@@ -284,8 +288,8 @@ impl Frame {
             0x04 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
-                let _final_size = VarInt::decode(&mut data)?;
-                Ok(Some(Frame::ResetStream(ResetStream { id, code })))
+                let final_size = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::ResetStream(ResetStream { id, code, final_size })))
             }
             // STOP_SENDING
             0x05 => {

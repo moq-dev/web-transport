@@ -728,7 +728,7 @@ impl SendStream {
             return error.clone();
         }
 
-        let frame = ResetStream { id: self.id, code };
+        let frame = ResetStream { id: self.id, code, final_size: self.offset };
 
         let error = Error::StreamStop(code);
 
@@ -872,7 +872,7 @@ impl generic::SendStream for SendStream {
         }
 
         let code = VarInt::from(code);
-        let frame = ResetStream { id: self.id, code };
+        let frame = ResetStream { id: self.id, code, final_size: self.offset };
 
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
