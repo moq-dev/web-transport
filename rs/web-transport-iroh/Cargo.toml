@@ -2,7 +2,7 @@
 name = "web-transport-iroh"
 description = "WebTransport library for Iroh"
 authors = ["Franz Heinzmann <frando@n0.computer>"]
-repository = "https://github.com/n0-computer/web-transport-iroh"
+repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 version = "0.2.2"
 edition = "2024"
@@ -23,8 +23,8 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 tracing = "0.1.41"
 url = "2"
-web-transport-proto = { path = "../web-transport-proto" }
-web-transport-trait = { path = "../web-transport-trait" }
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

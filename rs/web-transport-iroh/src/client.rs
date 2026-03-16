@@ -45,6 +45,9 @@ impl Client {
         addr: impl Into<EndpointAddr>,
         url: Url,
     ) -> Result<Session, ClientError> {
+        if url.scheme() != "https" {
+            return Err(ClientError::InvalidUrl);
+        }
         let conn = self.connect(addr, ALPN_H3.as_bytes()).await?;
         // Connect with the connection we established.
         Session::connect_h3(conn, url).await

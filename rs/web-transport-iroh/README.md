@@ -29,5 +29,5 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 [WebTransport]: https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.html
-[`web-transport-quinn`]: https://github.com/moq-dev/web-transport/tree/main/web-transport-quinn
-[`web-transport-trait`]: https://github.com/kixelated/web-transport/tree/main/web-transport-trait
+[`web-transport-quinn`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-quinn
+[`web-transport-trait`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-trait

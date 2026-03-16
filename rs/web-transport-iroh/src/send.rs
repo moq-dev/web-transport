@@ -131,7 +131,7 @@ impl web_transport_trait::SendStream for SendStream {
         Self::write(self, buf).await
     }
 
-    async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
+    async fn write_buf<B: Buf + web_transport_trait::MaybeSend>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
         // This can avoid making a copy when Buf is Bytes, as Quinn will allocate anyway.
         let size = buf.chunk().len();
         let chunk = buf.copy_to_bytes(size);
@@ -144,7 +144,9 @@ impl web_transport_trait::SendStream for SendStream {
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.stopped().await?;
-        Ok(())
+        match self.stopped().await? {
+            Some(code) => Err(WriteError::Stopped(code)),
+            None => Ok(()),
+        }
     }
 }

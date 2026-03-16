@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use iroh::{Endpoint, endpoint::ConnectionError};
 use n0_tracing_test::traced_test;
+use tokio::time::timeout;
 use tracing::Instrument;
 use url::Url;
 
@@ -69,8 +72,14 @@ async fn h3_smoke() -> n0_error::Result<()> {
         .instrument(tracing::error_span!("server")),
     );
 
-    client_task.await.unwrap();
-    server_task.await.unwrap();
+    timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client task timed out")
+        .unwrap();
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
 
     Ok(())
 }
@@ -124,8 +133,14 @@ async fn quic_smoke() -> n0_error::Result<()> {
         .instrument(tracing::error_span!("server"))
     });
 
-    client_task.await.unwrap();
-    server_task.await.unwrap();
+    timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client task timed out")
+        .unwrap();
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
 
     Ok(())
 }

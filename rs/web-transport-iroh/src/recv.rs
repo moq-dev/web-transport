@@ -64,9 +64,7 @@ impl RecvStream {
     pub async fn received_reset(&mut self) -> Result<Option<u32>, SessionError> {
         match self.inner.received_reset().await {
             Ok(None) => Ok(None),
-            Ok(Some(code)) => Ok(Some(
-                web_transport_proto::error_from_http3(code.into_inner()).unwrap(),
-            )),
+            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
             Err(endpoint::ResetError::ConnectionLost(e)) => Err(e.into()),
             Err(endpoint::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
