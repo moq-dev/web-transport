@@ -21,8 +21,12 @@ const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 // This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
 const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
 // SAFETY: 0x3f5153300d0a0d0a < 2^62 (VarInt max), verified by the assertion below.
-const QX_TRANSPORT_PARAMETERS_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_TRANSPORT_PARAMETERS) };
-const _: () = assert!(QX_TRANSPORT_PARAMETERS < (1 << 62), "QX_TRANSPORT_PARAMETERS must fit in VarInt");
+const QX_TRANSPORT_PARAMETERS_VI: VarInt =
+    unsafe { VarInt::from_u64_unchecked(QX_TRANSPORT_PARAMETERS) };
+const _: () = assert!(
+    QX_TRANSPORT_PARAMETERS < (1 << 62),
+    "QX_TRANSPORT_PARAMETERS must fit in VarInt"
+);
 
 /// Stream data frame carrying payload bytes for a specific stream.
 #[derive(Debug, Clone)]
@@ -127,7 +131,8 @@ impl Frame {
         match self {
             Frame::Stream(s) => {
                 // Always LEN bit (0x02), never OFF bit. Type = 0x0a | fin_bit
-                let frame_type = VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
+                let frame_type =
+                    VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
                 frame_type.encode(buf);
                 s.id.0.encode(buf);
                 VarInt::try_from(s.data.len())?.encode(buf);
@@ -219,7 +224,11 @@ impl Frame {
             0x04 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
-                Ok(Frame::ResetStream(ResetStream { id, code, final_size: 0 }))
+                Ok(Frame::ResetStream(ResetStream {
+                    id,
+                    code,
+                    final_size: 0,
+                }))
             }
             0x05 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
@@ -289,7 +298,11 @@ impl Frame {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
                 let final_size = VarInt::decode(&mut data)?.into_inner();
-                Ok(Some(Frame::ResetStream(ResetStream { id, code, final_size })))
+                Ok(Some(Frame::ResetStream(ResetStream {
+                    id,
+                    code,
+                    final_size,
+                })))
             }
             // STOP_SENDING
             0x05 => {

@@ -294,8 +294,7 @@ impl<T: Transport> SessionState<T> {
                                         // Peer opened this bidi stream, so our send limit
                                         // is their bidi_local (they are local to this stream)
                                         Some(Credit::new(
-                                            self.peer_params
-                                                .initial_max_stream_data_bidi_local,
+                                            self.peer_params.initial_max_stream_data_bidi_local,
                                         ))
                                     } else {
                                         None
@@ -432,7 +431,6 @@ impl<T: Transport> SessionState<T> {
 
         Ok(())
     }
-
 }
 
 impl Session {
@@ -463,10 +461,22 @@ impl Session {
 
         let closed = watch::Sender::new(None);
 
-        let open_bi_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
-        let open_uni_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
+        let open_bi_credit = Credit::new(if version == Version::QMux00 {
+            0
+        } else {
+            u64::MAX
+        });
+        let open_uni_credit = Credit::new(if version == Version::QMux00 {
+            0
+        } else {
+            u64::MAX
+        });
 
-        let conn_send_credit = Credit::new(if version == Version::QMux00 { 0 } else { u64::MAX });
+        let conn_send_credit = Credit::new(if version == Version::QMux00 {
+            0
+        } else {
+            u64::MAX
+        });
 
         let our_params = if version == Version::QMux00 {
             TransportParams::recommended()
@@ -728,7 +738,11 @@ impl SendStream {
             return error.clone();
         }
 
-        let frame = ResetStream { id: self.id, code, final_size: self.offset };
+        let frame = ResetStream {
+            id: self.id,
+            code,
+            final_size: self.offset,
+        };
 
         let error = Error::StreamStop(code);
 
@@ -872,7 +886,11 @@ impl generic::SendStream for SendStream {
         }
 
         let code = VarInt::from(code);
-        let frame = ResetStream { id: self.id, code, final_size: self.offset };
+        let frame = ResetStream {
+            id: self.id,
+            code,
+            final_size: self.offset,
+        };
 
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));

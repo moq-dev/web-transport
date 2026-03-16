@@ -10,22 +10,22 @@ use crate::Error;
 /// until the peer advertises its limits.
 #[derive(Debug, Clone, Default)]
 pub struct TransportParams {
-    pub initial_max_data: u64,                   // ID 0x04
-    pub initial_max_stream_data_bidi_local: u64, // ID 0x05
+    pub initial_max_data: u64,                    // ID 0x04
+    pub initial_max_stream_data_bidi_local: u64,  // ID 0x05
     pub initial_max_stream_data_bidi_remote: u64, // ID 0x06
-    pub initial_max_stream_data_uni: u64,        // ID 0x07
-    pub initial_max_streams_bidi: u64,           // ID 0x08
-    pub initial_max_streams_uni: u64,            // ID 0x09
+    pub initial_max_stream_data_uni: u64,         // ID 0x07
+    pub initial_max_streams_bidi: u64,            // ID 0x08
+    pub initial_max_streams_uni: u64,             // ID 0x09
 }
 
 impl TransportParams {
     /// Recommended defaults for a receiver that wants reasonable flow control.
     pub fn recommended() -> Self {
         Self {
-            initial_max_data: 1_048_576,                    // 1 MB
-            initial_max_stream_data_bidi_local: 262_144,    // 256 KB
-            initial_max_stream_data_bidi_remote: 262_144,   // 256 KB
-            initial_max_stream_data_uni: 262_144,           // 256 KB
+            initial_max_data: 1_048_576,                  // 1 MB
+            initial_max_stream_data_bidi_local: 262_144,  // 256 KB
+            initial_max_stream_data_bidi_remote: 262_144, // 256 KB
+            initial_max_stream_data_uni: 262_144,         // 256 KB
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
         }
@@ -57,11 +57,31 @@ impl TransportParams {
         }
 
         write_param(&mut buf, Self::INITIAL_MAX_DATA, self.initial_max_data)?;
-        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, self.initial_max_stream_data_bidi_local)?;
-        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, self.initial_max_stream_data_bidi_remote)?;
-        write_param(&mut buf, Self::INITIAL_MAX_STREAM_DATA_UNI, self.initial_max_stream_data_uni)?;
-        write_param(&mut buf, Self::INITIAL_MAX_STREAMS_BIDI, self.initial_max_streams_bidi)?;
-        write_param(&mut buf, Self::INITIAL_MAX_STREAMS_UNI, self.initial_max_streams_uni)?;
+        write_param(
+            &mut buf,
+            Self::INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            self.initial_max_stream_data_bidi_local,
+        )?;
+        write_param(
+            &mut buf,
+            Self::INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            self.initial_max_stream_data_bidi_remote,
+        )?;
+        write_param(
+            &mut buf,
+            Self::INITIAL_MAX_STREAM_DATA_UNI,
+            self.initial_max_stream_data_uni,
+        )?;
+        write_param(
+            &mut buf,
+            Self::INITIAL_MAX_STREAMS_BIDI,
+            self.initial_max_streams_bidi,
+        )?;
+        write_param(
+            &mut buf,
+            Self::INITIAL_MAX_STREAMS_UNI,
+            self.initial_max_streams_uni,
+        )?;
 
         Ok(buf.freeze())
     }
@@ -90,15 +110,9 @@ impl TransportParams {
                     params.initial_max_stream_data_bidi_remote =
                         decode_varint_param(&mut param_data)?
                 }
-                0x07 => {
-                    params.initial_max_stream_data_uni = decode_varint_param(&mut param_data)?
-                }
-                0x08 => {
-                    params.initial_max_streams_bidi = decode_varint_param(&mut param_data)?
-                }
-                0x09 => {
-                    params.initial_max_streams_uni = decode_varint_param(&mut param_data)?
-                }
+                0x07 => params.initial_max_stream_data_uni = decode_varint_param(&mut param_data)?,
+                0x08 => params.initial_max_streams_bidi = decode_varint_param(&mut param_data)?,
+                0x09 => params.initial_max_streams_uni = decode_varint_param(&mut param_data)?,
                 _ => {
                     // Unknown parameter, skip (already split off)
                 }
