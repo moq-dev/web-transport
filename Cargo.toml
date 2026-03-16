@@ -1,18 +1,18 @@
 [workspace]
 members = [
-    "qmux",
-    "web-transport",
-    "web-transport-node",
-    "web-transport-noq",
-    "web-transport-proto",
-    "web-transport-quiche",
-    "web-transport-quinn",
-    "web-transport-trait",
-    "web-transport-wasm",
-    "web-transport-ws",
+    "rs/qmux",
+    "rs/web-transport",
+    "rs/web-transport-node",
+    "rs/web-transport-noq",
+    "rs/web-transport-proto",
+    "rs/web-transport-quiche",
+    "rs/web-transport-quinn",
+    "rs/web-transport-trait",
+    "rs/web-transport-wasm",
+    "rs/web-transport-ws",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-web-transport-proto = { path = "web-transport-proto", version = "0.6" }
-web-transport-trait = { path = "web-transport-trait", version = "0.3" }
+web-transport-proto = { path = "rs/web-transport-proto", version = "0.6" }
+web-transport-trait = { path = "rs/web-transport-trait", version = "0.3" }

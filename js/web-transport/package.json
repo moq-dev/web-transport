@@ -22,7 +22,7 @@
 		"*.node"
 	],
 	"scripts": {
-		"build": "napi build --platform --release",
+		"build": "napi build --platform --release --cargo-cwd ../../rs/web-transport-node",
 		"check": "tsc --noEmit"
 	},
 	"devDependencies": {
