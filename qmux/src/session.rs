@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::config::Config;
 use crate::credit::Credit;
 use crate::transport::Transport;
 use crate::{
@@ -18,7 +19,7 @@ use web_transport_trait as generic;
 #[derive(Clone)]
 pub struct Session {
     is_server: bool,
-    version: Version,
+    config: Config,
 
     outbound: mpsc::Sender<Frame>,
     outbound_priority: mpsc::UnboundedSender<Frame>,
@@ -31,9 +32,6 @@ pub struct Session {
 
     closed: watch::Sender<Option<Error>>,
 
-    /// The negotiated application-level subprotocol, if any.
-    protocol: Option<String>,
-
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
     open_uni_credit: Credit,
@@ -43,14 +41,11 @@ pub struct Session {
 
     // Shared connection-level recv credit (shared with RecvStreams)
     conn_recv_credit: Credit,
-
-    // Our params (for per-stream initial windows)
-    our_params: TransportParams,
 }
 
 struct SessionState<T: Transport> {
     transport: T,
-    version: Version,
+    config: Config,
     is_server: bool,
 
     outbound: (mpsc::Sender<Frame>, mpsc::Receiver<Frame>),
@@ -77,10 +72,8 @@ struct SessionState<T: Transport> {
     // Stream count tracking
     open_bi_credit: Credit,
     open_uni_credit: Credit,
-    recv_streams_bidi_max: u64,
-    recv_streams_uni_max: u64,
-    recv_streams_bidi_opened: u64,
-    recv_streams_uni_opened: u64,
+    recv_bi_credit: Credit,
+    recv_uni_credit: Credit,
 }
 
 impl<T: Transport> SessionState<T> {
@@ -100,7 +93,7 @@ impl<T: Transport> SessionState<T> {
     // or moving recv_frame into a dedicated task that never gets cancelled.
     async fn run(&mut self) -> Result<(), Error> {
         // QMux requires TRANSPORT_PARAMETERS as the first frame on the connection.
-        if self.version == Version::QMux00 {
+        if self.config.version == Version::QMux00 {
             self.send_transport_parameters().await?;
         }
 
@@ -111,7 +104,7 @@ impl<T: Transport> SessionState<T> {
                 biased;
                 result = self.transport.recv() => {
                     let data = result?;
-                    if let Some(frame) = Frame::decode(data, self.version)? {
+                    if let Some(frame) = Frame::decode(data, self.config.version)? {
                         self.recv_frame(frame).await?;
                     }
                 }
@@ -155,7 +148,9 @@ impl<T: Transport> SessionState<T> {
     /// Send a QX_TRANSPORT_PARAMETERS frame with our defaults.
     async fn send_transport_parameters(&mut self) -> Result<(), Error> {
         let frame = Frame::TransportParameters(self.our_params.clone());
-        self.transport.send(frame.encode(self.version)?).await
+        self.transport
+            .send(frame.encode(self.config.version)?)
+            .await
     }
 
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -173,7 +168,9 @@ impl<T: Transport> SessionState<T> {
             _ => {}
         };
 
-        self.transport.send(frame.encode(self.version)?).await
+        self.transport
+            .send(frame.encode(self.config.version)?)
+            .await
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -218,23 +215,13 @@ impl<T: Transport> SessionState<T> {
                         // Per QUIC RFC 9000 §4.6, the limit applies to the stream index,
                         // not the count of seen streams. A peer opening stream index N
                         // implicitly opens all streams 0..N.
-                        if self.version == Version::QMux00 {
-                            let stream_index = stream.id.index();
-                            match stream.id.dir() {
-                                StreamDir::Bi => {
-                                    if stream_index + 1 > self.recv_streams_bidi_max {
-                                        return Err(Error::StreamLimitExceeded);
-                                    }
-                                    self.recv_streams_bidi_opened =
-                                        self.recv_streams_bidi_opened.max(stream_index + 1);
-                                }
-                                StreamDir::Uni => {
-                                    if stream_index + 1 > self.recv_streams_uni_max {
-                                        return Err(Error::StreamLimitExceeded);
-                                    }
-                                    self.recv_streams_uni_opened =
-                                        self.recv_streams_uni_opened.max(stream_index + 1);
-                                }
+                        if self.config.version == Version::QMux00 {
+                            let credit = match stream.id.dir() {
+                                StreamDir::Bi => &self.recv_bi_credit,
+                                StreamDir::Uni => &self.recv_uni_credit,
+                            };
+                            if !credit.receive_up_to(stream.id.index() + 1) {
+                                return Err(Error::StreamLimitExceeded);
                             }
                         }
 
@@ -242,7 +229,7 @@ impl<T: Transport> SessionState<T> {
                         let (tx2, rx2) = mpsc::unbounded_channel();
 
                         // Determine initial stream recv window
-                        let recv_window = if self.version == Version::QMux00 {
+                        let recv_window = if self.config.version == Version::QMux00 {
                             match stream.id.dir() {
                                 StreamDir::Bi => {
                                     self.our_params.initial_max_stream_data_bidi_remote
@@ -266,6 +253,15 @@ impl<T: Transport> SessionState<T> {
                             recv_credit: recv_credit.clone(),
                         };
 
+                        let recv_streams_credit = if self.config.version == Version::QMux00 {
+                            Some(match stream.id.dir() {
+                                StreamDir::Bi => self.recv_bi_credit.clone(),
+                                StreamDir::Uni => self.recv_uni_credit.clone(),
+                            })
+                        } else {
+                            None
+                        };
+
                         let recv_frontend = RecvStream {
                             id: stream.id,
                             inbound_data: rx,
@@ -276,7 +272,8 @@ impl<T: Transport> SessionState<T> {
                             fin: false,
                             recv_credit,
                             conn_recv_credit: self.conn_recv_credit.clone(),
-                            version: self.version,
+                            version: self.config.version,
+                            recv_streams_credit,
                         };
 
                         match stream.id.dir() {
@@ -290,7 +287,7 @@ impl<T: Transport> SessionState<T> {
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let send_backend = SendState {
                                     inbound_stopped: tx,
-                                    stream_credit: if self.version == Version::QMux00 {
+                                    stream_credit: if self.config.version == Version::QMux00 {
                                         // Peer opened this bidi stream, so our send limit
                                         // is their bidi_local (they are local to this stream)
                                         Some(Credit::new(
@@ -310,7 +307,7 @@ impl<T: Transport> SessionState<T> {
                                     closed: None,
                                     fin: false,
                                     stream_credit: send_backend.stream_credit.clone(),
-                                    conn_credit: if self.version == Version::QMux00 {
+                                    conn_credit: if self.config.version == Version::QMux00 {
                                         Some(self.conn_send_credit.clone())
                                     } else {
                                         None
@@ -420,7 +417,15 @@ impl<T: Transport> SessionState<T> {
         for (id, send) in &self.send_streams {
             if let Some(credit) = &send.stream_credit {
                 let initial = match id.dir() {
-                    StreamDir::Bi => params.initial_max_stream_data_bidi_remote,
+                    StreamDir::Bi => {
+                        if id.server_initiated() == self.is_server {
+                            // We initiated this stream — peer's bidi_remote applies
+                            params.initial_max_stream_data_bidi_remote
+                        } else {
+                            // Peer initiated this stream — peer's bidi_local applies
+                            params.initial_max_stream_data_bidi_local
+                        }
+                    }
                     StreamDir::Uni => params.initial_max_stream_data_uni,
                 };
                 credit.increase_max(initial).ok();
@@ -435,21 +440,19 @@ impl<T: Transport> SessionState<T> {
 
 impl Session {
     /// Create a client-side session over the given transport.
-    pub fn connect<T: Transport>(transport: T, version: Version, protocol: Option<String>) -> Self {
-        Self::new(transport, version, false, protocol)
+    pub fn connect<T: Transport>(transport: T, config: Config) -> Self {
+        Self::new(transport, false, config)
     }
 
     /// Create a server-side session over the given transport.
-    pub fn accept<T: Transport>(transport: T, version: Version, protocol: Option<String>) -> Self {
-        Self::new(transport, version, true, protocol)
+    pub fn accept<T: Transport>(transport: T, config: Config) -> Self {
+        Self::new(transport, true, config)
     }
 
-    fn new<T: Transport>(
-        transport: T,
-        version: Version,
-        is_server: bool,
-        protocol: Option<String>,
-    ) -> Self {
+    fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
+        let version = config.version;
+        let our_params = config.to_transport_params();
+
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
 
@@ -478,17 +481,27 @@ impl Session {
             u64::MAX
         });
 
-        let our_params = if version == Version::QMux00 {
-            TransportParams::recommended()
+        let conn_recv_credit = Credit::new(if version == Version::QMux00 {
+            our_params.initial_max_data
         } else {
-            TransportParams::default()
-        };
+            u64::MAX
+        });
 
-        let conn_recv_credit = Credit::new(our_params.initial_max_data);
+        // Stream count credits for incoming streams
+        let recv_bi_credit = Credit::new(if version == Version::QMux00 {
+            config.max_streams_bidi
+        } else {
+            u64::MAX
+        });
+        let recv_uni_credit = Credit::new(if version == Version::QMux00 {
+            config.max_streams_uni
+        } else {
+            u64::MAX
+        });
 
         let mut backend = SessionState {
             transport,
-            version,
+            config: config.clone(),
             outbound: (outbound_tx.clone(), outbound_rx),
             outbound_priority: (outbound_priority_tx.clone(), outbound_priority_rx),
             accept_bi: accept_bi_tx,
@@ -506,19 +519,27 @@ impl Session {
             params_received: false,
             open_bi_credit: open_bi_credit.clone(),
             open_uni_credit: open_uni_credit.clone(),
-            recv_streams_bidi_max: our_params.initial_max_streams_bidi,
-            recv_streams_uni_max: our_params.initial_max_streams_uni,
-            recv_streams_bidi_opened: 0,
-            recv_streams_uni_opened: 0,
+            recv_bi_credit: recv_bi_credit.clone(),
+            recv_uni_credit: recv_uni_credit.clone(),
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
+            // Close all credits so blocked claim()/claim_index() calls unblock
+            backend.open_bi_credit.close();
+            backend.open_uni_credit.close();
+            backend.conn_send_credit.close();
+            backend.conn_recv_credit.close();
+            for send in backend.send_streams.values() {
+                if let Some(credit) = &send.stream_credit {
+                    credit.close();
+                }
+            }
             backend.closed.send(Some(err)).ok();
         });
 
         Session {
             is_server,
-            version,
+            config,
             outbound: outbound_tx,
             outbound_priority: outbound_priority_tx,
             accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
@@ -526,12 +547,10 @@ impl Session {
             create_uni: create_uni_tx,
             create_bi: create_bi_tx,
             closed,
-            protocol,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,
             conn_recv_credit,
-            our_params,
         }
     }
 }
@@ -566,7 +585,7 @@ impl generic::Session for Session {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let stream_credit = if self.version == Version::QMux00 {
+        let stream_credit = if self.config.version == Version::QMux00 {
             // For uni streams we initiate, peer's uni limit applies
             Some(Credit::new(0)) // Will be set when peer params arrive
         } else {
@@ -586,7 +605,7 @@ impl generic::Session for Session {
             closed: None,
             fin: false,
             stream_credit,
-            conn_credit: if self.version == Version::QMux00 {
+            conn_credit: if self.config.version == Version::QMux00 {
                 Some(self.conn_send_credit.clone())
             } else {
                 None
@@ -609,7 +628,7 @@ impl generic::Session for Session {
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();
 
-        let stream_credit = if self.version == Version::QMux00 {
+        let stream_credit = if self.config.version == Version::QMux00 {
             // For bidi streams we initiate, peer's bidi_remote applies to our sends
             Some(Credit::new(0)) // Will be set when peer params arrive
         } else {
@@ -629,7 +648,7 @@ impl generic::Session for Session {
             closed: None,
             fin: false,
             stream_credit,
-            conn_credit: if self.version == Version::QMux00 {
+            conn_credit: if self.config.version == Version::QMux00 {
                 Some(self.conn_send_credit.clone())
             } else {
                 None
@@ -637,8 +656,8 @@ impl generic::Session for Session {
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let recv_window = if self.version == Version::QMux00 {
-            self.our_params.initial_max_stream_data_bidi_local
+        let recv_window = if self.config.version == Version::QMux00 {
+            self.config.max_stream_data_bidi_local
         } else {
             u64::MAX
         };
@@ -658,7 +677,8 @@ impl generic::Session for Session {
             fin: false,
             recv_credit,
             conn_recv_credit: self.conn_recv_credit.clone(),
-            version: self.version,
+            version: self.config.version,
+            recv_streams_credit: None, // We initiated this stream, no stream count tracking
         };
 
         self.create_bi
@@ -706,7 +726,7 @@ impl generic::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+        self.config.protocol.as_deref()
     }
 }
 
@@ -954,6 +974,9 @@ pub struct RecvStream {
     // Flow control: per-stream and connection-level recv credit
     recv_credit: Credit,
     conn_recv_credit: Credit,
+
+    // Stream count credit — consume(1) on drop triggers MAX_STREAMS
+    recv_streams_credit: Option<Credit>,
 }
 
 impl RecvStream {
@@ -993,6 +1016,17 @@ impl Drop for RecvStream {
     fn drop(&mut self) {
         if !self.fin && self.closed.is_none() {
             generic::RecvStream::stop(self, 0);
+        }
+
+        // Replenish stream count when this recv half is done
+        if let Some(credit) = &self.recv_streams_credit {
+            if let Some(new_max) = credit.consume(1) {
+                let frame = match self.id.dir() {
+                    StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
+                    StreamDir::Uni => Frame::MaxStreamsUni(new_max),
+                };
+                self.outbound_priority.send(frame).ok();
+            }
         }
     }
 }

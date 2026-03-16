@@ -8,6 +8,8 @@ struct CreditState {
     max: u64,
     /// Bytes freed/consumed since the last window update (recv-side only).
     released: u64,
+    /// Set to true when the credit is closed (session teardown).
+    closed: bool,
 }
 
 /// Tracks used/max credit for flow control.
@@ -30,6 +32,7 @@ impl Credit {
                 used: 0,
                 max,
                 released: 0,
+                closed: false,
             }),
         }
     }
@@ -55,13 +58,17 @@ impl Credit {
     /// Claim up to `limit` units, waiting until credit is available.
     pub async fn claim(&self, limit: u64) -> Result<u64, Error> {
         loop {
+            if self.inner.borrow().closed {
+                return Err(Error::Closed);
+            }
+
             let claimed = self.try_claim(limit);
             if claimed > 0 {
                 return Ok(claimed);
             }
 
             let mut rx = self.inner.subscribe();
-            rx.wait_for(|state| state.used < state.max)
+            rx.wait_for(|state| state.used < state.max || state.closed)
                 .await
                 .map_err(|_| Error::Closed)?;
         }
@@ -70,6 +77,10 @@ impl Credit {
     /// Claim exactly 1 unit and return the index (value of `used` before incrementing).
     pub async fn claim_index(&self) -> Result<u64, Error> {
         loop {
+            if self.inner.borrow().closed {
+                return Err(Error::Closed);
+            }
+
             let mut index = 0;
             let claimed = self.inner.send_if_modified(|state| {
                 if state.used < state.max {
@@ -85,10 +96,23 @@ impl Credit {
             }
 
             let mut rx = self.inner.subscribe();
-            rx.wait_for(|state| state.used < state.max)
+            rx.wait_for(|state| state.used < state.max || state.closed)
                 .await
                 .map_err(|_| Error::Closed)?;
         }
+    }
+
+    /// Close the credit, causing all pending and future `claim()`/`claim_index()` calls
+    /// to return `Err(Error::Closed)`.
+    pub fn close(&self) {
+        self.inner.send_if_modified(|state| {
+            if state.closed {
+                false
+            } else {
+                state.closed = true;
+                true
+            }
+        });
     }
 
     /// Return previously claimed credit (rollback on failed send).
@@ -126,6 +150,24 @@ impl Credit {
     }
 
     // --- Recv-side methods ---
+
+    /// Set used to max(used, value). Returns false if value > max (flow control violation).
+    /// Used for stream count tracking where opening index N implies all indices 0..N.
+    pub fn receive_up_to(&self, value: u64) -> bool {
+        let mut ok = true;
+        self.inner.send_if_modified(|state| {
+            if value > state.max {
+                ok = false;
+                false
+            } else if value > state.used {
+                state.used = value;
+                true
+            } else {
+                false
+            }
+        });
+        ok
+    }
 
     /// Validate and account for incoming data. Returns false if flow control is violated.
     pub fn receive(&self, len: u64) -> bool {

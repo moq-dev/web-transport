@@ -19,18 +19,6 @@ pub struct TransportParams {
 }
 
 impl TransportParams {
-    /// Recommended defaults for a receiver that wants reasonable flow control.
-    pub fn recommended() -> Self {
-        Self {
-            initial_max_data: 1_048_576,                  // 1 MB
-            initial_max_stream_data_bidi_local: 262_144,  // 256 KB
-            initial_max_stream_data_bidi_remote: 262_144, // 256 KB
-            initial_max_stream_data_uni: 262_144,         // 256 KB
-            initial_max_streams_bidi: 100,
-            initial_max_streams_uni: 100,
-        }
-    }
-
     // Transport parameter IDs (all fit in u8)
     const INITIAL_MAX_DATA: VarInt = VarInt::from_u32(0x04);
     const INITIAL_MAX_STREAM_DATA_BIDI_LOCAL: VarInt = VarInt::from_u32(0x05);
@@ -89,6 +77,8 @@ impl TransportParams {
     /// Decode transport parameters from bytes.
     pub fn decode(mut data: Bytes) -> Result<Self, Error> {
         let mut params = TransportParams::default();
+        // Track seen IDs to detect duplicates (bitmask for IDs 0x04-0x09)
+        let mut seen: u8 = 0;
 
         while data.has_remaining() {
             let id = VarInt::decode(&mut data)?.into_inner();
@@ -101,18 +91,36 @@ impl TransportParams {
             let mut param_data = data.split_to(len);
 
             match id {
-                0x04 => params.initial_max_data = decode_varint_param(&mut param_data)?,
-                0x05 => {
-                    params.initial_max_stream_data_bidi_local =
-                        decode_varint_param(&mut param_data)?
+                0x04..=0x09 => {
+                    let bit = 1 << (id - 0x04);
+                    if seen & bit != 0 {
+                        return Err(Error::DuplicateParam(id));
+                    }
+                    seen |= bit;
+
+                    match id {
+                        0x04 => params.initial_max_data = decode_varint_param(&mut param_data)?,
+                        0x05 => {
+                            params.initial_max_stream_data_bidi_local =
+                                decode_varint_param(&mut param_data)?
+                        }
+                        0x06 => {
+                            params.initial_max_stream_data_bidi_remote =
+                                decode_varint_param(&mut param_data)?
+                        }
+                        0x07 => {
+                            params.initial_max_stream_data_uni =
+                                decode_varint_param(&mut param_data)?
+                        }
+                        0x08 => {
+                            params.initial_max_streams_bidi = decode_varint_param(&mut param_data)?
+                        }
+                        0x09 => {
+                            params.initial_max_streams_uni = decode_varint_param(&mut param_data)?
+                        }
+                        _ => unreachable!(),
+                    }
                 }
-                0x06 => {
-                    params.initial_max_stream_data_bidi_remote =
-                        decode_varint_param(&mut param_data)?
-                }
-                0x07 => params.initial_max_stream_data_uni = decode_varint_param(&mut param_data)?,
-                0x08 => params.initial_max_streams_bidi = decode_varint_param(&mut param_data)?,
-                0x09 => params.initial_max_streams_uni = decode_varint_param(&mut param_data)?,
                 _ => {
                     // Unknown parameter, skip (already split off)
                 }

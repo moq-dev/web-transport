@@ -1,9 +1,45 @@
 import { Credit } from "./credit.ts";
 import type { TransportParams, Version } from "./frame.ts";
 import * as Frame from "./frame.ts";
-import { DEFAULT_TRANSPORT_PARAMS, MAX_FRAME_PAYLOAD, RECOMMENDED_TRANSPORT_PARAMS } from "./frame.ts";
+import { DEFAULT_TRANSPORT_PARAMS, MAX_FRAME_PAYLOAD } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
+
+/** Configuration for a QMux session. */
+export interface Config {
+	/** Max concurrent bidirectional streams the peer can open. */
+	maxStreamsBidi?: bigint;
+	/** Max concurrent unidirectional streams the peer can open. */
+	maxStreamsUni?: bigint;
+	/** Connection-level receive window in bytes. */
+	maxData?: bigint;
+	/** Per-stream receive window for bidi streams we initiate. */
+	maxStreamDataBidiLocal?: bigint;
+	/** Per-stream receive window for bidi streams the peer initiates. */
+	maxStreamDataBidiRemote?: bigint;
+	/** Per-stream receive window for uni streams. */
+	maxStreamDataUni?: bigint;
+}
+
+const DEFAULT_CONFIG: Required<Config> = {
+	maxStreamsBidi: 100n,
+	maxStreamsUni: 100n,
+	maxData: 1_048_576n,
+	maxStreamDataBidiLocal: 262_144n,
+	maxStreamDataBidiRemote: 262_144n,
+	maxStreamDataUni: 262_144n,
+};
+
+function configToTransportParams(config: Required<Config>): TransportParams {
+	return {
+		initialMaxData: config.maxData,
+		initialMaxStreamDataBidiLocal: config.maxStreamDataBidiLocal,
+		initialMaxStreamDataBidiRemote: config.maxStreamDataBidiRemote,
+		initialMaxStreamDataUni: config.maxStreamDataUni,
+		initialMaxStreamsBidi: config.maxStreamsBidi,
+		initialMaxStreamsUni: config.maxStreamsUni,
+	};
+}
 
 // TODO Implement this
 export class Datagrams implements WebTransportDatagramDuplexStream {
@@ -33,6 +69,9 @@ export interface SessionOptions extends WebTransportOptions {
 	 * Each protocol is prefixed with `webtransport.` and `qmux-00.` on the wire.
 	 */
 	protocols?: string[];
+
+	/** QMux flow control configuration. Only used when the QMux wire format is negotiated. */
+	config?: Config;
 }
 
 const PREFIX_WEBTRANSPORT = "webtransport.";
@@ -83,7 +122,8 @@ export default class Session implements WebTransport {
 	readonly datagrams = new Datagrams();
 
 	// Flow control state
-	#ourParams: TransportParams = { ...RECOMMENDED_TRANSPORT_PARAMS };
+	#config: Required<Config>;
+	#ourParams: TransportParams;
 	#peerParams: TransportParams = { ...DEFAULT_TRANSPORT_PARAMS };
 	#paramsReceived = false;
 
@@ -98,11 +138,13 @@ export default class Session implements WebTransport {
 	// Per-stream flow control
 	#streamFlow = new Map<bigint, StreamFlowState>();
 
-	// Stream count tracking via Credit
+	// Stream count tracking via Credit (for sending — peer's limits)
 	#bidiStreamCredit: Credit;
 	#uniStreamCredit: Credit;
-	#recvBidiOpened = 0n;
-	#recvUniOpened = 0n;
+
+	// Stream count tracking via Credit (for receiving — our limits)
+	#recvBiCredit: Credit;
+	#recvUniCredit: Credit;
 
 	constructor(url: string | URL, options?: SessionOptions) {
 		if (options?.requireUnreliable) {
@@ -114,6 +156,10 @@ export default class Session implements WebTransport {
 		}
 
 		url = Session.#convertToWebSocketUrl(url);
+
+		// Merge user config with defaults
+		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
+		this.#ourParams = configToTransportParams(this.#config);
 
 		// Offer both qmux-00 and webtransport prefixed protocols, preferring qmux-00
 		const appProtocols = options?.protocols ?? [];
@@ -133,6 +179,8 @@ export default class Session implements WebTransport {
 		this.#connCredit = new Credit(0n);
 		this.#bidiStreamCredit = new Credit(0n);
 		this.#uniStreamCredit = new Credit(0n);
+		this.#recvBiCredit = new Credit(this.#config.maxStreamsBidi);
+		this.#recvUniCredit = new Credit(this.#config.maxStreamsUni);
 
 		this.ready = new Promise((resolve) => {
 			this.#readyResolve = resolve;
@@ -278,6 +326,15 @@ export default class Session implements WebTransport {
 		this.#connCredit.increaseMax(params.initialMaxData);
 		this.#bidiStreamCredit.increaseMax(params.initialMaxStreamsBidi);
 		this.#uniStreamCredit.increaseMax(params.initialMaxStreamsUni);
+
+		// Update per-stream send credits for locally-opened streams created before params arrived.
+		// Peer-opened streams can't exist yet (params are the first frame on the wire).
+		for (const [streamIdVal, flow] of this.#streamFlow) {
+			const id = new Stream.Id(VarInt.from(streamIdVal));
+			const sendLimit =
+				id.dir === Stream.Dir.Bi ? params.initialMaxStreamDataBidiRemote : params.initialMaxStreamDataUni;
+			flow.sendCredit.increaseMax(sendLimit);
+		}
 	}
 
 	async #claimSendCredit(streamId: bigint, desired: bigint): Promise<bigint> {
@@ -393,6 +450,21 @@ export default class Session implements WebTransport {
 		}
 	}
 
+	/** Replenish stream count credit for a peer-initiated stream and send MAX_STREAMS if needed. */
+	#replenishStreamCredit(dir: Stream.DirType) {
+		if (this.#version !== "qmux-00") return;
+
+		const credit = dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
+		const newMax = credit.consume(1n);
+		if (newMax !== null) {
+			if (dir === Stream.Dir.Bi) {
+				this.#sendPriorityFrame({ type: "max_streams_bidi", max: newMax });
+			} else {
+				this.#sendPriorityFrame({ type: "max_streams_uni", max: newMax });
+			}
+		}
+	}
+
 	/** Delete stream flow state only when both send and recv sides are gone. */
 	#maybeDeleteStreamFlow(streamId: bigint) {
 		if (!this.#sendStreams.has(streamId) && !this.#recvStreams.has(streamId)) {
@@ -430,23 +502,10 @@ export default class Session implements WebTransport {
 			// Per QUIC RFC 9000 §4.6, the limit applies to the stream index.
 			// A peer opening stream index N implicitly opens all streams 0..N.
 			if (this.#version === "qmux-00") {
-				const streamIndex = frame.id.index;
-				if (frame.id.dir === Stream.Dir.Bi) {
-					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsBidi) {
-						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
-						return;
-					}
-					if (streamIndex + 1n > this.#recvBidiOpened) {
-						this.#recvBidiOpened = streamIndex + 1n;
-					}
-				} else {
-					if (streamIndex + 1n > this.#ourParams.initialMaxStreamsUni) {
-						this.close({ closeCode: 1002, reason: "stream limit exceeded" });
-						return;
-					}
-					if (streamIndex + 1n > this.#recvUniOpened) {
-						this.#recvUniOpened = streamIndex + 1n;
-					}
+				const credit = frame.id.dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
+				if (!credit.receiveUpTo(frame.id.index + 1n)) {
+					this.close({ closeCode: 1002, reason: "stream limit exceeded" });
+					return;
 				}
 			}
 
@@ -487,6 +546,7 @@ export default class Session implements WebTransport {
 					});
 
 					this.#recvStreams.delete(streamId);
+					this.#replenishStreamCredit(frame.id.dir);
 					this.#maybeDeleteStreamFlow(streamId);
 				},
 			});
@@ -552,6 +612,9 @@ export default class Session implements WebTransport {
 		if (frame.fin) {
 			stream.close();
 			this.#recvStreams.delete(streamId);
+			if (frame.id.serverInitiated !== this.#isServer) {
+				this.#replenishStreamCredit(frame.id.dir);
+			}
 			this.#maybeDeleteStreamFlow(streamId);
 		}
 	}
@@ -563,6 +626,9 @@ export default class Session implements WebTransport {
 
 		stream.error(new Error(`RESET_STREAM: ${frame.code.value}`));
 		this.#recvStreams.delete(streamId);
+		if (frame.id.serverInitiated !== this.#isServer) {
+			this.#replenishStreamCredit(frame.id.dir);
+		}
 		this.#maybeDeleteStreamFlow(streamId);
 	}
 
@@ -831,6 +897,8 @@ export default class Session implements WebTransport {
 		this.#connCredit.close();
 		this.#bidiStreamCredit.close();
 		this.#uniStreamCredit.close();
+		this.#recvBiCredit.close();
+		this.#recvUniCredit.close();
 	}
 
 	close(info?: { closeCode?: number; reason?: string }) {

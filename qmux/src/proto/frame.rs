@@ -224,6 +224,7 @@ impl Frame {
             0x04 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
+                // WebTransport wire format has no final_size; flow control is QMux-only.
                 Ok(Frame::ResetStream(ResetStream {
                     id,
                     code,

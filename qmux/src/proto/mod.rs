@@ -5,7 +5,7 @@ mod params;
 mod version;
 
 pub use frame::*;
-pub use params::*;
+pub(crate) use params::*;
 pub use version::*;
 
 /// Maximum size of a single QMux frame on the wire (type + fields + payload).

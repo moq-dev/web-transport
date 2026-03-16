@@ -30,6 +30,9 @@ pub enum Error {
     #[error("stream limit exceeded")]
     StreamLimitExceeded,
 
+    #[error("duplicate transport parameter: 0x{0:02x}")]
+    DuplicateParam(u64),
+
     #[error("short frame")]
     Short,
 

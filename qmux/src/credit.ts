@@ -7,6 +7,7 @@
 export class Credit {
 	#used: bigint;
 	#max: bigint;
+	#released = 0n;
 	#closed = false;
 	#waiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
 
@@ -64,6 +65,29 @@ export class Credit {
 		this.#waiters = [];
 		const err = new Error("closed");
 		for (const { reject } of waiters) reject(err);
+	}
+
+	/** Set used to max(used, value). Returns false if value > max (flow control violation). */
+	receiveUpTo(value: bigint): boolean {
+		if (value > this.#max) return false;
+		if (value > this.#used) this.#used = value;
+		return true;
+	}
+
+	/** Report that `len` units have been consumed.
+	 *  Returns the new max if a window update should be sent, or null otherwise. */
+	consume(len: bigint): bigint | null {
+		this.#released += len;
+
+		// Send a window update when: used + 2*released > max
+		if (this.#used + 2n * this.#released > this.#max) {
+			const newMax = this.#max + this.#released;
+			this.#max = newMax;
+			this.#released = 0n;
+			this.#wake();
+			return newMax;
+		}
+		return null;
 	}
 
 	/** Get current available credit (max - used). */
