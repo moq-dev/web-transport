@@ -9,7 +9,10 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use iroh::endpoint::{self, Connection};
+use iroh::{
+    Watcher,
+    endpoint::{self, Connection, PathInfoList, PathWatcher},
+};
 use n0_future::{
     FuturesUnordered,
     stream::{Stream, StreamExt},
@@ -33,6 +36,9 @@ use crate::{
 pub struct Session {
     conn: Connection,
     h3: Option<H3SessionState>,
+    // An iroh connection drops stats of abandoned paths if no `PathWatcher` is alive. We need sums of all
+    // paths for the implementation of `SessionStats`, so we keep this watcher as a guard.
+    _path_stats_guard: PathWatcher,
 }
 
 impl Session {
@@ -41,7 +47,12 @@ impl Session {
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
     pub fn raw(conn: Connection) -> Self {
-        Self { conn, h3: None }
+        let paths = conn.paths();
+        Self {
+            conn,
+            _path_stats_guard: paths,
+            h3: None,
+        }
     }
 
     /// Connect using an established QUIC connection if you want to create the connection yourself.
@@ -67,8 +78,13 @@ impl Session {
 
     /// Creates a session from pre-established HTTP/3 handshake components.
     pub fn new_h3(conn: Connection, settings: Settings, mut connect: Connected) -> Self {
+        let paths = conn.paths();
         let h3 = H3SessionState::connect(conn.clone(), settings, &connect);
-        let this = Session { conn, h3: Some(h3) };
+        let this = Session {
+            conn,
+            h3: Some(h3),
+            _path_stats_guard: paths,
+        };
         // Run a background task to check if the connect stream is closed.
         let this2 = this.clone();
         tokio::spawn(async move {
@@ -571,6 +587,79 @@ impl web_transport_trait::Session for Session {
         match self.h3.as_ref() {
             None => std::str::from_utf8(self.conn.alpn()).ok(),
             Some(h3) => h3.response.protocol.as_deref(),
+        }
+    }
+
+    fn stats(&self) -> impl web_transport_trait::Stats {
+        // We're not using [`Self::_path_stats_guard`] because updating its value to the current path list
+        // needs mutable access. Instead, we just create a new watcher from the iroh connection, which is
+        // cheap enough (but has an allocation and mutex lock).
+        let paths = self.conn().paths().get();
+        SessionStats {
+            stats: self.conn.stats(),
+            paths,
+        }
+    }
+}
+
+pub struct SessionStats {
+    stats: iroh::endpoint::ConnectionStats,
+    paths: PathInfoList,
+}
+
+impl web_transport_trait::Stats for SessionStats {
+    fn bytes_sent(&self) -> Option<u64> {
+        Some(self.stats.udp_tx.bytes)
+    }
+
+    fn bytes_received(&self) -> Option<u64> {
+        Some(self.stats.udp_rx.bytes)
+    }
+
+    fn bytes_lost(&self) -> Option<u64> {
+        Some(
+            self.paths
+                .iter()
+                .filter_map(|path| path.stats())
+                .map(|path| path.lost_bytes)
+                .sum(),
+        )
+    }
+
+    fn packets_sent(&self) -> Option<u64> {
+        Some(self.stats.udp_tx.datagrams)
+    }
+
+    fn packets_received(&self) -> Option<u64> {
+        Some(self.stats.udp_rx.datagrams)
+    }
+
+    fn packets_lost(&self) -> Option<u64> {
+        Some(
+            self.paths
+                .iter()
+                .filter_map(|path| path.stats())
+                .map(|path| path.lost_packets)
+                .sum(),
+        )
+    }
+
+    fn rtt(&self) -> Option<std::time::Duration> {
+        self.paths
+            .iter()
+            .filter(|p| p.is_selected())
+            .filter_map(|p| p.rtt())
+            .next()
+    }
+
+    fn estimated_send_rate(&self) -> Option<u64> {
+        let path = self.paths.iter().find(|p| p.is_selected())?;
+        let stats = path.stats()?;
+        let rtt_secs = stats.rtt.as_secs_f64();
+        if stats.cwnd > 0 && rtt_secs > 0.0 {
+            Some((stats.cwnd as f64 * 8.0 / rtt_secs) as u64)
+        } else {
+            None
         }
     }
 }
