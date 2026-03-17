@@ -47,10 +47,10 @@ export default class Session implements WebTransport {
 	#incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>> | undefined;
 
 	// Construct from URL (client-side polyfill)
-	constructor(url: string | URL, options?: WebTransportOptions);
+	constructor(url: string | URL, options?: SessionOptions);
 	// Construct from existing NapiSession (server-side)
 	constructor(session: NapiSession);
-	constructor(urlOrSession: string | URL | NapiSession, options?: WebTransportOptions) {
+	constructor(urlOrSession: string | URL | NapiSession, options?: SessionOptions) {
 		const ready = Promise.withResolvers<void>();
 		const closed = Promise.withResolvers<WebTransportCloseInfo>();
 		this.ready = ready.promise;
@@ -76,7 +76,7 @@ export default class Session implements WebTransport {
 
 			const hashes = options?.serverCertificateHashes;
 			let client: NapiClient;
-			if ((options as SessionOptions)?.serverCertificateDisableVerify) {
+			if (options?.serverCertificateDisableVerify) {
 				client = NapiClient.disableVerify();
 			} else if (hashes && hashes.length > 0) {
 				const buffers = hashes
