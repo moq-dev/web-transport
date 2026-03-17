@@ -47,7 +47,7 @@ check:
 	# Check JavaScript/TypeScript with biome
 	bun install
 	bun run check
-	bun --filter '*' run check
+	bun run --filter '*' check
 
 # Run any CI tests
 test:

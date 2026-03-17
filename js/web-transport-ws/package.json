@@ -18,7 +18,7 @@
 		"dev": "tsc --watch",
 		"check": "tsc --noEmit",
 		"example": "tsx examples/client.ts",
-		"release": "tsx ../common/release.ts"
+		"release": "bun ../common/release.ts"
 	},
 	"dependencies": {
 		"@moq/qmux": "workspace:*"

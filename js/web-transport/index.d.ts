@@ -12,6 +12,11 @@ export declare class NapiBiStream {
 export declare class NapiClient {
 	/** Create a client that validates server certificates against system root CAs. */
 	static withSystemRoots(): NapiClient;
+	/**
+	 * Create a client that skips certificate verification entirely.
+	 * WARNING: Only use for testing with self-signed certificates.
+	 */
+	static disableVerify(): NapiClient;
 	/** Create a client that validates server certificates by SHA-256 hash. */
 	static withCertificateHashes(hashes: Array<Buffer>): NapiClient;
 	/** Connect to a WebTransport server at the given URL. */
