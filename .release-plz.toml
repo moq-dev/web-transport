@@ -1,2 +1,6 @@
 [workspace]
 dependencies_update = true
+
+[[package]]
+name = "web-transport-node"
+publish = false

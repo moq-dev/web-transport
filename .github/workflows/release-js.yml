@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - host: macos-15-large
+          - host: macos-latest
             target: x86_64-apple-darwin
           - host: macos-latest
             target: aarch64-apple-darwin
@@ -60,7 +60,7 @@ jobs:
       - name: Build native module
         working-directory: js/web-transport
         run: |
-          npx napi build --platform --release --target ${{ matrix.target }} --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir .
+          bunx napi build --platform --release --target ${{ matrix.target }} --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir .
 
       - uses: actions/upload-artifact@v4
         with:
@@ -121,7 +121,7 @@ jobs:
 
       - name: Move artifacts
         working-directory: js/web-transport
-        run: npx napi artifacts --dir artifacts
+        run: bunx napi artifacts --dir artifacts
 
       - name: Check if already published
         id: check-native
