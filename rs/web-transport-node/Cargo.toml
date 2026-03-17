@@ -1,5 +1,9 @@
 [package]
 name = "web-transport-node"
+description = "WebTransport NAPI-RS bindings for Node.js"
+authors = ["Luke Curley"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
 version = "0.0.1"
 edition = "2021"
 

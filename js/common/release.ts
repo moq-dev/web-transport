@@ -24,7 +24,7 @@ console.log(`📦 Building ${name}@${version}...`);
 execSync("bun run build", { stdio: "inherit" });
 
 console.log(`🚀 Publishing ${name}@${version}...`);
-execSync("npm publish --access public", {
+execSync("npm publish --access public --provenance", {
 	stdio: "inherit",
 	cwd: "dist",
 });
