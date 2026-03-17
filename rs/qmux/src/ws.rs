@@ -214,6 +214,7 @@ impl Server {
         let negotiated_clone = negotiated.clone();
         let supported = self.protocols.clone();
 
+        #[allow(clippy::result_large_err)]
         let callback = move |req: &server::Request,
                              mut response: server::Response|
               -> Result<server::Response, server::ErrorResponse> {
