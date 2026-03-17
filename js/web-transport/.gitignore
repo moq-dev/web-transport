@@ -1,5 +1,3 @@
 *.node
-index.js
-index.d.ts
 dist/
 target/
