@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.3](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.2.2...web-transport-iroh-v0.2.3) - 2026-03-17
+
+### Added
+
+- add web-transport-iroh ([#203](https://github.com/moq-dev/web-transport/pull/203))
+
 ## [0.2.2](https://github.com/n0-computer/web-transport-iroh/compare/v0.2.1..0.2.2) - 2026-03-09
 
 ### ⛰️  Features

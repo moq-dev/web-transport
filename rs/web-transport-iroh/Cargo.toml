@@ -4,7 +4,7 @@ description = "WebTransport library for Iroh"
 authors = ["Franz Heinzmann <frando@n0.computer>"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 keywords = ["quic", "http3", "webtransport", "iroh"]
