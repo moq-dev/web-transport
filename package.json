@@ -13,6 +13,7 @@
 		"fix": "biome check --fix"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "^2.2.2"
+		"@biomejs/biome": "^2.2.2",
+		"publint": "^0.3.18"
 	}
 }
