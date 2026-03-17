@@ -64,9 +64,10 @@ pkg.scripts = undefined;
 writeFileSync("dist/package.json", JSON.stringify(pkg, null, 2));
 
 // Copy static files
-console.log("📄 Copying README.md...");
-copyFileSync("README.md", join("dist", "README.md"));
-copyFileSync("../LICENSE-MIT", join("dist", "LICENSE-MIT"));
-copyFileSync("../LICENSE-APACHE", join("dist", "LICENSE-APACHE"));
+for (const file of ["README.md", "../../LICENSE-MIT", "../../LICENSE-APACHE"]) {
+	const dest = join("dist", file.replace(/^\.\.\/+/g, ""));
+	copyFileSync(file, dest);
+	console.log(`📄 Copied ${file}`);
+}
 
 console.log("📦 Package built successfully in dist/");
