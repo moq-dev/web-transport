@@ -14,11 +14,11 @@
 		"./src"
 	],
 	"scripts": {
-		"build": "rimraf dist && tsc && tsx scripts/package.ts",
+		"build": "rimraf dist && tsc && tsx ../common/package.ts",
 		"dev": "tsc --watch",
 		"check": "tsc --noEmit",
 		"example": "tsx examples/client.ts",
-		"release": "tsx scripts/release.ts"
+		"release": "tsx ../common/release.ts"
 	},
 	"dependencies": {
 		"@moq/qmux": "workspace:*"

@@ -100,7 +100,7 @@ jobs:
   release-native:
     if: github.repository_owner == 'moq-dev'
     runs-on: ubuntu-latest
-    needs: build-native
+    needs: [build-native, release-pure-ts]
     steps:
       - uses: actions/checkout@v4
 
@@ -123,7 +123,21 @@ jobs:
         working-directory: js/web-transport
         run: npx napi artifacts --dir artifacts
 
+      - name: Check if already published
+        id: check-native
+        working-directory: js/web-transport
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "${PKG_NAME}@${PKG_VERSION} already published, skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish platform packages
+        if: steps.check-native.outputs.skip != 'true'
         working-directory: js/web-transport
         run: |
           for dir in npm/*/; do
@@ -138,6 +152,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main package
+        if: steps.check-native.outputs.skip != 'true'
         working-directory: js/web-transport
         run: npm publish --access public
         env:
