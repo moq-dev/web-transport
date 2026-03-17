@@ -33,7 +33,6 @@ tokio = { version = "1", default-features = false, features = [
 
 tokio-quiche = "0.12"
 tracing = "0.1"
-url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
@@ -43,3 +42,4 @@ clap = { version = "4", features = ["derive"] }
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"

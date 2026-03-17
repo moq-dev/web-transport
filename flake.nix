@@ -42,6 +42,7 @@
           pkgs.cargo-hack
           pkgs.just
           pkgs.bun
+          pkgs.wasm-bindgen-cli
           pkgs.pkg-config
           pkgs.glib
           pkgs.gtk3

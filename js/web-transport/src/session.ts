@@ -75,6 +75,10 @@ export default class Session implements WebTransport {
 			this.datagrams = new DeferredDatagrams();
 
 			const hashes = options?.serverCertificateHashes;
+			if (options?.serverCertificateDisableVerify && hashes && hashes.length > 0) {
+				throw new Error("serverCertificateDisableVerify and serverCertificateHashes cannot be used together");
+			}
+
 			let client: NapiClient;
 			if (options?.serverCertificateDisableVerify) {
 				client = NapiClient.disableVerify();
