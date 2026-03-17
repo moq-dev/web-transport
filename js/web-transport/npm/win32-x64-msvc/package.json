@@ -1,6 +1,6 @@
 {
 	"name": "@moq/web-transport-win32-x64-msvc",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"cpu": [
 		"x64"
 	],

@@ -1,6 +1,6 @@
 {
 	"name": "@moq/web-transport",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "WebTransport polyfill for Node.js via QUIC/HTTP3",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
@@ -36,11 +36,11 @@
 		"@types/node": "^24.3.0"
 	},
 	"optionalDependencies": {
-		"@moq/web-transport-darwin-x64": "0.0.1",
-		"@moq/web-transport-darwin-arm64": "0.0.1",
-		"@moq/web-transport-win32-x64-msvc": "0.0.1",
-		"@moq/web-transport-linux-x64-gnu": "0.0.1",
-		"@moq/web-transport-linux-arm64-gnu": "0.0.1"
+		"@moq/web-transport-darwin-x64": "0.0.2",
+		"@moq/web-transport-darwin-arm64": "0.0.2",
+		"@moq/web-transport-win32-x64-msvc": "0.0.2",
+		"@moq/web-transport-linux-x64-gnu": "0.0.2",
+		"@moq/web-transport-linux-arm64-gnu": "0.0.2"
 	},
 	"keywords": [
 		"webtransport",
