@@ -48,6 +48,8 @@
           pkgs.gtk3
           # Required to compile boringssl (via bindgen loading libclang)
           pkgs.llvmPackages.libclang.lib
+          # Only for NPM publishing
+          pkgs.nodejs_24
         ];
       in
       {

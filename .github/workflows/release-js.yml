@@ -41,7 +41,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -79,11 +78,6 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
       - run: nix develop --command bun install
 
       - name: Release @moq/qmux
@@ -101,14 +95,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: cachix/install-nix-action@v27
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oven-sh/setup-bun@v2
-
-      - run: bun install
+      - run: nix develop --command bun install
         working-directory: js/web-transport
 
       - name: Download all artifacts
@@ -118,4 +109,4 @@ jobs:
 
       - name: Release
         working-directory: js/web-transport
-        run: bun run release
+        run: nix develop --command bun run release
