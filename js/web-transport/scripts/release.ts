@@ -32,7 +32,7 @@ for (const dir of readdirSync("npm")) {
 	const pkgPath = `npm/${dir}/package.json`;
 	if (existsSync(pkgPath)) {
 		console.log(`Publishing ${dir}...`);
-		execSync("npm publish --access public --provenance", {
+		execSync("npm publish --access public", {
 			stdio: "inherit",
 			cwd: `npm/${dir}`,
 		});
@@ -41,4 +41,4 @@ for (const dir of readdirSync("npm")) {
 
 // Publish the main package
 console.log(`Publishing ${name}@${version}...`);
-execSync("npm publish --access public --provenance", { stdio: "inherit" });
+execSync("npm publish --access public", { stdio: "inherit" });
