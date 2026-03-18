@@ -1,0 +1,5 @@
+# Python bindings are released to PyPI via release-py.yml, not crates.io
+[[package]]
+name = "web-transport-python"
+publish = false
+release = false

@@ -1,0 +1,130 @@
+name: release-py
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "py/**"
+      - "rs/web-transport-python/**"
+
+concurrency:
+  group: release-py
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    if: github.repository_owner == 'moq-dev'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            manylinux: auto
+          - target: aarch64
+            manylinux: 2_28
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: py/web-transport
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.12 -i python3.13
+          manylinux: ${{ matrix.manylinux }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: py/web-transport/dist
+
+  macos:
+    if: github.repository_owner == 'moq-dev'
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.13
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: py/web-transport
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.12 -i python3.13
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: py/web-transport/dist
+
+  windows:
+    if: github.repository_owner == 'moq-dev'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.12
+            3.13
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: py/web-transport
+          target: x86_64
+          args: --release --out dist -i python3.12 -i python3.13
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x86_64
+          path: py/web-transport/dist
+
+  sdist:
+    if: github.repository_owner == 'moq-dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: py/web-transport
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: py/web-transport/dist
+
+  publish:
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/web-transport-quinn
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
