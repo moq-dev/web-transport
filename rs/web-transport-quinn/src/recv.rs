@@ -28,7 +28,7 @@ impl RecvStream {
     fn map_error(&self, e: impl Into<ReadError>) -> ReadError {
         let e = e.into();
         if let Some(err) = self.error.get() {
-            if matches!(&e, ReadError::SessionError(_)) {
+            if matches!(&e, ReadError::SessionError(_) | ReadError::InvalidReset(_)) {
                 return ReadError::SessionError(err.clone());
             }
         }

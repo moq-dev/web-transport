@@ -427,6 +427,7 @@ impl Session {
             if matches!(
                 &e,
                 SessionError::ConnectionError(_)
+                    | SessionError::WebTransportError(WebTransportError::Closed(..))
                     | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(_))
             ) {
                 return err.clone();

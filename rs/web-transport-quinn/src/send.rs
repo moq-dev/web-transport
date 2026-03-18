@@ -28,7 +28,7 @@ impl SendStream {
     fn map_error(&self, e: impl Into<WriteError>) -> WriteError {
         let e = e.into();
         if let Some(err) = self.error.get() {
-            if matches!(&e, WriteError::SessionError(_)) {
+            if matches!(&e, WriteError::SessionError(_) | WriteError::InvalidStopped(_)) {
                 return WriteError::SessionError(err.clone());
             }
         }
