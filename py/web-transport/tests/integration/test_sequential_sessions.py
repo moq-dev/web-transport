@@ -31,6 +31,7 @@ async def _handle_session(session: web_transport.Session) -> None:
     Each stream is handled independently — a misbehaving stream (reset, stop,
     etc.) does not break the handler for subsequent streams in the same session.
     """
+    stream_tasks: list[asyncio.Task[None]] = []
 
     async def echo_one_bidi(
         send: web_transport.SendStream, recv: web_transport.RecvStream
@@ -46,7 +47,8 @@ async def _handle_session(session: web_transport.Session) -> None:
         try:
             while True:
                 send, recv = await session.accept_bi()
-                asyncio.create_task(echo_one_bidi(send, recv))
+                task = asyncio.create_task(echo_one_bidi(send, recv))
+                stream_tasks.append(task)
         except web_transport.SessionError:
             pass
 
@@ -63,7 +65,8 @@ async def _handle_session(session: web_transport.Session) -> None:
         try:
             while True:
                 recv = await session.accept_uni()
-                asyncio.create_task(echo_one_uni(recv))
+                task = asyncio.create_task(echo_one_uni(recv))
+                stream_tasks.append(task)
         except web_transport.SessionError:
             pass
 
@@ -85,6 +88,9 @@ async def _handle_session(session: web_transport.Session) -> None:
     finally:
         for t in tasks:
             t.cancel()
+        for t in stream_tasks:
+            t.cancel()
+        await asyncio.gather(*stream_tasks, return_exceptions=True)
 
 
 async def _accept_loop(
