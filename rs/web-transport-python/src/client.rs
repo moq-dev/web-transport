@@ -123,9 +123,10 @@ impl Client {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(transport.into());
 
-        // Create endpoint bound to [::]:0 — matches ClientBuilder::build()
+        // Create endpoint — try IPv6 (dual-stack) first, fall back to IPv4-only
         let _guard = runtime::get_runtime().enter();
         let endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
+            .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()))
             .map_err(|e| PyValueError::new_err(format!("failed to create endpoint: {e}")))?;
 
         // Build the upstream Client via its public constructor
