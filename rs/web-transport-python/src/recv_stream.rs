@@ -88,14 +88,11 @@ impl RecvStream {
         let eof = self.eof.clone();
         let has_exception = exc_type.is_some();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            if has_exception {
-                // Cancel first to interrupt any in-progress read, then lock.
+            if has_exception || !eof.load(Ordering::Acquire) {
+                // Cancel pending reads so we don't block on the lock,
+                // then send STOP_SENDING to signal the peer promptly.
                 stop_code.store(0, Ordering::Release);
                 cancel.cancel();
-                let mut guard = inner.lock().await;
-                let _ = guard.stop(0);
-            } else if !eof.load(Ordering::Acquire) {
-                // Clean exit but not at EOF — promptly signal the peer.
                 let mut guard = inner.lock().await;
                 let _ = guard.stop(0);
             }
