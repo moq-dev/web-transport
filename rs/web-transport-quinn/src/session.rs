@@ -381,22 +381,30 @@ impl Session {
         len.encode(&mut frame);
         frame.extend_from_slice(&capsule_bytes);
 
-        // Write the DATA frame to the CONNECT send stream.
-        if let Err(e) = send.write_all(&frame).await {
-            tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
-            conn.close(http3_code, b"");
-            return;
-        }
+        // Bound the entire graceful-close sequence (capsule write, FIN,
+        // waiting for the peer) with a single timeout.  Without this, an
+        // unresponsive peer can cause write_all to block indefinitely when
+        // the send buffer fills up and no idle timeout is configured.
+        let graceful = async {
+            // Write the DATA frame to the CONNECT send stream.
+            if let Err(e) = send.write_all(&frame).await {
+                tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
+                conn.close(http3_code, b"");
+                return;
+            }
 
-        // FIN the send stream so the peer knows no more capsules are coming.
-        if let Err(e) = send.finish() {
-            tracing::warn!(?e, "failed to finish CONNECT send stream");
-            conn.close(http3_code, b"");
-            return;
-        }
+            // FIN the send stream so the peer knows no more capsules are coming.
+            if let Err(e) = send.finish() {
+                tracing::warn!(?e, "failed to finish CONNECT send stream");
+                conn.close(http3_code, b"");
+                return;
+            }
 
-        // Wait for the peer to close the CONNECT stream after receiving the capsule.
-        if tokio::time::timeout(timeout, conn.closed()).await.is_err() {
+            // Wait for the peer to close the CONNECT stream after receiving the capsule.
+            conn.closed().await;
+        };
+
+        if tokio::time::timeout(timeout, graceful).await.is_err() {
             tracing::debug!("timeout waiting for peer to close; force-closing connection");
             conn.close(http3_code, b"");
         }
