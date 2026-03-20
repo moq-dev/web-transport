@@ -62,7 +62,7 @@ async def test_connect_no_server():
         # max_idle_timeout only applies to established connections, not to
         # the initial QUIC handshake, so the connect may hang until the
         # asyncio timeout fires.
-        with pytest.raises((web_transport.ConnectError,)):
+        with pytest.raises((web_transport.ConnectError, asyncio.TimeoutError)):
             await asyncio.wait_for(
                 client.connect("https://[::1]:19999"),
                 timeout=5.0,
