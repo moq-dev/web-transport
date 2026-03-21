@@ -15,6 +15,7 @@ pub struct Server {
     inner: Arc<Mutex<web_transport_quinn::Server>>,
     endpoint: quinn::Endpoint,
     local_addr: (String, u16),
+    transport_config: Arc<quinn::TransportConfig>,
 }
 
 #[pymethods]
@@ -33,25 +34,7 @@ impl Server {
             .parse()
             .map_err(|e| PyValueError::new_err(format!("invalid bind address: {e}")))?;
 
-        // Build TLS config
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certificate_chain
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect();
-
-        let key = rustls::pki_types::PrivateKeyDer::try_from(private_key)
-            .map_err(|e| PyValueError::new_err(format!("invalid private key: {e}")))?;
-
-        let provider = rustls::crypto::ring::default_provider();
-
-        let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| PyValueError::new_err(format!("TLS config error: {e}")))?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| PyValueError::new_err(format!("certificate error: {e}")))?;
-
-        tls_config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+        let tls_config = build_tls_config(certificate_chain, private_key)?;
 
         // Build transport config
         let mut transport = quinn::TransportConfig::default();
@@ -88,12 +71,13 @@ impl Server {
         if let Some(cc) = congestion_controller {
             transport.congestion_controller_factory(cc.clone());
         }
+        let transport_config = Arc::new(transport);
 
         // Build quinn server config
         let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .map_err(|e| PyValueError::new_err(format!("QUIC config error: {e}")))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-        server_config.transport_config(Arc::new(transport));
+        server_config.transport_config(transport_config.clone());
 
         // Bind endpoint
         let _guard = runtime::get_runtime().enter();
@@ -110,6 +94,7 @@ impl Server {
             inner: Arc::new(Mutex::new(server)),
             endpoint,
             local_addr: (local_addr.ip().to_string(), local_addr.port()),
+            transport_config,
         })
     }
 
@@ -185,6 +170,47 @@ impl Server {
     fn local_addr(&self) -> (String, u16) {
         self.local_addr.clone()
     }
+
+    /// Replace the TLS certificate for new incoming connections.
+    fn reload_certificates(
+        &self,
+        certificate_chain: Vec<Vec<u8>>,
+        private_key: Vec<u8>,
+    ) -> PyResult<()> {
+        let tls_config = build_tls_config(certificate_chain, private_key)?;
+        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+            .map_err(|e| PyValueError::new_err(format!("QUIC config error: {e}")))?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        server_config.transport_config(self.transport_config.clone());
+        self.endpoint.set_server_config(Some(server_config));
+        Ok(())
+    }
+}
+
+fn build_tls_config(
+    certificate_chain: Vec<Vec<u8>>,
+    private_key: Vec<u8>,
+) -> PyResult<rustls::ServerConfig> {
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certificate_chain
+        .into_iter()
+        .map(rustls::pki_types::CertificateDer::from)
+        .collect();
+
+    let key = rustls::pki_types::PrivateKeyDer::try_from(private_key)
+        .map_err(|e| PyValueError::new_err(format!("invalid private key: {e}")))?;
+
+    let provider = rustls::crypto::ring::default_provider();
+
+    let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| PyValueError::new_err(format!("TLS config error: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| PyValueError::new_err(format!("certificate error: {e}")))?;
+
+    tls_config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+
+    Ok(tls_config)
 }
 
 // ---------------------------------------------------------------------------

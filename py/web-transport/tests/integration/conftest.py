@@ -60,6 +60,7 @@ async def connect_pair(cert, key, cert_hash, *, server_kwargs=None, client_kwarg
 
         client = web_transport.Client(**client_kw)  # type: ignore[invalid-argument-type]
         async with client:
+
             async def accept():
                 request = await server.accept()
                 assert request is not None

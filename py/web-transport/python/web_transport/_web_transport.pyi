@@ -337,6 +337,25 @@ class Server:
         """The local ``(host, port)`` the server is bound to."""
         ...
 
+    def reload_certificates(
+        self,
+        certificate_chain: list[bytes],
+        private_key: bytes,
+    ) -> None:
+        """Replace the TLS certificate for new incoming connections.
+
+        Existing connections are not affected. Only new connections
+        will use the updated certificate.
+
+        Args:
+            certificate_chain: DER-encoded certificates (leaf first).
+            private_key: DER-encoded PKCS#8 private key.
+
+        Raises:
+            ValueError: If the certificate chain or private key is invalid.
+        """
+        ...
+
 class SessionRequest:
     """An incoming WebTransport session request.
 

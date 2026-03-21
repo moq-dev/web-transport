@@ -6,6 +6,15 @@ import pytest
 
 import web_transport
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _second_cert():
+    """Generate a second self-signed cert distinct from the fixture."""
+    return web_transport.generate_self_signed(["localhost", "127.0.0.1", "::1"])
+
 
 @pytest.mark.asyncio
 async def test_server_async_iterator(self_signed_cert, cert_hash):
@@ -389,6 +398,147 @@ async def test_server_close_propagates_as_application(self_signed_cert, cert_has
                     assert e.source == "application"
                 except web_transport.SessionClosedLocally:
                     pass
+
+        await asyncio.gather(
+            asyncio.create_task(server_task()),
+            asyncio.create_task(client_task()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Certificate hot reload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reload_certificates(self_signed_cert):
+    """After reload, new connections use the new certificate."""
+    cert1, key1 = self_signed_cert
+    cert2, key2 = _second_cert()
+    cert2_hash = web_transport.certificate_hash(cert2)
+
+    async with web_transport.Server(
+        certificate_chain=[cert1], private_key=key1, bind="[::1]:0"
+    ) as server:
+        _, port = server.local_addr
+
+        server.reload_certificates(certificate_chain=[cert2], private_key=key2)
+
+        async def server_task():
+            request = await server.accept()
+            assert request is not None
+            session = await request.accept()
+            session.close()
+
+        async def client_task():
+            async with web_transport.Client(
+                server_certificate_hashes=[cert2_hash]
+            ) as client:
+                session = await client.connect(f"https://[::1]:{port}")
+                await session.wait_closed()
+
+        await asyncio.gather(
+            asyncio.create_task(server_task()),
+            asyncio.create_task(client_task()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reload_old_cert_rejected(self_signed_cert, cert_hash):
+    """After reload, old cert hash is rejected by pinning clients."""
+    cert1, key1 = self_signed_cert
+    cert2, key2 = _second_cert()
+
+    async with web_transport.Server(
+        certificate_chain=[cert1],
+        private_key=key1,
+        bind="[::1]:0",
+        max_idle_timeout=1,
+    ) as server:
+        _, port = server.local_addr
+
+        server.reload_certificates(certificate_chain=[cert2], private_key=key2)
+
+        async with web_transport.Client(
+            server_certificate_hashes=[cert_hash],
+            max_idle_timeout=1,
+        ) as client:
+            with pytest.raises(web_transport.ConnectError):
+                await client.connect(f"https://[::1]:{port}")
+
+
+@pytest.mark.asyncio
+async def test_reload_existing_session_survives(self_signed_cert, cert_hash):
+    """Existing sessions are not disrupted by certificate reload."""
+    cert1, key1 = self_signed_cert
+    cert2, key2 = _second_cert()
+
+    async with web_transport.Server(
+        certificate_chain=[cert1], private_key=key1, bind="[::1]:0"
+    ) as server:
+        _, port = server.local_addr
+
+        async def server_task():
+            # Accept session with cert1
+            request = await server.accept()
+            assert request is not None
+            session = await request.accept()
+
+            # Reload while session is active
+            server.reload_certificates(certificate_chain=[cert2], private_key=key2)
+
+            # Echo data on the existing session
+            send, recv = await session.accept_bi()
+            data = await recv.read()
+            async with send:
+                await send.write(data)
+
+        async def client_task():
+            async with web_transport.Client(
+                server_certificate_hashes=[cert_hash]
+            ) as client:
+                session = await client.connect(f"https://[::1]:{port}")
+                send, recv = await session.open_bi()
+                async with send:
+                    await send.write(b"still alive")
+                result = await recv.read()
+                assert result == b"still alive"
+                session.close()
+
+        await asyncio.gather(
+            asyncio.create_task(server_task()),
+            asyncio.create_task(client_task()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reload_invalid_cert_raises(self_signed_cert, cert_hash):
+    """Invalid cert/key on reload raises ValueError; server keeps working."""
+    cert, key = self_signed_cert
+
+    async with web_transport.Server(
+        certificate_chain=[cert], private_key=key, bind="[::1]:0"
+    ) as server:
+        _, port = server.local_addr
+
+        with pytest.raises(ValueError):
+            server.reload_certificates(
+                certificate_chain=[b"not a cert"], private_key=b"not a key"
+            )
+
+        # Server still works with the original cert
+        async def server_task():
+            request = await server.accept()
+            assert request is not None
+            session = await request.accept()
+            session.close()
+
+        async def client_task():
+            async with web_transport.Client(
+                server_certificate_hashes=[cert_hash]
+            ) as client:
+                session = await client.connect(f"https://[::1]:{port}")
+                await session.wait_closed()
 
         await asyncio.gather(
             asyncio.create_task(server_task()),
