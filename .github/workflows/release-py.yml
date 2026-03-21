@@ -113,6 +113,7 @@ jobs:
           path: py/web-transport/dist
 
   publish:
+    if: github.repository_owner == 'moq-dev'
     needs: [linux, macos, windows, sdist]
     runs-on: ubuntu-latest
     environment:
