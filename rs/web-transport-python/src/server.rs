@@ -280,11 +280,10 @@ impl SessionRequest {
                 .respond(status)
                 .await
                 .map_err(errors::map_server_error)?;
-            // Close from our side so we don't block on client behavior.
-            // The QUIC draining period ensures the rejection response is
-            // transmitted alongside the CONNECTION_CLOSE.
+            // Close from our side. The close capsule and CONNECTION_CLOSE
+            // are sent by a background task; the endpoint's wait_idle()
+            // ensures they are transmitted before shutdown.
             session.close(0, b"");
-            session.closed().await;
             Ok(())
         })
     }
