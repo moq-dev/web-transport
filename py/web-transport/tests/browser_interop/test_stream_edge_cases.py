@@ -174,7 +174,8 @@ async def test_browser_cancel_recv_with_code(
 ) -> None:
     """Browser reader.cancel(42) → server send.write() raises StreamClosedByPeer(kind='stop', code=42)."""
     async with start_server() as (server, port, hash_b64):
-        error: BaseException | None = None
+
+        error: web_transport.StreamClosedByPeer | None = None
 
         async def server_side() -> None:
             nonlocal error
@@ -183,15 +184,11 @@ async def test_browser_cancel_recv_with_code(
             session = await request.accept()
             async with session:
                 send, recv = await session.accept_bi()
-                # Wait a moment for the browser to cancel
                 try:
-                    # Write enough data to trigger the stop
-                    for _ in range(10):
-                        await send.write(b"x" * 65536)
-                except (
-                    web_transport.StreamClosedByPeer,
-                    web_transport.SessionClosedByPeer,
-                ) as e:
+                    async with asyncio.timeout(5):
+                        while True:
+                            await send.write(b"x" * 65536)
+                except web_transport.StreamClosedByPeer as e:
                     error = e
                 try:
                     await recv.read()
@@ -217,9 +214,8 @@ async def test_browser_cancel_recv_with_code(
             )
 
     assert error is not None
-    if isinstance(error, web_transport.StreamClosedByPeer):
-        assert error.kind == "stop"
-        assert error.code == 42
+    assert error.kind == "stop"
+    assert error.code == 42
 
 
 async def test_server_stop_causes_browser_write_error(

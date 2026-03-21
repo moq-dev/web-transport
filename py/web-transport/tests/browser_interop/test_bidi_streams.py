@@ -403,11 +403,11 @@ async def test_bidi_interleaved_request_response(
                 send, recv = await session.accept_bi()
                 async with send:
                     # Read "ping", write "pong"
-                    data1 = await recv.read(1024)
+                    data1 = await recv.readexactly(4)
                     assert data1 == b"ping"
                     await send.write(b"pong")
                     # Read "ping2", write "pong2"
-                    data2 = await recv.read(1024)
+                    data2 = await recv.readexactly(5)
                     assert data2 == b"ping2"
                     await send.write(b"pong2")
                 await session.wait_closed()
@@ -514,7 +514,7 @@ async def test_bidi_server_stream_priority(
                     messages.push(text);
                 }
                 reader.releaseLock();
-                return messages.sort();
+                return messages;
             """,
             )
 
