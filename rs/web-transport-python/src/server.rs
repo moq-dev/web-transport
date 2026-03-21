@@ -221,14 +221,17 @@ fn build_tls_config(
 pub struct SessionRequest {
     inner: Option<web_transport_quinn::Request>,
     url: String,
+    remote_address: (String, u16),
 }
 
 impl SessionRequest {
     pub fn new(request: web_transport_quinn::Request) -> Self {
         let url = request.url.to_string();
+        let addr = request.remote_address();
         Self {
             inner: Some(request),
             url,
+            remote_address: (addr.ip().to_string(), addr.port()),
         }
     }
 }
@@ -239,6 +242,12 @@ impl SessionRequest {
     #[getter]
     fn url(&self) -> String {
         self.url.clone()
+    }
+
+    /// The remote peer's ``(host, port)``.
+    #[getter]
+    fn remote_address(&self) -> (String, u16) {
+        self.remote_address.clone()
     }
 
     /// Accept the session request.

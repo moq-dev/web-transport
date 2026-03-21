@@ -368,6 +368,11 @@ class SessionRequest:
         """The URL requested by the client."""
         ...
 
+    @property
+    def remote_address(self) -> tuple[str, int]:
+        """The remote peer's ``(host, port)``."""
+        ...
+
     async def accept(self) -> Session:
         """Accept the session request.
 
