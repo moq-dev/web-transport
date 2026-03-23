@@ -24,7 +24,7 @@
 		"@moq/qmux": "workspace:*"
 	},
 	"devDependencies": {
-		"typescript": "^5.9.2",
+		"typescript": "^6.0.0",
 		"rimraf": "^6.0.1",
 		"@types/node": "^24.3.0",
 		"tsx": "^4.20.5"

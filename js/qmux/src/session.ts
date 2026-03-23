@@ -655,7 +655,7 @@ export default class Session implements WebTransport {
 			params: this.#ourParams,
 		};
 		const encoded = Frame.encode(frame, this.#version);
-		this.#ws.send(encoded);
+		this.#ws.send(encoded as Uint8Array<ArrayBuffer>);
 	}
 
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
@@ -715,12 +715,12 @@ export default class Session implements WebTransport {
 		}
 
 		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(chunk);
+		this.#ws.send(chunk as Uint8Array<ArrayBuffer>);
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
 		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(chunk);
+		this.#ws.send(chunk as Uint8Array<ArrayBuffer>);
 	}
 
 	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {

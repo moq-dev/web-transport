@@ -8,6 +8,7 @@
 		"declaration": true,
 		"isolatedModules": true,
 		"strict": true,
+		"types": ["node"],
 		"skipLibCheck": true,
 		"rewriteRelativeImportExtensions": true
 	},
