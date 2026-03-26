@@ -9,4 +9,4 @@ export function install(): boolean {
 }
 
 export default Session;
-export { NapiRequest, NapiServer } from "../index.js";
+export { Request, Server } from "./server.ts";

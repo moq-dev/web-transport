@@ -51,16 +51,16 @@ install(); // globalThis.WebTransport = Session (no-op if already defined)
 
 ## Server
 
-Use `NapiServer` and `NapiRequest` to accept incoming connections, then wrap each session to get the W3C API:
+Use `Server` to accept incoming connections. Each `Request` can be accepted (returning a W3C `Session`) or rejected:
 
 ```ts
-import Session, { NapiServer } from "@moq/web-transport";
+import { Server } from "@moq/web-transport";
 import fs from "node:fs";
 
 const cert = fs.readFileSync("cert.pem");
 const key = fs.readFileSync("key.pem");
 
-const server = NapiServer.bind("0.0.0.0:4433", cert, key);
+const server = Server.bind("0.0.0.0:4433", cert, key);
 
 while (true) {
 	const request = await server.accept();
@@ -69,8 +69,7 @@ while (true) {
 	const url = await request.url;
 	console.log("incoming session:", url);
 
-	const napiSession = await request.ok(); // or request.reject(404)
-	const session = new Session(napiSession);
+	const session = await request.ok(); // or request.reject(404)
 
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
