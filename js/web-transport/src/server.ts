@@ -17,4 +17,8 @@ export class Server {
 		if (!inner) return null;
 		return new Request(inner);
 	}
+
+	close(): void {
+		this.#inner.close();
+	}
 }
