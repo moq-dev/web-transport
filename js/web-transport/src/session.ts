@@ -1,4 +1,4 @@
-import { NapiClient, type NapiRecvStream, type NapiSendStream, type NapiSession } from "../index.js";
+import { NapiClient, type NapiRecvStream, type NapiSendStream, type NapiSession } from "../napi.js";
 import { Datagrams } from "./datagrams.ts";
 
 function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {

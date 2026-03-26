@@ -21,12 +21,12 @@
 	"types": "./src/index.ts",
 	"files": [
 		"./src",
-		"index.js",
-		"index.d.ts",
+		"napi.js",
+		"napi.d.ts",
 		"*.node"
 	],
 	"scripts": {
-		"build": "napi build --platform --release --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir .",
+		"build": "napi build --platform --release --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir . --js napi.js --dts napi.d.ts",
 		"check": "tsc --noEmit",
 		"release": "bun scripts/release.ts"
 	},
