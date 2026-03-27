@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use iroh::{Endpoint, endpoint::ConnectionError};
+use iroh::{
+    Endpoint,
+    endpoint::{ConnectionError, presets},
+};
 use n0_tracing_test::traced_test;
 use tokio::time::timeout;
 use tracing::Instrument;
