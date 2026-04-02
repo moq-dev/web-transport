@@ -34,7 +34,7 @@ check:
 	cargo fmt --all --check
 
 	# requires: cargo install cargo-hack
-	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node
+	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-python
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
 
