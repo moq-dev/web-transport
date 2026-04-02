@@ -1,7 +1,7 @@
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
-export type Version = "webtransport" | "qmux-00";
+export type Version = "webtransport" | "qmux-00" | "qmux-01";
 
 /** Maximum size of a single QMux frame on the wire. */
 export const MAX_FRAME_SIZE = 16384;
@@ -82,38 +82,54 @@ export interface TransportParameters {
 }
 
 export interface TransportParams {
+	maxIdleTimeout: bigint;
 	initialMaxData: bigint;
 	initialMaxStreamDataBidiLocal: bigint;
 	initialMaxStreamDataBidiRemote: bigint;
 	initialMaxStreamDataUni: bigint;
 	initialMaxStreamsBidi: bigint;
 	initialMaxStreamsUni: bigint;
+	maxRecordSize: bigint;
 }
 
+/** Default max_record_size per draft-01. */
+export const DEFAULT_MAX_RECORD_SIZE = 16382n;
+
 export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
+	maxIdleTimeout: 0n,
 	initialMaxData: 0n,
 	initialMaxStreamDataBidiLocal: 0n,
 	initialMaxStreamDataBidiRemote: 0n,
 	initialMaxStreamDataUni: 0n,
 	initialMaxStreamsBidi: 0n,
 	initialMaxStreamsUni: 0n,
+	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
 };
 
 export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
+	maxIdleTimeout: 30_000n,
 	initialMaxData: 1_048_576n,
 	initialMaxStreamDataBidiLocal: 262_144n,
 	initialMaxStreamDataBidiRemote: 262_144n,
 	initialMaxStreamDataUni: 262_144n,
 	initialMaxStreamsBidi: 100n,
 	initialMaxStreamsUni: 100n,
+	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
 };
 
 export interface Padding {
 	type: "padding";
 }
 
-export interface Ping {
-	type: "ping";
+/** QX_PING frame (draft-01) */
+export interface PingRequest {
+	type: "ping_request";
+	sequence: bigint;
+}
+
+export interface PingResponse {
+	type: "ping_response";
+	sequence: bigint;
 }
 
 export type Any =
@@ -129,7 +145,9 @@ export type Any =
 	| StreamDataBlocked
 	| StreamsBlockedBidi
 	| StreamsBlockedUni
-	| TransportParameters;
+	| TransportParameters
+	| PingRequest
+	| PingResponse;
 
 export function encode(frame: Any, version: Version = "webtransport"): Uint8Array {
 	if (version === "webtransport") {
@@ -137,6 +155,17 @@ export function encode(frame: Any, version: Version = "webtransport"): Uint8Arra
 	}
 	return encodeQMux(frame);
 }
+
+/** Returns true if the version uses QMux framing (draft-00 or later). */
+export function isQmux(version: Version): boolean {
+	return version === "qmux-00" || version === "qmux-01";
+}
+
+// QX_PING frame type constants (draft-01)
+const QX_PING_REQUEST = 0x348c67529ef8c7bdn;
+const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
+// max_record_size transport parameter ID
+const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
@@ -319,15 +348,29 @@ function encodeQMux(frame: Any): Uint8Array {
 			buffer.set(payload, buffer.byteLength - payload.byteLength);
 			return buffer;
 		}
+
+		case "ping_request": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(QX_PING_REQUEST).encode(buffer);
+			buffer = VarInt.from(frame.sequence).encode(buffer);
+			return buffer;
+		}
+
+		case "ping_response": {
+			let buffer = new Uint8Array(new ArrayBuffer(16), 0, 0);
+			buffer = VarInt.from(QX_PING_RESPONSE).encode(buffer);
+			buffer = VarInt.from(frame.sequence).encode(buffer);
+			return buffer;
+		}
 	}
 }
 
 function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
 	// Each param: id(varint) + length(varint) + value(varint)
-	// Max 6 params * 24 bytes each
-	let buffer = new Uint8Array(new ArrayBuffer(144), 0, 0);
+	// Max 8 params * 24 bytes each
+	let buffer = new Uint8Array(new ArrayBuffer(192), 0, 0);
 
-	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number, value: bigint): Uint8Array<ArrayBuffer> {
+	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number | bigint, value: bigint): Uint8Array<ArrayBuffer> {
 		if (value === 0n) return buf;
 		const valVi = VarInt.from(value);
 		buf = VarInt.from(id).encode(buf);
@@ -336,12 +379,14 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 		return buf;
 	}
 
+	buffer = writeParam(buffer, 0x01, params.maxIdleTimeout);
 	buffer = writeParam(buffer, 0x04, params.initialMaxData);
 	buffer = writeParam(buffer, 0x05, params.initialMaxStreamDataBidiLocal);
 	buffer = writeParam(buffer, 0x06, params.initialMaxStreamDataBidiRemote);
 	buffer = writeParam(buffer, 0x07, params.initialMaxStreamDataUni);
 	buffer = writeParam(buffer, 0x08, params.initialMaxStreamsBidi);
 	buffer = writeParam(buffer, 0x09, params.initialMaxStreamsUni);
+	buffer = writeParam(buffer, MAX_RECORD_SIZE_ID, params.maxRecordSize);
 
 	return buffer;
 }
@@ -373,6 +418,9 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		paramValue = v.value;
 
 		switch (id) {
+			case 0x01n:
+				params.maxIdleTimeout = paramValue;
+				break;
 			case 0x04n:
 				params.initialMaxData = paramValue;
 				break;
@@ -391,6 +439,9 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 			case 0x09n:
 				params.initialMaxStreamsUni = paramValue;
 				break;
+			case MAX_RECORD_SIZE_ID:
+				params.maxRecordSize = paramValue;
+				break;
 			// Unknown params: skip
 		}
 	}
@@ -407,6 +458,34 @@ export function decode(buffer: Uint8Array, version: Version = "webtransport"): A
 		return decodeWebTransport(buffer);
 	}
 	return decodeQMux(buffer);
+}
+
+/** Decode all frames from a QMux Record payload (draft-01).
+ * A record contains one or more frames concatenated together.
+ */
+export function decodeRecord(buffer: Uint8Array): Any[] {
+	const frames: Any[] = [];
+	while (buffer.byteLength > 0) {
+		const result = decodeQMuxOne(buffer);
+		if (result === null) break;
+		const [frame, remaining] = result;
+		if (frame !== null) {
+			frames.push(frame);
+		}
+		buffer = remaining;
+	}
+	return frames;
+}
+
+/** Encode a frame wrapped in a QMux Record (Size + Frames) for draft-01. */
+export function encodeRecord(frameBytes: Uint8Array): Uint8Array {
+	const sizeVi = VarInt.from(frameBytes.byteLength);
+	const totalSize = sizeVi.size() + frameBytes.byteLength;
+	let buffer = new Uint8Array(new ArrayBuffer(totalSize), 0, 0);
+	buffer = sizeVi.encode(buffer);
+	buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + frameBytes.byteLength);
+	buffer.set(frameBytes, buffer.byteLength - frameBytes.byteLength);
+	return buffer;
 }
 
 function decodeWebTransport(buffer: Uint8Array): Any {
@@ -597,6 +676,18 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "transport_parameters", params };
 	}
 
+	// QX_PING request
+	if (frameType === QX_PING_REQUEST) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "ping_request", sequence: v.value };
+	}
+
+	// QX_PING response
+	if (frameType === QX_PING_RESPONSE) {
+		[v, buffer] = VarInt.decode(buffer);
+		return { type: "ping_response", sequence: v.value };
+	}
+
 	// DATAGRAM without length
 	if (frameType === 0x30n) {
 		return null;
@@ -610,4 +701,168 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 
 	// Unknown frame type
 	return null;
+}
+
+/** Decode a single QMux frame, returning the frame and remaining buffer.
+ * Returns null if the buffer is empty.
+ */
+function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
+	if (buffer.byteLength === 0) return null;
+
+	let v: VarInt;
+	[v, buffer] = VarInt.decode(buffer);
+	const frameType = v.value;
+
+	// PADDING
+	if (frameType === 0x00n) {
+		return [null, buffer];
+	}
+
+	// STREAM frames: 0x08-0x0f
+	if (frameType >= 0x08n && frameType <= 0x0fn) {
+		const hasOff = (frameType & 0x04n) !== 0n;
+		const hasLen = (frameType & 0x02n) !== 0n;
+		const hasFin = (frameType & 0x01n) !== 0n;
+
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+
+		if (hasOff) {
+			[v, buffer] = VarInt.decode(buffer);
+		}
+
+		let data: Uint8Array;
+		if (hasLen) {
+			[v, buffer] = VarInt.decode(buffer);
+			const len = Number(v.value);
+			data = buffer.slice(0, len);
+			buffer = buffer.slice(len);
+		} else {
+			data = buffer;
+			buffer = buffer.slice(buffer.byteLength);
+		}
+
+		return [{ type: "stream", id, data, fin: hasFin }, buffer];
+	}
+
+	// RESET_STREAM
+	if (frameType === 0x04n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer); // final_size
+		return [{ type: "reset_stream", id, code }, buffer];
+	}
+
+	// STOP_SENDING
+	if (frameType === 0x05n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		return [{ type: "stop_sending", id, code }, buffer];
+	}
+
+	// CONNECTION_CLOSE / APPLICATION_CLOSE
+	if (frameType === 0x1cn || frameType === 0x1dn) {
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer); // frame_type
+		[v, buffer] = VarInt.decode(buffer);
+		const reasonLen = Number(v.value);
+		const reason = new TextDecoder().decode(buffer.slice(0, reasonLen));
+		buffer = buffer.slice(reasonLen);
+		return [{ type: "connection_close", code, reason }, buffer];
+	}
+
+	// MAX_DATA
+	if (frameType === 0x10n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "max_data", max: v.value }, buffer];
+	}
+
+	// MAX_STREAM_DATA
+	if (frameType === 0x11n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "max_stream_data", id, max: v.value }, buffer];
+	}
+
+	// MAX_STREAMS (bidi)
+	if (frameType === 0x12n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "max_streams_bidi", max: v.value }, buffer];
+	}
+
+	// MAX_STREAMS (uni)
+	if (frameType === 0x13n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "max_streams_uni", max: v.value }, buffer];
+	}
+
+	// DATA_BLOCKED
+	if (frameType === 0x14n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "data_blocked", limit: v.value }, buffer];
+	}
+
+	// STREAM_DATA_BLOCKED
+	if (frameType === 0x15n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "stream_data_blocked", id, limit: v.value }, buffer];
+	}
+
+	// STREAMS_BLOCKED (bidi)
+	if (frameType === 0x16n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "streams_blocked_bidi", limit: v.value }, buffer];
+	}
+
+	// STREAMS_BLOCKED (uni)
+	if (frameType === 0x17n) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "streams_blocked_uni", limit: v.value }, buffer];
+	}
+
+	// QX_TRANSPORT_PARAMETERS
+	if (frameType === 0x3f5153300d0a0d0an) {
+		[v, buffer] = VarInt.decode(buffer);
+		const len = Number(v.value);
+		const payload = buffer.slice(0, len);
+		buffer = buffer.slice(len);
+		const params = decodeTransportParams(payload);
+		return [{ type: "transport_parameters", params }, buffer];
+	}
+
+	// QX_PING request
+	if (frameType === QX_PING_REQUEST) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "ping_request", sequence: v.value }, buffer];
+	}
+
+	// QX_PING response
+	if (frameType === QX_PING_RESPONSE) {
+		[v, buffer] = VarInt.decode(buffer);
+		return [{ type: "ping_response", sequence: v.value }, buffer];
+	}
+
+	// DATAGRAM without length
+	if (frameType === 0x30n) {
+		return [null, buffer.slice(buffer.byteLength)];
+	}
+
+	// DATAGRAM with length
+	if (frameType === 0x31n) {
+		[v, buffer] = VarInt.decode(buffer);
+		const len = Number(v.value);
+		buffer = buffer.slice(len);
+		return [null, buffer];
+	}
+
+	// Unknown: skip remaining (can't delimit)
+	return [null, buffer.slice(buffer.byteLength)];
 }

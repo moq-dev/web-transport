@@ -2,7 +2,7 @@
 	"name": "@moq/qmux",
 	"author": "Luke Curley <kixelated@gmail.com>",
 	"version": "0.0.6",
-	"description": "QMux protocol (draft-ietf-quic-qmux-00) over WebSockets",
+	"description": "QMux protocol (draft-ietf-quic-qmux-01) over WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": "github:moq-dev/web-transport",

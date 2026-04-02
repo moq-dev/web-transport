@@ -7,8 +7,8 @@ use crate::config::Config;
 use crate::credit::Credit;
 use crate::transport::Transport;
 use crate::{
-    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
-    TransportParams, Version, MAX_FRAME_PAYLOAD,
+    encode_record, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
+    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -93,7 +93,7 @@ impl<T: Transport> SessionState<T> {
     // or moving recv_frame into a dedicated task that never gets cancelled.
     async fn run(&mut self) -> Result<(), Error> {
         // QMux requires TRANSPORT_PARAMETERS as the first frame on the connection.
-        if self.config.version == Version::QMux00 {
+        if self.config.version.is_qmux() {
             self.send_transport_parameters().await?;
         }
 
@@ -104,7 +104,12 @@ impl<T: Transport> SessionState<T> {
                 biased;
                 result = self.transport.recv() => {
                     let data = result?;
-                    if let Some(frame) = Frame::decode(data, self.config.version)? {
+                    if self.config.version == Version::QMux01 {
+                        // QMux01: data is a record containing one or more frames
+                        for frame in Frame::decode_record(data)? {
+                            self.recv_frame(frame).await?;
+                        }
+                    } else if let Some(frame) = Frame::decode(data, self.config.version)? {
                         self.recv_frame(frame).await?;
                     }
                 }
@@ -148,9 +153,17 @@ impl<T: Transport> SessionState<T> {
     /// Send a QX_TRANSPORT_PARAMETERS frame with our defaults.
     async fn send_transport_parameters(&mut self) -> Result<(), Error> {
         let frame = Frame::TransportParameters(self.our_params.clone());
-        self.transport
-            .send(frame.encode(self.config.version)?)
-            .await
+        self.send_encoded(frame.encode(self.config.version)?).await
+    }
+
+    /// Send pre-encoded frame bytes, wrapping in a record for QMux01.
+    async fn send_encoded(&mut self, frame_bytes: Bytes) -> Result<(), Error> {
+        let data = if self.config.version == Version::QMux01 {
+            encode_record(&frame_bytes)?
+        } else {
+            frame_bytes
+        };
+        self.transport.send(data).await
     }
 
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -168,9 +181,7 @@ impl<T: Transport> SessionState<T> {
             _ => {}
         };
 
-        self.transport
-            .send(frame.encode(self.config.version)?)
-            .await
+        self.send_encoded(frame.encode(self.config.version)?).await
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -215,7 +226,7 @@ impl<T: Transport> SessionState<T> {
                         // Per QUIC RFC 9000 §4.6, the limit applies to the stream index,
                         // not the count of seen streams. A peer opening stream index N
                         // implicitly opens all streams 0..N.
-                        if self.config.version == Version::QMux00 {
+                        if self.config.version.is_qmux() {
                             let credit = match stream.id.dir() {
                                 StreamDir::Bi => &self.recv_bi_credit,
                                 StreamDir::Uni => &self.recv_uni_credit,
@@ -229,7 +240,7 @@ impl<T: Transport> SessionState<T> {
                         let (tx2, rx2) = mpsc::unbounded_channel();
 
                         // Determine initial stream recv window
-                        let recv_window = if self.config.version == Version::QMux00 {
+                        let recv_window = if self.config.version.is_qmux() {
                             match stream.id.dir() {
                                 StreamDir::Bi => {
                                     self.our_params.initial_max_stream_data_bidi_remote
@@ -253,7 +264,7 @@ impl<T: Transport> SessionState<T> {
                             recv_credit: recv_credit.clone(),
                         };
 
-                        let recv_streams_credit = if self.config.version == Version::QMux00 {
+                        let recv_streams_credit = if self.config.version.is_qmux() {
                             Some(match stream.id.dir() {
                                 StreamDir::Bi => self.recv_bi_credit.clone(),
                                 StreamDir::Uni => self.recv_uni_credit.clone(),
@@ -287,7 +298,7 @@ impl<T: Transport> SessionState<T> {
                                 let (tx, rx) = mpsc::unbounded_channel();
                                 let send_backend = SendState {
                                     inbound_stopped: tx,
-                                    stream_credit: if self.config.version == Version::QMux00 {
+                                    stream_credit: if self.config.version.is_qmux() {
                                         // Peer opened this bidi stream, so our send limit
                                         // is their bidi_local (they are local to this stream)
                                         Some(Credit::new(
@@ -307,7 +318,7 @@ impl<T: Transport> SessionState<T> {
                                     closed: None,
                                     fin: false,
                                     stream_credit: send_backend.stream_credit.clone(),
-                                    conn_credit: if self.config.version == Version::QMux00 {
+                                    conn_credit: if self.config.version.is_qmux() {
                                         Some(self.conn_send_credit.clone())
                                     } else {
                                         None
@@ -388,6 +399,18 @@ impl<T: Transport> SessionState<T> {
             | Frame::StreamDataBlocked { .. }
             | Frame::StreamsBlockedBidi(_)
             | Frame::StreamsBlockedUni(_) => {}
+            // PADDING is a no-op
+            Frame::Padding => {}
+            // QX_PING: respond to requests, ignore responses
+            Frame::Ping(ping) => {
+                if !ping.response {
+                    let response = Frame::Ping(crate::Ping {
+                        sequence: ping.sequence,
+                        response: true,
+                    });
+                    self.outbound_priority.0.send(response).ok();
+                }
+            }
         }
 
         Ok(())
@@ -464,36 +487,24 @@ impl Session {
 
         let closed = watch::Sender::new(None);
 
-        let open_bi_credit = Credit::new(if version == Version::QMux00 {
-            0
-        } else {
-            u64::MAX
-        });
-        let open_uni_credit = Credit::new(if version == Version::QMux00 {
-            0
-        } else {
-            u64::MAX
-        });
+        let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
+        let open_uni_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
 
-        let conn_send_credit = Credit::new(if version == Version::QMux00 {
-            0
-        } else {
-            u64::MAX
-        });
+        let conn_send_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
 
-        let conn_recv_credit = Credit::new(if version == Version::QMux00 {
+        let conn_recv_credit = Credit::new(if version.is_qmux() {
             our_params.initial_max_data
         } else {
             u64::MAX
         });
 
         // Stream count credits for incoming streams
-        let recv_bi_credit = Credit::new(if version == Version::QMux00 {
+        let recv_bi_credit = Credit::new(if version.is_qmux() {
             config.max_streams_bidi
         } else {
             u64::MAX
         });
-        let recv_uni_credit = Credit::new(if version == Version::QMux00 {
+        let recv_uni_credit = Credit::new(if version.is_qmux() {
             config.max_streams_uni
         } else {
             u64::MAX
@@ -585,7 +596,7 @@ impl generic::Session for Session {
 
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let stream_credit = if self.config.version == Version::QMux00 {
+        let stream_credit = if self.config.version.is_qmux() {
             // For uni streams we initiate, peer's uni limit applies
             Some(Credit::new(0)) // Will be set when peer params arrive
         } else {
@@ -605,7 +616,7 @@ impl generic::Session for Session {
             closed: None,
             fin: false,
             stream_credit,
-            conn_credit: if self.config.version == Version::QMux00 {
+            conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
             } else {
                 None
@@ -628,7 +639,7 @@ impl generic::Session for Session {
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx2, rx2) = mpsc::unbounded_channel();
 
-        let stream_credit = if self.config.version == Version::QMux00 {
+        let stream_credit = if self.config.version.is_qmux() {
             // For bidi streams we initiate, peer's bidi_remote applies to our sends
             Some(Credit::new(0)) // Will be set when peer params arrive
         } else {
@@ -648,7 +659,7 @@ impl generic::Session for Session {
             closed: None,
             fin: false,
             stream_credit,
-            conn_credit: if self.config.version == Version::QMux00 {
+            conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
             } else {
                 None
@@ -656,7 +667,7 @@ impl generic::Session for Session {
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let recv_window = if self.config.version == Version::QMux00 {
+        let recv_window = if self.config.version.is_qmux() {
             self.config.max_stream_data_bidi_local
         } else {
             u64::MAX
@@ -991,7 +1002,7 @@ impl RecvStream {
 
     /// Report consumed bytes to flow control, sending window updates as needed.
     fn report_consumed(&self, len: u64) {
-        if self.version != Version::QMux00 {
+        if !self.version.is_qmux() {
             return;
         }
 

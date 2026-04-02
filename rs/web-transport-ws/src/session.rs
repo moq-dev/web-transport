@@ -20,7 +20,7 @@ impl Session {
             + Send
             + 'static,
     {
-        Self(qmux::ws::accept(ws, protocol.as_deref()))
+        Self(qmux::ws::accept(ws, protocol.as_deref(), None))
     }
 
     /// Wrap a pre-upgraded WebSocket as a client-side session.
@@ -32,7 +32,7 @@ impl Session {
             + Send
             + 'static,
     {
-        Self(qmux::ws::connect(ws, protocol.as_deref()))
+        Self(qmux::ws::connect(ws, protocol.as_deref(), None))
     }
 
     /// Get the inner qmux::Session.
