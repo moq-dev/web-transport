@@ -74,6 +74,9 @@ while (true) {
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
 }
+
+// Stop accepting new connections
+server.close();
 ```
 
 ## W3C WebTransport API

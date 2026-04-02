@@ -1,6 +1,6 @@
 {
 	"name": "@moq/web-transport-linux-arm64-gnu",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"cpu": [
 		"arm64"
 	],
