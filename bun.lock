@@ -28,18 +28,18 @@
     },
     "js/web-transport": {
       "name": "@moq/web-transport",
-      "version": "0.0.4",
+      "version": "0.1.0",
       "devDependencies": {
         "@napi-rs/cli": "^3",
         "@types/node": "^24.3.0",
         "typescript": "^5.9.2",
       },
       "optionalDependencies": {
-        "@moq/web-transport-darwin-arm64": "0.0.4",
-        "@moq/web-transport-darwin-x64": "0.0.4",
-        "@moq/web-transport-linux-arm64-gnu": "0.0.4",
-        "@moq/web-transport-linux-x64-gnu": "0.0.4",
-        "@moq/web-transport-win32-x64-msvc": "0.0.4",
+        "@moq/web-transport-darwin-arm64": "0.1.0",
+        "@moq/web-transport-darwin-x64": "0.1.0",
+        "@moq/web-transport-linux-arm64-gnu": "0.1.0",
+        "@moq/web-transport-linux-x64-gnu": "0.1.0",
+        "@moq/web-transport-win32-x64-msvc": "0.1.0",
       },
     },
     "js/web-transport-ws": {
@@ -192,16 +192,6 @@
     "@moq/qmux": ["@moq/qmux@workspace:js/qmux"],
 
     "@moq/web-transport": ["@moq/web-transport@workspace:js/web-transport"],
-
-    "@moq/web-transport-darwin-arm64": ["@moq/web-transport-darwin-arm64@0.0.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-mMuLABJcdpvynfn3r5mRetHOfkKUzBCqH6GFTam0TB2R48mtqrKnZzFCudF7n8R5EHyNqpHve9dTZ2ytZy3X/Q=="],
-
-    "@moq/web-transport-darwin-x64": ["@moq/web-transport-darwin-x64@0.0.4", "", { "os": "darwin", "cpu": "x64" }, "sha512-46FGhCQQIDGSKZss2BEozrvFu/sLsSOfhVQMMZUY8kqTdneYMRww0v6Vp98UtKwbBVNjlHASJuuxMmsAG9A7Nw=="],
-
-    "@moq/web-transport-linux-arm64-gnu": ["@moq/web-transport-linux-arm64-gnu@0.0.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-Lx4f3zTu8r3+Kwmy50PIHNyfFZTTm1nbiel3YXKlGIyPrXsqPZJBs9hOCJ1M09gVvYX9FZzkBs9XA9wMI1eogw=="],
-
-    "@moq/web-transport-linux-x64-gnu": ["@moq/web-transport-linux-x64-gnu@0.0.4", "", { "os": "linux", "cpu": "x64" }, "sha512-fdBRedIfDL7k8aLWbCI9lNDKmoYqtGSF0Tg+SWWtJUqkigYw6zhp4JiiFXFXVfB758xxEsdUGO5i+gQJDK90Gw=="],
-
-    "@moq/web-transport-win32-x64-msvc": ["@moq/web-transport-win32-x64-msvc@0.0.4", "", { "os": "win32", "cpu": "x64" }, "sha512-b1RT3vI8S3jC8gTLJv96KeVkHUFQDe/LOoaVSQmJy7JO6Q1EiMEnUrJb32uAVVFx2tJWUBlm9T5mm/dETVFoqg=="],
 
     "@moq/web-transport-ws": ["@moq/web-transport-ws@workspace:js/web-transport-ws"],
 

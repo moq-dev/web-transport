@@ -59,6 +59,8 @@ export declare class NapiServer {
 	static bind(addr: string, certPem: Buffer, keyPem: Buffer): NapiServer;
 	/** Accept the next incoming WebTransport session request. */
 	accept(): Promise<NapiRequest | null>;
+	/** Close the server, stopping it from accepting new connections. */
+	close(): void;
 }
 
 /** An established WebTransport session. */
