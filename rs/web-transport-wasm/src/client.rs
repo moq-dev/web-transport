@@ -1,8 +1,7 @@
-
+use js_sys::Uint8Array;
 use url::Url;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{WebTransport, WebTransportHash, WebTransportOptions};
-use js_sys::Uint8Array;
 
 use crate::{Error, Session};
 
