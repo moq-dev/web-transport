@@ -11,7 +11,7 @@
     },
     "js/qmux": {
       "name": "@moq/qmux",
-      "version": "0.0.4",
+      "version": "0.0.6",
       "devDependencies": {
         "@types/node": "^24.3.0",
         "rimraf": "^6.0.1",
@@ -28,18 +28,18 @@
     },
     "js/web-transport": {
       "name": "@moq/web-transport",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "devDependencies": {
         "@napi-rs/cli": "^3",
         "@types/node": "^24.3.0",
         "typescript": "^5.9.2",
       },
       "optionalDependencies": {
-        "@moq/web-transport-darwin-arm64": "0.0.1",
-        "@moq/web-transport-darwin-x64": "0.0.1",
-        "@moq/web-transport-linux-arm64-gnu": "0.0.1",
-        "@moq/web-transport-linux-x64-gnu": "0.0.1",
-        "@moq/web-transport-win32-x64-msvc": "0.0.1",
+        "@moq/web-transport-darwin-arm64": "0.1.0",
+        "@moq/web-transport-darwin-x64": "0.1.0",
+        "@moq/web-transport-linux-arm64-gnu": "0.1.0",
+        "@moq/web-transport-linux-x64-gnu": "0.1.0",
+        "@moq/web-transport-win32-x64-msvc": "0.1.0",
       },
     },
     "js/web-transport-ws": {
