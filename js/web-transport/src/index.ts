@@ -9,4 +9,6 @@ export function install(): boolean {
 }
 
 export default Session;
-export { Request, Server } from "./server.ts";
+export { Request } from "./request.ts";
+export { Server } from "./server.ts";
+export type { SessionOptions } from "./session.ts";

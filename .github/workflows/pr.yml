@@ -27,3 +27,46 @@ jobs:
       # Make sure u guys don't write bad code
       - run: nix develop --command just check
       - run: nix develop --command just test
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Install Python dependencies
+        working-directory: py/web-transport
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Build native module
+        working-directory: py/web-transport
+        run: uv run maturin develop
+
+      - name: Ruff format check
+        working-directory: py/web-transport
+        run: uv run ruff format --check .
+
+      - name: Ruff lint
+        working-directory: py/web-transport
+        run: uv run ruff check .
+
+      - name: Type check
+        working-directory: py/web-transport
+        run: uv run ty check
+
+      - name: Install Playwright browsers
+        working-directory: py/web-transport
+        run: uv run playwright install chromium --with-deps
+
+      - name: Python tests
+        working-directory: py/web-transport
+        run: uv run pytest

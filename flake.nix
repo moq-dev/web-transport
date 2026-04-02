@@ -43,6 +43,8 @@
           pkgs.just
           pkgs.bun
           pkgs.wasm-bindgen-cli
+          pkgs.python312
+          pkgs.uv
           pkgs.pkg-config
           pkgs.glib
           pkgs.gtk3

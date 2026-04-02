@@ -17,7 +17,7 @@ Connect to a WebTransport server using the `Session` class, which implements the
 ```ts
 import Session from "@moq/web-transport";
 
-const session = new Session("https://example.com:4433/path");
+const session = new Session("https://example.com:4443/path");
 await session.ready;
 
 // Use the standard W3C WebTransport API from here on
@@ -27,12 +27,12 @@ await session.ready;
 
 ```ts
 // Skip certificate verification (testing only!)
-const session = new Session("https://localhost:4433", {
+const session = new Session("https://localhost:4443", {
 	serverCertificateDisableVerify: true,
 });
 
 // Pin to specific certificate hashes
-const session = new Session("https://localhost:4433", {
+const session = new Session("https://localhost:4443", {
 	serverCertificateHashes: [
 		{ algorithm: "sha-256", value: certHash },
 	],
@@ -60,7 +60,7 @@ import fs from "node:fs";
 const cert = fs.readFileSync("cert.pem");
 const key = fs.readFileSync("key.pem");
 
-const server = Server.bind("0.0.0.0:4433", cert, key);
+const server = Server.bind("[::]:4443", cert, key);
 
 while (true) {
 	const request = await server.accept();

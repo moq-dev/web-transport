@@ -6,6 +6,7 @@ members = [
     "rs/web-transport-node",
     "rs/web-transport-noq",
     "rs/web-transport-proto",
+    "rs/web-transport-python",
     "rs/web-transport-quiche",
     "rs/web-transport-quinn",
     "rs/web-transport-trait",

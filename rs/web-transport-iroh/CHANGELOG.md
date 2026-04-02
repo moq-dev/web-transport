@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.2.2...web-transport-iroh-v0.3.0) - 2026-03-31
+
+### Deps
+
+- Update to iroh 0.97
+
+### ⚙️ Miscellaneous Tasks
+
+- Move web-transport-iroh into web-transport-rs repo ([#203](https://github.com/moq-dev/web-transport/pull/203))
+
 ## [0.2.2](https://github.com/n0-computer/web-transport-iroh/compare/v0.2.1..0.2.2) - 2026-03-09
 
 ### ⛰️  Features

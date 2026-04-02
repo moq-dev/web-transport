@@ -83,7 +83,7 @@ impl NapiClient {
 /// A WebTransport server that accepts incoming sessions.
 #[napi]
 pub struct NapiServer {
-    inner: Mutex<web_transport_quinn::Server>,
+    inner: Mutex<Option<web_transport_quinn::Server>>,
 }
 
 #[napi]
@@ -109,7 +109,7 @@ impl NapiServer {
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
             Ok(Self {
-                inner: Mutex::new(server),
+                inner: Mutex::new(Some(server)),
             })
         })
     }
@@ -117,13 +117,28 @@ impl NapiServer {
     /// Accept the next incoming WebTransport session request.
     #[napi]
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
-        let mut server = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        let server = match guard.as_mut() {
+            Some(server) => server,
+            None => return Ok(None),
+        };
         match server.accept().await {
             Some(request) => Ok(Some(NapiRequest {
                 inner: Mutex::new(Some(request)),
             })),
-            None => Ok(None),
+            None => {
+                guard.take();
+                Ok(None)
+            }
         }
+    }
+
+    /// Close the server, stopping it from accepting new connections.
+    #[napi]
+    pub fn close(&self) {
+        within_runtime_if_available(|| {
+            self.inner.blocking_lock().take();
+        });
     }
 }
 
