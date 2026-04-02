@@ -1,6 +1,6 @@
 # @moq/qmux
 
-A [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) polyfill for browsers, using WebSockets as the underlying transport with [QMux](https://www.ietf.org/archive/id/draft-ietf-quic-qmux-00.html) (draft-ietf-quic-qmux-00) framing.
+A [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) polyfill for browsers, using WebSockets as the underlying transport with [QMux](https://www.ietf.org/archive/id/draft-ietf-quic-qmux-01.html) (draft-ietf-quic-qmux-01) framing.
 
 QMux brings QUIC's multiplexed streams and flow control to reliable, ordered byte-stream transports like WebSockets. This allows WebTransport applications to seamlessly fall back when QUIC/UDP is blocked by network middleboxes.
 

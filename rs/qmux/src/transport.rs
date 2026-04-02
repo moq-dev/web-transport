@@ -27,24 +27,30 @@ mod stream_transport {
     use web_transport_proto::VarInt;
 
     use super::Transport;
-    use crate::{Error, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
+    use crate::{Error, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
 
     pub(crate) struct StreamTransport<T> {
         reader: BufReader<tokio::io::ReadHalf<T>>,
         writer: BufWriter<tokio::io::WriteHalf<T>>,
+        version: Version,
+        /// Peer's max_record_size (for send validation). Defaults to 16382 per draft-01.
+        max_record_size: usize,
     }
 
     impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamTransport<T> {
-        pub fn new(stream: T) -> Self {
+        pub fn new(stream: T, version: Version) -> Self {
             let (read, write) = tokio::io::split(stream);
             Self {
                 reader: BufReader::new(read),
                 writer: BufWriter::new(write),
+                version,
+                max_record_size: crate::proto::DEFAULT_MAX_RECORD_SIZE as usize,
             }
         }
 
-        /// Read a varint, appending raw bytes to buf. Returns the decoded value.
-        async fn read_varint(&mut self, buf: &mut BytesMut) -> Result<VarInt, Error> {
+        /// Read a varint from the stream, returning the decoded value.
+        /// If `buf` is provided, appends the raw bytes to it.
+        async fn read_varint_into(&mut self, buf: &mut BytesMut) -> Result<VarInt, Error> {
             let first = self.reader.read_u8().await?;
             buf.put_u8(first);
 
@@ -73,6 +79,30 @@ mod stream_transport {
             VarInt::try_from(value).map_err(|_| Error::Short)
         }
 
+        /// Read a varint from the stream without collecting raw bytes.
+        async fn read_varint(&mut self) -> Result<VarInt, Error> {
+            let first = self.reader.read_u8().await?;
+            let tag = first >> 6;
+            let len = 1usize << tag;
+
+            if len == 1 {
+                return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
+            }
+
+            let mut raw = [0u8; 8];
+            raw[0] = first & 0x3f;
+            self.reader.read_exact(&mut raw[1..len]).await?;
+
+            let value = match len {
+                2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
+                4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
+                8 => u64::from_be_bytes(raw),
+                _ => unreachable!(),
+            };
+
+            VarInt::try_from(value).map_err(|_| Error::Short)
+        }
+
         /// Read exactly `len` bytes, appending to buf.
         async fn read_bytes(&mut self, len: usize, buf: &mut BytesMut) -> Result<(), Error> {
             let start = buf.len();
@@ -81,24 +111,36 @@ mod stream_transport {
             Ok(())
         }
 
-        /// Read one complete QMux frame from the byte stream, returning raw bytes.
-        async fn recv_qmux_frame(&mut self) -> Result<Bytes, Error> {
+        /// Read one QMux Record from the byte stream (draft-01).
+        /// Returns the record payload (frames concatenated).
+        async fn recv_record(&mut self) -> Result<Bytes, Error> {
+            let size = self.read_varint().await?.into_inner() as usize;
+            if size > self.max_record_size {
+                return Err(Error::FrameTooLarge);
+            }
+            let mut buf = BytesMut::zeroed(size);
+            self.reader.read_exact(&mut buf).await?;
+            Ok(buf.freeze())
+        }
+
+        /// Read one complete QMux frame from the byte stream (draft-00), returning raw bytes.
+        async fn recv_qmux00_frame(&mut self) -> Result<Bytes, Error> {
             let mut buf = BytesMut::new();
-            let frame_type = self.read_varint(&mut buf).await?.into_inner();
+            let frame_type = self.read_varint_into(&mut buf).await?.into_inner();
 
             // STREAM frames: 0x08-0x0f
             if (0x08..=0x0f).contains(&frame_type) {
                 let has_off = frame_type & 0x04 != 0;
                 let has_len = frame_type & 0x02 != 0;
 
-                self.read_varint(&mut buf).await?; // stream id
+                self.read_varint_into(&mut buf).await?; // stream id
 
                 if has_off {
-                    self.read_varint(&mut buf).await?; // offset
+                    self.read_varint_into(&mut buf).await?; // offset
                 }
 
                 if has_len {
-                    let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
                     if len > MAX_FRAME_PAYLOAD {
                         return Err(Error::FrameTooLarge);
                     }
@@ -111,22 +153,24 @@ mod stream_transport {
             }
 
             match frame_type {
+                // PADDING
+                0x00 => {}
                 // RESET_STREAM
                 0x04 => {
-                    self.read_varint(&mut buf).await?; // id
-                    self.read_varint(&mut buf).await?; // code
-                    self.read_varint(&mut buf).await?; // final_size
+                    self.read_varint_into(&mut buf).await?; // id
+                    self.read_varint_into(&mut buf).await?; // code
+                    self.read_varint_into(&mut buf).await?; // final_size
                 }
                 // STOP_SENDING
                 0x05 => {
-                    self.read_varint(&mut buf).await?; // id
-                    self.read_varint(&mut buf).await?; // code
+                    self.read_varint_into(&mut buf).await?; // id
+                    self.read_varint_into(&mut buf).await?; // code
                 }
                 // CONNECTION_CLOSE / APPLICATION_CLOSE
                 0x1c | 0x1d => {
-                    self.read_varint(&mut buf).await?; // code
-                    self.read_varint(&mut buf).await?; // frame_type
-                    let reason_len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    self.read_varint_into(&mut buf).await?; // code
+                    self.read_varint_into(&mut buf).await?; // frame_type
+                    let reason_len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
                     if reason_len > MAX_FRAME_SIZE {
                         return Err(Error::FrameTooLarge);
                     }
@@ -134,35 +178,35 @@ mod stream_transport {
                 }
                 // MAX_DATA
                 0x10 => {
-                    self.read_varint(&mut buf).await?;
+                    self.read_varint_into(&mut buf).await?;
                 }
                 // MAX_STREAM_DATA
                 0x11 => {
-                    self.read_varint(&mut buf).await?; // id
-                    self.read_varint(&mut buf).await?; // max
+                    self.read_varint_into(&mut buf).await?; // id
+                    self.read_varint_into(&mut buf).await?; // max
                 }
                 // MAX_STREAMS (bidi/uni)
                 0x12 | 0x13 => {
-                    self.read_varint(&mut buf).await?;
+                    self.read_varint_into(&mut buf).await?;
                 }
                 // DATA_BLOCKED
                 0x14 => {
-                    self.read_varint(&mut buf).await?;
+                    self.read_varint_into(&mut buf).await?;
                 }
                 // STREAM_DATA_BLOCKED
                 0x15 => {
-                    self.read_varint(&mut buf).await?; // id
-                    self.read_varint(&mut buf).await?; // limit
+                    self.read_varint_into(&mut buf).await?; // id
+                    self.read_varint_into(&mut buf).await?; // limit
                 }
                 // STREAMS_BLOCKED (bidi/uni)
                 0x16 | 0x17 => {
-                    self.read_varint(&mut buf).await?;
+                    self.read_varint_into(&mut buf).await?;
                 }
                 // DATAGRAM without length — can't delimit on a byte stream
                 0x30 => return Err(Error::InvalidFrameType(frame_type)),
                 // DATAGRAM with length
                 0x31 => {
-                    let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
                     if len > MAX_FRAME_SIZE {
                         return Err(Error::FrameTooLarge);
                     }
@@ -170,11 +214,15 @@ mod stream_transport {
                 }
                 // QX_TRANSPORT_PARAMETERS
                 0x3f5153300d0a0d0a => {
-                    let len = self.read_varint(&mut buf).await?.into_inner() as usize;
+                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
                     if len > MAX_FRAME_SIZE {
                         return Err(Error::FrameTooLarge);
                     }
                     self.read_bytes(len, &mut buf).await?;
+                }
+                // QX_PING request/response (also valid in draft-00 for forward compat)
+                0x348c67529ef8c7bd | 0x348c67529ef8c7be => {
+                    self.read_varint_into(&mut buf).await?; // sequence
                 }
                 _ => return Err(Error::InvalidFrameType(frame_type)),
             }
@@ -191,7 +239,10 @@ mod stream_transport {
         }
 
         async fn recv(&mut self) -> Result<Bytes, Error> {
-            self.recv_qmux_frame().await
+            match self.version {
+                Version::QMux01 => self.recv_record().await,
+                _ => self.recv_qmux00_frame().await,
+            }
         }
 
         async fn close(&mut self) -> Result<(), Error> {

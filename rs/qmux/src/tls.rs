@@ -8,33 +8,55 @@ use crate::{alpn, Config, Error, Session, Version};
 
 /// Parse a TLS ALPN into a version and app protocol.
 ///
-/// Strips the qmux/webtransport prefix (e.g. `qmux-00.moqt-16` → `moqt-16`).
-/// TLS always uses the QMux wire format regardless of prefix.
+/// Strips the qmux/webtransport prefix (e.g. `qmux-01.moqt-16` → `moqt-16`).
+/// TLS always uses the QMux wire format; the version depends on the ALPN prefix.
 fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
     let alpn = match alpn {
         Some(s) if !s.is_empty() => s,
-        _ => return (Version::QMux00, None),
+        _ => return (Version::QMux01, None),
     };
 
-    for &known in crate::ALPNS {
-        if alpn == known {
-            return (Version::QMux00, None);
+    // Check qmux-01 first (preferred)
+    if alpn == crate::ALPN_QMUX_01 {
+        return (Version::QMux01, None);
+    }
+    if let Some(proto) = alpn.strip_prefix(crate::PREFIX_QMUX_01) {
+        if !proto.is_empty() {
+            return (Version::QMux01, Some(proto.to_string()));
         }
-        if let Some(proto) = alpn.strip_prefix(&format!("{known}.")) {
-            if !proto.is_empty() {
-                return (Version::QMux00, Some(proto.to_string()));
-            }
+        return (Version::QMux01, None);
+    }
+
+    // Check qmux-00
+    if alpn == crate::ALPN_QMUX_00 {
+        return (Version::QMux00, None);
+    }
+    if let Some(proto) = alpn.strip_prefix(crate::PREFIX_QMUX_00) {
+        if !proto.is_empty() {
+            return (Version::QMux00, Some(proto.to_string()));
         }
+        return (Version::QMux00, None);
+    }
+
+    // Check webtransport (legacy, still uses QMux01 framing over TLS)
+    if alpn == crate::ALPN_WEBTRANSPORT {
+        return (Version::QMux01, None);
+    }
+    if let Some(proto) = alpn.strip_prefix(crate::PREFIX_WEBTRANSPORT) {
+        if !proto.is_empty() {
+            return (Version::QMux01, Some(proto.to_string()));
+        }
+        return (Version::QMux01, None);
     }
 
     tracing::warn!(?alpn, "unrecognized TLS ALPN");
-    (Version::QMux00, None)
+    (Version::QMux01, None)
 }
 
 /// Connect over TLS. Always uses the QMux wire format.
 ///
 /// The caller's `alpn_protocols` are treated as application-level protocols
-/// and automatically wrapped with `qmux-00.` and `webtransport.` prefixes.
+/// and automatically wrapped with `qmux-01.`, `qmux-00.`, and `webtransport.` prefixes.
 /// The prefix is stripped from the negotiated result.
 ///
 /// The `server_name` is used for SNI and certificate verification.
@@ -72,7 +94,7 @@ pub async fn connect(
     let (version, protocol) = parse_alpn(negotiated_str);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream);
+    let transport = StreamTransport::new(tls_stream, version);
     Ok(Session::connect(transport, Config::new(version, protocol)))
 }
 
@@ -93,6 +115,6 @@ pub async fn accept(
     let (version, protocol) = parse_alpn(negotiated_str);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream);
+    let transport = StreamTransport::new(tls_stream, version);
     Ok(Session::accept(transport, Config::new(version, protocol)))
 }

@@ -17,6 +17,8 @@ const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 
+const PADDING: VarInt = VarInt::from_u32(0x00);
+
 // QX_TRANSPORT_PARAMETERS magic: "\xffQMX\r\n\r\n"
 // This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
 const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
@@ -26,6 +28,20 @@ const QX_TRANSPORT_PARAMETERS_VI: VarInt =
 const _: () = assert!(
     QX_TRANSPORT_PARAMETERS < (1 << 62),
     "QX_TRANSPORT_PARAMETERS must fit in VarInt"
+);
+
+// QX_PING frame types (draft-01)
+const QX_PING_REQUEST: u64 = 0x348c67529ef8c7bd;
+const QX_PING_REQUEST_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_PING_REQUEST) };
+const _: () = assert!(
+    QX_PING_REQUEST < (1 << 62),
+    "QX_PING_REQUEST must fit in VarInt"
+);
+const QX_PING_RESPONSE: u64 = 0x348c67529ef8c7be;
+const QX_PING_RESPONSE_VI: VarInt = unsafe { VarInt::from_u64_unchecked(QX_PING_RESPONSE) };
+const _: () = assert!(
+    QX_PING_RESPONSE < (1 << 62),
+    "QX_PING_RESPONSE must fit in VarInt"
 );
 
 /// Stream data frame carrying payload bytes for a specific stream.
@@ -68,9 +84,19 @@ pub struct ConnectionClose {
     pub reason: String,
 }
 
+/// A QX_PING frame for connection liveness probing (draft-01).
+#[derive(Debug, Clone)]
+pub struct Ping {
+    /// Monotonically increasing sequence number.
+    pub sequence: u64,
+    /// Whether this is a response (true) or request (false).
+    pub response: bool,
+}
+
 /// A QUIC-compatible frame for multiplexed transport.
 #[derive(Debug, Clone)]
 pub enum Frame {
+    Padding,
     ResetStream(ResetStream),
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
@@ -84,19 +110,200 @@ pub enum Frame {
     StreamsBlockedBidi(u64),
     StreamsBlockedUni(u64),
     TransportParameters(TransportParams),
+    Ping(Ping),
 }
 
 impl Frame {
     /// Encode the frame into bytes using the given wire format version.
+    ///
+    /// For QMux01, this encodes the raw frame without a record wrapper.
+    /// Use [`encode_record`] to wrap frames in a record.
     pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
 
         match version {
             Version::WebTransport => self.encode_wt(&mut buf)?,
-            Version::QMux00 => self.encode_qmux(&mut buf)?,
+            Version::QMux00 | Version::QMux01 => self.encode_qmux(&mut buf)?,
         }
 
         Ok(buf.freeze())
+    }
+
+    /// Decode all frames from a QMux record payload (draft-01).
+    ///
+    /// A record contains one or more frames concatenated together.
+    /// Returns a Vec of decoded frames (skipping PADDING and other ignored frames).
+    pub fn decode_record(mut data: Bytes) -> Result<Vec<Self>, Error> {
+        let mut frames = Vec::new();
+
+        while data.has_remaining() {
+            if let Some(frame) = Self::decode_qmux_one(&mut data)? {
+                frames.push(frame);
+            }
+        }
+
+        Ok(frames)
+    }
+
+    /// Decode a single QMux frame from a buffer, advancing past the consumed bytes.
+    ///
+    /// Unlike `decode_qmux`, this correctly handles multiple frames in a record
+    /// by not consuming trailing bytes for STREAM frames without the LEN bit.
+    fn decode_qmux_one(data: &mut Bytes) -> Result<Option<Self>, Error> {
+        let frame_type = VarInt::decode(data)?.into_inner();
+
+        // PADDING: single zero byte, already consumed by VarInt decode
+        if frame_type == 0x00 {
+            return Ok(None);
+        }
+
+        // STREAM frames: 0x08-0x0f
+        if (0x08..=0x0f).contains(&frame_type) {
+            let has_off = frame_type & 0x04 != 0;
+            let has_len = frame_type & 0x02 != 0;
+            let has_fin = frame_type & 0x01 != 0;
+
+            let id = StreamId(VarInt::decode(data)?);
+
+            if has_off {
+                let _offset = VarInt::decode(data)?;
+            }
+
+            let stream_data = if has_len {
+                let len = VarInt::decode(data)?.into_inner();
+                if (data.remaining() as u64) < len {
+                    return Err(Error::Short);
+                }
+                data.split_to(len as usize)
+            } else {
+                // No LEN bit: rest of record is payload
+                data.split_to(data.remaining())
+            };
+
+            return Ok(Some(Frame::Stream(Stream {
+                id,
+                data: stream_data,
+                fin: has_fin,
+            })));
+        }
+
+        match frame_type {
+            // RESET_STREAM
+            0x04 => {
+                let id = StreamId(VarInt::decode(data)?);
+                let code = VarInt::decode(data)?;
+                let final_size = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::ResetStream(ResetStream {
+                    id,
+                    code,
+                    final_size,
+                })))
+            }
+            // STOP_SENDING
+            0x05 => {
+                let id = StreamId(VarInt::decode(data)?);
+                let code = VarInt::decode(data)?;
+                Ok(Some(Frame::StopSending(StopSending { id, code })))
+            }
+            // CONNECTION_CLOSE / APPLICATION_CLOSE
+            0x1c | 0x1d => {
+                let code = VarInt::decode(data)?;
+                let _frame_type = VarInt::decode(data)?;
+                let reason_len = VarInt::decode(data)?.into_inner();
+                if (data.remaining() as u64) < reason_len {
+                    return Err(Error::Short);
+                }
+                let reason =
+                    String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
+                Ok(Some(Frame::ConnectionClose(ConnectionClose {
+                    code,
+                    reason,
+                })))
+            }
+            // MAX_DATA
+            0x10 => {
+                let max = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::MaxData(max)))
+            }
+            // MAX_STREAM_DATA
+            0x11 => {
+                let id = StreamId(VarInt::decode(data)?);
+                let max = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::MaxStreamData { id, max }))
+            }
+            // MAX_STREAMS (bidi)
+            0x12 => {
+                let max = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::MaxStreamsBidi(max)))
+            }
+            // MAX_STREAMS (uni)
+            0x13 => {
+                let max = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::MaxStreamsUni(max)))
+            }
+            // DATA_BLOCKED
+            0x14 => {
+                let limit = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::DataBlocked(limit)))
+            }
+            // STREAM_DATA_BLOCKED
+            0x15 => {
+                let id = StreamId(VarInt::decode(data)?);
+                let limit = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::StreamDataBlocked { id, limit }))
+            }
+            // STREAMS_BLOCKED (bidi)
+            0x16 => {
+                let limit = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::StreamsBlockedBidi(limit)))
+            }
+            // STREAMS_BLOCKED (uni)
+            0x17 => {
+                let limit = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::StreamsBlockedUni(limit)))
+            }
+            // DATAGRAM without length — rest of record is payload
+            0x30 => {
+                let _payload = data.split_to(data.remaining());
+                Ok(None)
+            }
+            // DATAGRAM with length
+            0x31 => {
+                let len = VarInt::decode(data)?.into_inner();
+                if (data.remaining() as u64) < len {
+                    return Err(Error::Short);
+                }
+                let _payload = data.split_to(len as usize);
+                Ok(None)
+            }
+            // QX_TRANSPORT_PARAMETERS
+            0x3f5153300d0a0d0a => {
+                let len = VarInt::decode(data)?.into_inner();
+                if (data.remaining() as u64) < len {
+                    return Err(Error::Short);
+                }
+                let payload = data.split_to(len as usize);
+                let params = TransportParams::decode(payload)?;
+                Ok(Some(Frame::TransportParameters(params)))
+            }
+            // QX_PING request
+            QX_PING_REQUEST => {
+                let sequence = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::Ping(Ping {
+                    sequence,
+                    response: false,
+                })))
+            }
+            // QX_PING response
+            QX_PING_RESPONSE => {
+                let sequence = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::Ping(Ping {
+                    sequence,
+                    response: true,
+                })))
+            }
+            _ => Err(Error::InvalidFrameType(frame_type)),
+        }
     }
 
     fn encode_wt(&self, buf: &mut BytesMut) -> Result<(), Error> {
@@ -198,6 +405,17 @@ impl Frame {
                 VarInt::try_from(payload.len())?.encode(buf);
                 buf.put_slice(&payload);
             }
+            Frame::Padding => {
+                PADDING.encode(buf);
+            }
+            Frame::Ping(ping) => {
+                if ping.response {
+                    QX_PING_RESPONSE_VI.encode(buf);
+                } else {
+                    QX_PING_REQUEST_VI.encode(buf);
+                }
+                VarInt::try_from(ping.sequence)?.encode(buf);
+            }
         }
 
         Ok(())
@@ -213,7 +431,7 @@ impl Frame {
 
         match version {
             Version::WebTransport => Self::decode_wt(data).map(Some),
-            Version::QMux00 => Self::decode_qmux(data),
+            Version::QMux00 | Version::QMux01 => Self::decode_qmux(data),
         }
     }
 
@@ -294,6 +512,8 @@ impl Frame {
         }
 
         match frame_type {
+            // PADDING
+            0x00 => Ok(None),
             // RESET_STREAM
             0x04 => {
                 let id = StreamId(VarInt::decode(&mut data)?);
@@ -392,9 +612,33 @@ impl Frame {
                 let params = TransportParams::decode(payload)?;
                 Ok(Some(Frame::TransportParameters(params)))
             }
+            // QX_PING request
+            QX_PING_REQUEST => {
+                let sequence = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::Ping(Ping {
+                    sequence,
+                    response: false,
+                })))
+            }
+            // QX_PING response
+            QX_PING_RESPONSE => {
+                let sequence = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::Ping(Ping {
+                    sequence,
+                    response: true,
+                })))
+            }
             _ => Err(Error::InvalidFrameType(frame_type)),
         }
     }
+}
+
+/// Wrap encoded frame bytes in a QMux Record (Size + Frames) for draft-01.
+pub fn encode_record(frame_bytes: &Bytes) -> Result<Bytes, Error> {
+    let mut buf = BytesMut::new();
+    VarInt::try_from(frame_bytes.len())?.encode(&mut buf);
+    buf.put_slice(frame_bytes);
+    Ok(buf.freeze())
 }
 
 impl From<Stream> for Frame {

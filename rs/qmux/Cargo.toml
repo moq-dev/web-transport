@@ -1,6 +1,6 @@
 [package]
 name = "qmux"
-description = "QMux protocol (draft-ietf-quic-qmux-00) over reliable transports"
+description = "QMux protocol (draft-ietf-quic-qmux-01) over reliable transports"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"

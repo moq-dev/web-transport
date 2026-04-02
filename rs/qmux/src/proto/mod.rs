@@ -8,8 +8,12 @@ pub use frame::*;
 pub(crate) use params::*;
 pub use version::*;
 
+/// Default maximum record size per draft-01 (16382 bytes).
+pub use params::DEFAULT_MAX_RECORD_SIZE;
+
 /// Maximum size of a single QMux frame on the wire (type + fields + payload).
-/// This is the default value per the qmux spec; parameter negotiation is TBD.
+/// For draft-00, this is the maximum frame size.
+/// For draft-01, this is superseded by max_record_size.
 pub const MAX_FRAME_SIZE: usize = 16384;
 
 /// Maximum payload size for a STREAM frame, accounting for frame overhead.

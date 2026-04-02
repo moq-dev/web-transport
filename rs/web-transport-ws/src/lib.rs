@@ -2,7 +2,7 @@
 //!
 //! This crate has been superseded by the [`qmux`] crate, which supports
 //! TCP, TLS, and WebSocket transports with both the legacy `webtransport`
-//! wire format and the new QMux (draft-ietf-quic-qmux-00) protocol.
+//! wire format and the new QMux (draft-ietf-quic-qmux-01) protocol.
 //!
 //! All Rust types in this crate are thin wrappers or re-exports from `qmux`.
 //! Please migrate to `qmux` directly.
