@@ -46,18 +46,5 @@ pub use transport::Transport;
 /// All supported ALPN identifiers, in preference order.
 ///
 /// Use this when configuring TLS to advertise QMux support.
-/// New versions are added automatically; callers don't need to update.
-pub const ALPNS: &[&str] = &[ALPN_QMUX_01, ALPN_QMUX_00, ALPN_WEBTRANSPORT];
-
-/// All supported WebSocket subprotocol prefixes, in preference order.
-///
-/// Each prefix is prepended to the application protocol name during
-/// WebSocket subprotocol negotiation (e.g. `"qmux-01." + "moq-03"`).
-pub const PREFIXES: &[&str] = &[PREFIX_QMUX_01, PREFIX_QMUX_00, PREFIX_WEBTRANSPORT];
-
-const ALPN_WEBTRANSPORT: &str = "webtransport";
-const ALPN_QMUX_00: &str = "qmux-00";
-const ALPN_QMUX_01: &str = "qmux-01";
-const PREFIX_WEBTRANSPORT: &str = "webtransport.";
-const PREFIX_QMUX_00: &str = "qmux-00.";
-const PREFIX_QMUX_01: &str = "qmux-01.";
+/// For version-specific ALPNs, use [`Version::alpn()`].
+pub const ALPNS: &[&str] = &["qmux-01", "qmux-00", "webtransport"];

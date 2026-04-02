@@ -3,54 +3,37 @@ use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
-use crate::{
-    alpn, Config, Error, Session, Version, PREFIX_QMUX_00, PREFIX_QMUX_01, PREFIX_WEBTRANSPORT,
-};
+use crate::{alpn, Config, Error, Session, Version};
 
 /// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
 ///
 /// Supports bare ALPNs (`"qmux-01"`, `"qmux-00"`, `"webtransport"`) and
 /// prefixed variants (`"qmux-01.moq-03"`, `"qmux-00.moq-03"`, `"webtransport.moq-03"`).
-/// Defaults to `WebTransport` when `None` or empty.
-fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
+///
+/// If `pin` is `Some`, the version is forced regardless of the ALPN prefix.
+/// Defaults to `WebTransport` when `None` or empty and no pin is set.
+fn parse_alpn(alpn: Option<&str>, pin: Option<Version>) -> (Version, Option<String>) {
     let alpn = match alpn {
         Some(s) if !s.is_empty() => s,
-        _ => return (Version::WebTransport, None),
+        _ => return (pin.unwrap_or(Version::WebTransport), None),
     };
 
-    if let Some(proto) = alpn.strip_prefix(PREFIX_QMUX_01) {
-        let proto = if proto.is_empty() {
-            None
-        } else {
-            Some(proto.to_string())
-        };
-        return (Version::QMux01, proto);
-    }
-    if alpn == crate::ALPN_QMUX_01 {
-        return (Version::QMux01, None);
-    }
-    if let Some(proto) = alpn.strip_prefix(PREFIX_QMUX_00) {
-        let proto = if proto.is_empty() {
-            None
-        } else {
-            Some(proto.to_string())
-        };
-        return (Version::QMux00, proto);
-    }
-    if alpn == crate::ALPN_QMUX_00 {
-        return (Version::QMux00, None);
-    }
-    if let Some(proto) = alpn.strip_prefix(PREFIX_WEBTRANSPORT) {
-        let proto = if proto.is_empty() {
-            None
-        } else {
-            Some(proto.to_string())
-        };
-        return (Version::WebTransport, proto);
+    for &version in Version::ALL {
+        if alpn == version.alpn() {
+            return (pin.unwrap_or(version), None);
+        }
+        if let Some(proto) = alpn.strip_prefix(version.prefix()) {
+            let proto = if proto.is_empty() {
+                None
+            } else {
+                Some(proto.to_string())
+            };
+            return (pin.unwrap_or(version), proto);
+        }
     }
 
-    // Unknown or bare "webtransport"
-    (Version::WebTransport, None)
+    // Unknown
+    (pin.unwrap_or(Version::WebTransport), None)
 }
 
 /// Wrap a pre-upgraded WebSocket connection as a client-side session.
@@ -58,7 +41,10 @@ fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
 /// Use this when the WebSocket handshake was already performed by an
 /// external framework. Pass the negotiated `sec-websocket-protocol`
 /// header value (or `None` to default to the WebTransport wire format).
-pub fn connect<T>(ws: T, alpn: Option<&str>) -> Session
+///
+/// If `version` is `Some`, the QMux version is forced regardless of
+/// the ALPN prefix. The ALPN is still used to extract the app protocol.
+pub fn connect<T>(ws: T, alpn: Option<&str>, version: Option<Version>) -> Session
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -66,7 +52,7 @@ where
         + Send
         + 'static,
 {
-    let (version, protocol) = parse_alpn(alpn);
+    let (version, protocol) = parse_alpn(alpn, version);
     let transport = WsTransport::new(ws);
     Session::connect(transport, Config::new(version, protocol))
 }
@@ -76,7 +62,10 @@ where
 /// Use this when the WebSocket handshake was already performed by an
 /// external framework (e.g. axum). Pass the negotiated `sec-websocket-protocol`
 /// header value (or `None` to default to the WebTransport wire format).
-pub fn accept<T>(ws: T, alpn: Option<&str>) -> Session
+///
+/// If `version` is `Some`, the QMux version is forced regardless of
+/// the ALPN prefix. The ALPN is still used to extract the app protocol.
+pub fn accept<T>(ws: T, alpn: Option<&str>, version: Option<Version>) -> Session
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -84,18 +73,20 @@ where
         + Send
         + 'static,
 {
-    let (version, protocol) = parse_alpn(alpn);
+    let (version, protocol) = parse_alpn(alpn, version);
     let transport = WsTransport::new(ws);
     Session::accept(transport, Config::new(version, protocol))
 }
 
 /// A QMux client that connects over WebSocket.
 ///
-/// Supports `qmux-01.`, `qmux-00.`, and `webtransport.` subprotocol prefixes,
-/// preferring the latest QMux version when available.
+/// By default, supports `qmux-01.`, `qmux-00.`, and `webtransport.` subprotocol
+/// prefixes, preferring the latest QMux version. Use [`with_version`](Client::with_version)
+/// to pin a specific QMux version.
 #[derive(Default, Clone)]
 pub struct Client {
     protocols: Vec<String>,
+    version: Option<Version>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
     #[cfg(feature = "wss")]
     connector: Option<tokio_tungstenite::Connector>,
@@ -104,6 +95,22 @@ pub struct Client {
 impl Client {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin a specific QMux version for this client.
+    ///
+    /// When set, only ALPNs for this version are offered during negotiation,
+    /// and the session always uses this version regardless of the negotiated ALPN.
+    ///
+    /// For example, if `moq-transport-17` always uses QMux draft-00:
+    /// ```ignore
+    /// let client = Client::new()
+    ///     .with_version(Version::QMux00)
+    ///     .with_protocol("moq-transport-17");
+    /// ```
+    pub fn with_version(mut self, version: Version) -> Self {
+        self.version = Some(version);
+        self
     }
 
     /// Add a supported application-level subprotocol for negotiation.
@@ -144,8 +151,8 @@ impl Client {
             .into_client_request()
             .map_err(|e| Error::Io(e.to_string()))?;
 
-        // Offer both prefix families, preferring qmux-00
-        let protocol_value = alpn::build(&self.protocols).join(", ");
+        let versions: Vec<Version> = self.version.into_iter().collect();
+        let protocol_value = alpn::build(&self.protocols, &versions).join(", ");
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
@@ -177,7 +184,7 @@ impl Client {
             .get(http::header::SEC_WEBSOCKET_PROTOCOL)
             .and_then(|h| h.to_str().ok());
 
-        let (version, protocol) = parse_alpn(negotiated);
+        let (version, protocol) = parse_alpn(negotiated, self.version);
 
         let transport = WsTransport::new(ws_stream);
         Ok(Session::connect(transport, Config::new(version, protocol)))
@@ -186,16 +193,27 @@ impl Client {
 
 /// A QMux server that accepts WebSocket connections.
 ///
-/// Supports `qmux-01.`, `qmux-00.`, and `webtransport.` subprotocol prefixes,
-/// preferring the latest QMux version when available.
+/// By default, supports `qmux-01.`, `qmux-00.`, and `webtransport.` subprotocol
+/// prefixes, preferring the latest QMux version. Use [`with_version`](Server::with_version)
+/// to pin a specific QMux version.
 #[derive(Default, Clone)]
 pub struct Server {
     protocols: Vec<String>,
+    version: Option<Version>,
 }
 
 impl Server {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin a specific QMux version for this server.
+    ///
+    /// When set, only ALPNs for this version are accepted during negotiation,
+    /// and the session always uses this version regardless of the negotiated ALPN.
+    pub fn with_version(mut self, version: Version) -> Self {
+        self.version = Some(version);
+        self
     }
 
     /// Add a supported application-level subprotocol for negotiation.
@@ -226,6 +244,13 @@ impl Server {
         let negotiated = Arc::new(Mutex::new(None::<(Version, Option<String>)>));
         let negotiated_clone = negotiated.clone();
         let supported = self.protocols.clone();
+        let pin_version = self.version;
+
+        // Determine which versions to try, in preference order
+        let versions: Vec<Version> = match pin_version {
+            Some(v) => vec![v],
+            None => Version::ALL.to_vec(),
+        };
 
         #[allow(clippy::result_large_err)]
         let callback = move |req: &server::Request,
@@ -241,86 +266,37 @@ impl Server {
                 .filter(|p| !p.is_empty())
                 .collect();
 
-            // Try qmux-01 prefix first
-            let qmux01_match = header_protocols
-                .iter()
-                .filter_map(|p| p.strip_prefix(PREFIX_QMUX_01))
-                .find(|p| supported.iter().any(|s| s == p))
-                .map(|p| p.to_string());
+            for &version in &versions {
+                let prefix = version.prefix();
+                let version = pin_version.unwrap_or(version);
 
-            if let Some(ref proto) = qmux01_match {
-                let response_value = format!("{PREFIX_QMUX_01}{proto}");
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(&response_value).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux01, Some(proto.clone())));
-                return Ok(response);
-            }
+                // Try prefixed protocol match
+                let matched = header_protocols
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(prefix))
+                    .find(|p| supported.iter().any(|s| s == p))
+                    .map(|p| p.to_string());
 
-            // Accept bare qmux-01 only when no specific protocols are configured.
-            if supported.is_empty() && header_protocols.contains(&crate::ALPN_QMUX_01) {
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(crate::ALPN_QMUX_01).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux01, None));
-                return Ok(response);
-            }
+                if let Some(ref proto) = matched {
+                    let response_value = format!("{prefix}{proto}");
+                    response.headers_mut().insert(
+                        http::header::SEC_WEBSOCKET_PROTOCOL,
+                        http::HeaderValue::from_str(&response_value).unwrap(),
+                    );
+                    *negotiated_clone.lock().unwrap() = Some((version, Some(proto.clone())));
+                    return Ok(response);
+                }
 
-            // Try qmux-00 prefix
-            let qmux00_match = header_protocols
-                .iter()
-                .filter_map(|p| p.strip_prefix(PREFIX_QMUX_00))
-                .find(|p| supported.iter().any(|s| s == p))
-                .map(|p| p.to_string());
-
-            if let Some(ref proto) = qmux00_match {
-                let response_value = format!("{PREFIX_QMUX_00}{proto}");
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(&response_value).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux00, Some(proto.clone())));
-                return Ok(response);
-            }
-
-            // Accept bare qmux-00 only when no specific protocols are configured.
-            if supported.is_empty() && header_protocols.contains(&crate::ALPN_QMUX_00) {
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(crate::ALPN_QMUX_00).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::QMux00, None));
-                return Ok(response);
-            }
-
-            // Fall back to webtransport prefix
-            let wt_match = header_protocols
-                .iter()
-                .filter_map(|p| p.strip_prefix(PREFIX_WEBTRANSPORT))
-                .find(|p| supported.iter().any(|s| s == p))
-                .map(|p| p.to_string());
-
-            if let Some(ref proto) = wt_match {
-                let response_value = format!("{PREFIX_WEBTRANSPORT}{proto}");
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(&response_value).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() =
-                    Some((Version::WebTransport, Some(proto.clone())));
-                return Ok(response);
-            }
-
-            // Check for bare webtransport only when no specific protocols are configured.
-            if supported.is_empty() && header_protocols.contains(&crate::ALPN_WEBTRANSPORT) {
-                response.headers_mut().insert(
-                    http::header::SEC_WEBSOCKET_PROTOCOL,
-                    http::HeaderValue::from_str(crate::ALPN_WEBTRANSPORT).unwrap(),
-                );
-                *negotiated_clone.lock().unwrap() = Some((Version::WebTransport, None));
-                return Ok(response);
+                // Accept bare version ALPN only when no specific protocols are configured.
+                let bare_alpn = pin_version.unwrap_or(version).alpn();
+                if supported.is_empty() && header_protocols.contains(&bare_alpn) {
+                    response.headers_mut().insert(
+                        http::header::SEC_WEBSOCKET_PROTOCOL,
+                        http::HeaderValue::from_str(bare_alpn).unwrap(),
+                    );
+                    *negotiated_clone.lock().unwrap() = Some((version, None));
+                    return Ok(response);
+                }
             }
 
             Err(http::Response::builder()

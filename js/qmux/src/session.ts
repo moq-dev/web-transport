@@ -74,17 +74,58 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 export interface SessionOptions extends WebTransportOptions {
 	/** Application-level subprotocols to request during the WebSocket handshake.
 	 *
-	 * Each protocol is prefixed with `qmux-01.`, `qmux-00.`, and `webtransport.` on the wire.
+	 * Each protocol is prefixed with version-specific prefixes on the wire.
 	 */
 	protocols?: string[];
 
 	/** QMux flow control configuration. Only used when the QMux wire format is negotiated. */
 	config?: Config;
+
+	/** Pin a specific QMux version.
+	 *
+	 * When set, only subprotocols for this version are offered during negotiation,
+	 * and the session always uses this version regardless of the negotiated subprotocol.
+	 *
+	 * For example, if moq-transport-17 always uses qmux-00:
+	 * ```ts
+	 * new Session(url, { version: "qmux-00", protocols: ["moq-transport-17"] })
+	 * ```
+	 */
+	version?: Version;
 }
 
 const PREFIX_WEBTRANSPORT = "webtransport.";
 const PREFIX_QMUX_00 = "qmux-00.";
 const PREFIX_QMUX_01 = "qmux-01.";
+
+/** All versions in preference order. */
+const ALL_VERSIONS: Version[] = ["qmux-01", "qmux-00", "webtransport"];
+
+/** Get the ALPN/subprotocol prefix for a version. */
+function versionPrefix(version: Version): string {
+	switch (version) {
+		case "qmux-01":
+			return PREFIX_QMUX_01;
+		case "qmux-00":
+			return PREFIX_QMUX_00;
+		case "webtransport":
+			return PREFIX_WEBTRANSPORT;
+	}
+}
+
+/** Parse a negotiated subprotocol into [version, appProtocol]. */
+function parseAlpn(raw: string, pin?: Version): [Version, string] {
+	for (const version of ALL_VERSIONS) {
+		const prefix = versionPrefix(version);
+		if (raw.startsWith(prefix)) {
+			return [pin ?? version, raw.slice(prefix.length)];
+		}
+		if (raw === version) {
+			return [pin ?? version, ""];
+		}
+	}
+	return [pin ?? "webtransport", ""];
+}
 
 /** Per-stream flow control state. */
 interface StreamFlowState {
@@ -170,22 +211,28 @@ export default class Session implements WebTransport {
 		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
 		this.#ourParams = configToTransportParams(this.#config);
 
-		// Offer qmux-01, qmux-00, and webtransport prefixed protocols, preferring qmux-01
+		const pinVersion = options?.version;
 		const appProtocols = options?.protocols ?? [];
-		const prefixed = new Set<string>(["qmux-01", "qmux-00", "webtransport"]);
-		for (const p of appProtocols) {
-			const stripped = p.startsWith(PREFIX_WEBTRANSPORT)
-				? p.slice(PREFIX_WEBTRANSPORT.length)
-				: p.startsWith(PREFIX_QMUX_01)
-					? p.slice(PREFIX_QMUX_01.length)
-					: p.startsWith(PREFIX_QMUX_00)
-						? p.slice(PREFIX_QMUX_00.length)
-						: p;
-			prefixed.add(`${PREFIX_QMUX_01}${stripped}`);
-			prefixed.add(`${PREFIX_QMUX_00}${stripped}`);
-			prefixed.add(`${PREFIX_WEBTRANSPORT}${stripped}`);
+
+		// Build subprotocol list, filtered to pinned version if set
+		const versions = pinVersion ? [pinVersion] : ALL_VERSIONS;
+		const prefixed: string[] = [];
+		for (const v of versions) {
+			const prefix = versionPrefix(v);
+			prefixed.push(v); // bare ALPN
+			for (const p of appProtocols) {
+				// Strip any existing prefix
+				const stripped = p.startsWith(PREFIX_WEBTRANSPORT)
+					? p.slice(PREFIX_WEBTRANSPORT.length)
+					: p.startsWith(PREFIX_QMUX_01)
+						? p.slice(PREFIX_QMUX_01.length)
+						: p.startsWith(PREFIX_QMUX_00)
+							? p.slice(PREFIX_QMUX_00.length)
+							: p;
+				prefixed.push(`${prefix}${stripped}`);
+			}
 		}
-		this.#ws = new WebSocket(url, [...prefixed]);
+		this.#ws = new WebSocket(url, prefixed);
 
 		// Initialize credits — will be adjusted when version is detected
 		this.#connCredit = new Credit(0n);
@@ -204,27 +251,10 @@ export default class Session implements WebTransport {
 
 		this.#ws.binaryType = "arraybuffer";
 		this.#ws.onopen = () => {
-			// Detect version from the negotiated subprotocol
-			const raw = this.#ws.protocol;
-			if (raw.startsWith(PREFIX_QMUX_01)) {
-				this.#version = "qmux-01";
-				this.#protocol = raw.slice(PREFIX_QMUX_01.length);
-			} else if (raw === "qmux-01") {
-				this.#version = "qmux-01";
-				this.#protocol = "";
-			} else if (raw.startsWith(PREFIX_QMUX_00)) {
-				this.#version = "qmux-00";
-				this.#protocol = raw.slice(PREFIX_QMUX_00.length);
-			} else if (raw.startsWith(PREFIX_WEBTRANSPORT)) {
-				this.#version = "webtransport";
-				this.#protocol = raw.slice(PREFIX_WEBTRANSPORT.length);
-			} else if (raw === "qmux-00") {
-				this.#version = "qmux-00";
-				this.#protocol = "";
-			} else {
-				this.#version = "webtransport";
-				this.#protocol = "";
-			}
+			// Detect version from the negotiated subprotocol, respecting pinned version
+			const [version, protocol] = parseAlpn(this.#ws.protocol, pinVersion);
+			this.#version = version;
+			this.#protocol = protocol;
 
 			if (isQmux(this.#version)) {
 				this.#recvDataMax = this.#ourParams.initialMaxData;

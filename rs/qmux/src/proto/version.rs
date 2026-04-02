@@ -18,4 +18,25 @@ impl Version {
     pub fn is_qmux(self) -> bool {
         matches!(self, Version::QMux00 | Version::QMux01)
     }
+
+    /// The bare ALPN identifier for this version (e.g. `"qmux-01"`).
+    pub fn alpn(self) -> &'static str {
+        match self {
+            Version::WebTransport => "webtransport",
+            Version::QMux00 => "qmux-00",
+            Version::QMux01 => "qmux-01",
+        }
+    }
+
+    /// The ALPN/subprotocol prefix for this version (e.g. `"qmux-01."`).
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Version::WebTransport => "webtransport.",
+            Version::QMux00 => "qmux-00.",
+            Version::QMux01 => "qmux-01.",
+        }
+    }
+
+    /// All supported versions, in preference order (newest first).
+    pub const ALL: &[Version] = &[Version::QMux01, Version::QMux00, Version::WebTransport];
 }
