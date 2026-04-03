@@ -35,4 +35,12 @@ web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
+anyhow = "1"
 tokio = { version = "1", features = ["full"] }
+url = "2"
+web-transport-proto = { workspace = true }
+web-transport-trait = { workspace = true }
+
+[[example]]
+name = "h3qx"
+required-features = ["tcp"]
