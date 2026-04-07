@@ -184,6 +184,12 @@ impl Request {
         &self.conn
     }
 
+    /// The remote peer's address.
+    #[deprecated(note = "use conn().remote_address() instead")]
+    pub fn remote_address(&self) -> std::net::SocketAddr {
+        self.conn.remote_address()
+    }
+
     /// Returns the CONNECT request that was sent by the client.
     ///
     /// DEPRECATED: You can access this via the Deref impl.
