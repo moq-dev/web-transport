@@ -179,7 +179,13 @@ impl Request {
         Ok(())
     }
 
+    /// Returns the underlying QUIC connection.
+    pub fn conn(&self) -> &quinn::Connection {
+        &self.conn
+    }
+
     /// The remote peer's address.
+    #[deprecated(note = "use conn().remote_address() instead")]
     pub fn remote_address(&self) -> std::net::SocketAddr {
         self.conn.remote_address()
     }

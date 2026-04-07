@@ -38,6 +38,11 @@ impl Request {
         Ok(Connection::new(self.conn, self.settings, connect))
     }
 
+    /// Returns the underlying QUIC connection.
+    pub fn conn(&self) -> &ez::Connection {
+        &self.conn
+    }
+
     /// Reject the session, returing your favorite HTTP status code.
     pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
         self.connect.reject(status).await?;
