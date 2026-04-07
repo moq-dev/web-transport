@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport", "websocket", "polyfill"]
@@ -19,7 +19,7 @@ rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots", "qmux/ws
 [dependencies]
 bytes = "1"
 futures = "0.3"
-qmux = { path = "../qmux", version = "0.0.5", default-features = false, features = ["ws"] }
+qmux = { path = "../qmux", version = "0.0.6", default-features = false, features = ["ws"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tokio-tungstenite = "0.28"
 web-transport-trait = { workspace = true }
