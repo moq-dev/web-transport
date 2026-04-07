@@ -227,7 +227,7 @@ pub struct SessionRequest {
 impl SessionRequest {
     pub fn new(request: web_transport_quinn::Request) -> Self {
         let url = request.url.to_string();
-        let addr = request.remote_address();
+        let addr = request.conn().remote_address();
         Self {
             inner: Some(request),
             url,

@@ -39,8 +39,8 @@ impl Request {
     }
 
     /// Returns the underlying QUIC connection.
-    pub fn conn(&self) -> ez::Connection {
-        self.conn.clone()
+    pub fn conn(&self) -> &ez::Connection {
+        &self.conn
     }
 
     /// Reject the session, returing your favorite HTTP status code.

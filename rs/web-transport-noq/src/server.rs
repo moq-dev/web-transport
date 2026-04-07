@@ -178,8 +178,8 @@ impl Request {
     }
 
     /// Returns the underlying QUIC connection.
-    pub fn conn(&self) -> noq::Connection {
-        self.conn.clone()
+    pub fn conn(&self) -> &noq::Connection {
+        &self.conn
     }
 
     /// Returns the CONNECT request that was sent by the client.
