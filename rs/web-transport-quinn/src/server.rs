@@ -179,9 +179,9 @@ impl Request {
         Ok(())
     }
 
-    /// The remote peer's address.
-    pub fn remote_address(&self) -> std::net::SocketAddr {
-        self.conn.remote_address()
+    /// Returns the underlying QUIC connection.
+    pub fn conn(&self) -> quinn::Connection {
+        self.conn.clone()
     }
 
     /// Returns the CONNECT request that was sent by the client.

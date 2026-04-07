@@ -177,6 +177,11 @@ impl Request {
         Ok(())
     }
 
+    /// Returns the underlying QUIC connection.
+    pub fn conn(&self) -> noq::Connection {
+        self.conn.clone()
+    }
+
     /// Returns the CONNECT request that was sent by the client.
     ///
     /// DEPRECATED: You can access this via the Deref impl.
