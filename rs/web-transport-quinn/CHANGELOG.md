@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.9](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.8...web-transport-quinn-v0.11.9) - 2026-04-07
+
+### Other
+
+- Expose conn() by reference and fix Python bindings ([#227](https://github.com/moq-dev/web-transport/pull/227))
+- Add Python bindings for web-transport-quinn via PyO3 ([#216](https://github.com/moq-dev/web-transport/pull/216))
+- Bound close_with_capsule graceful-close sequence with timeout ([#217](https://github.com/moq-dev/web-transport/pull/217))
+- Fix a minor regression in map_error ([#215](https://github.com/moq-dev/web-transport/pull/215))
+
 ## [0.11.8](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.7...web-transport-quinn-v0.11.8) - 2026-03-11
 
 ### Added

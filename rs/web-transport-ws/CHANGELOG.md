@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.3.4...web-transport-ws-v0.3.5) - 2026-04-07
+
+### Other
+
+- Split monorepo into rs/ and js/ top-level directories ([#202](https://github.com/moq-dev/web-transport/pull/202))
+
 ## [0.3.4](https://github.com/moq-dev/web-transport/compare/web-transport-ws-v0.3.3...web-transport-ws-v0.3.4) - 2026-03-13
 
 ### Other
