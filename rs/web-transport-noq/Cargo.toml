@@ -23,7 +23,7 @@ ring = ["noq/ring", "rustls/ring"]
 bytes = "1"
 futures = "0.3"
 http = "1"
-noq = { version = "0.17.0", default-features = false, features = [
+noq = { version = "0.18.0", default-features = false, features = [
     "tracing-log",
     "platform-verifier",
     "runtime-tokio",
