@@ -11,9 +11,9 @@ keywords = ["quic", "http3", "webtransport", "iroh"]
 categories = ["network-programming", "web-programming"]
 
 [features]
-default = ["ring"]
-ring = ["iroh/tls-ring"]
-aws-lc-rs = ["iroh/tls-aws-lc-rs"]
+default = ["tls-ring"]
+tls-ring = ["iroh/tls-ring"]
+tls-aws-lc-rs = ["iroh/tls-aws-lc-rs"]
 
 [dependencies]
 bytes = "1"
