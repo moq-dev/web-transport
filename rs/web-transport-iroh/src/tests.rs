@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use iroh::{Endpoint, endpoint::ConnectionError};
+use iroh::{Endpoint, endpoint::ConnectionError, endpoint::presets};
 use n0_tracing_test::traced_test;
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -11,7 +11,7 @@ use crate::{ALPN_H3, Client, H3Request, QuicRequest, SessionError};
 #[tokio::test]
 #[traced_test]
 async fn h3_smoke() -> n0_error::Result<()> {
-    let client = Endpoint::empty_builder()
+    let client = Endpoint::builder(presets::Empty)
         .bind()
         .instrument(tracing::error_span!("client-ep"))
         .await
@@ -19,7 +19,7 @@ async fn h3_smoke() -> n0_error::Result<()> {
     let client_id = client.id();
     let client = Client::new(client);
 
-    let server = Endpoint::empty_builder()
+    let server = Endpoint::builder(presets::Empty)
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .instrument(tracing::error_span!("server-ep"))
@@ -89,11 +89,11 @@ async fn h3_smoke() -> n0_error::Result<()> {
 async fn quic_smoke() -> n0_error::Result<()> {
     const ALPN: &str = "moql";
 
-    let client = Endpoint::empty_builder().bind().await.unwrap();
+    let client = Endpoint::builder(presets::Empty).bind().await.unwrap();
     let client_id = client.id();
     let client = Client::new(client);
 
-    let server = Endpoint::empty_builder()
+    let server = Endpoint::builder(presets::Empty)
         .alpns(vec![ALPN.as_bytes().to_vec()])
         .bind()
         .await
