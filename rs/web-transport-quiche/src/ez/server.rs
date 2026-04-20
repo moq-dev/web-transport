@@ -288,13 +288,31 @@ impl<M: Metrics> Server<M> {
 
             let accept_bi = flume::unbounded();
             let accept_uni = flume::unbounded();
+            let dgram_in = flume::unbounded();
+            let dgram_out = flume::unbounded();
+            let dgram_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let state = Lock::new(DriverState::new(true));
             state.lock().set_server_name(server_name);
-            let session = Driver::new(state.clone(), accept_bi.0, accept_uni.0);
+            let session = Driver::new(
+                state.clone(),
+                accept_bi.0,
+                accept_uni.0,
+                dgram_in.0,
+                dgram_out.1,
+                dgram_max.clone(),
+            );
 
             let inner = initial.start(session);
-            let connection = Connection::new(inner, state.clone(), accept_bi.1, accept_uni.1);
+            let connection = Connection::new(
+                inner,
+                state.clone(),
+                accept_bi.1,
+                accept_uni.1,
+                dgram_in.1,
+                dgram_out.0,
+                dgram_max,
+            );
             let incoming = Incoming {
                 connection,
                 driver: state,

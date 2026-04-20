@@ -1,11 +1,17 @@
 use std::{
-    collections::{hash_map, HashMap, HashSet},
+    collections::{hash_map, HashMap, HashSet, VecDeque},
     future::poll_fn,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Poll, Waker},
 };
+use bytes::Bytes;
 use tokio_quiche::{
     buf_factory::{BufFactory, PooledBuf},
     quic::{HandshakeInfo, QuicheConnection},
+    quiche,
 };
 
 use crate::ez::Lock;
@@ -123,6 +129,12 @@ impl DriverState {
         std::mem::take(&mut self.handshake_wakers)
     }
 
+    /// Take the driver's waker, if any. The caller is responsible for waking it.
+    #[must_use = "wake the driver"]
+    pub fn wake(&mut self) -> Option<Waker> {
+        self.waker.take()
+    }
+
     #[must_use = "wake the driver"]
     pub fn send(&mut self, stream_id: StreamId) -> Option<Waker> {
         if !self.send.insert(stream_id) {
@@ -199,6 +211,14 @@ pub(super) struct Driver {
 
     accept_bi: flume::Sender<(SendStream, RecvStream)>,
     accept_uni: flume::Sender<RecvStream>,
+
+    // Datagrams.
+    dgram_in: flume::Sender<Bytes>,
+    dgram_out: flume::Receiver<Bytes>,
+    // Holds datagrams that quiche refused because its outbound queue was full.
+    dgram_pending: VecDeque<Bytes>,
+    // Published on every `process_writes`, read by the application side.
+    dgram_max: Arc<AtomicUsize>,
 }
 
 impl Driver {
@@ -206,6 +226,9 @@ impl Driver {
         state: Lock<DriverState>,
         accept_bi: flume::Sender<(SendStream, RecvStream)>,
         accept_uni: flume::Sender<RecvStream>,
+        dgram_in: flume::Sender<Bytes>,
+        dgram_out: flume::Receiver<Bytes>,
+        dgram_max: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             state,
@@ -214,6 +237,10 @@ impl Driver {
             buf: BufFactory::get_max_buf(),
             accept_bi,
             accept_uni,
+            dgram_in,
+            dgram_out,
+            dgram_pending: VecDeque::new(),
+            dgram_max,
         }
     }
 
@@ -398,6 +425,8 @@ impl Driver {
             return Poll::Pending;
         }
 
+        let dgram_work = !self.dgram_out.is_empty() || !self.dgram_pending.is_empty();
+
         let (sleep, send, recv, bi_wakers, uni_wakers) = {
             let mut driver = self.state.lock();
             driver.waker = Some(waker.clone());
@@ -405,7 +434,8 @@ impl Driver {
             let sleep = driver.bi.create.is_empty()
                 && driver.uni.create.is_empty()
                 && driver.send.is_empty()
-                && driver.recv.is_empty();
+                && driver.recv.is_empty()
+                && !dgram_work;
 
             for (id, (send, recv)) in driver.bi.create.drain(..) {
                 qconn.stream_send(id.into(), &[], false)?;
@@ -554,6 +584,24 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         if let Err(e) = self.read(qconn) {
             self.abort(e);
+            return Ok(());
+        }
+
+        // Drain any incoming datagrams into the application-side flume channel.
+        loop {
+            match qconn.dgram_recv_vec() {
+                Ok(buf) => {
+                    if self.dgram_in.try_send(Bytes::from(buf)).is_err() {
+                        // Receiver dropped — connection gone or not interested.
+                        break;
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(err) => {
+                    tracing::trace!(?err, "ignoring datagram recv error");
+                    break;
+                }
+            }
         }
 
         Ok(())
@@ -562,6 +610,41 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         if let Err(e) = self.write(qconn) {
             self.abort(e);
+            return Ok(());
+        }
+
+        // Publish the current writable MTU so the application can size frames.
+        self.dgram_max.store(
+            qconn.dgram_max_writable_len().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+
+        // Retry anything that didn't fit last time before accepting new datagrams.
+        while let Some(buf) = self.dgram_pending.front() {
+            match qconn.dgram_send(buf) {
+                Ok(()) => {
+                    self.dgram_pending.pop_front();
+                }
+                Err(quiche::Error::Done) => return Ok(()),
+                Err(err) => {
+                    tracing::trace!(?err, "dropping pending datagram");
+                    self.dgram_pending.pop_front();
+                }
+            }
+        }
+
+        // Drain freshly-queued datagrams from the application side.
+        while let Ok(buf) = self.dgram_out.try_recv() {
+            match qconn.dgram_send(&buf) {
+                Ok(()) => {}
+                Err(quiche::Error::Done) => {
+                    self.dgram_pending.push_back(buf);
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::trace!(?err, "dropping outbound datagram");
+                }
+            }
         }
 
         Ok(())
