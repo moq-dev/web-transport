@@ -16,15 +16,21 @@ all-features = true
 
 [features]
 default = ["aws-lc-rs"]
-aws-lc-rs = ["rustls/aws-lc-rs"]
-ring = ["rustls/ring"]
+aws-lc-rs = ["rustls/aws-lc-rs", "noq/aws-lc-rs"]
+ring = ["rustls/ring", "noq/ring"]
 
 [dependencies]
 bytes = "1"
 futures = "0.3"
 http = "1"
 
-noq = "0.18.0"
+noq = { version = "0.18.0", default-features = false, features = [
+    "tracing-log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls",
+    "bloom",
+] }
 
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
