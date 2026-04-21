@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.3.0...web-transport-iroh-v0.4.0) - 2026-04-21
+
+### Other
+
+- bump web-transport-iroh to 0.4.0 ([#232](https://github.com/moq-dev/web-transport/pull/232))
+- update to iroh 0.98 and noq 0.18 ([#230](https://github.com/moq-dev/web-transport/pull/230))
+
 ## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.2.2...web-transport-iroh-v0.3.0) - 2026-03-31
 
 ### Deps
