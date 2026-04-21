@@ -2,9 +2,13 @@ use std::sync::Arc;
 use std::{
     future::poll_fn,
     ops::Deref,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     task::{Poll, Waker},
 };
+use bytes::Bytes;
 use thiserror::Error;
 use tokio_quiche::quiche;
 
@@ -118,6 +122,12 @@ pub struct Connection {
     accept_bi: flume::Receiver<(SendStream, RecvStream)>,
     accept_uni: flume::Receiver<RecvStream>,
 
+    // Datagram plumbing. All channels are unbounded; drops are observed via
+    // the `close` handle, not the channel errors.
+    dgram_in: flume::Receiver<Bytes>,
+    dgram_out: flume::Sender<Bytes>,
+    dgram_max: Arc<AtomicUsize>,
+
     driver: Lock<DriverState>,
 
     // Held in an Arc so we can use Drop when all references are dropped.
@@ -130,6 +140,9 @@ impl Connection {
         driver: Lock<DriverState>,
         accept_bi: flume::Receiver<(SendStream, RecvStream)>,
         accept_uni: flume::Receiver<RecvStream>,
+        dgram_in: flume::Receiver<Bytes>,
+        dgram_out: flume::Sender<Bytes>,
+        dgram_max: Arc<AtomicUsize>,
     ) -> Self {
         let close = Arc::new(ConnectionClose::new(driver.clone()));
 
@@ -137,6 +150,9 @@ impl Connection {
             inner: Arc::new(conn),
             accept_bi,
             accept_uni,
+            dgram_in,
+            dgram_out,
+            dgram_max,
             driver,
             close,
         }
@@ -184,6 +200,51 @@ impl Connection {
 
         let send = SendStream::new(id, send, self.driver.clone());
         Ok(send)
+    }
+
+    /// Receive the next application datagram from the remote peer.
+    ///
+    /// Waits until a datagram arrives or the connection is closed.
+    pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
+        tokio::select! {
+            res = self.dgram_in.recv_async() => match res {
+                Ok(bytes) => Ok(bytes),
+                // Sender dropped — the driver closed; surface the close reason.
+                Err(_) => Err(self.closed().await),
+            },
+            err = self.closed() => Err(err),
+        }
+    }
+
+    /// Queue an application datagram for the driver to send.
+    ///
+    /// Datagrams are unreliable. If quiche's outbound queue is full the driver
+    /// will either back off (buffering locally) or drop the datagram on hard
+    /// errors. This call itself only fails if the driver is already gone.
+    pub fn send_datagram(&self, data: Bytes) -> Result<(), ConnectionError> {
+        self.dgram_out
+            .send(data)
+            .map_err(|_| ConnectionError::Dropped)?;
+
+        // Nudge the driver so it picks up the new datagram on the next poll.
+        let waker = self.driver.lock().wake();
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Ok(())
+    }
+
+    /// Maximum size of a datagram that can be sent right now.
+    ///
+    /// Returns `None` before the handshake completes or when datagrams are
+    /// disabled in the peer's transport parameters.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        let v = self.dgram_max.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
     }
 
     /// Immediately close the connection with an error code and reason.
