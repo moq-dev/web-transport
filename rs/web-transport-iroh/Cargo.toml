@@ -34,6 +34,6 @@ web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
+iroh = { version = "0.98", features = ["tls-ring"] }
 n0-tracing-test = "0.3.0"
 tokio = { version = "1", features = ["full"] }
-iroh = { version = "0.98", features = ["tls-ring"] }
