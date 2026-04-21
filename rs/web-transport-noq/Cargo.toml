@@ -28,7 +28,7 @@ noq = { version = "0.18.0", default-features = false, features = [
     "platform-verifier",
     "runtime-tokio",
     "rustls",
-    "bloom"
+    "bloom",
 ] }
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
