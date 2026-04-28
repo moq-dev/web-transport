@@ -39,6 +39,16 @@ const session = new Session("https://localhost:4443", {
 });
 ```
 
+### Subprotocol negotiation
+
+```ts
+const session = new Session("https://example.com:4443/path", {
+	protocols: ["moqt-16"],
+});
+await session.ready;
+console.log(session.protocol); // "moqt-16" (server-selected)
+```
+
 ### Polyfill
 
 Install `Session` as the global `WebTransport` for libraries that expect the browser API:

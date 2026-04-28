@@ -64,13 +64,23 @@ impl NapiClient {
 
     /// Connect to a WebTransport server at the given URL.
     #[napi]
-    pub async fn connect(&self, url_str: String) -> Result<NapiSession> {
+    pub async fn connect(
+        &self,
+        url_str: String,
+        options: Option<NapiConnectOptions>,
+    ) -> Result<NapiSession> {
         let url: url::Url = url_str
             .parse()
             .map_err(|e: url::ParseError| Error::from_reason(e.to_string()))?;
+        let mut request = web_transport_quinn::proto::ConnectRequest::new(url);
+        if let Some(opts) = options {
+            if let Some(protocols) = opts.protocols {
+                request = request.with_protocols(protocols);
+            }
+        }
         let session = self
             .inner
-            .connect(url)
+            .connect(request)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
@@ -78,6 +88,13 @@ impl NapiClient {
             closed: Mutex::new(None),
         })
     }
+}
+
+/// Options for connecting to a WebTransport server.
+#[napi(object)]
+pub struct NapiConnectOptions {
+    /// Subprotocols for WT-Available-Protocols negotiation.
+    pub protocols: Option<Vec<String>>,
 }
 
 /// A WebTransport server that accepts incoming sessions.
@@ -243,6 +260,12 @@ impl NapiBiStream {
 
 #[napi]
 impl NapiSession {
+    /// The subprotocol selected by the server during WT-Available-Protocols negotiation.
+    #[napi(getter)]
+    pub fn protocol(&self) -> Option<String> {
+        self.inner.response().protocol.clone()
+    }
+
     /// Accept an incoming unidirectional stream.
     #[napi]
     pub async fn accept_uni(&self) -> Result<NapiRecvStream> {

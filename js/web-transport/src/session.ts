@@ -91,8 +91,10 @@ export default class Session implements WebTransport {
 				client = NapiClient.withSystemRoots();
 			}
 
+			const connectOptions = options?.protocols ? { protocols: options.protocols } : null;
+
 			client
-				.connect(url)
+				.connect(url, connectOptions)
 				.then((session) => {
 					// Check if close() was called before connect completed.
 					if (this.#pendingClose) {
@@ -117,6 +119,10 @@ export default class Session implements WebTransport {
 					closed.resolve({ closeCode: 0, reason: String(err) });
 				});
 		}
+	}
+
+	get protocol(): string {
+		return this.#session?.protocol ?? "";
 	}
 
 	get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {

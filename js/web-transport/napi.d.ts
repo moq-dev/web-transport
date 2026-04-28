@@ -20,7 +20,7 @@ export declare class NapiClient {
 	/** Create a client that validates server certificates by SHA-256 hash. */
 	static withCertificateHashes(hashes: Array<Buffer>): NapiClient;
 	/** Connect to a WebTransport server at the given URL. */
-	connect(urlStr: string): Promise<NapiSession>;
+	connect(urlStr: string, options?: NapiConnectOptions | undefined | null): Promise<NapiSession>;
 }
 
 /** A receive stream for reading data. */
@@ -65,6 +65,8 @@ export declare class NapiServer {
 
 /** An established WebTransport session. */
 export declare class NapiSession {
+	/** The subprotocol selected by the server during WT-Available-Protocols negotiation. */
+	get protocol(): string | null;
 	/** Accept an incoming unidirectional stream. */
 	acceptUni(): Promise<NapiRecvStream>;
 	/** Accept an incoming bidirectional stream. */
@@ -83,6 +85,12 @@ export declare class NapiSession {
 	close(code: number, reason: string): void;
 	/** Wait for the session to close, returning close info matching W3C WebTransportCloseInfo. */
 	closed(): Promise<NapiCloseInfo>;
+}
+
+/** Options for connecting to a WebTransport server. */
+export interface NapiConnectOptions {
+	/** Subprotocols for WT-Available-Protocols negotiation. */
+	protocols?: Array<string> | undefined | null;
 }
 
 /** Info about why a session was closed, matching W3C WebTransportCloseInfo. */
