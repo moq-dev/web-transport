@@ -207,14 +207,52 @@ pub(crate) use stream_transport::StreamTransport;
 // WsTransport: message I/O over WebSocket.
 #[cfg(feature = "ws")]
 mod ws_transport {
+    use std::pin::Pin;
+    use std::time::Duration;
+
     use bytes::Bytes;
+    use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
     use tokio_tungstenite::tungstenite;
 
     use super::Transport;
     use crate::Error;
+    use crate::ws::Keepalive;
 
     pub(crate) struct WsTransport<T> {
         ws: T,
+        keepalive: Option<KeepaliveState>,
+    }
+
+    struct KeepaliveState {
+        // Fires on each interval; we send a Ping when it does.
+        interval: Interval,
+
+        // Resets every time we receive a frame. If it elapses, the peer is gone.
+        deadline: Pin<Box<Sleep>>,
+
+        timeout: Duration,
+    }
+
+    impl KeepaliveState {
+        fn new(config: Keepalive) -> Self {
+            // Skip catch-up bursts after a long pause; we just want one Ping per tick.
+            let mut interval = tokio::time::interval(config.interval);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // First tick fires immediately by default; consume it so we don't ping on connect.
+            interval.reset();
+
+            Self {
+                interval,
+                deadline: Box::pin(tokio::time::sleep(config.timeout)),
+                timeout: config.timeout,
+            }
+        }
+
+        fn observe_recv(&mut self) {
+            self.deadline
+                .as_mut()
+                .reset(Instant::now() + self.timeout);
+        }
     }
 
     impl<T> WsTransport<T>
@@ -226,7 +264,14 @@ mod ws_transport {
             + 'static,
     {
         pub fn new(ws: T) -> Self {
-            Self { ws }
+            Self { ws, keepalive: None }
+        }
+
+        pub fn with_keepalive(ws: T, keepalive: Keepalive) -> Self {
+            Self {
+                ws,
+                keepalive: Some(KeepaliveState::new(keepalive)),
+            }
         }
     }
 
@@ -249,10 +294,45 @@ mod ws_transport {
         }
 
         async fn recv(&mut self) -> Result<Bytes, Error> {
-            use futures::StreamExt;
+            use futures::{SinkExt, StreamExt};
+
+            // Destructure so we can take separate &mut borrows of `ws` and `keepalive`.
+            let Self { ws, keepalive } = self;
 
             loop {
-                let message = self.ws.next().await.ok_or(Error::Closed)??;
+                enum Event<M> {
+                    Message(M),
+                    SendPing,
+                    Timeout,
+                }
+
+                let event = match keepalive {
+                    Some(ka) => tokio::select! {
+                        msg = ws.next() => Event::Message(msg),
+                        _ = ka.interval.tick() => Event::SendPing,
+                        _ = ka.deadline.as_mut() => Event::Timeout,
+                    },
+                    None => Event::Message(ws.next().await),
+                };
+
+                let message = match event {
+                    Event::Message(msg) => msg.ok_or(Error::Closed)??,
+                    Event::SendPing => {
+                        ws.send(tungstenite::Message::Ping(Bytes::new()))
+                            .await
+                            .map_err(|_| Error::Closed)?;
+                        continue;
+                    }
+                    Event::Timeout => {
+                        tracing::debug!("websocket keepalive timeout");
+                        return Err(Error::Closed);
+                    }
+                };
+
+                if let Some(ka) = keepalive.as_mut() {
+                    ka.observe_recv();
+                }
+
                 match message {
                     tungstenite::Message::Binary(data) => {
                         return Ok(data);
@@ -261,9 +341,7 @@ mod ws_transport {
                         return Err(Error::Closed);
                     }
                     tungstenite::Message::Ping(data) => {
-                        use futures::SinkExt;
-                        self.ws
-                            .send(tungstenite::Message::Pong(data))
+                        ws.send(tungstenite::Message::Pong(data))
                             .await
                             .map_err(|_| Error::Closed)?;
                         continue;
