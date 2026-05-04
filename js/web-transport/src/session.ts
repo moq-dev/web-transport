@@ -34,6 +34,8 @@ function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 export interface SessionOptions extends WebTransportOptions {
 	/** Skip all certificate verification. Only use for testing. */
 	serverCertificateDisableVerify?: boolean;
+	/** Subprotocols for WT-Available-Protocols negotiation. */
+	protocols?: string[];
 }
 
 export default class Session implements WebTransport {
