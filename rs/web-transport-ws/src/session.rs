@@ -4,8 +4,8 @@ use qmux::tungstenite;
 ///
 /// # Deprecated
 ///
-/// Use [`qmux::Session`] with [`qmux::ws::accept`] / [`qmux::ws::connect`] instead.
-#[deprecated(note = "use qmux::Session with qmux::ws::accept/connect instead")]
+/// Use [`qmux::Session`] with [`qmux::ws::Bare`] instead.
+#[deprecated(note = "use qmux::Session with qmux::ws::Bare instead")]
 #[derive(Clone)]
 pub struct Session(qmux::Session);
 
@@ -20,7 +20,7 @@ impl Session {
             + Send
             + 'static,
     {
-        Self(qmux::ws::accept(ws, protocol.as_deref()))
+        Self(qmux::ws::Bare::new(ws, protocol.as_deref()).accept())
     }
 
     /// Wrap a pre-upgraded WebSocket as a client-side session.
@@ -32,7 +32,7 @@ impl Session {
             + Send
             + 'static,
     {
-        Self(qmux::ws::connect(ws, protocol.as_deref()))
+        Self(qmux::ws::Bare::new(ws, protocol.as_deref()).connect())
     }
 
     /// Get the inner qmux::Session.

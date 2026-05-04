@@ -215,15 +215,15 @@ mod ws_transport {
     use tokio_tungstenite::tungstenite;
 
     use super::Transport;
+    use crate::ws::KeepAlive;
     use crate::Error;
-    use crate::ws::Keepalive;
 
     pub(crate) struct WsTransport<T> {
         ws: T,
-        keepalive: Option<KeepaliveState>,
+        keepalive: Option<KeepAliveState>,
     }
 
-    struct KeepaliveState {
+    struct KeepAliveState {
         // Fires on each interval; we send a Ping when it does.
         interval: Interval,
 
@@ -233,25 +233,29 @@ mod ws_transport {
         timeout: Duration,
     }
 
-    impl KeepaliveState {
-        fn new(config: Keepalive) -> Self {
+    impl KeepAliveState {
+        fn new(config: KeepAlive) -> Self {
+            // tokio::time::interval panics on a zero Duration, and a deadline shorter than the
+            // interval would fire before the first ping. Floor both to 1ms so a misconfigured
+            // KeepAlive degrades into "very chatty" instead of crashing.
+            let interval_dur = config.interval.max(Duration::from_millis(1));
+            let timeout = config.timeout.max(interval_dur);
+
             // Skip catch-up bursts after a long pause; we just want one Ping per tick.
-            let mut interval = tokio::time::interval(config.interval);
+            let mut interval = tokio::time::interval(interval_dur);
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             // First tick fires immediately by default; consume it so we don't ping on connect.
             interval.reset();
 
             Self {
                 interval,
-                deadline: Box::pin(tokio::time::sleep(config.timeout)),
-                timeout: config.timeout,
+                deadline: Box::pin(tokio::time::sleep(timeout)),
+                timeout,
             }
         }
 
         fn observe_recv(&mut self) {
-            self.deadline
-                .as_mut()
-                .reset(Instant::now() + self.timeout);
+            self.deadline.as_mut().reset(Instant::now() + self.timeout);
         }
     }
 
@@ -264,14 +268,15 @@ mod ws_transport {
             + 'static,
     {
         pub fn new(ws: T) -> Self {
-            Self { ws, keepalive: None }
-        }
-
-        pub fn with_keepalive(ws: T, keepalive: Keepalive) -> Self {
             Self {
                 ws,
-                keepalive: Some(KeepaliveState::new(keepalive)),
+                keepalive: None,
             }
+        }
+
+        pub fn with_keepalive(mut self, keepalive: KeepAlive) -> Self {
+            self.keepalive = Some(KeepAliveState::new(keepalive));
+            self
         }
     }
 
