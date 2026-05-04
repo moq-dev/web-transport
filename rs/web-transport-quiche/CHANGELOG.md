@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.3.0...web-transport-quiche-v0.3.1) - 2026-04-07
+
+### Other
+
+- Expose conn() by reference and fix Python bindings ([#227](https://github.com/moq-dev/web-transport/pull/227))
+- Add NapiClient.disableVerify() and use NAPI tokio runtime ([#205](https://github.com/moq-dev/web-transport/pull/205))
+
 ## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.2.3...web-transport-quiche-v0.3.0) - 2026-03-13
 
 ### Other

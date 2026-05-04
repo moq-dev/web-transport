@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.5...qmux-v0.0.6) - 2026-04-07
+
+### Other
+
+- Fix @moq/qmux publish and build scripts ([#207](https://github.com/moq-dev/web-transport/pull/207))
+- Add NapiClient.disableVerify() and use NAPI tokio runtime ([#205](https://github.com/moq-dev/web-transport/pull/205))
+
 ## [0.0.4](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.3...qmux-v0.0.4) - 2026-03-13
 
 ### Other
