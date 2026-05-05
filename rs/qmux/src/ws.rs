@@ -76,11 +76,12 @@ fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
     (Version::WebTransport, None)
 }
 
-/// Builder for wrapping a pre-upgraded WebSocket as a session.
+/// Wrap a pre-upgraded WebSocket connection as a session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). Call [`Bare::connect`] for a client-side
-/// session or [`Bare::accept`] for a server-side session.
+/// external framework (e.g. axum). Set the negotiated
+/// `sec-websocket-protocol` header value with [`Bare::with_alpn`];
+/// without it, the WebTransport wire format is used.
 pub struct Bare<T> {
     ws: T,
     alpn: Option<String>,
@@ -95,14 +96,18 @@ where
         + Send
         + 'static,
 {
-    /// Wrap the given WebSocket. Pass the negotiated `sec-websocket-protocol`
-    /// header value (or `None` to default to the WebTransport wire format).
-    pub fn new(ws: T, alpn: Option<&str>) -> Self {
+    pub fn new(ws: T) -> Self {
         Self {
             ws,
-            alpn: alpn.map(str::to_string),
+            alpn: None,
             keep_alive: None,
         }
+    }
+
+    /// Set the negotiated `sec-websocket-protocol` value from the handshake.
+    pub fn with_alpn(mut self, alpn: &str) -> Self {
+        self.alpn = Some(alpn.to_string());
+        self
     }
 
     /// Drive a keep-alive Ping/timeout on the WebSocket.

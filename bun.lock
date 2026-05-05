@@ -28,31 +28,18 @@
     },
     "js/web-transport": {
       "name": "@moq/web-transport",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "devDependencies": {
         "@napi-rs/cli": "^3",
         "@types/node": "^24.3.0",
         "typescript": "^5.9.2",
       },
       "optionalDependencies": {
-        "@moq/web-transport-darwin-arm64": "0.1.0",
-        "@moq/web-transport-darwin-x64": "0.1.0",
-        "@moq/web-transport-linux-arm64-gnu": "0.1.0",
-        "@moq/web-transport-linux-x64-gnu": "0.1.0",
-        "@moq/web-transport-win32-x64-msvc": "0.1.0",
-      },
-    },
-    "js/web-transport-ws": {
-      "name": "@moq/web-transport-ws",
-      "version": "0.3.0",
-      "dependencies": {
-        "@moq/qmux": "workspace:*",
-      },
-      "devDependencies": {
-        "@types/node": "^24.3.0",
-        "rimraf": "^6.0.1",
-        "tsx": "^4.20.5",
-        "typescript": "^5.9.2",
+        "@moq/web-transport-darwin-arm64": "0.1.1",
+        "@moq/web-transport-darwin-x64": "0.1.1",
+        "@moq/web-transport-linux-arm64-gnu": "0.1.1",
+        "@moq/web-transport-linux-x64-gnu": "0.1.1",
+        "@moq/web-transport-win32-x64-msvc": "0.1.1",
       },
     },
   },
@@ -193,7 +180,15 @@
 
     "@moq/web-transport": ["@moq/web-transport@workspace:js/web-transport"],
 
-    "@moq/web-transport-ws": ["@moq/web-transport-ws@workspace:js/web-transport-ws"],
+    "@moq/web-transport-darwin-arm64": ["@moq/web-transport-darwin-arm64@0.1.1", "", { "os": "darwin", "cpu": "arm64" }, "sha512-CkE0AkKab+0Yu77riOZsGKwaTytjThYiVon4Pq+2ye8iBC1QHoGddfHBBjvEsgllWOgg3nosb5EIIO8Q3h+2Mg=="],
+
+    "@moq/web-transport-darwin-x64": ["@moq/web-transport-darwin-x64@0.1.1", "", { "os": "darwin", "cpu": "x64" }, "sha512-T0Nk5Fj3SxbeREK9saWVjMirOhQIsaT858sWkBGQgudKGN9SXvOtmtiBMEMsxHUQKtoOw1My33wedsPZJPI5fQ=="],
+
+    "@moq/web-transport-linux-arm64-gnu": ["@moq/web-transport-linux-arm64-gnu@0.1.1", "", { "os": "linux", "cpu": "arm64" }, "sha512-ICdsu3gchDToZmPOhMfgztr9kX1HMRu9bnXdq1sVD1ewplO3q21ftVjSli8WqDAVOdsP8fzNSJ+sVxFzbgU33A=="],
+
+    "@moq/web-transport-linux-x64-gnu": ["@moq/web-transport-linux-x64-gnu@0.1.1", "", { "os": "linux", "cpu": "x64" }, "sha512-1/YvemSqVVUjbzNk4uoSUwmpuuL2iU3A4Ag11FIIxghNpzVG5Ls5qgWhl1uagb4vV7Cv8VIywkpgFGv+jwyJmQ=="],
+
+    "@moq/web-transport-win32-x64-msvc": ["@moq/web-transport-win32-x64-msvc@0.1.1", "", { "os": "win32", "cpu": "x64" }, "sha512-10NJGJ6IM/gfvRs+QdnbT5xWG9JA6ioPQZWVL9y1lp+uDEEpXe17wnkUP+ZT7cvEfxrmgHGdZPBNFyde9hD46w=="],
 
     "@msgpackr-extract/msgpackr-extract-darwin-arm64": ["@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.3", "", { "os": "darwin", "cpu": "arm64" }, "sha512-QZHtlVgbAdy2zAqNA9Gu1UpIuI8Xvsd1v8ic6B2pZmeFnFcMWiPLfWXh7TVw4eGEZ/C9TH281KwhVoeQUKbyjw=="],
 

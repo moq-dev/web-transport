@@ -52,13 +52,11 @@ web-transport  web-transport  web-transport  web-transport
 - **`rs/web-transport-wasm`** — WASM bindings to the browser's native WebTransport API via `wasm-bindgen`.
 - **`rs/web-transport-node`** — NAPI-RS bridge: compiles Rust to `.node` binary for Node.js.
 - **`rs/qmux`** — QMux protocol (draft-ietf-quic-qmux) over TCP/TLS/WebSocket (Rust implementation).
-- **`rs/web-transport-ws`** — **Deprecated**, thin wrapper around qmux.
 
 ### TypeScript Packages (`js/`)
 
 - **`js/qmux`** (`@moq/qmux`) — QMux protocol over WebSocket (TypeScript implementation).
 - **`js/web-transport`** (`@moq/web-transport`) — Node.js WebTransport via NAPI-RS (TS wrapper around `rs/web-transport-node`).
-- **`js/web-transport-ws`** (`@moq/web-transport-ws`) — **Deprecated**, thin wrapper around `@moq/qmux`.
 - **`js/web-demo`** — Browser demo app.
 
 ### WASM Considerations
