@@ -220,7 +220,7 @@ mod ws_transport {
 
     pub(crate) struct WsTransport<T> {
         ws: T,
-        keepalive: Option<KeepAliveState>,
+        keep_alive: Option<KeepAliveState>,
     }
 
     struct KeepAliveState {
@@ -270,12 +270,12 @@ mod ws_transport {
         pub fn new(ws: T) -> Self {
             Self {
                 ws,
-                keepalive: None,
+                keep_alive: None,
             }
         }
 
-        pub fn with_keepalive(mut self, keepalive: KeepAlive) -> Self {
-            self.keepalive = Some(KeepAliveState::new(keepalive));
+        pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+            self.keep_alive = Some(KeepAliveState::new(keep_alive));
             self
         }
     }
@@ -301,8 +301,8 @@ mod ws_transport {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             use futures::{SinkExt, StreamExt};
 
-            // Destructure so we can take separate &mut borrows of `ws` and `keepalive`.
-            let Self { ws, keepalive } = self;
+            // Destructure so we can take separate &mut borrows of `ws` and `keep_alive`.
+            let Self { ws, keep_alive } = self;
 
             loop {
                 enum Event<M> {
@@ -311,7 +311,7 @@ mod ws_transport {
                     Timeout,
                 }
 
-                let event = match keepalive {
+                let event = match keep_alive {
                     Some(ka) => tokio::select! {
                         msg = ws.next() => Event::Message(msg),
                         _ = ka.interval.tick() => Event::SendPing,
@@ -329,12 +329,12 @@ mod ws_transport {
                         continue;
                     }
                     Event::Timeout => {
-                        tracing::debug!("websocket keepalive timeout");
+                        tracing::debug!("websocket keep_alive timeout");
                         return Err(Error::Closed);
                     }
                 };
 
-                if let Some(ka) = keepalive.as_mut() {
+                if let Some(ka) = keep_alive.as_mut() {
                     ka.observe_recv();
                 }
 

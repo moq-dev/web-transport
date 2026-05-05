@@ -11,7 +11,7 @@ use crate::{alpn, Config, Error, Session, Version, PREFIX_QMUX, PREFIX_WEBTRANSP
 ///
 /// WebSocket has no built-in idle timeout: when the peer's host crashes
 /// or its network drops without sending a TCP FIN, the local socket
-/// stays "open" until OS-level TCP keepalive eventually probes — typically
+/// stays "open" until OS-level TCP keep_alive eventually probes — typically
 /// hours. Set this to send periodic Pings and close the session if no
 /// frame arrives within `timeout`.
 #[derive(Debug, Clone, Copy)]
@@ -84,7 +84,7 @@ fn parse_alpn(alpn: Option<&str>) -> (Version, Option<String>) {
 pub struct Bare<T> {
     ws: T,
     alpn: Option<String>,
-    keepalive: Option<KeepAlive>,
+    keep_alive: Option<KeepAlive>,
 }
 
 impl<T> Bare<T>
@@ -101,13 +101,13 @@ where
         Self {
             ws,
             alpn: alpn.map(str::to_string),
-            keepalive: None,
+            keep_alive: None,
         }
     }
 
     /// Drive a keep-alive Ping/timeout on the WebSocket.
-    pub fn with_keepalive(mut self, keepalive: KeepAlive) -> Self {
-        self.keepalive = Some(keepalive);
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -125,8 +125,8 @@ where
 
     fn into_transport(self) -> WsTransport<T> {
         let transport = WsTransport::new(self.ws);
-        match self.keepalive {
-            Some(ka) => transport.with_keepalive(ka),
+        match self.keep_alive {
+            Some(ka) => transport.with_keep_alive(ka),
             None => transport,
         }
     }
@@ -140,7 +140,7 @@ where
 pub struct Client {
     protocols: Vec<String>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
-    keepalive: Option<KeepAlive>,
+    keep_alive: Option<KeepAlive>,
     #[cfg(feature = "wss")]
     connector: Option<tokio_tungstenite::Connector>,
 }
@@ -172,9 +172,9 @@ impl Client {
     /// Send periodic Pings and close the session if the peer goes silent.
     ///
     /// WebSocket has no built-in idle timeout, so without this a crashed peer
-    /// stays "connected" until OS-level TCP keepalive eventually probes.
-    pub fn with_keepalive(mut self, keepalive: KeepAlive) -> Self {
-        self.keepalive = Some(keepalive);
+    /// stays "connected" until OS-level TCP keep_alive eventually probes.
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -232,8 +232,8 @@ impl Client {
 
         let (version, protocol) = parse_alpn(negotiated);
 
-        let transport = match self.keepalive {
-            Some(ka) => WsTransport::new(ws_stream).with_keepalive(ka),
+        let transport = match self.keep_alive {
+            Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
             None => WsTransport::new(ws_stream),
         };
         Ok(Session::connect(transport, Config::new(version, protocol)))
@@ -247,7 +247,7 @@ impl Client {
 #[derive(Default, Clone)]
 pub struct Server {
     protocols: Vec<String>,
-    keepalive: Option<KeepAlive>,
+    keep_alive: Option<KeepAlive>,
 }
 
 impl Server {
@@ -271,9 +271,9 @@ impl Server {
     /// Send periodic Pings and close the session if the peer goes silent.
     ///
     /// WebSocket has no built-in idle timeout, so without this a crashed peer
-    /// stays "connected" until OS-level TCP keepalive eventually probes.
-    pub fn with_keepalive(mut self, keepalive: KeepAlive) -> Self {
-        self.keepalive = Some(keepalive);
+    /// stays "connected" until OS-level TCP keep_alive eventually probes.
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -376,8 +376,8 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
-        let transport = match self.keepalive {
-            Some(ka) => WsTransport::new(ws).with_keepalive(ka),
+        let transport = match self.keep_alive {
+            Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
             None => WsTransport::new(ws),
         };
         Ok(Session::accept(transport, Config::new(version, protocol)))
