@@ -345,15 +345,12 @@ mod ws_transport {
                     tungstenite::Message::Close(_) => {
                         return Err(Error::Closed);
                     }
-                    tungstenite::Message::Ping(data) => {
-                        ws.send(tungstenite::Message::Pong(data))
-                            .await
-                            .map_err(|_| Error::Closed)?;
-                        continue;
-                    }
-                    tungstenite::Message::Text(_)
+                    tungstenite::Message::Ping(_)
                     | tungstenite::Message::Pong(_)
+                    | tungstenite::Message::Text(_)
                     | tungstenite::Message::Frame(_) => {
+                        // tungstenite auto-queues a Pong reply when it reads a Ping;
+                        // it gets flushed on our next send/read. No manual reply needed.
                         continue;
                     }
                 }
