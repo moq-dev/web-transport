@@ -34,6 +34,8 @@ function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 export interface SessionOptions extends WebTransportOptions {
 	/** Skip all certificate verification. Only use for testing. */
 	serverCertificateDisableVerify?: boolean;
+	/** Subprotocols for WT-Available-Protocols negotiation. */
+	protocols?: string[];
 }
 
 export default class Session implements WebTransport {
@@ -91,8 +93,10 @@ export default class Session implements WebTransport {
 				client = NapiClient.withSystemRoots();
 			}
 
+			const connectOptions = options?.protocols ? { protocols: options.protocols } : null;
+
 			client
-				.connect(url)
+				.connect(url, connectOptions)
 				.then((session) => {
 					// Check if close() was called before connect completed.
 					if (this.#pendingClose) {
@@ -117,6 +121,10 @@ export default class Session implements WebTransport {
 					closed.resolve({ closeCode: 0, reason: String(err) });
 				});
 		}
+	}
+
+	get protocol(): string {
+		return this.#session?.protocol ?? "";
 	}
 
 	get incomingBidirectionalStreams(): ReadableStream<WebTransportBidirectionalStream> {
