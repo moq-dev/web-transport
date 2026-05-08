@@ -41,16 +41,16 @@ impl RecvStream {
     }
 
     /// Read a chunk of data from the stream. See [`iroh::endpoint::RecvStream::read_chunk`].
-    pub async fn read_chunk(
-        &mut self,
-        max_length: usize,
-    ) -> Result<Option<endpoint::Chunk>, ReadError> {
+    pub async fn read_chunk(&mut self, max_length: usize) -> Result<Option<Bytes>, ReadError> {
         self.inner.read_chunk(max_length).await.map_err(Into::into)
     }
 
-    /// Read chunks of data from the stream. See [`iroh::endpoint::RecvStream::read_chunks`].
-    pub async fn read_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Option<usize>, ReadError> {
-        self.inner.read_chunks(bufs).await.map_err(Into::into)
+    /// Read chunks of data from the stream. See [`iroh::endpoint::RecvStream::read_many_chunks`].
+    pub async fn read_many_chunks(
+        &mut self,
+        bufs: &mut [Bytes],
+    ) -> Result<Option<usize>, ReadError> {
+        self.inner.read_many_chunks(bufs).await.map_err(Into::into)
     }
 
     /// Read until the end of the stream or the limit is hit. See [`iroh::endpoint::RecvStream::read_to_end`].
@@ -95,9 +95,7 @@ impl web_transport_trait::RecvStream for RecvStream {
     }
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        self.read_chunk(max)
-            .await
-            .map(|r| r.map(|chunk| chunk.bytes))
+        self.read_chunk(max).await
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
