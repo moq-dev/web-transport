@@ -58,6 +58,19 @@ impl SendStream {
         self.stream.write_all(buf).await.map_err(Into::into)
     }
 
+    /// Write chunks of data to the stream, returning the number of bytes written.
+    ///
+    /// See [`iroh::endpoint::SendStream::write_many_chunks`].
+    pub async fn write_many_chunks(
+        &mut self,
+        bufs: &mut &mut [Bytes],
+    ) -> Result<usize, WriteError> {
+        self.stream
+            .write_many_chunks(bufs)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Write a chunk of data to the stream. See [`iroh::endpoint::SendStream::write_chunk`].
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
         self.stream.write_chunk(buf).await.map_err(Into::into)

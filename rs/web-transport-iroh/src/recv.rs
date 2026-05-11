@@ -7,7 +7,7 @@ use std::{
 use bytes::Bytes;
 use iroh::endpoint;
 
-use crate::{ReadError, ReadExactError, ReadToEndError, SessionError};
+use crate::{ClosedStream, ReadError, ReadExactError, ReadToEndError, SessionError};
 
 /// A stream that can be used to receive bytes. See [`iroh::endpoint::RecvStream`].
 #[derive(Debug)]
@@ -68,6 +68,14 @@ impl RecvStream {
             Err(endpoint::ResetError::ConnectionLost(e)) => Err(e.into()),
             Err(endpoint::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
+    }
+
+    /// Returns the number of bytes read from this stream.
+    ///
+    /// This is the offset of the next byte to be read, i.e. the length of the contiguous
+    /// prefix of the stream consumed by the application.
+    pub fn bytes_read(&self) -> Result<u64, ClosedStream> {
+        self.inner.bytes_read().map_err(|_| ClosedStream)
     }
 
     // We purposely don't expose the stream ID or 0RTT because it's not valid with WebTransport
