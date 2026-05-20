@@ -1,0 +1,21 @@
+[package]
+name = "web-transport-ffi"
+description = "WebTransport over HTTP/3 — UniFFI bindings for Swift, Kotlin, and Python"
+authors = ["ai-and-i"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "web_transport_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { version = "0.29", features = ["tokio", "cli"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+thiserror = "2"
