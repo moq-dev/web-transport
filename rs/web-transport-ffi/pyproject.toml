@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "web-transport-ffi"
+description = "WebTransport over HTTP/3 — low-level UniFFI bindings"
+authors = [{ name = "ai-and-i" }]
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+classifiers = [
+	"License :: OSI Approved :: Apache Software License",
+	"License :: OSI Approved :: MIT License",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/moq-dev/web-transport"
+
+[tool.maturin]
+bindings = "uniffi"
+manifest-path = "Cargo.toml"
+module-name = "web_transport"
