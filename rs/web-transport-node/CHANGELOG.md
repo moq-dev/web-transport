@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.2...web-transport-node-v0.0.3) - 2026-05-21
+
+### Other
+
+- Wire up W3C protocols option and protocol getter ([#233](https://github.com/moq-dev/web-transport/pull/233))
+
 ## [0.0.2](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.1...web-transport-node-v0.0.2) - 2026-04-07
 
 ### Other

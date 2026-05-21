@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.6...qmux-v0.0.7) - 2026-05-21
+
+### Other
+
+- add Keepalive option for WebSocket transports ([#234](https://github.com/moq-dev/web-transport/pull/234))
+
 ## [0.0.6](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.5...qmux-v0.0.6) - 2026-04-07
 
 ### Other
