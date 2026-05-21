@@ -84,10 +84,6 @@ jobs:
         working-directory: js/qmux
         run: nix develop --command bun run release
 
-      - name: Release @moq/web-transport-ws
-        working-directory: js/web-transport-ws
-        run: nix develop --command bun run release
-
   release-native:
     if: github.repository_owner == 'moq-dev'
     runs-on: ubuntu-latest
