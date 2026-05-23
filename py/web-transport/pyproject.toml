@@ -7,7 +7,7 @@ name = "web-transport-rs"
 dynamic = ["version"]
 description = "Python bindings for WebTransport over HTTP/3 (Rust + UniFFI)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "ai-and-i", email = "ai.and.i.project@gmail.com" }]
 keywords = ["webtransport", "quic", "http3", "asyncio", "networking"]
@@ -20,8 +20,6 @@ classifiers = [
     "Topic :: System :: Networking",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
@@ -44,6 +42,15 @@ module-name = "web_transport._uniffi"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+# UniFFI-generated bindings live at python/web_transport/_uniffi/ after
+# `maturin develop` (and in the wheel). They're vendored, machine-emitted
+# Python — ruff/ty would never agree with the generator's style choices.
+[tool.ruff]
+extend-exclude = ["python/web_transport/_uniffi"]
+
+[tool.ty.src]
+exclude = ["python/web_transport/_uniffi"]
 
 [dependency-groups]
 dev = [
