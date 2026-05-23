@@ -16,8 +16,8 @@ pub enum WebTransportError {
     #[error("connect: {0}")]
     Connect(String),
 
-    #[error("session rejected: HTTP {status_code}: {message}")]
-    SessionRejected { status_code: u16, message: String },
+    #[error("session rejected: HTTP {status_code}: {detail}")]
+    SessionRejected { status_code: u16, detail: String },
 
     #[error("session closed by peer ({closed_by}): {reason}")]
     SessionClosedByPeer {
@@ -225,7 +225,7 @@ pub fn map_client_error(err: web_transport_quinn::ClientError) -> WebTransportEr
             ),
         ) => WebTransportError::SessionRejected {
             status_code: status.as_u16(),
-            message: err.to_string(),
+            detail: err.to_string(),
         },
         _ => WebTransportError::Connect(err.to_string()),
     }

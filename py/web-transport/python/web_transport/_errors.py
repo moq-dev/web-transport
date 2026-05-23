@@ -155,7 +155,7 @@ def reraise(err: BaseException) -> None:
         raise ConnectError(err[0]) from err
 
     if isinstance(err, _uniffi.WebTransportError.SessionRejected):
-        new = SessionRejected(err.message)
+        new = SessionRejected(err.detail)
         new.status_code = err.status_code
         raise new from err
 

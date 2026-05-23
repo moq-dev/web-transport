@@ -83,7 +83,15 @@ if (androidEnabled) {
 
 mavenPublishing {
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
-    signAllPublications()
+    // Only sign when a signing key is actually configured. PR smoke tests run
+    // gradle `:web-transport:publishToMavenLocal` (via kt/scripts/package.sh)
+    // without the SIGNING_* env vars; an unconditional signAllPublications()
+    // would fail those builds with "no configured signatory". The release-kt
+    // workflow always sets ORG_GRADLE_PROJECT_signingInMemoryKey before
+    // publishAndReleaseToMavenCentral, so real releases sign as expected.
+    if (System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey") != null) {
+        signAllPublications()
+    }
     coordinates("dev.moq", "web-transport", version.toString())
 
     pom {
