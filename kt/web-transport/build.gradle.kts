@@ -15,7 +15,13 @@
 //
 // Android target is opt-in via `-Pandroid.enabled=true` so contributors
 // without the Android SDK (or Google maven access) can still build/test
-// the JVM variant. CI always sets the flag.
+// the JVM variant. CI always sets the flag. The Android-specific config is
+// inlined here (gated by androidEnabled) instead of in a separate
+// `apply(from = "android.gradle.kts")` script because Gradle Kotlin DSL
+// doesn't generate type-safe accessors for plugins applied from
+// `apply(from = ...)` files — that path failed in CI with "Unresolved
+// reference: kotlin / androidTarget / compileOptions" once -Pandroid.enabled
+// was set.
 //
 // Publishing uses com.vanniktech.maven.publish, which handles the Sonatype
 // Central Portal upload protocol + GPG signing in a single Gradle task.
@@ -25,20 +31,42 @@
 //   ORG_GRADLE_PROJECT_mavenCentralPassword
 //   ORG_GRADLE_PROJECT_signingInMemoryKey
 //   ORG_GRADLE_PROJECT_signingInMemoryKeyPassword
-// If the signing key isn't set (e.g., local `:web-transport:assemble` without secrets),
-// signAllPublications() becomes a no-op so local builds still work.
+// signAllPublications() is gated on ORG_GRADLE_PROJECT_signingInMemoryKey
+// being present so PR smoke tests (which run publishToMavenLocal without
+// the signing key) don't trip on "no configured signatory".
 
 import com.vanniktech.maven.publish.SonatypeHost
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true"
 
 plugins {
     kotlin("multiplatform") version "2.0.21"
     id("com.vanniktech.maven.publish") version "0.30.0"
+    // AGP needs to be on the buildscript classpath (so the Kotlin DSL
+    // resolves `androidTarget {}`, `LibraryExtension`, `ndk {}`, etc.)
+    // *and* its version pinned here, but `apply false` keeps it off the
+    // project unless `-Pandroid.enabled=true`. The pluginManagement block
+    // in settings.gradle.kts only resolves the plugin marker; the
+    // classpath/types come from this block.
+    id("com.android.library") version "8.7.3" apply false
 }
 
-val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true"
+// AGP is applied imperatively only when the Android target is enabled, so
+// contributors without Google maven access can still build the JVM variant.
+if (androidEnabled) {
+    apply(plugin = "com.android.library")
+}
 
 kotlin {
     jvm()
+
+    if (androidEnabled) {
+        androidTarget {
+            publishLibraryVariants("release")
+            compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
+        }
+    }
 
     @Suppress("UNUSED_VARIABLE")
     sourceSets {
@@ -74,11 +102,42 @@ kotlin {
         val jvmTest by getting {
             dependsOn(jvmAndAndroidTest)
         }
+
+        if (androidEnabled) {
+            val androidMain by getting {
+                dependsOn(jvmAndAndroidMain)
+                dependencies {
+                    implementation("net.java.dev.jna:jna:5.15.0@aar")
+                }
+            }
+            val androidUnitTest by getting {
+                dependsOn(jvmAndAndroidTest)
+            }
+        }
     }
 }
 
 if (androidEnabled) {
-    apply(from = "android.gradle.kts")
+    extensions.configure<com.android.build.gradle.LibraryExtension>("android") {
+        namespace = "dev.moq.webtransport"
+        compileSdk = 35
+        defaultConfig {
+            minSdk = 24
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            }
+        }
+        compileOptions {
+            sourceCompatibility = JavaVersion.VERSION_17
+            targetCompatibility = JavaVersion.VERSION_17
+        }
+        publishing {
+            singleVariant("release") {
+                withSourcesJar()
+            }
+        }
+        sourceSets.getByName("main").jniLibs.srcDirs("src/androidMain/jniLibs")
+    }
 }
 
 mavenPublishing {
