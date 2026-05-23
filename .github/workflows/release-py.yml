@@ -4,17 +4,27 @@ name: Release Py
 # rs/web-transport-ffi/Cargo.toml. The wheel inherits its version from that same
 # Cargo.toml (via maturin's dynamic version), so the web-transport-rs package
 # stays lockstep with the web-transport-ffi crate without a separate bump.
+#
+# Also runs in pull_request mode (paths-filtered) as a smoke test — every
+# job except `publish` is exercised end-to-end, so a broken release-py.yml
+# fails the PR instead of failing the first real release tag.
 
 on:
   push:
     tags:
       - "web-transport-ffi-v*"
+  pull_request:
+    paths:
+      - "rs/web-transport-ffi/**"
+      - "py/web-transport/**"
+      - ".github/workflows/release-py.yml"
+      - ".github/scripts/release.sh"
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-py
+  group: release-py-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -29,14 +39,26 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Parse version from tag
+      - name: Parse version
         id: parse
-        run: .github/scripts/release.sh parse-version web-transport-ffi
+        # PR runs use the in-tree Cargo.toml version (no tag exists). Tag
+        # runs use release.sh, which validates the SemVer in the tag name.
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "PR build, using Cargo.toml version: ${VERSION}"
+          else
+            .github/scripts/release.sh parse-version web-transport-ffi
+          fi
 
   verify-version:
     name: Verify version matches Cargo.toml
     needs: [parse-version]
     runs-on: ubuntu-latest
+    # Tautological on PRs (we sourced the version FROM Cargo.toml). Only
+    # meaningful when a tag is pushed.
+    if: github.event_name != 'pull_request'
 
     steps:
       - uses: actions/checkout@v6
@@ -57,7 +79,7 @@ jobs:
 
   build:
     name: Build wheels (${{ matrix.target }})
-    needs: [parse-version, verify-version]
+    needs: [parse-version]
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -108,7 +130,7 @@ jobs:
 
   sdist:
     name: Build sdist
-    needs: [parse-version, verify-version]
+    needs: [parse-version]
     runs-on: ubuntu-latest
 
     steps:
@@ -131,10 +153,11 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [build, sdist]
+    needs: [build, sdist, verify-version]
     runs-on: ubuntu-latest
-    # Skipped until PUBLISH_PYTHON=true is set in repo variables.
-    if: vars.PUBLISH_PYTHON == 'true'
+    # Tag pushes only, and only once PUBLISH_PYTHON=true is set in repo
+    # variables. PR runs always skip publish.
+    if: github.event_name != 'pull_request' && vars.PUBLISH_PYTHON == 'true'
     environment:
       name: pypi
       url: https://pypi.org/p/web-transport-rs
