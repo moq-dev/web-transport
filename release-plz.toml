@@ -1,5 +1,5 @@
-# Python bindings are released to PyPI via release-py.yml, not crates.io
-[[package]]
-name = "web-transport-python"
-publish = false
-release = false
+# web-transport-ffi is released to crates.io for downstream Rust consumers,
+# and its auto-pushed tag (web-transport-ffi-v*) drives the downstream
+# release-py / release-kt / release-swift workflows that publish the
+# Python wheel, Maven artifact, and GitHub Release XCFramework asset.
+# All other crates use release-plz's defaults.

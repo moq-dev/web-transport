@@ -8,18 +8,18 @@
 use std::sync::LazyLock;
 
 pub(crate) static RUNTIME: LazyLock<tokio::runtime::Handle> = LazyLock::new(|| {
-	let runtime = tokio::runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.expect("failed to build web-transport-ffi runtime");
-	let handle = runtime.handle().clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build web-transport-ffi runtime");
+    let handle = runtime.handle().clone();
 
-	std::thread::Builder::new()
-		.name("web-transport-ffi".into())
-		.spawn(move || {
-			runtime.block_on(std::future::pending::<()>());
-		})
-		.expect("failed to spawn web-transport-ffi runtime thread");
+    std::thread::Builder::new()
+        .name("web-transport-ffi".into())
+        .spawn(move || {
+            runtime.block_on(std::future::pending::<()>());
+        })
+        .expect("failed to spawn web-transport-ffi runtime thread");
 
-	handle
+    handle
 });

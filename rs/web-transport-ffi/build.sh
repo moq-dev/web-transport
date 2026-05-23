@@ -1,191 +1,238 @@
 #!/usr/bin/env bash
-# Packaging script for web-transport-ffi.
-#
-# Modes:
-#   ./build.sh --bindings-only [--version X.Y.Z]
-#       Build for the host target and emit per-language bindings tarballs
-#       (dist/web-transport-ffi-${VERSION}-{python,swift,kotlin}.tar.gz).
-#
-#   ./build.sh --target <triple> [--version X.Y.Z] [--output dist]
-#       Cross-compile native libs for <triple> and emit
-#       dist/web-transport-ffi-${VERSION}-<triple>.{tar.gz,zip}.
-#
-# Special targets:
-#   universal-apple-darwin    — lipo of x86_64 + aarch64 macOS dylib/staticlib.
-#   *-linux-android*          — uses `cargo ndk` with the active NDK.
-#   *-apple-ios*              — staticlib only (no dylib on iOS).
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CRATE_DIR="$SCRIPT_DIR"
-WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CRATE_NAME="web-transport-ffi"
-LIB_BASENAME="web_transport_ffi"
+# Build and package web-transport-ffi native libraries for release.
+# Usage: ./build.sh [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only] [--archive]
+#
+# Examples:
+#   ./build.sh                                    # Build for host, detect version from Cargo.toml
+#   ./build.sh --target aarch64-apple-darwin      # Cross-compile for Apple Silicon
+#   ./build.sh --target aarch64-linux-android     # Cross-compile for Android (requires cargo-ndk)
+#   ./build.sh --bindings-only --output dist      # Build for host and generate bindings only
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+WORKSPACE_DIR="$(cd "$RS_DIR/.." && pwd)"
+
+# Resolve cargo target directory (respects CARGO_TARGET_DIR, .cargo/config, etc.)
+TARGET_BASE_DIR=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps 2>/dev/null \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' \
+    || echo "$WORKSPACE_DIR/target")
+
+# Defaults
 TARGET=""
 VERSION=""
-OUTPUT="$CRATE_DIR/dist"
-BINDINGS_ONLY=0
-
-usage() {
-	cat >&2 <<EOF
-Usage: $0 [--target TRIPLE] [--version X.Y.Z] [--output DIR] [--bindings-only]
-EOF
-	exit 1
-}
+OUTPUT_DIR="dist"
+BINDINGS_ONLY=false
+ARCHIVE=false
 
 while [[ $# -gt 0 ]]; do
-	case "$1" in
-		--target) TARGET="$2"; shift 2 ;;
-		--version) VERSION="$2"; shift 2 ;;
-		--output) OUTPUT="$2"; shift 2 ;;
-		--bindings-only) BINDINGS_ONLY=1; shift ;;
-		-h|--help) usage ;;
-		*) echo "unknown arg: $1" >&2; usage ;;
-	esac
+    case $1 in
+        --target)         TARGET="$2"; shift 2 ;;
+        --version)        VERSION="$2"; shift 2 ;;
+        --output)         OUTPUT_DIR="$2"; shift 2 ;;
+        --bindings-only)  BINDINGS_ONLY=true; shift ;;
+        --archive)        ARCHIVE=true; shift ;;
+        -h|--help)
+            echo "Usage: $0 [--target TARGET] [--version VERSION] [--output DIR] [--bindings-only] [--archive]"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
 done
 
 if [[ -z "$VERSION" ]]; then
-	VERSION="$(grep -m1 '^version' "$CRATE_DIR/Cargo.toml" | sed -E 's/version *= *"([^"]+)"/\1/')"
-fi
-if [[ -z "$VERSION" ]]; then
-	echo "could not determine version" >&2
-	exit 1
+    VERSION=$(grep '^version' "$SCRIPT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    echo "Detected version: $VERSION"
 fi
 
-mkdir -p "$OUTPUT"
-
-host_triple() {
-	rustc -vV | awk '/^host: / { print $2 }'
-}
-
-# Pick the cdylib suffix Rust will emit for the given target triple.
-cdylib_filename() {
-	local triple="$1"
-	case "$triple" in
-		*-apple-darwin|universal-apple-darwin) echo "lib${LIB_BASENAME}.dylib" ;;
-		*-apple-ios*)                          echo "lib${LIB_BASENAME}.a"     ;;  # staticlib only
-		*-windows-*)                           echo "${LIB_BASENAME}.dll"      ;;
-		*)                                     echo "lib${LIB_BASENAME}.so"    ;;
-	esac
-}
-
-staticlib_filename() {
-	local triple="$1"
-	case "$triple" in
-		*-windows-*) echo "${LIB_BASENAME}.lib" ;;
-		*)           echo "lib${LIB_BASENAME}.a" ;;
-	esac
-}
-
-# Build the crate for $1 (target triple) and echo the path to the resulting cdylib
-# (or staticlib for iOS). For universal-apple-darwin this lipos x86_64+aarch64.
-build_target() {
-	local triple="$1"
-	local profile_dir="release"
-
-	if [[ "$triple" == "universal-apple-darwin" ]]; then
-		(cd "$WORKSPACE_DIR" && cargo build --release --target x86_64-apple-darwin -p "$CRATE_NAME")
-		(cd "$WORKSPACE_DIR" && cargo build --release --target aarch64-apple-darwin -p "$CRATE_NAME")
-		local out_dir="$WORKSPACE_DIR/target/universal-apple-darwin/$profile_dir"
-		mkdir -p "$out_dir"
-		lipo -create \
-			"$WORKSPACE_DIR/target/x86_64-apple-darwin/$profile_dir/lib${LIB_BASENAME}.dylib" \
-			"$WORKSPACE_DIR/target/aarch64-apple-darwin/$profile_dir/lib${LIB_BASENAME}.dylib" \
-			-output "$out_dir/lib${LIB_BASENAME}.dylib"
-		lipo -create \
-			"$WORKSPACE_DIR/target/x86_64-apple-darwin/$profile_dir/lib${LIB_BASENAME}.a" \
-			"$WORKSPACE_DIR/target/aarch64-apple-darwin/$profile_dir/lib${LIB_BASENAME}.a" \
-			-output "$out_dir/lib${LIB_BASENAME}.a"
-		echo "$out_dir/lib${LIB_BASENAME}.dylib"
-		return
-	fi
-
-	case "$triple" in
-		*-linux-android*)
-			# cargo-ndk picks the right linker/sysroot from $ANDROID_NDK_HOME.
-			(cd "$WORKSPACE_DIR" && cargo ndk --target "$triple" --platform 24 build --release -p "$CRATE_NAME")
-			;;
-		*)
-			(cd "$WORKSPACE_DIR" && cargo build --release --target "$triple" -p "$CRATE_NAME")
-			;;
-	esac
-
-	local target_dir="$WORKSPACE_DIR/target/$triple/$profile_dir"
-	case "$triple" in
-		*-apple-ios*) echo "$target_dir/$(staticlib_filename "$triple")" ;;
-		*)            echo "$target_dir/$(cdylib_filename "$triple")"    ;;
-	esac
-}
-
-# Package the lib artifacts for $1 (triple) using the build dir of $2 into a tar/zip.
-package_target() {
-	local triple="$1"
-	local lib_path="$2"
-	local target_dir
-	target_dir="$(dirname "$lib_path")"
-
-	local stage
-	stage="$(mktemp -d)"
-	local pkg_name="${CRATE_NAME}-${VERSION}-${triple}"
-	mkdir -p "$stage/$pkg_name"
-
-	# Copy whichever lib flavors exist for this triple.
-	local cd_name sl_name
-	cd_name="$(cdylib_filename "$triple")"
-	sl_name="$(staticlib_filename "$triple")"
-	[[ -f "$target_dir/$cd_name" ]] && cp "$target_dir/$cd_name" "$stage/$pkg_name/"
-	[[ -f "$target_dir/$sl_name" ]] && cp "$target_dir/$sl_name" "$stage/$pkg_name/"
-
-	case "$triple" in
-		*-windows-*)
-			local pdb="$target_dir/${LIB_BASENAME}.pdb"
-			[[ -f "$pdb" ]] && cp "$pdb" "$stage/$pkg_name/"
-			(cd "$stage" && zip -qr "$OUTPUT/${pkg_name}.zip" "$pkg_name")
-			;;
-		*)
-			tar -czf "$OUTPUT/${pkg_name}.tar.gz" -C "$stage" "$pkg_name"
-			;;
-	esac
-
-	rm -rf "$stage"
-}
-
-# Generate bindings for all three languages using the cdylib at $1.
-generate_bindings() {
-	local lib_path="$1"
-	local bindings_root
-	bindings_root="$(mktemp -d)"
-
-	for lang in python swift kotlin; do
-		local out="$bindings_root/$lang"
-		mkdir -p "$out"
-		(cd "$WORKSPACE_DIR" && cargo run --quiet --release -p "$CRATE_NAME" --bin uniffi-bindgen -- \
-			generate --library "$lib_path" --language "$lang" --out-dir "$out") || {
-				# Auto-format warnings (ktlint/swift-format/yapf missing) exit non-zero on some setups; tolerate.
-				echo "warning: bindgen for $lang reported issues — continuing" >&2
-			}
-		local pkg_name="${CRATE_NAME}-${VERSION}-${lang}"
-		tar -czf "$OUTPUT/${pkg_name}.tar.gz" -C "$bindings_root" "$lang" --transform "s|^$lang|$pkg_name|"
-	done
-
-	rm -rf "$bindings_root"
-}
-
-if [[ "$BINDINGS_ONLY" -eq 1 ]]; then
-	host="$(host_triple)"
-	(cd "$WORKSPACE_DIR" && cargo build --release -p "$CRATE_NAME")
-	lib_path="$WORKSPACE_DIR/target/release/$(cdylib_filename "$host")"
-	generate_bindings "$lib_path"
-	echo "bindings written to $OUTPUT"
-	exit 0
-fi
+HOST_TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
 
 if [[ -z "$TARGET" ]]; then
-	echo "--target is required (unless --bindings-only)" >&2
-	usage
+    TARGET="$HOST_TARGET"
+    echo "Detected target: $TARGET"
 fi
 
-lib_path="$(build_target "$TARGET")"
-package_target "$TARGET" "$lib_path"
-echo "packaged $TARGET → $OUTPUT/${CRATE_NAME}-${VERSION}-${TARGET}.*"
+is_android() { [[ "$1" == *"-android"* || "$1" == *"-androideabi"* ]]; }
+is_ios()     { [[ "$1" == *"-apple-ios"* ]]; }
+
+can_run_on_host() {
+    local t="$1"
+    if [[ "$t" == "universal-apple-darwin" && "$(uname)" == "Darwin" ]]; then
+        return 0
+    fi
+    [[ "$t" == "$HOST_TARGET" ]]
+}
+
+build_target() {
+    local t="$1"
+    echo "Building web-transport-ffi for $t..."
+    if is_android "$t"; then
+        cargo ndk --target "$t" --platform 24 -- \
+            build --release --package web-transport-ffi --manifest-path "$WORKSPACE_DIR/Cargo.toml"
+    else
+        if [[ "$t" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+        fi
+        cargo build --release --package web-transport-ffi --target "$t" --manifest-path "$WORKSPACE_DIR/Cargo.toml"
+    fi
+}
+
+find_cdylib() {
+    local t="$1"
+    local d="$TARGET_BASE_DIR/$t/release"
+    if [[ "$t" == *"-apple-"* ]]; then
+        echo "$d/libweb_transport_ffi.dylib"
+    elif [[ "$t" == *"-windows-"* ]]; then
+        echo "$d/web_transport_ffi.dll"
+    else
+        echo "$d/libweb_transport_ffi.so"
+    fi
+}
+
+# Generate language bindings into $OUTPUT_DIR/bindings/<lang>/. Tarring is
+# opt-in via --archive; the default leaves the directories alone for
+# actions/upload-artifact to handle directly.
+#
+# CRITICAL: invoke uniffi-bindgen as `cargo run ... --package web-transport-ffi
+# --bin uniffi-bindgen` — never bare `--bin uniffi-bindgen` — because the
+# workspace has other binaries (web-transport-quinn examples) and bare
+# invocation is ambiguous (moq d9878e7b).
+generate_bindings() {
+    local lib_path="$1"
+    echo "Generating bindings from $lib_path..."
+
+    for lang in kotlin swift python; do
+        echo "  Generating $lang bindings..."
+        cargo run --release --package web-transport-ffi --bin uniffi-bindgen --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
+            generate --library "$lib_path" \
+            --language "$lang" --out-dir "$OUTPUT_DIR/bindings/$lang"
+    done
+
+    if [[ "$ARCHIVE" == true ]]; then
+        for lang in kotlin swift python; do
+            local archive="web-transport-ffi-${VERSION}-${lang}.tar.gz"
+            tar -czf "$OUTPUT_DIR/$archive" -C "$OUTPUT_DIR/bindings" "$lang"
+            echo "Created: $OUTPUT_DIR/$archive"
+        done
+        rm -rf "$OUTPUT_DIR/bindings"
+    fi
+}
+
+mkdir -p "$OUTPUT_DIR"
+
+# --- Bindings-only mode ---
+if [[ "$BINDINGS_ONLY" == true ]]; then
+    build_target "$HOST_TARGET"
+    cdylib=$(find_cdylib "$HOST_TARGET")
+    if [[ ! -f "$cdylib" ]]; then
+        echo "Error: cdylib not found at $cdylib" >&2
+        exit 1
+    fi
+    generate_bindings "$cdylib"
+    echo "Done (bindings only)."
+    exit 0
+fi
+
+# --- Full build mode ---
+
+if [[ "$TARGET" == "universal-apple-darwin" ]]; then
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo "Error: Universal builds are only supported on macOS" >&2
+        exit 1
+    fi
+
+    build_target "x86_64-apple-darwin"
+    build_target "aarch64-apple-darwin"
+
+    LIB_X86_STATIC="$TARGET_BASE_DIR/x86_64-apple-darwin/release/libweb_transport_ffi.a"
+    LIB_ARM64_STATIC="$TARGET_BASE_DIR/aarch64-apple-darwin/release/libweb_transport_ffi.a"
+    LIB_X86_DYLIB="$TARGET_BASE_DIR/x86_64-apple-darwin/release/libweb_transport_ffi.dylib"
+    LIB_ARM64_DYLIB="$TARGET_BASE_DIR/aarch64-apple-darwin/release/libweb_transport_ffi.dylib"
+else
+    build_target "$TARGET"
+fi
+
+NAME="web-transport-ffi-${VERSION}-${TARGET}"
+PACKAGE_DIR="$OUTPUT_DIR/$NAME"
+
+echo "Packaging $NAME..."
+
+rm -rf "$PACKAGE_DIR"
+mkdir -p "$PACKAGE_DIR/lib"
+
+if [[ "$TARGET" == "universal-apple-darwin" ]]; then
+    echo "Creating universal binaries..."
+    lipo -create "$LIB_X86_STATIC" "$LIB_ARM64_STATIC" -output "$PACKAGE_DIR/lib/libweb_transport_ffi.a"
+    lipo -create "$LIB_X86_DYLIB" "$LIB_ARM64_DYLIB" -output "$PACKAGE_DIR/lib/libweb_transport_ffi.dylib"
+
+elif [[ "$TARGET" == *"-windows-"* ]]; then
+    D="$TARGET_BASE_DIR/$TARGET/release"
+    cp "$D/web_transport_ffi.dll" "$PACKAGE_DIR/lib/"
+    cp "$D/web_transport_ffi.dll.lib" "$PACKAGE_DIR/lib/" 2>/dev/null || true
+    cp "$D/web_transport_ffi.lib" "$PACKAGE_DIR/lib/" 2>/dev/null || true
+
+elif is_ios "$TARGET"; then
+    D="$TARGET_BASE_DIR/$TARGET/release"
+    cp "$D/libweb_transport_ffi.a" "$PACKAGE_DIR/lib/"
+
+elif is_android "$TARGET"; then
+    D="$TARGET_BASE_DIR/$TARGET/release"
+    cp "$D/libweb_transport_ffi.so" "$PACKAGE_DIR/lib/"
+
+elif [[ "$TARGET" == *"-apple-"* ]]; then
+    D="$TARGET_BASE_DIR/$TARGET/release"
+    cp "$D/libweb_transport_ffi.a" "$PACKAGE_DIR/lib/"
+    cp "$D/libweb_transport_ffi.dylib" "$PACKAGE_DIR/lib/"
+
+else
+    # Plain Linux: only .so is consumed (JNA / wheels); drop .a copy (moq de7cc60d).
+    D="$TARGET_BASE_DIR/$TARGET/release"
+    cp "$D/libweb_transport_ffi.so" "$PACKAGE_DIR/lib/"
+fi
+
+echo ""
+echo "Staged: $PACKAGE_DIR"
+
+if [[ "$ARCHIVE" == true ]]; then
+    cd "$OUTPUT_DIR"
+    if [[ "$TARGET" == *"-windows-"* ]]; then
+        AN="$NAME.zip"
+        if command -v 7z &> /dev/null; then
+            7z a "$AN" "$NAME"
+        elif command -v zip &> /dev/null; then
+            zip -r "$AN" "$NAME"
+        else
+            echo "Error: Neither 7z nor zip found" >&2
+            exit 1
+        fi
+    else
+        AN="$NAME.tar.gz"
+        tar -czf "$AN" "$NAME"
+    fi
+    rm -rf "$NAME"
+    echo "Created: $OUTPUT_DIR/$AN"
+    cd "$WORKSPACE_DIR"
+fi
+
+cd "$WORKSPACE_DIR"
+if can_run_on_host "$TARGET"; then
+    if [[ "$TARGET" == "universal-apple-darwin" ]]; then
+        host_arch=$(uname -m)
+        case "$host_arch" in
+            arm64|aarch64) cdylib=$(find_cdylib "aarch64-apple-darwin") ;;
+            x86_64)        cdylib=$(find_cdylib "x86_64-apple-darwin") ;;
+            *)             echo "Warning: unknown host arch $host_arch, skipping bindings"; cdylib="" ;;
+        esac
+    else
+        cdylib=$(find_cdylib "$TARGET")
+    fi
+
+    if [[ -f "$cdylib" ]]; then
+        generate_bindings "$cdylib"
+    else
+        echo "Warning: cdylib not found at $cdylib, skipping binding generation"
+    fi
+fi
+
+echo "Done."
