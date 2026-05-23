@@ -142,13 +142,16 @@ if (androidEnabled) {
 
 mavenPublishing {
     publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
-    // Only sign when a signing key is actually configured. PR smoke tests run
-    // gradle `:web-transport:publishToMavenLocal` (via kt/scripts/package.sh)
-    // without the SIGNING_* env vars; an unconditional signAllPublications()
-    // would fail those builds with "no configured signatory". The release-kt
-    // workflow always sets ORG_GRADLE_PROJECT_signingInMemoryKey before
-    // publishAndReleaseToMavenCentral, so real releases sign as expected.
-    if (System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey") != null) {
+    // Only sign when a non-empty signing key is configured. PR smoke tests
+    // run gradle `:web-transport:publishToMavenLocal` (via package.sh)
+    // without the SIGNING_* env vars; if SIGNING_KEY is declared in repo
+    // secrets but unset, `${{ secrets.SIGNING_KEY }}` expands to the empty
+    // string and the env var ends up as "" — a bare null-check would call
+    // signAllPublications() against an empty key and fail with "Could not
+    // read PGP secret key". isNullOrBlank() catches both cases. The
+    // release-kt workflow always sets a real ORG_GRADLE_PROJECT_signingInMemoryKey
+    // before publishAndReleaseToMavenCentral, so real releases sign as expected.
+    if (!System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey").isNullOrBlank()) {
         signAllPublications()
     }
     coordinates("dev.moq", "web-transport", version.toString())
