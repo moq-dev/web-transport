@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+**/jniLibs/
+**/resources/linux-*
+**/resources/darwin*
+**/resources/win32-*
+web-transport/src/jvmAndAndroidMain/kotlin/uniffi/

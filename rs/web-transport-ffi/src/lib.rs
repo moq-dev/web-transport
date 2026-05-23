@@ -1,12 +1,19 @@
+//! UniFFI bindings for [`web_transport_quinn`].
+//!
+//! Exposes a WebTransport client/server API to Swift, Kotlin, and Python via
+//! UniFFI. The shape mirrors `web-transport-quinn` with `Mutex<Option<T>>`
+//! take-out patterns for `finish()`/`reset()` and a single shared tokio
+//! runtime ([`ffi::RUNTIME`]).
+
+pub mod client;
+pub mod error;
+mod ffi;
+pub mod recv_stream;
+pub mod send_stream;
+pub mod server;
+pub mod session;
+
 uniffi::setup_scaffolding!("web_transport");
 
-#[uniffi::export]
-fn hello() -> String {
-	"hello from web-transport-ffi".to_string()
-}
-
-#[uniffi::export(async_runtime = "tokio")]
-async fn hello_async() -> String {
-	tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-	"hello async from web-transport-ffi".to_string()
-}
+#[cfg(test)]
+mod test;
