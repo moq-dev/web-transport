@@ -268,6 +268,11 @@ class Session:
 
     def __init__(self, inner: _uniffi.Session) -> None:
         self._inner = inner
+        # quinn's max_datagram_size can grow during the session as path-MTU
+        # discovery learns a larger MTU. Cache the initial value so the
+        # public property is stable and the boundary check in
+        # send_datagram is predictable for callers (legacy behavior).
+        self._max_datagram_size = inner.max_datagram_size()
 
     async def __aenter__(self) -> Session:
         return self
@@ -328,14 +333,13 @@ class Session:
     # -- Datagrams ------------------------------------------------------
 
     def send_datagram(self, data: bytes) -> None:
-        # quinn allows datagrams slightly over max_datagram_size (up to its
-        # internal UDP MTU). Enforce the strict boundary the legacy API
-        # advertised so callers don't silently transmit oversized payloads
-        # that may be dropped by intermediaries.
-        max_size = self._inner.max_datagram_size()
-        if len(data) > max_size:
+        # Enforce the strict cached boundary so callers see the same limit
+        # at any point in the session (quinn's live max grows with path-MTU
+        # discovery; without this check, send_datagram(max+1) might or
+        # might not succeed depending on what was sent earlier).
+        if len(data) > self._max_datagram_size:
             raise DatagramTooLargeError(
-                f"datagram size {len(data)} exceeds maximum {max_size}"
+                f"datagram size {len(data)} exceeds maximum {self._max_datagram_size}"
             )
         try:
             self._inner.send_datagram(data)
@@ -371,29 +375,35 @@ class Session:
     # -- Properties -----------------------------------------------------
 
     @property
-    def close_reason(self) -> WebTransportError | None:
+    def close_reason(self) -> SessionError | None:
         """The structured close reason, or ``None`` if the session is still open.
 
         Returns the same subclass that the originating operation would raise —
         :class:`SessionClosedByPeer` for peer-initiated closes (with
         ``.source``, ``.code``, ``.reason`` attributes), :class:`SessionTimeout`
         for idle timeout, :class:`SessionClosedLocally` for local close, etc.
+        Always a :class:`SessionError` subclass because the FFI only emits
+        session-level variants on a closed session.
         """
         raw = self._inner.close_reason()
         if raw is None:
             return None
         # Translate the structured FFI variant into the legacy subclass.
         try:
-            reraise(raw)
-        except WebTransportError as exc:
+            reraise(raw)  # type: ignore[arg-type]
+        except SessionError as exc:
             return exc
-        # `reraise()` always raises a WebTransportError, but ty doesn't know
-        # that; fall through with a generic instance.
-        return WebTransportError(str(raw))
+        except WebTransportError as exc:
+            # Defensive: a non-session WebTransportError variant somehow
+            # surfaced. Wrap it so the return type stays SessionError.
+            return SessionError(str(exc))
+        # `reraise()` always raises, but ty doesn't know that.
+        return SessionError(str(raw))
 
     @property
     def max_datagram_size(self) -> int:
-        return self._inner.max_datagram_size()
+        # Stable across the session; see note in __init__.
+        return self._max_datagram_size
 
     @property
     def remote_address(self) -> tuple[str, int]:
