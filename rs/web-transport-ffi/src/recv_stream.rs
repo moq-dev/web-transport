@@ -13,7 +13,7 @@ use crate::error::{
     map_read_error, map_read_exact_error, map_read_to_end_error, map_session_error,
     WebTransportError,
 };
-use crate::ffi::RUNTIME;
+use crate::ffi::{spawn_abortable, RUNTIME};
 
 #[derive(uniffi::Object)]
 pub struct RecvStream {
@@ -46,7 +46,7 @@ impl RecvStream {
         let stop_code = self.stop_code.clone();
         let stream = inner.clone();
 
-        let handle = RUNTIME.spawn(async move {
+        spawn_abortable(async move {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -60,11 +60,8 @@ impl RecvStream {
                     op(guard).await
                 } => result,
             }
-        });
-
-        handle
-            .await
-            .map_err(|e| WebTransportError::Io(format!("recv_stream task: {e}")))?
+        })
+        .await
     }
 }
 

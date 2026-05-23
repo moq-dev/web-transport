@@ -20,16 +20,8 @@ path = "./uniffi-bindgen.rs"
 
 [features]
 default = ["aws-lc-rs"]
-aws-lc-rs = [
-    "quinn/rustls-aws-lc-rs",
-    "rustls/aws-lc-rs",
-    "web-transport-quinn/aws-lc-rs",
-]
-ring = [
-    "quinn/rustls-ring",
-    "rustls/ring",
-    "web-transport-quinn/ring",
-]
+aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs", "web-transport-quinn/aws-lc-rs"]
+ring = ["quinn/rustls-ring", "rustls/ring", "web-transport-quinn/ring"]
 
 [dependencies]
 bytes = "1"

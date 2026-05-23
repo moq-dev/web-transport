@@ -142,6 +142,14 @@ impl Session {
         self.clone_handle.close_reason().is_some()
     }
 
+    /// If the session has been closed, return the close error structured as
+    /// a [`WebTransportError`]. Returns `None` while the session is alive.
+    pub fn close_reason(&self) -> Option<WebTransportError> {
+        self.clone_handle
+            .close_reason()
+            .map(crate::error::map_session_error)
+    }
+
     /// Maximum payload size accepted by [`Self::send_datagram`].
     pub fn max_datagram_size(&self) -> u64 {
         self.clone_handle.max_datagram_size() as u64

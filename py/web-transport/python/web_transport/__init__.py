@@ -10,6 +10,7 @@ etc.) rather than the flat ``_uniffi.WebTransportError``.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Literal
@@ -124,6 +125,13 @@ class SendStream:
                 self._inner.reset(0)
             except _UniffiError:
                 pass
+            # Yield to the event loop so the underlying FFI runtime gets a
+            # chance to transmit RESET_STREAM. The legacy PyO3 binding made
+            # __aexit__ truly async (it awaited the inner lock), which gave
+            # the asyncio loop a scheduling tick — without an equivalent
+            # yield, the peer's accept_bi/accept_uni never sees the stream
+            # before we tear it down.
+            await asyncio.sleep(0)
             return None
         try:
             await self._inner.finish()
@@ -193,11 +201,13 @@ class RecvStream:
         exc_tb: TracebackType | None,
     ) -> None:
         # Always best-effort STOP_SENDING on exit; swallow errors so they
-        # don't mask anything in flight.
+        # don't mask anything in flight. Yield after to give the FFI runtime
+        # a chance to transmit the frame (see SendStream.__aexit__).
         try:
             self._inner.stop(0)
         except _UniffiError:
             pass
+        await asyncio.sleep(0)
         return None
 
     def __aiter__(self) -> AsyncIterator[bytes]:
@@ -272,6 +282,13 @@ class Session:
             self._inner.close(0, "")
         except _UniffiError:
             pass
+        # Mirror the legacy PyO3 binding: await closed() so the close
+        # capsule actually transmits before __aexit__ returns. Without
+        # this, peer-side observers won't see the close in time.
+        try:
+            await self._inner.wait_closed()
+        except _UniffiError:
+            pass
         return None
 
     # -- Streams --------------------------------------------------------
@@ -311,6 +328,15 @@ class Session:
     # -- Datagrams ------------------------------------------------------
 
     def send_datagram(self, data: bytes) -> None:
+        # quinn allows datagrams slightly over max_datagram_size (up to its
+        # internal UDP MTU). Enforce the strict boundary the legacy API
+        # advertised so callers don't silently transmit oversized payloads
+        # that may be dropped by intermediaries.
+        max_size = self._inner.max_datagram_size()
+        if len(data) > max_size:
+            raise DatagramTooLargeError(
+                f"datagram size {len(data)} exceeds maximum {max_size}"
+            )
         try:
             self._inner.send_datagram(data)
         except _UniffiError as e:
@@ -326,7 +352,10 @@ class Session:
     # -- Lifecycle ------------------------------------------------------
 
     def close(self, code: int = 0, reason: str = "") -> None:
-        # Legacy contract: `close()` is non-raising on already-closed.
+        # Legacy contract: `close(code)` with an out-of-range u32 raises
+        # OverflowError (uniffi would raise ValueError for the same case).
+        if not 0 <= code < 2**32:
+            raise OverflowError(f"code out of range for u32: {code}")
         try:
             self._inner.close(code, reason)
         except _UniffiError:
@@ -342,12 +371,25 @@ class Session:
     # -- Properties -----------------------------------------------------
 
     @property
-    def close_reason(self) -> SessionError | None:
-        """Best-effort: report ``SessionClosedLocally`` if the session has
-        been closed. The original peer reason is not exposed by the FFI."""
-        if self._inner.is_closed():
-            return SessionClosedLocally("session closed")
-        return None
+    def close_reason(self) -> WebTransportError | None:
+        """The structured close reason, or ``None`` if the session is still open.
+
+        Returns the same subclass that the originating operation would raise —
+        :class:`SessionClosedByPeer` for peer-initiated closes (with
+        ``.source``, ``.code``, ``.reason`` attributes), :class:`SessionTimeout`
+        for idle timeout, :class:`SessionClosedLocally` for local close, etc.
+        """
+        raw = self._inner.close_reason()
+        if raw is None:
+            return None
+        # Translate the structured FFI variant into the legacy subclass.
+        try:
+            reraise(raw)
+        except WebTransportError as exc:
+            return exc
+        # `reraise()` always raises a WebTransportError, but ty doesn't know
+        # that; fall through with a generic instance.
+        return WebTransportError(str(raw))
 
     @property
     def max_datagram_size(self) -> int:

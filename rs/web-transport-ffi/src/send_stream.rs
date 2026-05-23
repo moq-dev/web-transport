@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{map_session_error, map_write_error, WebTransportError};
-use crate::ffi::RUNTIME;
+use crate::ffi::{spawn_abortable, RUNTIME};
 
 #[derive(uniffi::Object)]
 pub struct SendStream {
@@ -49,7 +49,7 @@ impl SendStream {
         let synced_priority = self.synced_priority.clone();
         let stream = inner.clone();
 
-        let handle = RUNTIME.spawn(async move {
+        spawn_abortable(async move {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -68,11 +68,8 @@ impl SendStream {
                     op(guard).await
                 } => result,
             }
-        });
-
-        handle
-            .await
-            .map_err(|e| WebTransportError::Io(format!("send_stream task: {e}")))?
+        })
+        .await
     }
 }
 

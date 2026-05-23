@@ -207,9 +207,9 @@ impl SessionRequest {
     pub async fn accept(&self) -> Result<Arc<Session>, WebTransportError> {
         let request = {
             let mut guard = self.inner.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| WebTransportError::invalid("request already accepted or rejected"))?
+            guard.take().ok_or_else(|| {
+                WebTransportError::protocol("request already accepted or rejected")
+            })?
         };
         let handle = RUNTIME.spawn(async move { request.ok().await.map_err(map_server_error) });
         let session = handle
@@ -223,9 +223,9 @@ impl SessionRequest {
     pub async fn reject(&self, status_code: u16) -> Result<(), WebTransportError> {
         let request = {
             let mut guard = self.inner.lock().await;
-            guard
-                .take()
-                .ok_or_else(|| WebTransportError::invalid("request already accepted or rejected"))?
+            guard.take().ok_or_else(|| {
+                WebTransportError::protocol("request already accepted or rejected")
+            })?
         };
         let status = http::StatusCode::from_u16(status_code)
             .map_err(|e| WebTransportError::invalid(format!("invalid status code: {e}")))?;
