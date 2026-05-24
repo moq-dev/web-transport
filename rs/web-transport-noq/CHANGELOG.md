@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.1.0...web-transport-noq-v0.1.1) - 2026-05-24
+
+### Other
+
+- release ([#228](https://github.com/moq-dev/web-transport/pull/228))
+
 ## [0.1.0](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.0.4...web-transport-noq-v0.1.0) - 2026-05-21
 
 ### Other

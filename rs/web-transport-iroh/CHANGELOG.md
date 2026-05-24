@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.5.0...web-transport-iroh-v0.5.1) - 2026-05-24
+
+### Other
+
+- release ([#228](https://github.com/moq-dev/web-transport/pull/228))
+
 ## [0.5.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.4.0...web-transport-iroh-v0.5.0) - 2026-05-21
 
 ### Other

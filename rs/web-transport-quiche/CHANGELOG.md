@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.3.1...web-transport-quiche-v0.4.0) - 2026-05-24
+
+### Other
+
+- bump tokio-quiche, tokio-tungstenite, flume, rcgen, sha2 ([#240](https://github.com/moq-dev/web-transport/pull/240))
+
 ## [0.3.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.3.0...web-transport-quiche-v0.3.1) - 2026-04-07
 
 ### Other
