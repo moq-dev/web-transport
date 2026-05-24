@@ -31,6 +31,17 @@ This project is broken up into quite a few different crates:
 -   [web-transport-quinn](web-transport-quinn) mirrors the [Quinn API](https://docs.rs/quinn/latest/quinn/index.html), abstracting away the HTTP/3 setup.
 -   [web-transport-noq](web-transport-noq) mirrors the [Noq API](https://docs.rs/noq/latest/noq/index.html), a Quinn fork with the same surface area.
 -   [web-transport-wasm](web-transport-wasm) wraps the [browser API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API)
-- [web-transport-ws](web-transport-ws) crudely implements the WebTransport API over WebSockets for backwards compatibility. Also includes a NPM package.
-- [web-transport-trait](web-transport-trait) defines an async trait, currently implemented by [web-transport-quinn](web-transport-quinn) and [web-transport-ws](web-transport-ws).
+-   [web-transport-ffi](rs/web-transport-ffi) exposes the WebTransport client/server through [UniFFI](https://mozilla.github.io/uniffi-rs/) for Python, Kotlin, and Swift.
+- [qmux](qmux) implements QMux (draft-ietf-quic-qmux) over TCP/TLS/WebSocket, with backwards compatibility for the legacy WebTransport-over-WebSocket wire format.
+- [web-transport-trait](web-transport-trait) defines an async trait, currently implemented by [web-transport-quinn](web-transport-quinn) and [qmux](qmux).
 -   [web-transport-proto](web-transport-proto) a bare minimum implementation of HTTP/3 just to establish the WebTransport session.
+
+## Language bindings
+
+Built from `rs/web-transport-ffi` via UniFFI; all three release workflows fire from a single `web-transport-ffi-v*` tag.
+
+| Language | Package                                                                      | Source       |
+|----------|------------------------------------------------------------------------------|--------------|
+| Python   | [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) (PyPI)      | `py/web-transport` |
+| Kotlin   | `dev.moq:web-transport` (Maven Central)                                      | `kt/`        |
+| Swift    | `WebTransportFFI.xcframework.zip` (attached to GitHub Releases)              | `swift/`     |

@@ -3,22 +3,23 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "web-transport-quinn"
-version = "0.1.1"
-description = "Python bindings for web-transport-quinn"
+name = "web-transport-rs"
+dynamic = ["version"]
+description = "Python bindings for WebTransport over HTTP/3 (Rust + UniFFI)"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
 authors = [{ name = "ai-and-i", email = "ai.and.i.project@gmail.com" }]
-keywords = ["webtransport", "quic", "asyncio", "networking"]
+keywords = ["webtransport", "quic", "http3", "asyncio", "networking"]
 dependencies = ["cryptography>=43.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Topic :: Internet",
     "Topic :: System :: Networking",
     "Programming Language :: Rust",
-    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
@@ -29,15 +30,27 @@ Homepage = "https://github.com/moq-dev/web-transport"
 Repository = "https://github.com/moq-dev/web-transport"
 Issues = "https://github.com/moq-dev/web-transport/issues"
 
+# Maturin builds rs/web-transport-ffi, generates the uniffi python file,
+# and packages the cdylib + bindings as the private `web_transport._uniffi`
+# subpackage. The public, hand-written API lives in `web_transport/__init__.py`.
 [tool.maturin]
-manifest-path = "../../rs/web-transport-python/Cargo.toml"
+bindings = "uniffi"
+manifest-path = "../../rs/web-transport-ffi/Cargo.toml"
 python-source = "python"
-module-name = "web_transport._web_transport"
-features = ["extension-module"]
+module-name = "web_transport._uniffi"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+# UniFFI-generated bindings live at python/web_transport/_uniffi/ after
+# `maturin develop` (and in the wheel). They're vendored, machine-emitted
+# Python — ruff/ty would never agree with the generator's style choices.
+[tool.ruff]
+extend-exclude = ["python/web_transport/_uniffi"]
+
+[tool.ty.src]
+exclude = ["python/web_transport/_uniffi"]
 
 [dependency-groups]
 dev = [

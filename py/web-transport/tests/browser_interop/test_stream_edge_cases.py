@@ -1080,7 +1080,7 @@ async def test_stream_stop_code_zero(
             session = await request.accept()
             async with session:
                 send, recv = await session.accept_bi()
-                # Also accept the keepalive stream
+                # Also accept the keep_alive stream
                 send2, recv2 = await session.accept_bi()
                 await send.write(b"\x01")
                 stop_code = await asyncio.wait_for(send.wait_closed(), timeout=5.0)
@@ -1100,7 +1100,7 @@ async def test_stream_stop_code_zero(
                 await reader.read();
                 let err = new WebTransportError({ message: "cancel", streamErrorCode: 0 });
                 await reader.cancel(err);
-                // Read from keepalive stream to let server complete
+                // Read from keep_alive stream to let server complete
                 const reader2 = stream2.readable.getReader();
                 await reader2.read();
                 reader2.releaseLock();
@@ -1123,7 +1123,7 @@ async def test_stream_stop_code_255(start_server: ServerFactory, run_js: RunJS) 
             session = await request.accept()
             async with session:
                 send, recv = await session.accept_bi()
-                # Also accept the keepalive stream
+                # Also accept the keep_alive stream
                 send2, recv2 = await session.accept_bi()
                 await send.write(b"\x01")
                 stop_code = await asyncio.wait_for(send.wait_closed(), timeout=5.0)
@@ -1143,7 +1143,7 @@ async def test_stream_stop_code_255(start_server: ServerFactory, run_js: RunJS) 
                 await reader.read();
                 let err = new WebTransportError({ message: "cancel", streamErrorCode: 255 });
                 await reader.cancel(err);
-                // Read from keepalive stream to let server complete
+                // Read from keep_alive stream to let server complete
                 const reader2 = stream2.readable.getReader();
                 await reader2.read();
                 reader2.releaseLock();

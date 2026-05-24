@@ -1,0 +1,45 @@
+[package]
+name = "web-transport-ffi"
+description = "WebTransport over HTTP/3 — UniFFI bindings for Swift, Kotlin, and Python"
+authors = ["ai-and-i"]
+repository = "https://github.com/moq-dev/web-transport"
+license = "MIT OR Apache-2.0"
+version = "0.1.1"
+edition = "2021"
+
+keywords = ["webtransport", "quic", "http3", "uniffi"]
+categories = ["network-programming", "web-programming"]
+
+[lib]
+name = "web_transport_ffi"
+crate-type = ["staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "./uniffi-bindgen.rs"
+
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs", "web-transport-quinn/aws-lc-rs"]
+ring = ["quinn/rustls-ring", "rustls/ring", "web-transport-quinn/ring"]
+
+[dependencies]
+bytes = "1"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-native-certs = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = "0.7"
+uniffi = { version = "0.31", features = ["cli"] }
+url = "2"
+web-transport-quinn = { workspace = true }
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

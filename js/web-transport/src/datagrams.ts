@@ -1,4 +1,4 @@
-import type { NapiSession } from "../index.js";
+import type { NapiSession } from "../napi.js";
 
 export class Datagrams implements WebTransportDatagramDuplexStream {
 	readonly readable: ReadableStream<Uint8Array>;

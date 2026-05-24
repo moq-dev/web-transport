@@ -73,10 +73,15 @@ impl SendStream {
             .map_err(|e| self.map_error(e))
     }
 
-    /// Write chunks of data to the stream. See [`noq::SendStream::write_chunks`].
-    pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<noq::Written, WriteError> {
+    /// Write chunks of data to the stream, returning the number of bytes written.
+    ///
+    /// See [`noq::SendStream::write_many_chunks`].
+    pub async fn write_many_chunks(
+        &mut self,
+        bufs: &mut &mut [Bytes],
+    ) -> Result<usize, WriteError> {
         self.stream
-            .write_chunks(bufs)
+            .write_many_chunks(bufs)
             .await
             .map_err(|e| self.map_error(e))
     }

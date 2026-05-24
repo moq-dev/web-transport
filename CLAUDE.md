@@ -51,15 +51,22 @@ web-transport  web-transport  web-transport  web-transport
 - **`rs/web-transport-quinn`** / **`rs/web-transport-noq`** / **`rs/web-transport-quiche`** — Backend adapters for different QUIC libraries.
 - **`rs/web-transport-wasm`** — WASM bindings to the browser's native WebTransport API via `wasm-bindgen`.
 - **`rs/web-transport-node`** — NAPI-RS bridge: compiles Rust to `.node` binary for Node.js.
+- **`rs/web-transport-ffi`** — UniFFI crate exporting WebTransport client/server to Python, Kotlin, and Swift. Default TLS provider is aws-lc-rs; opt in to ring with `--no-default-features --features ring`.
 - **`rs/qmux`** — QMux protocol (draft-ietf-quic-qmux) over TCP/TLS/WebSocket (Rust implementation).
-- **`rs/web-transport-ws`** — **Deprecated**, thin wrapper around qmux.
 
 ### TypeScript Packages (`js/`)
 
 - **`js/qmux`** (`@moq/qmux`) — QMux protocol over WebSocket (TypeScript implementation).
 - **`js/web-transport`** (`@moq/web-transport`) — Node.js WebTransport via NAPI-RS (TS wrapper around `rs/web-transport-node`).
-- **`js/web-transport-ws`** (`@moq/web-transport-ws`) — **Deprecated**, thin wrapper around `@moq/qmux`.
 - **`js/web-demo`** — Browser demo app.
+
+### Language Bindings (UniFFI)
+
+All built from `rs/web-transport-ffi`. A single `web-transport-ffi-v*` tag (pushed by release-plz) drives all three downstream release workflows.
+
+- **`py/web-transport`** — Python wheel, published to PyPI as `web-transport-rs`. Import name remains `web_transport`. Pure-Python wrapper at `python/web_transport/__init__.py` re-creates the legacy exception hierarchy on top of the flat `_uniffi.WebTransportError` enum.
+- **`kt/`** — Kotlin Multiplatform module (JVM + Android), published to Maven Central as `dev.moq:web-transport`. The `:web-transport` gradle module ships JNA-loaded desktop libs (`src/jvmMain/resources/<os>-<arch>/`) and Android `jniLibs/<abi>/`.
+- **`swift/`** — Swift Package Manager package. `WebTransportFFI.xcframework.zip` is attached to the GitHub Release (no SPM mirror yet — re-enable later via `vars.PUBLISH_SPM`).
 
 ### WASM Considerations
 

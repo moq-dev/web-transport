@@ -34,9 +34,15 @@ check:
 	cargo fmt --all --check
 
 	# requires: cargo install cargo-hack
-	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-python
+	# web-transport-ffi excluded from the feature powerset because aws-lc-rs and
+	# ring are mutually exclusive at link time (one rustls provider must win).
+	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-ffi
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
+
+	# web-transport-ffi: explicit check under each TLS provider.
+	cargo check -p web-transport-ffi
+	cargo check -p web-transport-ffi --no-default-features --features ring
 
 	# requires: cargo install cargo-shear
 	cargo shear
@@ -78,6 +84,14 @@ fix:
 	# Fix JavaScript/TypeScript with biome
 	bun install
 	bun run fix
+
+# Build the FFI staticlib/cdylib for the host and generate language bindings.
+build-ffi:
+	./rs/web-transport-ffi/build.sh --bindings-only --output rs/web-transport-ffi/dist
+
+# Build the FFI crate for a single target (use `just build-ffi-target aarch64-apple-darwin`).
+build-ffi-target target:
+	./rs/web-transport-ffi/build.sh --target {{target}} --output rs/web-transport-ffi/dist
 
 # Upgrade any tooling
 upgrade:

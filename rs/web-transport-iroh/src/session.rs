@@ -9,10 +9,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use iroh::{
-    Watcher,
-    endpoint::{self, Connection, PathInfoList, PathWatcher},
-};
+use iroh::endpoint::{self, Connection, PathStats};
 use n0_future::{
     FuturesUnordered,
     stream::{Stream, StreamExt},
@@ -36,9 +33,6 @@ use crate::{
 pub struct Session {
     conn: Connection,
     h3: Option<H3SessionState>,
-    // An iroh connection drops stats of abandoned paths if no `PathWatcher` is alive. We need sums of all
-    // paths for the implementation of `SessionStats`, so we keep this watcher as a guard.
-    _path_stats_guard: PathWatcher,
 }
 
 impl Session {
@@ -47,12 +41,7 @@ impl Session {
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
     pub fn raw(conn: Connection) -> Self {
-        let paths = conn.paths();
-        Self {
-            conn,
-            _path_stats_guard: paths,
-            h3: None,
-        }
+        Self { conn, h3: None }
     }
 
     /// Connect using an established QUIC connection if you want to create the connection yourself.
@@ -78,13 +67,8 @@ impl Session {
 
     /// Creates a session from pre-established HTTP/3 handshake components.
     pub fn new_h3(conn: Connection, settings: Settings, mut connect: Connected) -> Self {
-        let paths = conn.paths();
         let h3 = H3SessionState::connect(conn.clone(), settings, &connect);
-        let this = Session {
-            conn,
-            h3: Some(h3),
-            _path_stats_guard: paths,
-        };
+        let this = Session { conn, h3: Some(h3) };
         // Run a background task to check if the connect stream is closed.
         let this2 = this.clone();
         tokio::spawn(async move {
@@ -591,20 +575,22 @@ impl web_transport_trait::Session for Session {
     }
 
     fn stats(&self) -> impl web_transport_trait::Stats {
-        // We're not using [`Self::_path_stats_guard`] because updating its value to the current path list
-        // needs mutable access. Instead, we just create a new watcher from the iroh connection, which is
-        // cheap enough (but has an allocation and mutex lock).
-        let paths = self.conn().paths().get();
+        let selected_path_stats = self
+            .conn
+            .paths()
+            .iter()
+            .find(|p| p.is_selected())
+            .map(|p| p.stats());
         SessionStats {
             stats: self.conn.stats(),
-            paths,
+            selected_path_stats,
         }
     }
 }
 
 pub struct SessionStats {
     stats: iroh::endpoint::ConnectionStats,
-    paths: PathInfoList,
+    selected_path_stats: Option<PathStats>,
 }
 
 impl web_transport_trait::Stats for SessionStats {
@@ -617,13 +603,7 @@ impl web_transport_trait::Stats for SessionStats {
     }
 
     fn bytes_lost(&self) -> Option<u64> {
-        Some(
-            self.paths
-                .iter()
-                .filter_map(|path| path.stats())
-                .map(|path| path.lost_bytes)
-                .sum(),
-        )
+        Some(self.stats.lost_bytes)
     }
 
     fn packets_sent(&self) -> Option<u64> {
@@ -635,29 +615,18 @@ impl web_transport_trait::Stats for SessionStats {
     }
 
     fn packets_lost(&self) -> Option<u64> {
-        Some(
-            self.paths
-                .iter()
-                .filter_map(|path| path.stats())
-                .map(|path| path.lost_packets)
-                .sum(),
-        )
+        Some(self.stats.lost_packets)
     }
 
     fn rtt(&self) -> Option<std::time::Duration> {
-        self.paths
-            .iter()
-            .filter(|p| p.is_selected())
-            .filter_map(|p| p.rtt())
-            .next()
+        self.selected_path_stats.map(|p| p.rtt)
     }
 
     fn estimated_send_rate(&self) -> Option<u64> {
-        let path = self.paths.iter().find(|p| p.is_selected())?;
-        let stats = path.stats()?;
-        let rtt_secs = stats.rtt.as_secs_f64();
-        if stats.cwnd > 0 && rtt_secs > 0.0 {
-            Some((stats.cwnd as f64 * 8.0 / rtt_secs) as u64)
+        let path_stats = self.selected_path_stats?;
+        let rtt_secs = path_stats.rtt.as_secs_f64();
+        if path_stats.cwnd > 0 && rtt_secs > 0.0 {
+            Some((path_stats.cwnd as f64 * 8.0 / rtt_secs) as u64)
         } else {
             None
         }

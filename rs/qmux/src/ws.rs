@@ -1,9 +1,45 @@
+use std::time::Duration;
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
 use crate::{alpn, Config, Error, Session, Version};
+
+/// Keep-alive configuration for WebSocket transports.
+///
+/// WebSocket has no built-in idle timeout: when the peer's host crashes
+/// or its network drops without sending a TCP FIN, the local socket
+/// stays "open" until OS-level TCP keep_alive eventually probes — typically
+/// hours. Set this to send periodic Pings and close the session if no
+/// frame arrives within `timeout`.
+#[derive(Debug, Clone, Copy)]
+pub struct KeepAlive {
+    /// How often to send a Ping frame to the peer.
+    pub interval: Duration,
+
+    /// Close the session if no frame is received from the peer within this window.
+    /// Should be a small multiple of `interval` to tolerate transient drops.
+    pub timeout: Duration,
+}
+
+impl KeepAlive {
+    /// Create a keep-alive config with the given interval and timeout.
+    pub fn new(interval: Duration, timeout: Duration) -> Self {
+        Self { interval, timeout }
+    }
+}
+
+impl Default for KeepAlive {
+    fn default() -> Self {
+        // Match the QUIC defaults used by moq-native: 5s ping, 30s deadline.
+        Self {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
 
 /// Parse a negotiated WebSocket subprotocol header into a version and app protocol.
 ///
@@ -36,36 +72,20 @@ fn parse_alpn(alpn: Option<&str>, pin: Option<Version>) -> (Version, Option<Stri
     (pin.unwrap_or(Version::WebTransport), None)
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a client-side session.
+/// Wrap a pre-upgraded WebSocket connection as a session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework. Pass the negotiated `sec-websocket-protocol`
-/// header value (or `None` to default to the WebTransport wire format).
-///
-/// If `version` is `Some`, the QMux version is forced regardless of
-/// the ALPN prefix. The ALPN is still used to extract the app protocol.
-pub fn connect<T>(ws: T, alpn: Option<&str>, version: Option<Version>) -> Session
-where
-    T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
-        + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
-        + Unpin
-        + Send
-        + 'static,
-{
-    let (version, protocol) = parse_alpn(alpn, version);
-    let transport = WsTransport::new(ws);
-    Session::connect(transport, Config::new(version, protocol))
+/// external framework (e.g. axum). Set the negotiated
+/// `sec-websocket-protocol` header value with [`Bare::with_alpn`];
+/// without it, the WebTransport wire format is used.
+pub struct Bare<T> {
+    ws: T,
+    alpn: Option<String>,
+    version: Option<Version>,
+    keep_alive: Option<KeepAlive>,
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a server-side session.
-///
-/// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). Pass the negotiated `sec-websocket-protocol`
-/// header value (or `None` to default to the WebTransport wire format).
-///
-/// If `version` is `Some`, the QMux version is forced regardless of
-/// the ALPN prefix. The ALPN is still used to extract the app protocol.
-pub fn accept<T>(ws: T, alpn: Option<&str>, version: Option<Version>) -> Session
+impl<T> Bare<T>
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -73,9 +93,54 @@ where
         + Send
         + 'static,
 {
-    let (version, protocol) = parse_alpn(alpn, version);
-    let transport = WsTransport::new(ws);
-    Session::accept(transport, Config::new(version, protocol))
+    pub fn new(ws: T) -> Self {
+        Self {
+            ws,
+            alpn: None,
+            version: None,
+            keep_alive: None,
+        }
+    }
+
+    /// Set the negotiated `sec-websocket-protocol` value from the handshake.
+    pub fn with_alpn(mut self, alpn: &str) -> Self {
+        self.alpn = Some(alpn.to_string());
+        self
+    }
+
+    /// Pin a specific QMux version, ignoring the negotiated ALPN's prefix.
+    ///
+    /// The ALPN is still used to extract the application protocol.
+    pub fn with_version(mut self, version: Version) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    /// Drive a keep-alive Ping/timeout on the WebSocket.
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Wrap as a client-side session.
+    pub fn connect(self) -> Session {
+        let (version, protocol) = parse_alpn(self.alpn.as_deref(), self.version);
+        Session::connect(self.into_transport(), Config::new(version, protocol))
+    }
+
+    /// Wrap as a server-side session.
+    pub fn accept(self) -> Session {
+        let (version, protocol) = parse_alpn(self.alpn.as_deref(), self.version);
+        Session::accept(self.into_transport(), Config::new(version, protocol))
+    }
+
+    fn into_transport(self) -> WsTransport<T> {
+        let transport = WsTransport::new(self.ws);
+        match self.keep_alive {
+            Some(ka) => transport.with_keep_alive(ka),
+            None => transport,
+        }
+    }
 }
 
 /// A QMux client that connects over WebSocket.
@@ -88,6 +153,7 @@ pub struct Client {
     protocols: Vec<String>,
     version: Option<Version>,
     config: Option<tungstenite::protocol::WebSocketConfig>,
+    keep_alive: Option<KeepAlive>,
     #[cfg(feature = "wss")]
     connector: Option<tokio_tungstenite::Connector>,
 }
@@ -129,6 +195,15 @@ impl Client {
     /// Set the WebSocket configuration (e.g. max message/frame sizes).
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    /// Send periodic Pings and close the session if the peer goes silent.
+    ///
+    /// WebSocket has no built-in idle timeout, so without this a crashed peer
+    /// stays "connected" until OS-level TCP keep_alive eventually probes.
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -186,7 +261,10 @@ impl Client {
 
         let (version, protocol) = parse_alpn(negotiated, self.version);
 
-        let transport = WsTransport::new(ws_stream);
+        let transport = match self.keep_alive {
+            Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
+            None => WsTransport::new(ws_stream),
+        };
         Ok(Session::connect(transport, Config::new(version, protocol)))
     }
 }
@@ -200,6 +278,7 @@ impl Client {
 pub struct Server {
     protocols: Vec<String>,
     version: Option<Version>,
+    keep_alive: Option<KeepAlive>,
 }
 
 impl Server {
@@ -226,6 +305,15 @@ impl Server {
     pub fn with_protocols(mut self, protocols: &[&str]) -> Self {
         self.protocols
             .extend(protocols.iter().map(|s| s.to_string()));
+        self
+    }
+
+    /// Send periodic Pings and close the session if the peer goes silent.
+    ///
+    /// WebSocket has no built-in idle timeout, so without this a crashed peer
+    /// stays "connected" until OS-level TCP keep_alive eventually probes.
+    pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+        self.keep_alive = Some(keep_alive);
         self
     }
 
@@ -313,7 +401,10 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
-        let transport = WsTransport::new(ws);
+        let transport = match self.keep_alive {
+            Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
+            None => WsTransport::new(ws),
+        };
         Ok(Session::accept(transport, Config::new(version, protocol)))
     }
 }

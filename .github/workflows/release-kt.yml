@@ -1,0 +1,213 @@
+name: Release Kotlin
+
+# Tag-triggered for real releases; pull_request mode (paths-filtered) runs
+# every job except the Maven Central publish as a smoke test, so changes to
+# the build script, gradle config, or package.sh fail the PR instead of the
+# first release.
+
+on:
+  push:
+    tags:
+      - "web-transport-ffi-v*"
+  pull_request:
+    paths:
+      - "rs/web-transport-ffi/**"
+      - "kt/**"
+      - ".github/workflows/release-kt.yml"
+      - ".github/scripts/release.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-kt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  parse-version:
+    name: Parse version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Parse version
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "PR build, using Cargo.toml version: ${VERSION}"
+          else
+            .github/scripts/release.sh parse-version web-transport-ffi
+          fi
+
+  build:
+    name: Build web-transport-ffi (${{ matrix.target }})
+    needs: [parse-version]
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Android
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+          - target: x86_64-linux-android
+            os: ubuntu-latest
+          # Desktop JVM
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: universal-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cargo-ndk (Android)
+        if: contains(matrix.target, 'android')
+        run: cargo install cargo-ndk
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          ./rs/web-transport-ffi/build.sh \
+            --target "$BUILD_TARGET" \
+            --version "$BUILD_VERSION" \
+            --output dist
+
+      - name: Upload lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-lib-${{ matrix.target }}
+          # Upload only the lib/ contents; package.sh expects <target>/<libname>.
+          path: dist/web-transport-ffi-${{ needs.parse-version.outputs.version }}-${{ matrix.target }}/lib/
+
+  bindings:
+    name: Generate bindings
+    needs: [parse-version]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate bindings
+        env:
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          ./rs/web-transport-ffi/build.sh \
+            --bindings-only \
+            --version "$BUILD_VERSION" \
+            --output dist
+
+      - name: Upload bindings
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-bindings
+          # Upload only the kotlin subdir.
+          path: dist/bindings/kotlin/
+
+  package:
+    name: Package and publish
+    needs: [parse-version, build, bindings]
+    runs-on: ubuntu-latest
+    env:
+      # Picked up by com.vanniktech.maven.publish via Gradle project properties.
+      ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+      ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+      ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+      ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Download per-target libs
+        uses: actions/download-artifact@v8
+        with:
+          path: libs-raw
+          pattern: kotlin-lib-*
+
+      - name: Flatten lib layout
+        run: |
+          mkdir -p libs
+          for dir in libs-raw/kotlin-lib-*; do
+            target="${dir#libs-raw/kotlin-lib-}"
+            mv "$dir" "libs/$target"
+          done
+          ls -la libs
+
+      - name: Download bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: kotlin-bindings
+          path: bindings
+
+      - name: Stage native libs + bindings into the gradle module
+        env:
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          ./kt/scripts/package.sh \
+            --version "$BUILD_VERSION" \
+            --lib-dir libs \
+            --bindings-dir bindings \
+            --output release-out
+
+      - name: Publish to Maven Central
+        # Tag pushes only, and only once PUBLISH_KOTLIN=true is set in repo
+        # variables. PR runs always skip publish (secrets aren't available
+        # on PRs from forks anyway). The dev.moq:web-transport coordinates
+        # require MAVEN_CENTRAL_* and SIGNING_* secrets to be configured.
+        if: github.event_name != 'pull_request' && vars.PUBLISH_KOTLIN == 'true'
+        run: |
+          gradle -p kt \
+            -Pwebtransportffi.version="${{ needs.parse-version.outputs.version }}" \
+            -Pandroid.enabled=true \
+            :web-transport:publishAndReleaseToMavenCentral --no-configuration-cache
+
+      - name: Upload local maven layout
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-package
+          path: release-out/*

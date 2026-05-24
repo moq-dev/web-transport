@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.0.5"
+version = "0.0.8"
 edition = "2021"
 
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
 tokio-rustls = { version = "0.26", optional = true }
 
 # Optional: WebSocket
-tokio-tungstenite = { version = "0.28", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 tracing = "0.1"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }

@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+Package.resolved
+*.xcframework/
+*.xcframework.zip
+Sources/WebTransportFFI/Generated.swift

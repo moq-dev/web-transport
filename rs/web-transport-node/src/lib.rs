@@ -64,13 +64,23 @@ impl NapiClient {
 
     /// Connect to a WebTransport server at the given URL.
     #[napi]
-    pub async fn connect(&self, url_str: String) -> Result<NapiSession> {
+    pub async fn connect(
+        &self,
+        url_str: String,
+        options: Option<NapiConnectOptions>,
+    ) -> Result<NapiSession> {
         let url: url::Url = url_str
             .parse()
             .map_err(|e: url::ParseError| Error::from_reason(e.to_string()))?;
+        let mut request = web_transport_quinn::proto::ConnectRequest::new(url);
+        if let Some(opts) = options {
+            if let Some(protocols) = opts.protocols {
+                request = request.with_protocols(protocols);
+            }
+        }
         let session = self
             .inner
-            .connect(url)
+            .connect(request)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
@@ -80,10 +90,17 @@ impl NapiClient {
     }
 }
 
+/// Options for connecting to a WebTransport server.
+#[napi(object)]
+pub struct NapiConnectOptions {
+    /// Subprotocols for WT-Available-Protocols negotiation.
+    pub protocols: Option<Vec<String>>,
+}
+
 /// A WebTransport server that accepts incoming sessions.
 #[napi]
 pub struct NapiServer {
-    inner: Mutex<web_transport_quinn::Server>,
+    inner: Mutex<Option<web_transport_quinn::Server>>,
 }
 
 #[napi]
@@ -109,7 +126,7 @@ impl NapiServer {
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
             Ok(Self {
-                inner: Mutex::new(server),
+                inner: Mutex::new(Some(server)),
             })
         })
     }
@@ -117,13 +134,28 @@ impl NapiServer {
     /// Accept the next incoming WebTransport session request.
     #[napi]
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
-        let mut server = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        let server = match guard.as_mut() {
+            Some(server) => server,
+            None => return Ok(None),
+        };
         match server.accept().await {
             Some(request) => Ok(Some(NapiRequest {
                 inner: Mutex::new(Some(request)),
             })),
-            None => Ok(None),
+            None => {
+                guard.take();
+                Ok(None)
+            }
         }
+    }
+
+    /// Close the server, stopping it from accepting new connections.
+    #[napi]
+    pub fn close(&self) {
+        within_runtime_if_available(|| {
+            self.inner.blocking_lock().take();
+        });
     }
 }
 
@@ -228,6 +260,12 @@ impl NapiBiStream {
 
 #[napi]
 impl NapiSession {
+    /// The subprotocol selected by the server during WT-Available-Protocols negotiation.
+    #[napi(getter)]
+    pub fn protocol(&self) -> Option<String> {
+        self.inner.response().protocol.clone()
+    }
+
     /// Accept an incoming unidirectional stream.
     #[napi]
     pub async fn accept_uni(&self) -> Result<NapiRecvStream> {

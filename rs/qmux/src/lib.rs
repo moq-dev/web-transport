@@ -32,7 +32,7 @@ pub use tokio_tungstenite;
 pub use tokio_tungstenite::tungstenite;
 
 #[cfg(feature = "ws")]
-pub use ws::{Client, Server};
+pub use ws::{Client, KeepAlive, Server};
 
 use proto::*;
 

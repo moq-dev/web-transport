@@ -5,8 +5,7 @@
 	"workspaces": [
 		"js/qmux",
 		"js/web-demo",
-		"js/web-transport",
-		"js/web-transport-ws"
+		"js/web-transport"
 	],
 	"scripts": {
 		"check": "biome check",

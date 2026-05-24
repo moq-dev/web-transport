@@ -1,0 +1,209 @@
+name: Release Swift
+
+# Tag-triggered for real releases; pull_request mode (paths-filtered) runs
+# the build / bindings / package jobs as a smoke test. The release-assets
+# step is skipped on PRs (no tag to attach to).
+
+on:
+  push:
+    tags:
+      - "web-transport-ffi-v*"
+  pull_request:
+    paths:
+      - "rs/web-transport-ffi/**"
+      - "swift/**"
+      - ".github/workflows/release-swift.yml"
+      - ".github/scripts/release.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-swift-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  parse-version:
+    name: Parse version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Parse version
+        id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "PR build, using Cargo.toml version: ${VERSION}"
+          else
+            .github/scripts/release.sh parse-version web-transport-ffi
+          fi
+
+  build:
+    name: Build web-transport-ffi (${{ matrix.target }})
+    needs: [parse-version]
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - x86_64-apple-ios
+          - universal-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+          # Set iOS deployment target to avoid ___chkstk_darwin linker errors.
+          IPHONEOS_DEPLOYMENT_TARGET: ${{ contains(matrix.target, 'apple-ios') && '16.0' || '' }}
+        run: |
+          ./rs/web-transport-ffi/build.sh \
+            --target "$BUILD_TARGET" \
+            --version "$BUILD_VERSION" \
+            --output dist
+
+      - name: Upload lib
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-lib-${{ matrix.target }}
+          path: dist/web-transport-ffi-${{ needs.parse-version.outputs.version }}-${{ matrix.target }}/lib/
+
+  bindings:
+    name: Generate bindings
+    needs: [parse-version]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate bindings
+        env:
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          ./rs/web-transport-ffi/build.sh \
+            --bindings-only \
+            --version "$BUILD_VERSION" \
+            --output dist
+
+      - name: Upload bindings
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-bindings
+          path: dist/bindings/swift/
+
+  package:
+    name: Package
+    needs: [parse-version, build, bindings]
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download per-target libs
+        uses: actions/download-artifact@v8
+        with:
+          path: libs-raw
+          pattern: swift-lib-*
+
+      - name: Flatten lib layout
+        run: |
+          mkdir -p libs
+          for dir in libs-raw/swift-lib-*; do
+            target="${dir#libs-raw/swift-lib-}"
+            mv "$dir" "libs/$target"
+          done
+          ls -la libs
+
+      - name: Download bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: swift-bindings
+          path: bindings
+
+      - name: Package
+        env:
+          BUILD_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          ./swift/scripts/package.sh \
+            --version "$BUILD_VERSION" \
+            --lib-dir libs \
+            --bindings-dir bindings \
+            --output release-out
+
+      - name: Upload Swift package
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-package
+          path: release-out/*
+
+  release-assets:
+    name: Attach assets to GitHub Release
+    needs: [package, parse-version]
+    runs-on: ubuntu-latest
+    # Tag pushes only — there's no GitHub Release to attach to on a PR.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Swift package
+        uses: actions/download-artifact@v8
+        with:
+          name: swift-package
+          path: release-assets
+
+      - name: List assets
+        run: ls -la release-assets
+
+      - name: Find previous tag
+        id: prev
+        run: .github/scripts/release.sh prev-tag web-transport-ffi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TITLE: "WebTransport FFI v${{ needs.parse-version.outputs.version }}"
+          RELEASE_PREV_TAG: ${{ steps.prev.outputs.tag }}
+        run: .github/scripts/release.sh create release-assets/
+
+  publish:
+    name: Publish to Swift Package mirror
+    needs: [package, parse-version]
+    runs-on: ubuntu-latest
+    # Re-enable by adding a publish.sh and setting PUBLISH_SPM=true; see
+    # swift/README.md. Always skipped on PRs.
+    if: github.event_name != 'pull_request' && vars.PUBLISH_SPM == 'true'
+
+    steps:
+      - name: Placeholder
+        run: echo "SPM mirror publish not enabled yet"

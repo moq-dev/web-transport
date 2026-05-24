@@ -1,104 +1,142 @@
-name: release-py
+name: Release Py
 
-permissions:
-  contents: read
-  id-token: write
+# Driven by the `web-transport-ffi-v*` tag that release-plz pushes when it bumps
+# rs/web-transport-ffi/Cargo.toml. The wheel inherits its version from that same
+# Cargo.toml (via maturin's dynamic version), so the web-transport-rs package
+# stays lockstep with the web-transport-ffi crate without a separate bump.
+#
+# Also runs in pull_request mode (paths-filtered) as a smoke test — every
+# job except `publish` is exercised end-to-end, so a broken release-py.yml
+# fails the PR instead of failing the first real release tag.
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "web-transport-ffi-v*"
+  pull_request:
     paths:
-      - "py/**"
-      - "rs/web-transport-python/**"
+      - "rs/web-transport-ffi/**"
+      - "py/web-transport/**"
+      - ".github/workflows/release-py.yml"
+      - ".github/scripts/release.sh"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: release-py
-  cancel-in-progress: false
+  group: release-py-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  linux:
-    if: github.repository_owner == 'moq-dev'
+  parse-version:
+    name: Parse version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Parse version
+        id: parse
+        # PR runs use the in-tree Cargo.toml version (no tag exists). Tag
+        # runs use release.sh, which validates the SemVer in the tag name.
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "PR build, using Cargo.toml version: ${VERSION}"
+          else
+            .github/scripts/release.sh parse-version web-transport-ffi
+          fi
+
+  verify-version:
+    name: Verify version matches Cargo.toml
+    needs: [parse-version]
+    runs-on: ubuntu-latest
+    # Tautological on PRs (we sourced the version FROM Cargo.toml). Only
+    # meaningful when a tag is pushed.
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check Cargo.toml version matches tag
+        env:
+          TAG_VERSION: ${{ needs.parse-version.outputs.version }}
+        run: |
+          CARGO_VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Tag version:   $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: Tag version ($TAG_VERSION) does not match rs/web-transport-ffi/Cargo.toml version ($CARGO_VERSION)" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build wheels (${{ matrix.target }})
+    needs: [parse-version]
+    runs-on: ${{ matrix.os }}
+
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64
-            manylinux: auto
-          - target: aarch64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            # Use manylinux_2_28 for aarch64-linux to get a newer GCC.
+            # manylinux2014 ships GCC 4.8.5 which can't compile aws-lc-sys.
             manylinux: 2_28
+            # The cross image sets TARGET_CC/CXX which leaks into host builds.
+            before-script-linux: "unset TARGET_CC TARGET_CXX"
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          # py/web-transport/pyproject.toml drives the build; its [tool.maturin]
+          # block points at rs/web-transport-ffi/Cargo.toml.
           working-directory: py/web-transport
+          args: --release --out dist
           target: ${{ matrix.target }}
-          args: --release --out dist -i python3.12 -i python3.13
-          manylinux: ${{ matrix.manylinux }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          before-script-linux: ${{ matrix.before-script-linux || '' }}
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
         with:
-          name: wheels-linux-${{ matrix.target }}
-          path: py/web-transport/dist
-
-  macos:
-    if: github.repository_owner == 'moq-dev'
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        target: [x86_64, aarch64]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: |
-            3.12
-            3.13
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: py/web-transport
-          target: ${{ matrix.target }}
-          args: --release --out dist -i python3.12 -i python3.13
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-macos-${{ matrix.target }}
-          path: py/web-transport/dist
-
-  windows:
-    if: github.repository_owner == 'moq-dev'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: |
-            3.12
-            3.13
-
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          working-directory: py/web-transport
-          target: x86_64
-          args: --release --out dist -i python3.12 -i python3.13
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-x86_64
-          path: py/web-transport/dist
+          name: python-${{ matrix.target }}
+          path: py/web-transport/dist/*.whl
 
   sdist:
-    if: github.repository_owner == 'moq-dev'
+    name: Build sdist
+    needs: [parse-version]
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -107,25 +145,32 @@ jobs:
           command: sdist
           args: --out dist
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
         with:
-          name: wheels-sdist
-          path: py/web-transport/dist
+          name: python-sdist
+          path: py/web-transport/dist/*.tar.gz
 
   publish:
-    if: github.repository_owner == 'moq-dev'
-    needs: [linux, macos, windows, sdist]
+    name: Publish to PyPI
+    needs: [build, sdist, verify-version]
     runs-on: ubuntu-latest
+    # Tag pushes only, and only once PUBLISH_PYTHON=true is set in repo
+    # variables. PR runs always skip publish.
+    if: github.event_name != 'pull_request' && vars.PUBLISH_PYTHON == 'true'
     environment:
       name: pypi
-      url: https://pypi.org/p/web-transport-quinn
+      url: https://pypi.org/p/web-transport-rs
+    permissions:
+      id-token: write
+
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download wheels
+        uses: actions/download-artifact@v8
         with:
-          pattern: wheels-*
-          merge-multiple: true
+          pattern: python-*
           path: dist
+          merge-multiple: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

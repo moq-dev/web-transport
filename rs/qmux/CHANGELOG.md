@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.7...qmux-v0.0.8) - 2026-05-24
+
+### Other
+
+- bump tokio-quiche, tokio-tungstenite, flume, rcgen, sha2 ([#240](https://github.com/moq-dev/web-transport/pull/240))
+
+## [0.0.7](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.6...qmux-v0.0.7) - 2026-05-21
+
+### Other
+
+- add Keepalive option for WebSocket transports ([#234](https://github.com/moq-dev/web-transport/pull/234))
+
+## [0.0.6](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.5...qmux-v0.0.6) - 2026-04-07
+
+### Other
+
+- Fix @moq/qmux publish and build scripts ([#207](https://github.com/moq-dev/web-transport/pull/207))
+- Add NapiClient.disableVerify() and use NAPI tokio runtime ([#205](https://github.com/moq-dev/web-transport/pull/205))
+
 ## [0.0.4](https://github.com/moq-dev/web-transport/compare/qmux-v0.0.3...qmux-v0.0.4) - 2026-03-13
 
 ### Other
