@@ -33,18 +33,19 @@ mod stream_transport {
         reader: BufReader<tokio::io::ReadHalf<T>>,
         writer: BufWriter<tokio::io::WriteHalf<T>>,
         version: Version,
-        /// Peer's max_record_size (for send validation). Defaults to 16382 per draft-01.
-        max_record_size: usize,
+        /// OUR advertised max_record_size — bounds incoming records on the read side.
+        /// Mirrors `config.max_record_size`; what we tell the peer not to exceed.
+        our_max_record_size: usize,
     }
 
     impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamTransport<T> {
-        pub fn new(stream: T, version: Version) -> Self {
+        pub fn new(stream: T, version: Version, our_max_record_size: u64) -> Self {
             let (read, write) = tokio::io::split(stream);
             Self {
                 reader: BufReader::new(read),
                 writer: BufWriter::new(write),
                 version,
-                max_record_size: crate::proto::DEFAULT_MAX_RECORD_SIZE as usize,
+                our_max_record_size: our_max_record_size as usize,
             }
         }
 
@@ -115,7 +116,7 @@ mod stream_transport {
         /// Returns the record payload (frames concatenated).
         async fn recv_record(&mut self) -> Result<Bytes, Error> {
             let size = self.read_varint().await?.into_inner() as usize;
-            if size > self.max_record_size {
+            if size > self.our_max_record_size {
                 return Err(Error::FrameTooLarge);
             }
             let mut buf = BytesMut::zeroed(size);
@@ -233,6 +234,13 @@ mod stream_transport {
 
     impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for StreamTransport<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            // QMux01 frames travel inside size-prefixed records on byte streams.
+            // (Records are implicit on WebSocket, where the message boundary delimits them.)
+            if self.version == Version::QMux01 {
+                let mut size_buf = BytesMut::with_capacity(8);
+                VarInt::try_from(data.len())?.encode(&mut size_buf);
+                self.writer.write_all(&size_buf).await?;
+            }
             self.writer.write_all(&data).await?;
             self.writer.flush().await?;
             Ok(())

@@ -7,8 +7,8 @@ use crate::config::Config;
 use crate::credit::Credit;
 use crate::transport::Transport;
 use crate::{
-    encode_record, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
-    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
+    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
+    TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -74,6 +74,11 @@ struct SessionState<T: Transport> {
     open_uni_credit: Credit,
     recv_bi_credit: Credit,
     recv_uni_credit: Credit,
+
+    // QMux01 idle-timeout state (engaged once we've received the peer's params)
+    last_recv_at: tokio::time::Instant,
+    last_send_at: tokio::time::Instant,
+    next_ping_seq: u64,
 }
 
 impl<T: Transport> SessionState<T> {
@@ -100,10 +105,22 @@ impl<T: Transport> SessionState<T> {
         let mut closed = self.closed.subscribe();
 
         loop {
+            // Compute the effective idle timeout — the smaller of the two non-zero values.
+            // While we're still waiting on the peer's transport parameters, treat the
+            // timeout as disabled so we don't tear the connection down before negotiation.
+            let idle_timeout_ms = self.effective_idle_timeout_ms();
+            let idle_deadline =
+                idle_timeout_ms.map(|ms| self.last_recv_at + std::time::Duration::from_millis(ms));
+            // Keep-alive: send a QX_PING when we've been silent for a third of the timeout.
+            // (Any frame counts as activity; this fires only when both sides are idle.)
+            let ping_deadline = idle_timeout_ms
+                .map(|ms| self.last_send_at + std::time::Duration::from_millis(ms / 3));
+
             tokio::select! {
                 biased;
                 result = self.transport.recv() => {
                     let data = result?;
+                    self.last_recv_at = tokio::time::Instant::now();
                     if self.config.version == Version::QMux01 {
                         // QMux01: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
@@ -143,10 +160,39 @@ impl<T: Transport> SessionState<T> {
                         None => return Err(Error::Closed),
                     };
                 }
+                _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
+                    tracing::debug!("idle timeout fired");
+                    return Err(Error::IdleTimeout);
+                }
+                _ = async { tokio::time::sleep_until(ping_deadline.unwrap()).await }, if ping_deadline.is_some() => {
+                    // Periodic keep-alive: send a QX_PING so the peer's idle timer resets.
+                    let seq = self.next_ping_seq;
+                    self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
+                    self.send_frame(Frame::Ping(crate::Ping { sequence: seq, response: false })).await?;
+                }
                 _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
                     return Err(closed.borrow().clone().unwrap_or(Error::Closed))
                 }
             }
+        }
+    }
+
+    /// Effective idle timeout in milliseconds, or `None` if disabled.
+    ///
+    /// Only kicks in for QMux01 after both sides have exchanged transport parameters.
+    /// Per RFC 9000 §10.1, the effective timeout is `min(our, peer)` of the non-zero values
+    /// (or the single non-zero one). If both are zero, idle timeouts are disabled.
+    fn effective_idle_timeout_ms(&self) -> Option<u64> {
+        if self.config.version != Version::QMux01 || !self.params_received {
+            return None;
+        }
+        match (
+            self.our_params.max_idle_timeout,
+            self.peer_params.max_idle_timeout,
+        ) {
+            (0, 0) => None,
+            (a, 0) | (0, a) => Some(a),
+            (a, b) => Some(a.min(b)),
         }
     }
 
@@ -156,14 +202,25 @@ impl<T: Transport> SessionState<T> {
         self.send_encoded(frame.encode(self.config.version)?).await
     }
 
-    /// Send pre-encoded frame bytes, wrapping in a record for QMux01.
-    async fn send_encoded(&mut self, frame_bytes: Bytes) -> Result<(), Error> {
-        let data = if self.config.version == Version::QMux01 {
-            encode_record(&frame_bytes)?
-        } else {
-            frame_bytes
-        };
-        self.transport.send(data).await
+    /// Send pre-encoded frame bytes, validating against the peer's
+    /// `max_record_size` for QMux01. The transport handles any
+    /// transport-level framing (size varint on TCP/TLS; implicit on WS).
+    async fn send_encoded(&mut self, bytes: Bytes) -> Result<(), Error> {
+        if self.config.version == Version::QMux01 {
+            // Until the peer's TRANSPORT_PARAMETERS arrive, fall back to the draft-01
+            // default so we don't accidentally send a record the peer must reject.
+            let limit = if self.params_received {
+                self.peer_params.max_record_size
+            } else {
+                crate::proto::DEFAULT_MAX_RECORD_SIZE
+            };
+            if bytes.len() as u64 > limit {
+                return Err(Error::FrameTooLarge);
+            }
+        }
+        self.transport.send(bytes).await?;
+        self.last_send_at = tokio::time::Instant::now();
+        Ok(())
     }
 
     async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -532,6 +589,9 @@ impl Session {
             open_uni_credit: open_uni_credit.clone(),
             recv_bi_credit: recv_bi_credit.clone(),
             recv_uni_credit: recv_uni_credit.clone(),
+            last_recv_at: tokio::time::Instant::now(),
+            last_send_at: tokio::time::Instant::now(),
+            next_ping_seq: 0,
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);

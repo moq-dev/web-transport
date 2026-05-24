@@ -116,8 +116,9 @@ pub enum Frame {
 impl Frame {
     /// Encode the frame into bytes using the given wire format version.
     ///
-    /// For QMux01, this encodes the raw frame without a record wrapper.
-    /// Use [`encode_record`] to wrap frames in a record.
+    /// For QMux01, this encodes the raw frame without a record wrapper —
+    /// the transport layer is responsible for delimiting records (size
+    /// varint on TCP/TLS; implicit on WebSocket message boundaries).
     pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
 
@@ -631,14 +632,6 @@ impl Frame {
             _ => Err(Error::InvalidFrameType(frame_type)),
         }
     }
-}
-
-/// Wrap encoded frame bytes in a QMux Record (Size + Frames) for draft-01.
-pub fn encode_record(frame_bytes: &Bytes) -> Result<Bytes, Error> {
-    let mut buf = BytesMut::new();
-    VarInt::try_from(frame_bytes.len())?.encode(&mut buf);
-    buf.put_slice(frame_bytes);
-    Ok(buf.freeze())
 }
 
 impl From<Stream> for Frame {

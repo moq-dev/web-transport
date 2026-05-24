@@ -39,6 +39,9 @@ pub enum Error {
     #[error("connection closed")]
     Closed,
 
+    #[error("idle timeout")]
+    IdleTimeout,
+
     #[error("invalid protocol token: {0:?}")]
     InvalidProtocol(String),
 

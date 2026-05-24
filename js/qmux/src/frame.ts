@@ -477,17 +477,6 @@ export function decodeRecord(buffer: Uint8Array): Any[] {
 	return frames;
 }
 
-/** Encode a frame wrapped in a QMux Record (Size + Frames) for draft-01. */
-export function encodeRecord(frameBytes: Uint8Array): Uint8Array {
-	const sizeVi = VarInt.from(frameBytes.byteLength);
-	const totalSize = sizeVi.size() + frameBytes.byteLength;
-	let buffer = new Uint8Array(new ArrayBuffer(totalSize), 0, 0);
-	buffer = sizeVi.encode(buffer);
-	buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + frameBytes.byteLength);
-	buffer.set(frameBytes, buffer.byteLength - frameBytes.byteLength);
-	return buffer;
-}
-
 function decodeWebTransport(buffer: Uint8Array): Any {
 	const frameType = buffer[0];
 	buffer = buffer.slice(1);

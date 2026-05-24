@@ -94,7 +94,11 @@ impl TransportParams {
 
     /// Decode transport parameters from bytes.
     pub fn decode(mut data: Bytes) -> Result<Self, Error> {
-        let mut params = TransportParams::default();
+        // Per draft-01, `max_record_size` defaults to 16382 when omitted, not 0.
+        let mut params = TransportParams {
+            max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            ..TransportParams::default()
+        };
         // Track seen IDs to detect duplicates using a set of seen IDs
         let mut seen = std::collections::HashSet::new();
 

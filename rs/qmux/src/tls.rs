@@ -83,8 +83,9 @@ pub async fn connect(
     let (version, protocol) = parse_alpn(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream, version);
-    Ok(Session::connect(transport, Config::new(version, protocol)))
+    let session_config = Config::new(version, protocol);
+    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    Ok(Session::connect(transport, session_config))
 }
 
 /// Accept a TLS connection.
@@ -107,6 +108,7 @@ pub async fn accept(
     let (version, protocol) = parse_alpn(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let transport = StreamTransport::new(tls_stream, version);
-    Ok(Session::accept(transport, Config::new(version, protocol)))
+    let session_config = Config::new(version, protocol);
+    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    Ok(Session::accept(transport, session_config))
 }

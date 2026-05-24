@@ -196,6 +196,12 @@ export default class Session implements WebTransport {
 	#recvBiCredit: Credit;
 	#recvUniCredit: Credit;
 
+	// QMux01 idle-timeout tracking (engaged once we've received the peer's params).
+	#lastRecvAt = Date.now();
+	#lastSendAt = Date.now();
+	#nextPingSeq = 0;
+	#idleTimer?: ReturnType<typeof setInterval>;
+
 	constructor(url: string | URL, options?: SessionOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
@@ -310,6 +316,7 @@ export default class Session implements WebTransport {
 		if (!(event.data instanceof ArrayBuffer)) return;
 
 		const data = new Uint8Array(event.data);
+		this.#lastRecvAt = Date.now();
 		try {
 			if (this.#version === "qmux-01") {
 				// QMux01: each WS message is a record containing one or more frames
@@ -395,6 +402,58 @@ export default class Session implements WebTransport {
 			const sendLimit =
 				id.dir === Stream.Dir.Bi ? params.initialMaxStreamDataBidiRemote : params.initialMaxStreamDataUni;
 			flow.sendCredit.increaseMax(sendLimit);
+		}
+
+		this.#startIdleTimerIfEnabled();
+	}
+
+	/** Effective idle timeout in ms, or 0 if disabled.
+	 *
+	 * Per RFC 9000 §10.1, the effective value is `min(our, peer)` of the non-zero advertised values
+	 * (or the single non-zero one). If both are zero, idle timeouts are disabled.
+	 */
+	#effectiveIdleTimeoutMs(): bigint {
+		if (this.#version !== "qmux-01") return 0n;
+		const a = this.#ourParams.maxIdleTimeout;
+		const b = this.#peerParams.maxIdleTimeout;
+		if (a === 0n && b === 0n) return 0n;
+		if (a === 0n) return b;
+		if (b === 0n) return a;
+		return a < b ? a : b;
+	}
+
+	#startIdleTimerIfEnabled() {
+		const timeoutMs = this.#effectiveIdleTimeoutMs();
+		if (timeoutMs === 0n) return;
+		// Poll at a fraction of the timeout — frequent enough to trigger pings on time
+		// but not so frequent it burns CPU on otherwise-quiet sessions.
+		const tickMs = Math.max(50, Number(timeoutMs) / 6);
+		this.#idleTimer = setInterval(() => this.#idleTick(Number(timeoutMs)), tickMs);
+	}
+
+	#idleTick(timeoutMs: number) {
+		if (this.#closed) {
+			if (this.#idleTimer) clearInterval(this.#idleTimer);
+			return;
+		}
+		const now = Date.now();
+		if (now - this.#lastRecvAt > timeoutMs) {
+			// Peer has gone silent past the negotiated limit.
+			this.#closeReason = new Error("idle timeout");
+			this.#ws.close();
+			if (this.#idleTimer) clearInterval(this.#idleTimer);
+			return;
+		}
+		// Keep-alive: nudge the peer when our outbound side has been silent for a third
+		// of the timeout. Any frame counts as activity, so this only fires when truly idle.
+		if (now - this.#lastSendAt > timeoutMs / 3) {
+			const seq = this.#nextPingSeq;
+			this.#nextPingSeq = (this.#nextPingSeq + 1) >>> 0;
+			try {
+				this.#sendPriorityFrame({ type: "ping_request", sequence: BigInt(seq) });
+			} catch {
+				// Best effort — if the send fails, the close path will fire shortly.
+			}
 		}
 	}
 
@@ -715,8 +774,23 @@ export default class Session implements WebTransport {
 			type: "transport_parameters",
 			params: this.#ourParams,
 		};
-		const encoded = Frame.encode(frame, this.#version);
-		this.#ws.send(this.#version === "qmux-01" ? Frame.encodeRecord(encoded) : encoded);
+		// QMux01 over WebSocket uses the WS message boundary as the implicit record
+		// boundary; no extra size prefix is required.
+		this.#sendBytes(Frame.encode(frame, this.#version));
+	}
+
+	/** Send raw frame bytes, validating against the peer's max_record_size for QMux01. */
+	#sendBytes(bytes: Uint8Array) {
+		if (this.#version === "qmux-01") {
+			// Before the peer's TRANSPORT_PARAMETERS arrive, use the draft-01 default
+			// (16382) so we don't accidentally send something the peer will reject.
+			const limit = this.#paramsReceived ? this.#peerParams.maxRecordSize : Frame.DEFAULT_MAX_RECORD_SIZE;
+			if (BigInt(bytes.byteLength) > limit) {
+				throw new Error(`record exceeds peer max_record_size (${bytes.byteLength} > ${limit})`);
+			}
+		}
+		this.#ws.send(bytes);
+		this.#lastSendAt = Date.now();
 	}
 
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
@@ -775,13 +849,11 @@ export default class Session implements WebTransport {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 
-		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(this.#version === "qmux-01" ? Frame.encodeRecord(chunk) : chunk);
+		this.#sendBytes(Frame.encode(frame, this.#version));
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
-		const chunk = Frame.encode(frame, this.#version);
-		this.#ws.send(this.#version === "qmux-01" ? Frame.encodeRecord(chunk) : chunk);
+		this.#sendBytes(Frame.encode(frame, this.#version));
 	}
 
 	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
@@ -923,6 +995,10 @@ export default class Session implements WebTransport {
 	}
 
 	#close(code: number, reason: string) {
+		if (this.#idleTimer) {
+			clearInterval(this.#idleTimer);
+			this.#idleTimer = undefined;
+		}
 		this.#closedResolve({
 			closeCode: code,
 			reason,
