@@ -4,7 +4,7 @@ use std::{
     task::{Poll, Waker},
 };
 use tokio_quiche::{
-    buf_factory::{BufFactory, PooledBuf},
+    buf_factory::BufFactory,
     quic::{HandshakeInfo, QuicheConnection},
 };
 
@@ -195,7 +195,7 @@ pub(super) struct Driver {
     send: HashMap<StreamId, Lock<SendState>>,
     recv: HashMap<StreamId, Lock<RecvState>>,
 
-    buf: PooledBuf,
+    buf: Vec<u8>,
 
     accept_bi: flume::Sender<(SendStream, RecvStream)>,
     accept_uni: flume::Sender<RecvStream>,
@@ -211,7 +211,7 @@ impl Driver {
             state,
             send: HashMap::new(),
             recv: HashMap::new(),
-            buf: BufFactory::get_max_buf(),
+            buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
             accept_bi,
             accept_uni,
         }

@@ -17,7 +17,7 @@ fn self_signed_cert() -> (Vec<Vec<u8>>, Vec<u8>) {
     let cert = rcgen::generate_simple_self_signed(["localhost".to_string()])
         .expect("generate self-signed cert");
     let cert_der = cert.cert.der().to_vec();
-    let key_der = cert.key_pair.serialize_der();
+    let key_der = cert.signing_key.serialize_der();
     (vec![cert_der], key_der)
 }
 
