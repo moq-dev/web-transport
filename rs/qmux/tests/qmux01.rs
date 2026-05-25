@@ -11,6 +11,56 @@ use tokio::net::TcpListener;
 use web_transport_proto::VarInt;
 use web_transport_trait::{RecvStream, SendStream, Session as _};
 
+/// Byte-level wire snapshot: QMux00 must NOT prepend a size varint, QMux01 must.
+///
+/// Regression guard for the record-framing fix — it's easy for the size prefix
+/// to leak into the QMux00 path and silently break the old wire format.
+#[tokio::test]
+async fn wire_format_size_prefix_qmux01_only() {
+    use tokio::io::AsyncReadExt;
+
+    // Spin up a client→server TCP pair so we can read raw bytes off the wire
+    // before any frame parsing happens.
+    async fn capture_first_send(version: Version) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read whatever the client's first send produces, up to a reasonable cap.
+            let mut buf = vec![0u8; 256];
+            let n = sock.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+        // The session sends TRANSPORT_PARAMETERS as its first frame on connect.
+        let _client = qmux::tcp::connect(addr, Some(version)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        server.await.unwrap()
+    }
+
+    // QX_TRANSPORT_PARAMETERS frame type encodes to an 8-byte varint starting
+    // with 0xff (since the type tag is in the top two bits and the value is huge).
+    let qmux00_bytes = capture_first_send(Version::QMux00).await;
+    assert_eq!(
+        qmux00_bytes[0], 0xff,
+        "QMux00 must start with the QX_TRANSPORT_PARAMETERS frame type (no size prefix), got {qmux00_bytes:?}"
+    );
+
+    // QMux01 must lead with a size varint, then the frame.
+    let qmux01_bytes = capture_first_send(Version::QMux01).await;
+    assert_ne!(
+        qmux01_bytes[0], 0xff,
+        "QMux01 must lead with a record size varint, not the raw frame type"
+    );
+    // After stripping the size varint, the next byte should be 0xff (the frame type).
+    let size_tag = qmux01_bytes[0] >> 6;
+    let size_len = 1usize << size_tag;
+    assert_eq!(
+        qmux01_bytes[size_len], 0xff,
+        "expected QX_TRANSPORT_PARAMETERS frame type after the {size_len}-byte size varint"
+    );
+}
+
 /// Round-trip multiple frames concatenated inside one record body.
 ///
 /// Records can carry several frames, so `decode_record` must keep parsing
@@ -59,6 +109,47 @@ fn record_round_trip_multiple_frames() {
         Frame::MaxData(v) => assert_eq!(*v, 1024),
         other => panic!("expected MaxData, got {other:?}"),
     }
+}
+
+/// QMux00 round-trip over TCP, exercising the legacy wire format.
+///
+/// Regression test for the QMux01 record-framing changes: QMux00 must continue
+/// to talk raw frames without any size-varint prefix, and the QMux01-only
+/// idle-timeout / record-size logic must stay dormant.
+#[tokio::test]
+async fn qmux00_tcp_round_trip_unchanged() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let session = qmux::tcp::accept(sock, Some(Version::QMux00))
+            .await
+            .unwrap();
+
+        let mut recv = session.accept_uni().await.unwrap();
+        let payload = recv.read_all().await.unwrap();
+
+        let mut send = session.open_uni().await.unwrap();
+        send.write(&payload).await.unwrap();
+        send.finish().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let session = qmux::tcp::connect(addr, Some(Version::QMux00))
+        .await
+        .unwrap();
+    let mut send = session.open_uni().await.unwrap();
+    send.write(b"qmux00").await.unwrap();
+    send.finish().unwrap();
+
+    let mut recv = session.accept_uni().await.unwrap();
+    let echoed = recv.read_all().await.unwrap();
+    assert_eq!(echoed.as_ref(), b"qmux00");
+
+    session.close(0, "done");
+    server.await.unwrap();
 }
 
 /// End-to-end QMux01 over a real TCP socket: STREAM data + PING/PONG keep-alive.
