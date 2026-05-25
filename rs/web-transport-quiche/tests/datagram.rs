@@ -86,7 +86,10 @@ async fn datagram_round_trip() -> Result<()> {
     let mut client_settings = dgram_settings();
     client_settings.verify_peer = false;
 
-    let url = Url::parse(&format!("https://localhost:{}/", server_addr.port()))?;
+    // Use the IPv4 literal — matches the IPv4-only client bind below. On hosts
+    // where `localhost` resolves to ::1 first (default on CI), an IPv4 socket
+    // connecting to an IPv6 address fails with EAFNOSUPPORT.
+    let url = Url::parse(&format!("https://127.0.0.1:{}/", server_addr.port()))?;
     let client = ClientBuilder::default()
         .with_settings(client_settings)
         .with_bind((Ipv4Addr::LOCALHOST, 0))?;
@@ -173,7 +176,10 @@ async fn datagram_send_drops_when_channel_full() -> Result<()> {
     let mut client_settings = dgram_settings();
     client_settings.verify_peer = false;
 
-    let url = Url::parse(&format!("https://localhost:{}/", server_addr.port()))?;
+    // Use the IPv4 literal — matches the IPv4-only client bind below. On hosts
+    // where `localhost` resolves to ::1 first (default on CI), an IPv4 socket
+    // connecting to an IPv6 address fails with EAFNOSUPPORT.
+    let url = Url::parse(&format!("https://127.0.0.1:{}/", server_addr.port()))?;
     let client = ClientBuilder::default()
         .with_settings(client_settings)
         .with_bind((Ipv4Addr::LOCALHOST, 0))?;
