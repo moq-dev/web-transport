@@ -44,7 +44,7 @@ impl Default for KeepAlive {
 /// Extract the application protocol from a negotiated WebSocket subprotocol header.
 ///
 /// The QMux version is fixed by the caller via [`Client::new`] / [`Server::new`]
-/// (or [`Bare::new`]); this function just strips the expected prefix to recover
+/// (or [`Upgraded::new`]); this function just strips the expected prefix to recover
 /// the app protocol, if any. Accepts the bare version ALPN (returns `None`) and
 /// the prefixed form `{version.prefix()}{proto}`. Unknown values yield `None`.
 fn parse_protocol(alpn: Option<&str>, version: Version) -> Option<String> {
@@ -56,21 +56,22 @@ fn parse_protocol(alpn: Option<&str>, version: Version) -> Option<String> {
     (!proto.is_empty()).then(|| proto.to_string())
 }
 
-/// Wrap a pre-upgraded WebSocket connection as a session.
+/// Wrap an already-upgraded WebSocket as a QMux session.
 ///
 /// Use this when the WebSocket handshake was already performed by an
-/// external framework (e.g. axum). The caller must pick the QMux version
-/// at construction; pass the negotiated `sec-websocket-protocol` header
-/// value with [`Bare::with_alpn`] so the application protocol can be
-/// recovered.
-pub struct Bare<T> {
+/// external framework (e.g. axum) or by caller-driven code that needs to
+/// run its own handshake (e.g. to advertise multiple QMux versions in one
+/// `Sec-WebSocket-Protocol` header). The caller picks the QMux version at
+/// construction; pass the negotiated `sec-websocket-protocol` value with
+/// [`Upgraded::with_alpn`] so the application protocol can be recovered.
+pub struct Upgraded<T> {
     ws: T,
     alpn: Option<String>,
     version: Version,
     keep_alive: Option<KeepAlive>,
 }
 
-impl<T> Bare<T>
+impl<T> Upgraded<T>
 where
     T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
