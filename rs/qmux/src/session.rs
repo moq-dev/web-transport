@@ -113,8 +113,10 @@ impl<T: Transport> SessionState<T> {
                 idle_timeout_ms.map(|ms| self.last_recv_at + std::time::Duration::from_millis(ms));
             // Keep-alive: send a QX_PING when we've been silent for a third of the timeout.
             // (Any frame counts as activity; this fires only when both sides are idle.)
+            // Clamp to 1ms so a tiny configured timeout doesn't yield a zero-duration
+            // deadline that fires every loop iteration.
             let ping_deadline = idle_timeout_ms
-                .map(|ms| self.last_send_at + std::time::Duration::from_millis(ms / 3));
+                .map(|ms| self.last_send_at + std::time::Duration::from_millis((ms / 3).max(1)));
 
             tokio::select! {
                 biased;

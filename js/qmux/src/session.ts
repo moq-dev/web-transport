@@ -776,7 +776,16 @@ export default class Session implements WebTransport {
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = data.byteLength - offset;
-			const chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
+			// Cap by both the static frame-payload ceiling and the peer's record limit
+			// (qmux-01 only — once params are received). Leave 32 bytes of headroom for
+			// the STREAM frame header (frame type + stream id + length varints).
+			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
+			if (this.#version === "qmux-01" && this.#paramsReceived) {
+				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
+				if (peerLimit > 0) {
+					chunkMax = Math.min(chunkMax, peerLimit);
+				}
+			}
 
 			// Claim flow control credit (stream + connection)
 			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax));

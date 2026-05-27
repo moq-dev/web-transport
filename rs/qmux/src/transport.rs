@@ -249,7 +249,7 @@ mod stream_transport {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             match self.version {
                 Version::QMux01 => self.recv_record().await,
-                _ => self.recv_qmux00_frame().await,
+                Version::QMux00 | Version::WebTransport => self.recv_qmux00_frame().await,
             }
         }
 

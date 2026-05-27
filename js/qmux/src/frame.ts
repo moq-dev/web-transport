@@ -460,6 +460,19 @@ export function decode(buffer: Uint8Array, version: Version = "webtransport"): A
 	return decodeQMux(buffer);
 }
 
+/** Slice `len` bytes off the front of `buffer`, rejecting truncated input.
+ *
+ * `Uint8Array.slice` clamps to the buffer end and silently returns short data,
+ * which is the wrong behavior for parsing length-prefixed wire formats. Use
+ * `take` at every site that reads a varint-declared payload length.
+ */
+function take(buffer: Uint8Array, len: number): [Uint8Array, Uint8Array] {
+	if (buffer.byteLength < len) {
+		throw new Error(`frame truncated: need ${len} bytes, have ${buffer.byteLength}`);
+	}
+	return [buffer.slice(0, len), buffer.slice(len)];
+}
+
 /** Decode all frames from a QMux Record payload (draft-01).
  * A record contains one or more frames concatenated together.
  */
@@ -551,8 +564,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		if (hasLen) {
 			[v, buffer] = VarInt.decode(buffer);
 			const len = Number(v.value);
-			data = buffer.slice(0, len);
-			buffer = buffer.slice(len);
+			[data, buffer] = take(buffer, len);
 		} else {
 			data = buffer;
 		}
@@ -596,7 +608,9 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		// reason_length + reason
 		[v, buffer] = VarInt.decode(buffer);
 		const reasonLen = Number(v.value);
-		const reason = new TextDecoder().decode(buffer.slice(0, reasonLen));
+		let reasonBytes: Uint8Array;
+		[reasonBytes, buffer] = take(buffer, reasonLen);
+		const reason = new TextDecoder().decode(reasonBytes);
 
 		return { type: "connection_close", code, reason };
 	}
@@ -657,10 +671,8 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 	if (frameType === 0x3f5153300d0a0d0an) {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
-		if (buffer.byteLength < len) {
-			throw new Error("transport parameters frame truncated");
-		}
-		const payload = buffer.slice(0, len);
+		let payload: Uint8Array;
+		[payload, buffer] = take(buffer, len);
 		const params = decodeTransportParams(payload);
 		return { type: "transport_parameters", params };
 	}
@@ -724,8 +736,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		if (hasLen) {
 			[v, buffer] = VarInt.decode(buffer);
 			const len = Number(v.value);
-			data = buffer.slice(0, len);
-			buffer = buffer.slice(len);
+			[data, buffer] = take(buffer, len);
 		} else {
 			data = buffer;
 			buffer = buffer.slice(buffer.byteLength);
@@ -760,8 +771,9 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		[v, buffer] = VarInt.decode(buffer); // frame_type
 		[v, buffer] = VarInt.decode(buffer);
 		const reasonLen = Number(v.value);
-		const reason = new TextDecoder().decode(buffer.slice(0, reasonLen));
-		buffer = buffer.slice(reasonLen);
+		let reasonBytes: Uint8Array;
+		[reasonBytes, buffer] = take(buffer, reasonLen);
+		const reason = new TextDecoder().decode(reasonBytes);
 		return [{ type: "connection_close", code, reason }, buffer];
 	}
 
@@ -821,8 +833,8 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 	if (frameType === 0x3f5153300d0a0d0an) {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
-		const payload = buffer.slice(0, len);
-		buffer = buffer.slice(len);
+		let payload: Uint8Array;
+		[payload, buffer] = take(buffer, len);
 		const params = decodeTransportParams(payload);
 		return [{ type: "transport_parameters", params }, buffer];
 	}
@@ -848,7 +860,9 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 	if (frameType === 0x31n) {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
-		buffer = buffer.slice(len);
+		// Validate the declared length even though we discard the payload —
+		// a peer-supplied size larger than what's in the buffer is a protocol error.
+		[, buffer] = take(buffer, len);
 		return [null, buffer];
 	}
 

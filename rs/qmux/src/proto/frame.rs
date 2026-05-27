@@ -120,6 +120,15 @@ impl Frame {
     /// the transport layer is responsible for delimiting records (size
     /// varint on TCP/TLS; implicit on WebSocket message boundaries).
     pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
+        // Reject QMux01-only frames for older versions so a misrouted call
+        // can't accidentally emit draft-01 wire bytes on a draft-00 session.
+        if version != Version::QMux01 {
+            match self {
+                Frame::Padding | Frame::Ping(_) => return Err(Error::InvalidFrameType(0)),
+                _ => {}
+            }
+        }
+
         let mut buf = BytesMut::new();
 
         match version {

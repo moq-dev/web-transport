@@ -22,19 +22,26 @@ async fn wire_format_size_prefix_qmux01_only() {
     // Spin up a client→server TCP pair so we can read raw bytes off the wire
     // before any frame parsing happens.
     async fn capture_first_send(version: Version) -> Vec<u8> {
+        // TCP `read` can return partial data, so loop until we have enough bytes
+        // for the indexed assertions below (the longest is `qmux01_bytes[size_len]`,
+        // which needs the size varint plus one trailing byte — at most 9 bytes).
+        const MIN_BYTES: usize = 9;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            // Read whatever the client's first send produces, up to a reasonable cap.
-            let mut buf = vec![0u8; 256];
-            let n = sock.read(&mut buf).await.unwrap();
-            buf.truncate(n);
+            let mut buf = Vec::with_capacity(256);
+            let mut chunk = [0u8; 64];
+            while buf.len() < MIN_BYTES {
+                let n = sock.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "socket closed before the first frame header arrived");
+                buf.extend_from_slice(&chunk[..n]);
+            }
             buf
         });
         // The session sends TRANSPORT_PARAMETERS as its first frame on connect.
         let _client = qmux::tcp::connect(addr, Some(version)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
         server.await.unwrap()
     }
 
