@@ -6,52 +6,36 @@ use tokio_rustls::TlsConnector;
 use crate::transport::StreamTransport;
 use crate::{alpn, Config, Error, Session, Version};
 
-/// Parse a TLS ALPN into a version and app protocol.
+/// Extract the application protocol from a TLS ALPN, given the pinned version.
 ///
-/// Strips the qmux/webtransport prefix (e.g. `qmux-01.moqt-16` → `moqt-16`).
-/// If `pin` is `Some`, the version is forced regardless of the ALPN prefix.
-fn parse_alpn(alpn: Option<&str>, pin: Option<Version>) -> (Version, Option<String>) {
-    let alpn = match alpn {
-        Some(s) if !s.is_empty() => s,
-        _ => return (pin.unwrap_or(Version::QMux01), None),
-    };
-
-    // Try each version in preference order
-    for &version in Version::ALL {
-        if alpn == version.alpn() {
-            return (pin.unwrap_or(version), None);
-        }
-        if let Some(proto) = alpn.strip_prefix(version.prefix()) {
-            let proto = if proto.is_empty() {
-                None
-            } else {
-                Some(proto.to_string())
-            };
-            return (pin.unwrap_or(version), proto);
-        }
+/// The QMux version is set by the caller; this function only strips the
+/// expected prefix to recover the app protocol. Returns `None` for the bare
+/// version ALPN or for unrecognised values.
+fn parse_protocol(alpn: Option<&str>, version: Version) -> Option<String> {
+    let alpn = alpn.filter(|s| !s.is_empty())?;
+    if alpn == version.alpn() {
+        return None;
     }
-
-    tracing::warn!(?alpn, "unrecognized TLS ALPN");
-    (pin.unwrap_or(Version::QMux01), None)
+    let Some(proto) = alpn.strip_prefix(version.prefix()) else {
+        tracing::warn!(?alpn, ?version, "unrecognized TLS ALPN");
+        return None;
+    };
+    (!proto.is_empty()).then(|| proto.to_string())
 }
 
-/// Connect over TLS.
+/// Connect over TLS pinned to a specific QMux version.
 ///
-/// The caller's `alpn_protocols` are treated as application-level protocols
-/// and automatically wrapped with version-specific prefixes.
-/// The prefix is stripped from the negotiated result.
-///
-/// If `version` is `Some`, only that QMux version is offered and used,
-/// regardless of the negotiated ALPN prefix. This is useful when an
-/// application protocol mandates a specific QMux version (e.g. moq-transport-17
-/// always uses `QMux00`).
+/// The caller's `alpn_protocols` are treated as bare application-level
+/// protocols and wrapped with `{version.prefix()}` before offer. The prefix
+/// is stripped from the negotiated result. To advertise multiple QMux
+/// versions, drive separate connection attempts.
 ///
 /// The `server_name` is used for SNI and certificate verification.
 pub async fn connect(
     addr: impl ToSocketAddrs,
     server_name: &str,
     config: Arc<rustls::ClientConfig>,
-    version: Option<Version>,
+    version: Version,
 ) -> Result<Session, Error> {
     let stream = TcpStream::connect(&addr).await?;
 
@@ -59,14 +43,12 @@ pub async fn connect(
         .map_err(|e| Error::Io(e.to_string()))?
         .to_owned();
 
-    // Convert caller's raw ALPNs to prefixed qmux/webtransport ALPNs.
     let app_protocols: Vec<String> = config
         .alpn_protocols
         .iter()
         .map(|a| String::from_utf8_lossy(a).to_string())
         .collect();
-    let versions: Vec<Version> = version.into_iter().collect();
-    let prefixed = alpn::build(&app_protocols, &versions);
+    let prefixed = alpn::build(version, &app_protocols);
 
     let mut config = (*config).clone();
     config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -80,7 +62,7 @@ pub async fn connect(
     let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
     tracing::debug!(?negotiated_str, "TLS negotiated ALPN");
 
-    let (version, protocol) = parse_alpn(negotiated_str, version);
+    let protocol = parse_protocol(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let session_config = Config::new(version, protocol);
@@ -88,15 +70,11 @@ pub async fn connect(
     Ok(Session::connect(transport, session_config))
 }
 
-/// Accept a TLS connection.
-///
-/// If `version` is `Some`, the version is forced regardless of the
-/// negotiated ALPN prefix. The ALPN is still used to extract the
-/// application-level protocol name.
+/// Accept a TLS connection pinned to a specific QMux version.
 pub async fn accept(
     stream: TcpStream,
     config: Arc<rustls::ServerConfig>,
-    version: Option<Version>,
+    version: Version,
 ) -> Result<Session, Error> {
     let acceptor = TlsAcceptor::from(config);
     let tls_stream = acceptor.accept(stream).await?;
@@ -105,7 +83,7 @@ pub async fn accept(
     let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
     tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
 
-    let (version, protocol) = parse_alpn(negotiated_str, version);
+    let protocol = parse_protocol(negotiated_str, version);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
     let session_config = Config::new(version, protocol);
