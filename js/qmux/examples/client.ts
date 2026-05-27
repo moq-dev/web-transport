@@ -6,8 +6,14 @@
 import { WebSocket } from "ws";
 import Session from "../src/index";
 
-// Install the polyfill globally for Node.js
-globalThis.WebTransport = Session;
+// Install the polyfill globally for Node.js. Each consumer pins the QMux
+// version it wants to speak — Session takes it as a required option, so we
+// wrap it here to fit the standard WebTransport constructor signature.
+globalThis.WebTransport = class extends Session {
+	constructor(url: string | URL) {
+		super(url, { version: "qmux-01" });
+	}
+} as unknown as typeof WebTransport;
 globalThis.WebSocket = WebSocket;
 
 async function main() {
