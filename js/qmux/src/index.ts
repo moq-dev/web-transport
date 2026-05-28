@@ -1,21 +1,33 @@
-import type { Version } from "./frame.ts";
+import type { Version } from "./session.ts";
 import Session from "./session.ts";
 
-export type { Version } from "./frame.ts";
-export type { Config, SessionOptions } from "./session.ts";
+export type { Config, SessionOptions, Version } from "./session.ts";
 
-/** Install Session as the global `WebTransport` if the platform doesn't ship one.
+/** Options forwarded to every `Session` constructed by [[install]]. */
+export interface InstallOptions {
+	/** ALPN -> wire-format version(s). See [[SessionOptions.versions]]. */
+	versions?: Record<string, Version | Version[] | null>;
+	/** Also offer the bare version ALPNs. See [[SessionOptions.withoutProtocol]]. */
+	withoutProtocol?: boolean;
+}
+
+/** Install `Session` as the global `WebTransport` if the platform doesn't ship one.
  *
- * The QMux version must be picked at install time — each Session is pinned to a
- * single version (mirrors the Rust API). Returns `true` if the polyfill was
- * installed, `false` if `globalThis.WebTransport` already existed.
+ * The `versions` map and `withoutProtocol` flag are forwarded to every
+ * `Session` constructed via the polyfill. Callers that pass only explicit
+ * `{qmux-VV}.{alpn}` pairs in their `protocols` list can omit the map.
+ *
+ * Returns `true` if the polyfill was installed, `false` if `globalThis.WebTransport`
+ * already existed.
  */
-export function install(version: Version): boolean {
+export function install(options?: InstallOptions): boolean {
 	if ("WebTransport" in globalThis) return false;
+	const versions = options?.versions;
+	const withoutProtocol = options?.withoutProtocol;
 	// biome-ignore lint/suspicious/noExplicitAny: polyfill — extending Session to match the WebTransport constructor signature
 	(globalThis as any).WebTransport = class extends Session {
 		constructor(url: string | URL, options?: WebTransportOptions) {
-			super(url, { ...options, version });
+			super(url, { ...options, versions, withoutProtocol });
 		}
 	};
 	return true;

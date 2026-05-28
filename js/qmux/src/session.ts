@@ -1,9 +1,17 @@
 import { Credit } from "./credit.ts";
-import type { TransportParams, Version } from "./frame.ts";
+import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD } from "./frame.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
+
+/** The QMux wire-format versions a caller can advertise.
+ *
+ * The legacy `webtransport` wire format only appears bare on the wire (never
+ * prefixed) and is appended automatically by the polyfill, so it isn't a
+ * valid value here.
+ */
+export type Version = Exclude<WireFormat, "webtransport">;
 
 /** Configuration for a QMux session. */
 export interface Config {
@@ -70,49 +78,148 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 }
 
-/** Options for the WebTransport-over-WebSocket polyfill. */
+/** Options for opening a QMux Session over WebSocket. */
 export interface SessionOptions extends WebTransportOptions {
-	/** The QMux wire-format version to use.
+	/** Application-level subprotocols to advertise via `Sec-WebSocket-Protocol`.
 	 *
-	 * The version is fixed at construction. Only the corresponding bare ALPN and
-	 * `{prefix}{proto}` subprotocols are advertised during the WebSocket handshake.
-	 * Callers that want to negotiate across multiple QMux drafts should attempt
-	 * separate `Session` instances per version; this class does not cross-product
-	 * versions on its own.
-	 */
-	version: Version;
-
-	/** Application-level subprotocols to request during the WebSocket handshake.
+	 * Each entry is either:
+	 *  - A bare ALPN (e.g. `"moq-lite-04"`). The polyfill resolves it via
+	 *    [[SessionOptions.versions]] and emits the prefixed wire form
+	 *    `{version}.{alpn}` (e.g. `"qmux-01.moq-lite-04"`).
+	 *  - An explicit pair already prefixed with a QMux version
+	 *    (e.g. `"qmux-00.moq-transport-17"`). Advertised as-is.
 	 *
-	 * Each protocol is offered as `{version.prefix}{proto}` (e.g. `qmux-01.moq-03`).
-	 * The bare version ALPN is also advertised as a fallback.
+	 * Bare entries that have no matching `versions` entry throw at
+	 * construction time.
 	 */
 	protocols?: string[];
+
+	/** Maps each bare ALPN to the QMux wire-format version(s) it can ride on.
+	 *
+	 * Required for every bare entry in `protocols`; entries already in
+	 * `{qmux-VV}.{alpn}` pair form bypass this map. Per-entry semantics:
+	 *
+	 *  - `Version`: advertise exactly `{version}.{alpn}`.
+	 *  - `Version[]`: advertise one `{v}.{alpn}` per array entry in order.
+	 *    Lets the server pick across multiple QMux drafts.
+	 *  - `null`: advertise the ALPN under every QMux version this polyfill
+	 *    knows about (currently qmux-01, then qmux-00). Useful when the app
+	 *    doesn't care which draft and wants forward compatibility.
+	 *
+	 * The legacy `webtransport.{alpn}` pair form was used briefly during the
+	 * web-transport-ws -> qmux transition; no production client depended on
+	 * it, so this polyfill never emits it.
+	 */
+	versions?: Record<string, Version | Version[] | null>;
+
+	/** Also offer the bare version ALPNs `qmux-01`, `qmux-00`, and
+	 * `webtransport` (no application protocol attached). Use this when the
+	 * peer might only know a wire-format version and not the application
+	 * protocols you've configured — e.g. when talking to a relay that only
+	 * speaks the legacy `webtransport` wire format. Defaults to `false`,
+	 * which advertises only the configured prefixed pairs.
+	 */
+	withoutProtocol?: boolean;
 
 	/** QMux flow control configuration. Only used for the QMux wire formats. */
 	config?: Config;
 }
 
-/** Get the ALPN/subprotocol prefix for a version. */
+/** Get the subprotocol prefix for a QMux wire-format version. */
 function versionPrefix(version: Version): string {
 	switch (version) {
 		case "qmux-01":
 			return "qmux-01.";
 		case "qmux-00":
 			return "qmux-00.";
-		case "webtransport":
-			return "webtransport.";
 	}
 }
 
-/** Strip the negotiated subprotocol's expected prefix to recover the app protocol.
+/** QMux versions recognized as prefixed ALPNs, newest first. */
+const QMUX_VERSIONS = ["qmux-01", "qmux-00"] as const satisfies readonly Version[];
+
+/** Convert `http(s)://` to `ws(s)://`. Pass-through for `ws(s)://` URLs. */
+function toWebSocketUrl(url: string | URL): string {
+	const u = typeof url === "string" ? new URL(url) : url;
+	let scheme: string;
+	switch (u.protocol) {
+		case "https:":
+		case "wss:":
+			scheme = "wss:";
+			break;
+		case "http:":
+		case "ws:":
+			scheme = "ws:";
+			break;
+		default:
+			throw new Error(`Unsupported protocol: ${u.protocol}`);
+	}
+	return `${scheme}//${u.host}${u.pathname}${u.search}`;
+}
+
+/** Bare version ALPNs appended when `withoutProtocol` is set. Newest first. */
+const BARE_ALPNS = ["qmux-01", "qmux-00", "webtransport"] as const;
+
+/** Resolve a `protocols` + `versions` pair to the wire subprotocol list.
  *
- * The QMux version is already known (caller-supplied at construction); this only
- * peels off the prefix. Accepts the bare version ALPN (returns "") and the
- * prefixed form `{version.prefix}{proto}`. Unknown values yield "".
+ * Expansion rules per bare entry's `versions` value: single `Version`
+ * emits one pair; an array emits one pair per element; `null` emits one
+ * pair per [[QMUX_VERSIONS]] entry. Entries already in `{qmux-VV}.{alpn}`
+ * pair form pass through. When `withoutProtocol` is true, the bare version
+ * ALPNs (`qmux-01`, `qmux-00`, `webtransport`) are appended after the
+ * prefixed pairs for peers that don't pin an app protocol.
+ *
+ * Throws if any bare entry has no matching `versions` mapping.
  */
-function parseProtocol(raw: string, version: Version): string {
-	if (raw === "" || raw === version) return "";
+function resolveSubprotocols(
+	protocols: readonly string[],
+	versions: Readonly<Record<string, Version | Version[] | null>>,
+	withoutProtocol: boolean,
+): string[] {
+	const out: string[] = [];
+	for (const entry of protocols) {
+		const known = QMUX_VERSIONS.find((v) => entry.startsWith(versionPrefix(v)));
+		if (known !== undefined) {
+			out.push(entry);
+			continue;
+		}
+		if (!(entry in versions)) {
+			throw new Error(
+				`Sec-WebSocket-Protocol entry ${JSON.stringify(entry)} has no qmux prefix and no versions mapping`,
+			);
+		}
+		const value = versions[entry];
+		const expanded: readonly Version[] = value === null ? QMUX_VERSIONS : Array.isArray(value) ? value : [value];
+		for (const v of expanded) {
+			out.push(`${versionPrefix(v)}${entry}`);
+		}
+	}
+	if (withoutProtocol) {
+		out.push(...BARE_ALPNS);
+	}
+	return out;
+}
+
+/** Pick the QMux wire-format version from a negotiated subprotocol. */
+function detectVersion(negotiated: string): WireFormat {
+	for (const v of QMUX_VERSIONS) {
+		if (negotiated === v || negotiated.startsWith(versionPrefix(v))) {
+			return v;
+		}
+	}
+	// Empty or unrecognized: fall back to the pre-QMux wire format.
+	return "webtransport";
+}
+
+/** Strip the version prefix from a negotiated `Sec-WebSocket-Protocol` value.
+ *
+ * Returns the application protocol name, or `""` if only the bare version
+ * ALPN was negotiated (or the value was empty/unknown). `webtransport` is
+ * always bare on the wire, so it never yields an application protocol.
+ */
+function parseProtocol(raw: string, version: WireFormat): string {
+	if (raw === "" || version === "webtransport") return "";
+	if (raw === version) return "";
 	const prefix = versionPrefix(version);
 	return raw.startsWith(prefix) ? raw.slice(prefix.length) : "";
 }
@@ -137,7 +244,10 @@ export default class Session implements WebTransport {
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
 
-	readonly #version: Version;
+	// Default to the legacy wire format until the WebSocket opens and the
+	// negotiated subprotocol tells us otherwise. #handleOpen overrides this
+	// with the actual version derived from `ws.protocol`.
+	#version: WireFormat = "webtransport";
 
 	/** The negotiated application-level subprotocol, or empty string if none.
 	 *
@@ -167,8 +277,11 @@ export default class Session implements WebTransport {
 	#peerParams: TransportParams = { ...DEFAULT_TRANSPORT_PARAMS };
 	#paramsReceived = false;
 
-	// Connection-level send credit
-	#connCredit: Credit;
+	// Send credits start at the legacy wire format's "unlimited" values to
+	// match the default #version. #handleOpen replaces them with QMux-shaped
+	// zero-credits (waiting for TRANSPORT_PARAMETERS) when the negotiated
+	// version turns out to be a QMux draft.
+	#connCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
 
 	// Connection-level recv flow control
 	#recvDataOffset = 0n;
@@ -178,9 +291,11 @@ export default class Session implements WebTransport {
 	// Per-stream flow control
 	#streamFlow = new Map<bigint, StreamFlowState>();
 
-	// Stream count tracking via Credit (for sending — peer's limits)
-	#bidiStreamCredit: Credit;
-	#uniStreamCredit: Credit;
+	// Stream count tracking via Credit (for sending — peer's limits).
+	// Initialized to "unlimited" matching the default webtransport version;
+	// #handleOpen replaces them when a QMux draft is negotiated.
+	#bidiStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
+	#uniStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
 
 	// Stream count tracking via Credit (for receiving — our limits)
 	#recvBiCredit: Credit;
@@ -192,44 +307,38 @@ export default class Session implements WebTransport {
 	#nextPingSeq = 0;
 	#idleTimer?: ReturnType<typeof setInterval>;
 
-	constructor(url: string | URL, options: SessionOptions) {
-		if (options.requireUnreliable) {
+	/** Open a QMux session over WebSocket against `url`.
+	 *
+	 * The polyfill constructs the underlying `WebSocket` itself. Pass the
+	 * application-level ALPNs in `options.protocols` plus a `versions`
+	 * map saying which QMux wire-format version each bare ALPN rides on. The
+	 * wire form `{qmux-VV}.{alpn}` is built automatically; entries already in
+	 * pair form (e.g. `"qmux-00.moq-transport-17"`) pass through unchanged.
+	 *
+	 * Once the handshake completes, the QMux wire-format version is derived
+	 * from the negotiated `Sec-WebSocket-Protocol`. `.protocol` exposes the
+	 * application protocol with the QMux prefix stripped.
+	 */
+	constructor(url: string | URL, options?: SessionOptions) {
+		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
-
-		if (options.serverCertificateHashes) {
+		if (options?.serverCertificateHashes) {
 			console.warn("serverCertificateHashes is not supported; trying anyway");
 		}
 
-		url = Session.#convertToWebSocketUrl(url);
+		const subprotocols = resolveSubprotocols(
+			options?.protocols ?? [],
+			options?.versions ?? {},
+			options?.withoutProtocol ?? false,
+		);
+		this.#ws = new WebSocket(toWebSocketUrl(url), subprotocols);
 
 		// Merge user config with defaults
-		this.#config = { ...DEFAULT_CONFIG, ...options.config };
+		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
 		this.#ourParams = configToTransportParams(this.#config);
 
-		// The version is pinned at construction. Build the subprotocol list with
-		// only this version's bare ALPN + prefixed application protocols — no
-		// cross-product. Callers that need fallback across versions instantiate
-		// separate Sessions per version themselves.
-		this.#version = options.version;
-		const prefix = versionPrefix(this.#version);
-		const subprotocols: string[] = [this.#version];
-		for (const p of options.protocols ?? []) {
-			subprotocols.push(`${prefix}${p}`);
-		}
-		this.#ws = new WebSocket(url, subprotocols);
-
-		// Initialize credits up front — version is known immediately.
-		if (isQmux(this.#version)) {
-			this.#connCredit = new Credit(0n);
-			this.#bidiStreamCredit = new Credit(0n);
-			this.#uniStreamCredit = new Credit(0n);
-		} else {
-			// No flow control for WebTransport — set unlimited.
-			this.#connCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
-			this.#bidiStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
-			this.#uniStreamCredit = new Credit(BigInt(Number.MAX_SAFE_INTEGER));
-		}
+		// Recv stream count limits are version-independent.
 		this.#recvBiCredit = new Credit(this.#config.maxStreamsBidi);
 		this.#recvUniCredit = new Credit(this.#config.maxStreamsUni);
 
@@ -242,18 +351,7 @@ export default class Session implements WebTransport {
 		this.#closedResolve = closed.resolve;
 
 		this.#ws.binaryType = "arraybuffer";
-		this.#ws.onopen = () => {
-			// Recover the application protocol from the negotiated subprotocol.
-			// The QMux version is fixed; only the app protocol comes off the wire.
-			this.#protocol = parseProtocol(this.#ws.protocol, this.#version);
-
-			if (isQmux(this.#version)) {
-				this.#recvDataMax = this.#ourParams.initialMaxData;
-				this.#sendTransportParameters();
-			}
-
-			this.#readyResolve();
-		};
+		this.#ws.onopen = () => this.#handleOpen();
 		this.#ws.onmessage = (event) => this.#handleMessage(event);
 		this.#ws.onerror = (event) => this.#handleError(event);
 		this.#ws.onclose = (event) => this.#handleClose(event);
@@ -275,21 +373,25 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	static #convertToWebSocketUrl(url: string | URL): string {
-		const urlObj = typeof url === "string" ? new URL(url) : url;
+	#handleOpen() {
+		const version = detectVersion(this.#ws.protocol);
+		this.#version = version;
+		this.#protocol = parseProtocol(this.#ws.protocol, version);
 
-		// Convert https:// to wss:// and http:// to ws://
-		let protocol = urlObj.protocol;
-		if (protocol === "https:") {
-			protocol = "wss:";
-		} else if (protocol === "http:") {
-			protocol = "ws:";
-		} else if (protocol !== "ws:" && protocol !== "wss:") {
-			throw new Error(`Unsupported protocol: ${protocol}`);
+		// QMux drafts wait for the peer's TRANSPORT_PARAMETERS before sending,
+		// so reset the unlimited (webtransport-shaped) defaults to zero credits.
+		if (isQmux(version)) {
+			this.#connCredit.close();
+			this.#bidiStreamCredit.close();
+			this.#uniStreamCredit.close();
+			this.#connCredit = new Credit(0n);
+			this.#bidiStreamCredit = new Credit(0n);
+			this.#uniStreamCredit = new Credit(0n);
+			this.#recvDataMax = this.#ourParams.initialMaxData;
+			this.#sendTransportParameters();
 		}
 
-		// Build WebSocket URL
-		return `${protocol}//${urlObj.host}${urlObj.pathname}${urlObj.search}`;
+		this.#readyResolve();
 	}
 
 	#handleMessage(event: MessageEvent) {
@@ -1019,7 +1121,7 @@ export default class Session implements WebTransport {
 		}
 		this.#streamFlow.clear();
 
-		// Close global credits so blocked claim() calls reject
+		// Close global credits so blocked claim() calls reject.
 		this.#connCredit.close();
 		this.#bidiStreamCredit.close();
 		this.#uniStreamCredit.close();

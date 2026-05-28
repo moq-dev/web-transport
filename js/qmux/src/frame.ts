@@ -1,7 +1,13 @@
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
-export type Version = "webtransport" | "qmux-00" | "qmux-01";
+/** Wire format that frame encode/decode operates on.
+ *
+ * Internal to the qmux crate. The public `Version` type (exported from
+ * `index.ts`) only includes the QMux drafts; `"webtransport"` is the
+ * legacy fallback wire format and isn't a valid value for any public option.
+ */
+export type WireFormat = "webtransport" | "qmux-00" | "qmux-01";
 
 /** Maximum size of a single QMux frame on the wire. */
 export const MAX_FRAME_SIZE = 16384;
@@ -149,7 +155,7 @@ export type Any =
 	| PingRequest
 	| PingResponse;
 
-export function encode(frame: Any, version: Version = "webtransport"): Uint8Array {
+export function encode(frame: Any, version: WireFormat = "webtransport"): Uint8Array {
 	if (version === "webtransport") {
 		return encodeWebTransport(frame);
 	}
@@ -157,7 +163,7 @@ export function encode(frame: Any, version: Version = "webtransport"): Uint8Arra
 }
 
 /** Returns true if the version uses QMux framing (draft-00 or later). */
-export function isQmux(version: Version): boolean {
+export function isQmux(version: WireFormat): boolean {
 	return version === "qmux-00" || version === "qmux-01";
 }
 
@@ -449,7 +455,7 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 	return params;
 }
 
-export function decode(buffer: Uint8Array, version: Version = "webtransport"): Any | null {
+export function decode(buffer: Uint8Array, version: WireFormat = "webtransport"): Any | null {
 	if (buffer.length === 0) {
 		throw new Error("Invalid frame: empty buffer");
 	}

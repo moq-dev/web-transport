@@ -4,17 +4,13 @@
 // This demonstrates how to connect to a WebTransport server from Node.js
 
 import { WebSocket } from "ws";
-import Session from "../src/index";
+import { install } from "../src/index";
 
-// Install the polyfill globally for Node.js. Each consumer pins the QMux
-// version it wants to speak — Session takes it as a required option, so we
-// wrap it here to fit the standard WebTransport constructor signature.
-globalThis.WebTransport = class extends Session {
-	constructor(url: string | URL) {
-		super(url, { version: "qmux-01" });
-	}
-} as unknown as typeof WebTransport;
-globalThis.WebSocket = WebSocket;
+// Install the polyfill globally for Node.js. The example doesn't advertise any
+// application protocols, so no alpnVersions map is needed. Apps that pass
+// bare ALPNs in WebTransportOptions.protocols supply a map here keyed by ALPN.
+globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
+install();
 
 async function main() {
 	const url = process.argv[2] || "http://localhost:3000";
