@@ -20,215 +20,62 @@ pub trait Transport: Send + 'static {
 
 // StreamTransport: message I/O over a byte stream (TCP/TLS).
 // Handles QMux frame delimiting to return complete frames as Bytes.
+//
+// Cancel safety: a dedicated reader task owns the read half and pushes complete
+// frames into an `mpsc` channel. `recv()` is just `rx.recv().await`, which is
+// cancel safe — if the future is dropped (e.g. a sibling `tokio::select!` branch
+// wins), the buffered frame stays in the channel for the next call. The reader
+// task itself never gets cancelled mid-parse, so the multi-step async reads in
+// `recv_record`/`recv_qmux00_frame` are safe to keep as-is.
 #[cfg(feature = "tcp")]
 mod stream_transport {
     use bytes::{BufMut, Bytes, BytesMut};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
     use web_transport_proto::VarInt;
 
     use super::Transport;
     use crate::{Error, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
 
+    /// Bound on queued frames waiting for the session to drain them. Bytes the
+    /// session hasn't picked up yet are also buffered in the OS receive window
+    /// once this fills; the channel just gives a small slack so each `recv()`
+    /// is a cheap hand-off rather than a syscall.
+    const RECV_CHANNEL_CAPACITY: usize = 16;
+
     pub(crate) struct StreamTransport<T> {
-        reader: BufReader<tokio::io::ReadHalf<T>>,
+        rx: mpsc::Receiver<Result<Bytes, Error>>,
         writer: BufWriter<tokio::io::WriteHalf<T>>,
         version: Version,
-        /// OUR advertised max_record_size — bounds incoming records on the read side.
-        /// Mirrors `config.max_record_size`; what we tell the peer not to exceed.
-        our_max_record_size: usize,
+        /// Aborted on drop so the reader task can't outlive the transport.
+        reader_task: JoinHandle<()>,
     }
 
     impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamTransport<T> {
         pub fn new(stream: T, version: Version, our_max_record_size: u64) -> Self {
             let (read, write) = tokio::io::split(stream);
+            let (tx, rx) = mpsc::channel(RECV_CHANNEL_CAPACITY);
+            let reader_task = tokio::spawn(reader_loop(
+                BufReader::new(read),
+                version,
+                our_max_record_size as usize,
+                tx,
+            ));
             Self {
-                reader: BufReader::new(read),
+                rx,
                 writer: BufWriter::new(write),
                 version,
-                our_max_record_size: our_max_record_size as usize,
+                reader_task,
             }
         }
+    }
 
-        /// Read a varint from the stream, returning the decoded value.
-        /// If `buf` is provided, appends the raw bytes to it.
-        async fn read_varint_into(&mut self, buf: &mut BytesMut) -> Result<VarInt, Error> {
-            let first = self.reader.read_u8().await?;
-            buf.put_u8(first);
-
-            let tag = first >> 6;
-            let len = 1usize << tag;
-
-            if len == 1 {
-                return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
-            }
-
-            let start = buf.len();
-            buf.resize(start + len - 1, 0);
-            self.reader.read_exact(&mut buf[start..]).await?;
-
-            let mut raw = [0u8; 8];
-            raw[0] = first & 0x3f;
-            raw[1..len].copy_from_slice(&buf[start..start + len - 1]);
-
-            let value = match len {
-                2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
-                4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
-                8 => u64::from_be_bytes(raw),
-                _ => unreachable!(),
-            };
-
-            VarInt::try_from(value).map_err(|_| Error::Short)
-        }
-
-        /// Read a varint from the stream without collecting raw bytes.
-        async fn read_varint(&mut self) -> Result<VarInt, Error> {
-            let first = self.reader.read_u8().await?;
-            let tag = first >> 6;
-            let len = 1usize << tag;
-
-            if len == 1 {
-                return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
-            }
-
-            let mut raw = [0u8; 8];
-            raw[0] = first & 0x3f;
-            self.reader.read_exact(&mut raw[1..len]).await?;
-
-            let value = match len {
-                2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
-                4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
-                8 => u64::from_be_bytes(raw),
-                _ => unreachable!(),
-            };
-
-            VarInt::try_from(value).map_err(|_| Error::Short)
-        }
-
-        /// Read exactly `len` bytes, appending to buf.
-        async fn read_bytes(&mut self, len: usize, buf: &mut BytesMut) -> Result<(), Error> {
-            let start = buf.len();
-            buf.resize(start + len, 0);
-            self.reader.read_exact(&mut buf[start..]).await?;
-            Ok(())
-        }
-
-        /// Read one QMux Record from the byte stream (draft-01).
-        /// Returns the record payload (frames concatenated).
-        async fn recv_record(&mut self) -> Result<Bytes, Error> {
-            let size = self.read_varint().await?.into_inner() as usize;
-            if size > self.our_max_record_size {
-                return Err(Error::FrameTooLarge);
-            }
-            let mut buf = BytesMut::zeroed(size);
-            self.reader.read_exact(&mut buf).await?;
-            Ok(buf.freeze())
-        }
-
-        /// Read one complete QMux frame from the byte stream (draft-00), returning raw bytes.
-        async fn recv_qmux00_frame(&mut self) -> Result<Bytes, Error> {
-            let mut buf = BytesMut::new();
-            let frame_type = self.read_varint_into(&mut buf).await?.into_inner();
-
-            // STREAM frames: 0x08-0x0f
-            if (0x08..=0x0f).contains(&frame_type) {
-                let has_off = frame_type & 0x04 != 0;
-                let has_len = frame_type & 0x02 != 0;
-
-                self.read_varint_into(&mut buf).await?; // stream id
-
-                if has_off {
-                    self.read_varint_into(&mut buf).await?; // offset
-                }
-
-                if has_len {
-                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
-                    if len > MAX_FRAME_PAYLOAD {
-                        return Err(Error::FrameTooLarge);
-                    }
-                    self.read_bytes(len, &mut buf).await?;
-                } else {
-                    return Err(Error::Short);
-                }
-
-                return Ok(buf.freeze());
-            }
-
-            match frame_type {
-                // PADDING
-                0x00 => {}
-                // RESET_STREAM
-                0x04 => {
-                    self.read_varint_into(&mut buf).await?; // id
-                    self.read_varint_into(&mut buf).await?; // code
-                    self.read_varint_into(&mut buf).await?; // final_size
-                }
-                // STOP_SENDING
-                0x05 => {
-                    self.read_varint_into(&mut buf).await?; // id
-                    self.read_varint_into(&mut buf).await?; // code
-                }
-                // CONNECTION_CLOSE / APPLICATION_CLOSE
-                0x1c | 0x1d => {
-                    self.read_varint_into(&mut buf).await?; // code
-                    self.read_varint_into(&mut buf).await?; // frame_type
-                    let reason_len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
-                    if reason_len > MAX_FRAME_SIZE {
-                        return Err(Error::FrameTooLarge);
-                    }
-                    self.read_bytes(reason_len, &mut buf).await?;
-                }
-                // MAX_DATA
-                0x10 => {
-                    self.read_varint_into(&mut buf).await?;
-                }
-                // MAX_STREAM_DATA
-                0x11 => {
-                    self.read_varint_into(&mut buf).await?; // id
-                    self.read_varint_into(&mut buf).await?; // max
-                }
-                // MAX_STREAMS (bidi/uni)
-                0x12 | 0x13 => {
-                    self.read_varint_into(&mut buf).await?;
-                }
-                // DATA_BLOCKED
-                0x14 => {
-                    self.read_varint_into(&mut buf).await?;
-                }
-                // STREAM_DATA_BLOCKED
-                0x15 => {
-                    self.read_varint_into(&mut buf).await?; // id
-                    self.read_varint_into(&mut buf).await?; // limit
-                }
-                // STREAMS_BLOCKED (bidi/uni)
-                0x16 | 0x17 => {
-                    self.read_varint_into(&mut buf).await?;
-                }
-                // DATAGRAM without length — can't delimit on a byte stream
-                0x30 => return Err(Error::InvalidFrameType(frame_type)),
-                // DATAGRAM with length
-                0x31 => {
-                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
-                    if len > MAX_FRAME_SIZE {
-                        return Err(Error::FrameTooLarge);
-                    }
-                    self.read_bytes(len, &mut buf).await?;
-                }
-                // QX_TRANSPORT_PARAMETERS
-                0x3f5153300d0a0d0a => {
-                    let len = self.read_varint_into(&mut buf).await?.into_inner() as usize;
-                    if len > MAX_FRAME_SIZE {
-                        return Err(Error::FrameTooLarge);
-                    }
-                    self.read_bytes(len, &mut buf).await?;
-                }
-                // QX_PING request/response (also valid in draft-00 for forward compat)
-                0x348c67529ef8c7bd | 0x348c67529ef8c7be => {
-                    self.read_varint_into(&mut buf).await?; // sequence
-                }
-                _ => return Err(Error::InvalidFrameType(frame_type)),
-            }
-
-            Ok(buf.freeze())
+    impl<T> Drop for StreamTransport<T> {
+        fn drop(&mut self) {
+            // Make sure the reader task doesn't outlive the transport; otherwise
+            // it would hold the read half open until the connection drops.
+            self.reader_task.abort();
         }
     }
 
@@ -247,15 +94,294 @@ mod stream_transport {
         }
 
         async fn recv(&mut self) -> Result<Bytes, Error> {
-            match self.version {
-                Version::QMux01 => self.recv_record().await,
-                Version::QMux00 | Version::WebTransport => self.recv_qmux00_frame().await,
-            }
+            // mpsc::Receiver::recv is cancel safe, so dropping this future never
+            // loses a buffered frame. `None` means the reader task exited without
+            // sending — treat as a clean close.
+            self.rx.recv().await.unwrap_or(Err(Error::Closed))
         }
 
         async fn close(&mut self) -> Result<(), Error> {
             self.writer.shutdown().await?;
             Ok(())
+        }
+    }
+
+    /// Reader task: pull complete frames off the wire and ship them through `tx`.
+    /// On parse error, send the error and exit. If `tx` is closed (the transport
+    /// was dropped), exit silently.
+    async fn reader_loop<R: AsyncRead + Unpin>(
+        mut reader: BufReader<R>,
+        version: Version,
+        our_max_record_size: usize,
+        tx: mpsc::Sender<Result<Bytes, Error>>,
+    ) {
+        loop {
+            let result = match version {
+                Version::QMux01 => recv_record(&mut reader, our_max_record_size).await,
+                Version::QMux00 | Version::WebTransport => recv_qmux00_frame(&mut reader).await,
+            };
+            let stop = result.is_err();
+            if tx.send(result).await.is_err() {
+                return;
+            }
+            if stop {
+                return;
+            }
+        }
+    }
+
+    /// Read a varint from the stream, returning the decoded value.
+    /// If `buf` is provided, appends the raw bytes to it.
+    async fn read_varint_into<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        buf: &mut BytesMut,
+    ) -> Result<VarInt, Error> {
+        let first = reader.read_u8().await?;
+        buf.put_u8(first);
+
+        let tag = first >> 6;
+        let len = 1usize << tag;
+
+        if len == 1 {
+            return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
+        }
+
+        let start = buf.len();
+        buf.resize(start + len - 1, 0);
+        reader.read_exact(&mut buf[start..]).await?;
+
+        let mut raw = [0u8; 8];
+        raw[0] = first & 0x3f;
+        raw[1..len].copy_from_slice(&buf[start..start + len - 1]);
+
+        let value = match len {
+            2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
+            4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
+            8 => u64::from_be_bytes(raw),
+            _ => unreachable!(),
+        };
+
+        VarInt::try_from(value).map_err(|_| Error::Short)
+    }
+
+    /// Read a varint from the stream without collecting raw bytes.
+    async fn read_varint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<VarInt, Error> {
+        let first = reader.read_u8().await?;
+        let tag = first >> 6;
+        let len = 1usize << tag;
+
+        if len == 1 {
+            return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
+        }
+
+        let mut raw = [0u8; 8];
+        raw[0] = first & 0x3f;
+        reader.read_exact(&mut raw[1..len]).await?;
+
+        let value = match len {
+            2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
+            4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
+            8 => u64::from_be_bytes(raw),
+            _ => unreachable!(),
+        };
+
+        VarInt::try_from(value).map_err(|_| Error::Short)
+    }
+
+    /// Read exactly `len` bytes, appending to buf.
+    async fn read_bytes<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        len: usize,
+        buf: &mut BytesMut,
+    ) -> Result<(), Error> {
+        let start = buf.len();
+        buf.resize(start + len, 0);
+        reader.read_exact(&mut buf[start..]).await?;
+        Ok(())
+    }
+
+    /// Read one QMux Record from the byte stream (draft-01).
+    /// Returns the record payload (frames concatenated).
+    async fn recv_record<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        our_max_record_size: usize,
+    ) -> Result<Bytes, Error> {
+        let size = read_varint(reader).await?.into_inner() as usize;
+        if size > our_max_record_size {
+            return Err(Error::FrameTooLarge);
+        }
+        let mut buf = BytesMut::zeroed(size);
+        reader.read_exact(&mut buf).await?;
+        Ok(buf.freeze())
+    }
+
+    /// Read one complete QMux frame from the byte stream (draft-00), returning raw bytes.
+    async fn recv_qmux00_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Bytes, Error> {
+        let mut buf = BytesMut::new();
+        let frame_type = read_varint_into(reader, &mut buf).await?.into_inner();
+
+        // STREAM frames: 0x08-0x0f
+        if (0x08..=0x0f).contains(&frame_type) {
+            let has_off = frame_type & 0x04 != 0;
+            let has_len = frame_type & 0x02 != 0;
+
+            read_varint_into(reader, &mut buf).await?; // stream id
+
+            if has_off {
+                read_varint_into(reader, &mut buf).await?; // offset
+            }
+
+            if has_len {
+                let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
+                if len > MAX_FRAME_PAYLOAD {
+                    return Err(Error::FrameTooLarge);
+                }
+                read_bytes(reader, len, &mut buf).await?;
+            } else {
+                return Err(Error::Short);
+            }
+
+            return Ok(buf.freeze());
+        }
+
+        match frame_type {
+            // PADDING
+            0x00 => {}
+            // RESET_STREAM
+            0x04 => {
+                read_varint_into(reader, &mut buf).await?; // id
+                read_varint_into(reader, &mut buf).await?; // code
+                read_varint_into(reader, &mut buf).await?; // final_size
+            }
+            // STOP_SENDING
+            0x05 => {
+                read_varint_into(reader, &mut buf).await?; // id
+                read_varint_into(reader, &mut buf).await?; // code
+            }
+            // CONNECTION_CLOSE / APPLICATION_CLOSE
+            0x1c | 0x1d => {
+                read_varint_into(reader, &mut buf).await?; // code
+                read_varint_into(reader, &mut buf).await?; // frame_type
+                let reason_len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
+                if reason_len > MAX_FRAME_SIZE {
+                    return Err(Error::FrameTooLarge);
+                }
+                read_bytes(reader, reason_len, &mut buf).await?;
+            }
+            // MAX_DATA
+            0x10 => {
+                read_varint_into(reader, &mut buf).await?;
+            }
+            // MAX_STREAM_DATA
+            0x11 => {
+                read_varint_into(reader, &mut buf).await?; // id
+                read_varint_into(reader, &mut buf).await?; // max
+            }
+            // MAX_STREAMS (bidi/uni)
+            0x12 | 0x13 => {
+                read_varint_into(reader, &mut buf).await?;
+            }
+            // DATA_BLOCKED
+            0x14 => {
+                read_varint_into(reader, &mut buf).await?;
+            }
+            // STREAM_DATA_BLOCKED
+            0x15 => {
+                read_varint_into(reader, &mut buf).await?; // id
+                read_varint_into(reader, &mut buf).await?; // limit
+            }
+            // STREAMS_BLOCKED (bidi/uni)
+            0x16 | 0x17 => {
+                read_varint_into(reader, &mut buf).await?;
+            }
+            // DATAGRAM without length — can't delimit on a byte stream
+            0x30 => return Err(Error::InvalidFrameType(frame_type)),
+            // DATAGRAM with length
+            0x31 => {
+                let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
+                if len > MAX_FRAME_SIZE {
+                    return Err(Error::FrameTooLarge);
+                }
+                read_bytes(reader, len, &mut buf).await?;
+            }
+            // QX_TRANSPORT_PARAMETERS
+            0x3f5153300d0a0d0a => {
+                let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
+                if len > MAX_FRAME_SIZE {
+                    return Err(Error::FrameTooLarge);
+                }
+                read_bytes(reader, len, &mut buf).await?;
+            }
+            // QX_PING request/response (also valid in draft-00 for forward compat)
+            0x348c67529ef8c7bd | 0x348c67529ef8c7be => {
+                read_varint_into(reader, &mut buf).await?; // sequence
+            }
+            _ => return Err(Error::InvalidFrameType(frame_type)),
+        }
+
+        Ok(buf.freeze())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+
+        // Drip a frame in one byte at a time, racing each `recv` against an
+        // immediate yield so the recv future is dropped every iteration. With
+        // a cancel-safe `recv`, the final call must still return the whole
+        // frame intact.
+        #[tokio::test]
+        async fn recv_is_cancel_safe_across_partial_writes() {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+
+            // STREAM frame, type 0x0a (len bit set), id=4, length=5, payload="hello".
+            let mut frame = Vec::new();
+            frame.push(0x0a);
+            frame.push(0x04);
+            frame.push(0x05);
+            frame.extend_from_slice(b"hello");
+
+            for chunk in frame.chunks(1).take(frame.len() - 1) {
+                server.write_all(chunk).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::select! {
+                    _ = transport.recv() => panic!("recv completed with a partial frame"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+
+            server.write_all(&frame[frame.len() - 1..]).await.unwrap();
+            server.flush().await.unwrap();
+
+            let got = transport.recv().await.expect("frame should decode");
+            assert_eq!(&got[..], frame.as_slice());
+        }
+
+        #[tokio::test]
+        async fn recv_qmux01_record_is_cancel_safe() {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut transport = StreamTransport::new(client, Version::QMux01, 16 * 1024);
+
+            // 1-byte varint length (0x08) followed by 8 bytes of payload.
+            let mut record = vec![0x08];
+            record.extend_from_slice(b"abcdefgh");
+
+            for chunk in record.chunks(1).take(record.len() - 1) {
+                server.write_all(chunk).await.unwrap();
+                server.flush().await.unwrap();
+                tokio::select! {
+                    _ = transport.recv() => panic!("recv completed with a partial record"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+
+            server.write_all(&record[record.len() - 1..]).await.unwrap();
+            server.flush().await.unwrap();
+
+            let got = transport.recv().await.expect("record should decode");
+            assert_eq!(&got[..], b"abcdefgh");
         }
     }
 }
