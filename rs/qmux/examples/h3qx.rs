@@ -33,14 +33,12 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the server task.
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::accept(stream, Some(Version::QMux01))
-            .await
-            .unwrap();
+        let session = qmux::tcp::accept(stream, Version::QMux01).await.unwrap();
         run_server(session).await.unwrap();
     });
 
     // Connect the client.
-    let session = qmux::tcp::connect(addr, Some(Version::QMux01)).await?;
+    let session = qmux::tcp::connect(addr, Version::QMux01).await?;
     run_client(session).await?;
 
     server.await?;
