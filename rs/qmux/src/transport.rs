@@ -383,6 +383,64 @@ mod stream_transport {
             let got = transport.recv().await.expect("record should decode");
             assert_eq!(&got[..], b"abcdefgh");
         }
+
+        // Two frames arrive in a single write. Each recv() must return one
+        // complete frame, in order. Exercises the channel queue + the reader
+        // task looping on a buffer that still has bytes after parsing.
+        #[tokio::test]
+        async fn recv_returns_consecutive_frames_in_order() {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+
+            // Two STREAM frames (type 0x0a) for stream ids 4 and 8.
+            let frame_a: Vec<u8> = [0x0a, 0x04, 0x05].into_iter().chain(*b"hello").collect();
+            let frame_b: Vec<u8> = [0x0a, 0x08, 0x05].into_iter().chain(*b"world").collect();
+            let mut combined = frame_a.clone();
+            combined.extend_from_slice(&frame_b);
+
+            server.write_all(&combined).await.unwrap();
+            server.flush().await.unwrap();
+
+            let got_a = transport.recv().await.expect("first frame should decode");
+            let got_b = transport.recv().await.expect("second frame should decode");
+            assert_eq!(&got_a[..], frame_a.as_slice());
+            assert_eq!(&got_b[..], frame_b.as_slice());
+        }
+
+        // Reader task hits a parse error: `recv()` returns it, and the next
+        // `recv()` returns Error::Closed since the task has exited.
+        #[tokio::test]
+        async fn recv_propagates_parse_error_then_closes() {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+
+            // Frame type 0x02 isn't a recognized QMux00 frame type.
+            server.write_all(&[0x02]).await.unwrap();
+            server.flush().await.unwrap();
+
+            let err = transport.recv().await.expect_err("parse error expected");
+            assert!(matches!(err, Error::InvalidFrameType(0x02)), "got {err:?}");
+
+            // Task has exited after sending the error; subsequent recv sees the
+            // closed channel and reports Error::Closed.
+            let err = transport.recv().await.expect_err("closed expected");
+            assert!(matches!(err, Error::Closed), "got {err:?}");
+        }
+
+        // A record whose declared size exceeds `our_max_record_size` is
+        // rejected with FrameTooLarge before any payload is consumed.
+        #[tokio::test]
+        async fn recv_record_exceeding_max_returns_frame_too_large() {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let mut transport = StreamTransport::new(client, Version::QMux01, 4);
+
+            // 1-byte varint length = 5, which exceeds the configured max of 4.
+            server.write_all(&[0x05]).await.unwrap();
+            server.flush().await.unwrap();
+
+            let err = transport.recv().await.expect_err("FrameTooLarge expected");
+            assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
+        }
     }
 }
 
