@@ -1,10 +1,12 @@
-import { NapiServer } from "../napi.js";
+import napi from "../napi.cjs";
 import { Request } from "./request.ts";
 
-export class Server {
-	#inner: NapiServer;
+const { NapiServer } = napi;
 
-	private constructor(inner: NapiServer) {
+export class Server {
+	#inner: InstanceType<typeof NapiServer>;
+
+	private constructor(inner: InstanceType<typeof NapiServer>) {
 		this.#inner = inner;
 	}
 

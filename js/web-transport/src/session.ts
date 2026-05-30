@@ -1,5 +1,8 @@
-import { NapiClient, type NapiRecvStream, type NapiSendStream, type NapiSession } from "../napi.js";
+import type { NapiRecvStream, NapiSendStream, NapiSession } from "../napi.cjs";
+import napi from "../napi.cjs";
 import { Datagrams } from "./datagrams.ts";
+
+const { NapiClient } = napi;
 
 function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {
 	return new ReadableStream({
@@ -81,7 +84,7 @@ export default class Session implements WebTransport {
 				throw new Error("serverCertificateDisableVerify and serverCertificateHashes cannot be used together");
 			}
 
-			let client: NapiClient;
+			let client: InstanceType<typeof NapiClient>;
 			if (options?.serverCertificateDisableVerify) {
 				client = NapiClient.disableVerify();
 			} else if (hashes && hashes.length > 0) {

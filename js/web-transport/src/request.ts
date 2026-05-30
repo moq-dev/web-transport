@@ -1,4 +1,4 @@
-import type { NapiRequest } from "../napi.js";
+import type { NapiRequest } from "../napi.cjs";
 import Session from "./session.ts";
 
 export class Request {
