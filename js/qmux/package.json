@@ -1,7 +1,7 @@
 {
 	"name": "@moq/qmux",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "QMux protocol (draft-ietf-quic-qmux-01) over WebSockets",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
