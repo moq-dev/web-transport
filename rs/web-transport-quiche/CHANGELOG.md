@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.4.0...web-transport-quiche-v0.4.1) - 2026-05-30
+
+### Other
+
+- Add datagram support to quiche connection ([#231](https://github.com/moq-dev/web-transport/pull/231))
+
 ## [0.4.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.3.1...web-transport-quiche-v0.4.0) - 2026-05-24
 
 ### Other
