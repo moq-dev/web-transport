@@ -1,7 +1,9 @@
+import { openWebSocketStream, type WebSocketStreamLike } from "@moq/web-socket-stream";
 import { Credit } from "./credit.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD } from "./frame.ts";
+import { DEFAULT_SEND_ORDER, SendScheduler, type SendSink, WritableStreamSink } from "./scheduler.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
 
@@ -123,7 +125,20 @@ export interface SessionOptions extends WebTransportOptions {
 
 	/** QMux flow control configuration. Only used for the QMux wire formats. */
 	config?: Config;
+
+	/** Initial send-buffer high-water mark in bytes, used for write
+	 *  backpressure. Only takes effect when falling back to the
+	 *  `@moq/web-socket-stream` ponyfill (no native `WebSocketStream`); the
+	 *  native API sizes its own send buffer. Defaults to 64 KiB.
+	 *
+	 *  For best throughput *and* prioritization, set this to roughly the
+	 *  bandwidth-delay product (RTT × estimated throughput) and adjust it at
+	 *  runtime with {@link Session.setSendBufferSize}. */
+	sendBufferSize?: number;
 }
+
+/** Default send-buffer high-water mark (bytes) for the WebSocketStream ponyfill. */
+const DEFAULT_SEND_BUFFER_SIZE = 64 * 1024;
 
 /** Get the subprotocol prefix for a QMux wire-format version. */
 function versionPrefix(version: Version): string {
@@ -233,7 +248,12 @@ interface StreamFlowState {
 }
 
 export default class Session implements WebTransport {
-	#ws: WebSocket;
+	// The transport: a native `WebSocketStream` when the platform has one (real
+	// backpressure), otherwise the `@moq/web-socket-stream` ponyfill over a plain
+	// `WebSocket` (bufferedAmount-based backpressure). Either way, one API.
+	#wss?: WebSocketStreamLike;
+	#scheduler?: SendScheduler;
+	#sendBufferSize: number;
 	#isServer = false;
 	#closed?: Error;
 	#closeReason?: Error;
@@ -332,11 +352,11 @@ export default class Session implements WebTransport {
 			options?.versions ?? {},
 			options?.withoutProtocol ?? false,
 		);
-		this.#ws = new WebSocket(toWebSocketUrl(url), subprotocols);
 
 		// Merge user config with defaults
 		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
 		this.#ourParams = configToTransportParams(this.#config);
+		this.#sendBufferSize = options?.sendBufferSize ?? DEFAULT_SEND_BUFFER_SIZE;
 
 		// Recv stream count limits are version-independent.
 		this.#recvBiCredit = new Credit(this.#config.maxStreamsBidi);
@@ -349,12 +369,6 @@ export default class Session implements WebTransport {
 		const closed = Promise.withResolvers<WebTransportCloseInfo>();
 		this.closed = closed.promise;
 		this.#closedResolve = closed.resolve;
-
-		this.#ws.binaryType = "arraybuffer";
-		this.#ws.onopen = () => this.#handleOpen();
-		this.#ws.onmessage = (event) => this.#handleMessage(event);
-		this.#ws.onerror = (event) => this.#handleError(event);
-		this.#ws.onclose = (event) => this.#handleClose(event);
 
 		this.incomingBidirectionalStreams = new ReadableStream<WebTransportBidirectionalStream>({
 			start: (controller) => {
@@ -371,12 +385,72 @@ export default class Session implements WebTransport {
 		if (!this.#incomingBidirectionalStreams || !this.#incomingUnidirectionalStreams) {
 			throw new Error("ReadableStream didn't call start");
 		}
+
+		this.#connect(toWebSocketUrl(url), subprotocols);
 	}
 
-	#handleOpen() {
-		const version = detectVersion(this.#ws.protocol);
+	/** Open the transport via `WebSocketStream` — native when present (real
+	 *  backpressure), else the ponyfill over a plain `WebSocket`. One code path
+	 *  for both, so the path exercised in tests is the one Chromium runs natively. */
+	#connect(url: string, subprotocols: string[]) {
+		const wss = openWebSocketStream(url, {
+			protocols: subprotocols,
+			highWaterMark: this.#sendBufferSize,
+		});
+		this.#wss = wss;
+
+		wss.opened.then(
+			(conn) => {
+				this.#startSession(conn.protocol, new WritableStreamSink(conn.writable));
+				void this.#readLoop(conn.readable.getReader());
+			},
+			(err: unknown) => {
+				if (this.#closed) return;
+				this.#closed = err instanceof Error ? err : new Error("WebSocketStream failed to open");
+				this.#close(1006, "WebSocketStream error");
+			},
+		);
+		wss.closed.then(
+			(info) => {
+				if (this.#closed) return;
+				this.#closed = new Error(`Connection closed: ${info.closeCode ?? 0} ${info.reason ?? ""}`);
+				this.#close(info.closeCode ?? 1006, info.reason ?? "");
+			},
+			() => {
+				if (this.#closed) return;
+				this.#closed = new Error("WebSocketStream closed");
+				this.#close(1006, "WebSocketStream error");
+			},
+		);
+	}
+
+	async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array | string>) {
+		try {
+			while (true) {
+				const { value, done } = await reader.read();
+				if (done) break;
+				// QMux is a binary protocol; ignore any text frames.
+				if (typeof value !== "string") this.#onData(value);
+			}
+		} catch (err) {
+			if (this.#closed) return;
+			this.#closed = err instanceof Error ? err : new Error("WebSocketStream read error");
+			this.#close(1006, "WebSocketStream read error");
+		}
+	}
+
+	/** Derive the wire-format version, start the send scheduler, and (for QMux
+	 *  drafts) exchange transport parameters. Shared by both transports. */
+	#startSession(rawProtocol: string, sink: SendSink) {
+		const version = detectVersion(rawProtocol);
 		this.#version = version;
-		this.#protocol = parseProtocol(this.#ws.protocol, version);
+		this.#protocol = parseProtocol(rawProtocol, version);
+
+		this.#scheduler = new SendScheduler(sink, {
+			onActivity: () => {
+				this.#lastSendAt = Date.now();
+			},
+		});
 
 		// QMux drafts wait for the peer's TRANSPORT_PARAMETERS before sending,
 		// so reset the unlimited (webtransport-shaped) defaults to zero credits.
@@ -394,10 +468,7 @@ export default class Session implements WebTransport {
 		this.#readyResolve();
 	}
 
-	#handleMessage(event: MessageEvent) {
-		if (!(event.data instanceof ArrayBuffer)) return;
-
-		const data = new Uint8Array(event.data);
+	#onData(data: Uint8Array) {
 		this.#lastRecvAt = Date.now();
 		try {
 			if (this.#version === "qmux-01") {
@@ -418,20 +489,6 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	#handleError(event: Event) {
-		if (this.#closed) return;
-
-		this.#closed = new Error(`WebSocket error: ${event.type}`);
-		this.#close(1006, "WebSocket error");
-	}
-
-	#handleClose(event: CloseEvent) {
-		if (this.#closed) return;
-
-		this.#closed = new Error(`Connection closed: ${event.code} ${event.reason}`);
-		this.#close(event.code, event.reason);
-	}
-
 	#recvFrame(frame: Frame.Any) {
 		if (frame.type === "stream") {
 			this.#handleStreamFrame(frame);
@@ -441,7 +498,7 @@ export default class Session implements WebTransport {
 			this.#handleStopSending(frame);
 		} else if (frame.type === "connection_close") {
 			this.#closeReason = new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
-			this.#ws.close();
+			this.#transportClose();
 		} else if (frame.type === "transport_parameters") {
 			this.#handleTransportParameters(frame.params);
 		} else if (frame.type === "max_data") {
@@ -522,7 +579,7 @@ export default class Session implements WebTransport {
 		if (now - this.#lastRecvAt > timeoutMs) {
 			// Peer has gone silent past the negotiated limit.
 			this.#closeReason = new Error("idle timeout");
-			this.#ws.close();
+			this.#transportClose();
 			if (this.#idleTimer) clearInterval(this.#idleTimer);
 			return;
 		}
@@ -768,6 +825,7 @@ export default class Session implements WebTransport {
 					},
 					abort: (e) => {
 						console.warn("abort", e);
+						this.#scheduler?.dropStream(streamId, e instanceof Error ? e : new Error("stream aborted"));
 						this.#sendPriorityFrame({
 							type: "reset_stream",
 							id: frame.id,
@@ -778,20 +836,14 @@ export default class Session implements WebTransport {
 						this.#maybeDeleteStreamFlow(streamId);
 					},
 					close: async () => {
-						await Promise.race([
-							this.#sendFrame({
-								type: "stream",
-								id: frame.id,
-								data: new Uint8Array(),
-								fin: true,
-							}),
-							this.closed,
-						]);
+						await Promise.race([this.#sendStreamFin(frame.id), this.closed]);
 
 						this.#sendStreams.delete(streamId);
+						this.#scheduler?.forget(streamId);
 						this.#maybeDeleteStreamFlow(streamId);
 					},
 				});
+				this.#attachSendOrder(writer, streamId, DEFAULT_SEND_ORDER);
 
 				this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
 			} else {
@@ -841,6 +893,7 @@ export default class Session implements WebTransport {
 
 		stream.error(new Error(`STOP_SENDING: ${frame.code.value}`));
 		this.#sendStreams.delete(streamId);
+		this.#scheduler?.dropStream(streamId, new Error(`STOP_SENDING: ${frame.code.value}`));
 
 		this.#sendPriorityFrame({
 			type: "reset_stream",
@@ -852,17 +905,14 @@ export default class Session implements WebTransport {
 	}
 
 	#sendTransportParameters() {
-		const frame: Frame.TransportParameters = {
-			type: "transport_parameters",
-			params: this.#ourParams,
-		};
 		// QMux01 over WebSocket uses the WS message boundary as the implicit record
-		// boundary; no extra size prefix is required.
-		this.#sendBytes(Frame.encode(frame, this.#version));
+		// boundary; no extra size prefix is required. This is the first frame on the
+		// wire, so it leads the control queue ahead of any stream data.
+		this.#sendPriorityFrame({ type: "transport_parameters", params: this.#ourParams });
 	}
 
-	/** Send raw frame bytes, validating against the peer's max_record_size for QMux01. */
-	#sendBytes(bytes: Uint8Array) {
+	/** Validate an encoded record against the peer's max_record_size (QMux01). */
+	#validateRecordSize(bytes: Uint8Array) {
 		if (this.#version === "qmux-01") {
 			// Before the peer's TRANSPORT_PARAMETERS arrive, use the draft-01 default
 			// (16382) so we don't accidentally send something the peer will reject.
@@ -871,8 +921,15 @@ export default class Session implements WebTransport {
 				throw new Error(`record exceeds peer max_record_size (${bytes.byteLength} > ${limit})`);
 			}
 		}
-		this.#ws.send(bytes);
-		this.#lastSendAt = Date.now();
+	}
+
+	/** Encode and enqueue a stream-data/fin frame, resolving once it hits the wire. */
+	async #enqueueStreamFrame(streamId: bigint, frame: Frame.Data) {
+		const scheduler = this.#scheduler;
+		if (!scheduler) throw this.#closed ?? new Error("session not open");
+		const bytes = Frame.encode(frame, this.#version);
+		this.#validateRecordSize(bytes);
+		await scheduler.enqueueStream(streamId, bytes);
 	}
 
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
@@ -896,12 +953,7 @@ export default class Session implements WebTransport {
 			const chunk = data.subarray(offset, offset + sendable);
 
 			try {
-				await this.#sendFrame({
-					type: "stream",
-					id,
-					data: chunk,
-					fin: false,
-				});
+				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
 			} catch (e) {
 				// Return claimed credits on send failure
 				if (sendable > 0) {
@@ -924,35 +976,48 @@ export default class Session implements WebTransport {
 			for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
 				const end = Math.min(offset + MAX_FRAME_PAYLOAD, data.byteLength);
 				const chunk = data.subarray(offset, end);
-				await this.#sendFrame({
-					type: "stream",
-					id,
-					data: chunk,
-					fin: false,
-				});
+				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
 			}
 		}
 	}
 
-	async #sendFrame(frame: Frame.Any) {
-		// Add some backpressure so we don't saturate the connection
-		while (this.#ws.bufferedAmount > 64 * 1024) {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		}
-
-		this.#sendBytes(Frame.encode(frame, this.#version));
+	/** Send the FIN. Routed through the stream's own queue so it stays ordered
+	 *  after that stream's data (not via the control lane, which would jump ahead). */
+	async #sendStreamFin(id: Stream.Id) {
+		await this.#enqueueStreamFrame(id.value.value, { type: "stream", id, data: new Uint8Array(), fin: true });
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
-		this.#sendBytes(Frame.encode(frame, this.#version));
+		const bytes = Frame.encode(frame, this.#version);
+		this.#validateRecordSize(bytes);
+		this.#scheduler?.enqueueControl(bytes);
 	}
 
-	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
+	/** Register a stream's initial send priority and expose a mutable `sendOrder`
+	 *  accessor on its writable (matching the W3C `WebTransportSendStream` API).
+	 *  Updating it re-prioritizes the stream's queued data immediately. */
+	#attachSendOrder(writable: WritableStream<Uint8Array>, streamId: bigint, initial: number) {
+		this.#scheduler?.setSendOrder(streamId, initial);
+		let order = initial;
+		Object.defineProperty(writable, "sendOrder", {
+			configurable: true,
+			enumerable: true,
+			get: () => order,
+			set: (value: number) => {
+				order = value;
+				this.#scheduler?.setSendOrder(streamId, value);
+			},
+		});
+	}
+
+	async createBidirectionalStream(options?: WebTransportSendStreamOptions): Promise<WebTransportBidirectionalStream> {
 		await this.ready;
 
 		if (this.#closed) {
 			throw this.#closeReason || new Error("Connection closed");
 		}
+
+		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;
 
 		// Wait for stream count permit
 		await this.#bidiStreamCredit.claim(1n);
@@ -979,6 +1044,7 @@ export default class Session implements WebTransport {
 			},
 			abort: (e) => {
 				console.warn("abort", e);
+				this.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
 				this.#sendPriorityFrame({
 					type: "reset_stream",
 					id: streamId,
@@ -989,20 +1055,14 @@ export default class Session implements WebTransport {
 				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			close: async () => {
-				await Promise.race([
-					this.#sendFrame({
-						type: "stream",
-						id: streamId,
-						data: new Uint8Array(),
-						fin: true,
-					}),
-					this.closed,
-				]);
+				await Promise.race([this.#sendStreamFin(streamId), this.closed]);
 
 				this.#sendStreams.delete(streamIdVal);
+				this.#scheduler?.forget(streamIdVal);
 				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		});
+		this.#attachSendOrder(writer, streamIdVal, sendOrder);
 
 		const reader = new ReadableStream<Uint8Array>({
 			start: (controller) => {
@@ -1023,12 +1083,14 @@ export default class Session implements WebTransport {
 		return { readable: reader, writable: writer };
 	}
 
-	async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
+	async createUnidirectionalStream(options?: WebTransportSendStreamOptions): Promise<WritableStream<Uint8Array>> {
 		await this.ready;
 
 		if (this.#closed) {
 			throw this.#closed;
 		}
+
+		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;
 
 		// Wait for stream count permit
 		await this.#uniStreamCredit.claim(1n);
@@ -1057,6 +1119,7 @@ export default class Session implements WebTransport {
 			},
 			abort(e) {
 				console.warn("abort", e);
+				session.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
 				session.#sendPriorityFrame({
 					type: "reset_stream",
 					id: streamId,
@@ -1067,20 +1130,14 @@ export default class Session implements WebTransport {
 				session.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			async close() {
-				await Promise.race([
-					session.#sendFrame({
-						type: "stream",
-						id: streamId,
-						data: new Uint8Array(),
-						fin: true,
-					}),
-					session.closed,
-				]);
+				await Promise.race([session.#sendStreamFin(streamId), session.closed]);
 
 				session.#sendStreams.delete(streamIdVal);
+				session.#scheduler?.forget(streamIdVal);
 				session.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		});
+		this.#attachSendOrder(writer, streamIdVal, sendOrder);
 
 		return writer;
 	}
@@ -1127,6 +1184,19 @@ export default class Session implements WebTransport {
 		this.#uniStreamCredit.close();
 		this.#recvBiCredit.close();
 		this.#recvUniCredit.close();
+
+		// Reject pending stream writes; already-queued control (e.g. CONNECTION_CLOSE)
+		// still flushes before the socket is torn down.
+		this.#scheduler?.close(this.#closed ?? this.#closeReason ?? new Error("Connection closed"));
+	}
+
+	/** Tear down the underlying transport. The meaningful close code/reason
+	 *  already travels in the CONNECTION_CLOSE frame, so the WebSocket-level
+	 *  close is bare (avoids the WebSocket close-code validity constraints). */
+	#transportClose() {
+		try {
+			this.#wss?.close();
+		} catch {}
 	}
 
 	close(info?: { closeCode?: number; reason?: string }) {
@@ -1142,10 +1212,23 @@ export default class Session implements WebTransport {
 		});
 
 		setTimeout(() => {
-			this.#ws.close();
+			this.#transportClose();
 		}, 100);
 
 		this.#close(code, reason);
+	}
+
+	/** Resize the send-buffer high-water mark (bytes) used for write
+	 *  backpressure. A QMux extension beyond the standard `WebTransport` API:
+	 *  set this to roughly the bandwidth-delay product (RTT × estimated
+	 *  throughput) to keep the pipe full while leaving as much queued data as
+	 *  possible reprioritizable by the send scheduler.
+	 *
+	 *  No-op when a native `WebSocketStream` is in use (it sizes its own send
+	 *  buffer); effective with the `@moq/web-socket-stream` ponyfill fallback. */
+	setSendBufferSize(bytes: number) {
+		this.#sendBufferSize = Math.max(1, Math.floor(bytes));
+		this.#wss?.setHighWaterMark?.(this.#sendBufferSize);
 	}
 
 	get congestionControl(): string {

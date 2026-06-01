@@ -1,0 +1,208 @@
+import { describe, expect, test } from "bun:test";
+import { SendScheduler, type SendSink } from "./scheduler.ts";
+
+/** A sink that starts backpressured; `release()` admits exactly one write. */
+class GatedSink implements SendSink {
+	written: number[] = [];
+	#gate: Promise<void>;
+	#open!: () => void;
+	#admits = 0;
+	#onWrite?: () => void;
+
+	constructor() {
+		this.#gate = new Promise((resolve) => {
+			this.#open = resolve;
+		});
+	}
+
+	/** Record each written frame's first byte so tests can assert ordering. */
+	onWrite(fn: () => void) {
+		this.#onWrite = fn;
+	}
+
+	get hasRoom(): boolean {
+		return this.#admits > 0;
+	}
+
+	async ready(): Promise<void> {
+		while (this.#admits <= 0) {
+			await this.#gate;
+			this.#gate = new Promise((resolve) => {
+				this.#open = resolve;
+			});
+		}
+	}
+
+	write(bytes: Uint8Array): void {
+		this.#admits -= 1;
+		this.written.push(bytes[0]);
+		this.#onWrite?.();
+	}
+
+	/** Allow `n` more writes through. */
+	release(n = 1): void {
+		this.#admits += n;
+		this.#open();
+	}
+}
+
+/** Spin the microtask/macrotask queue until `fn()` is true or we give up. */
+async function until(fn: () => boolean, tries = 200): Promise<void> {
+	for (let i = 0; i < tries && !fn(); i++) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+}
+
+const frame = (tag: number) => new Uint8Array([tag]);
+
+describe("SendScheduler", () => {
+	test("control frames preempt stream data", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		sched.setSendOrder(1n, 0);
+		void sched.enqueueStream(1n, frame(10));
+		void sched.enqueueStream(2n, frame(20));
+		sched.enqueueControl(frame(99));
+
+		await until(() => false, 5); // let everything queue
+		sink.release(3);
+		await until(() => sink.written.length === 3);
+
+		expect(sink.written[0]).toBe(99); // control first
+	});
+
+	test("higher sendOrder is sent first", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		sched.setSendOrder(1n, 5);
+		sched.setSendOrder(2n, 1);
+		sched.setSendOrder(3n, 9);
+		void sched.enqueueStream(1n, frame(5));
+		void sched.enqueueStream(2n, frame(1));
+		void sched.enqueueStream(3n, frame(9));
+
+		await until(() => false, 5);
+		sink.release(3);
+		await until(() => sink.written.length === 3);
+
+		expect(sink.written).toEqual([9, 5, 1]);
+	});
+
+	test("round-robin among equal sendOrder", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+		sched.setSendOrder(2n, 0);
+
+		// Each stream re-arms after its frame is written, like a real writer task.
+		let aLeft = 3;
+		let bLeft = 3;
+		const armA = () => {
+			if (aLeft-- > 0) sched.enqueueStream(1n, frame(0xa)).then(armA);
+		};
+		const armB = () => {
+			if (bLeft-- > 0) sched.enqueueStream(2n, frame(0xb)).then(armB);
+		};
+		armA();
+		armB();
+
+		await until(() => false, 5);
+		sink.release(6);
+		await until(() => sink.written.length === 6);
+
+		// Strict alternation A,B,A,B,A,B (0xa, 0xb).
+		expect(sink.written).toEqual([0xa, 0xb, 0xa, 0xb, 0xa, 0xb]);
+	});
+
+	test("promoting a stream mid-backlog lets it jump ahead", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+		sched.setSendOrder(2n, 0);
+		void sched.enqueueStream(1n, frame(1));
+		void sched.enqueueStream(2n, frame(2));
+
+		await until(() => false, 5);
+		sched.setSendOrder(2n, 100); // promote stream 2 while both are queued
+		sink.release(2);
+		await until(() => sink.written.length === 2);
+
+		expect(sink.written).toEqual([2, 1]);
+	});
+
+	test("control is not starved by a stream flood", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+
+		let left = 50;
+		const arm = () => {
+			if (left-- > 0) sched.enqueueStream(1n, frame(1)).then(arm);
+		};
+		arm();
+		await until(() => false, 5);
+
+		sink.release(5); // drain a few stream frames
+		await until(() => sink.written.length === 5);
+		sched.enqueueControl(frame(99)); // control arrives mid-flood
+		sink.release(1);
+		await until(() => sink.written.length === 6);
+
+		expect(sink.written[5]).toBe(99); // served on the very next write
+	});
+
+	test("dropStream discards queued data and rejects its promise", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+
+		const p = sched.enqueueStream(1n, frame(1));
+		const rejected = p.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		sched.dropStream(1n, new Error("reset"));
+		sink.release(5);
+		await until(() => false, 10);
+
+		expect(await rejected).toBe("rejected");
+		expect(sink.written).toEqual([]); // nothing written
+	});
+
+	test("close rejects pending stream frames but flushes queued control", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+
+		const p = sched.enqueueStream(1n, frame(1));
+		const settled = p.then(
+			() => "resolved",
+			() => "rejected",
+		);
+		sched.enqueueControl(frame(99));
+		sched.close(new Error("closing"));
+
+		sink.release(5);
+		await until(() => sink.written.length === 1, 50);
+
+		expect(await settled).toBe("rejected");
+		expect(sink.written).toEqual([99]); // control flushed, stream dropped
+	});
+
+	test("onActivity fires once per written frame", async () => {
+		const sink = new GatedSink();
+		let activity = 0;
+		const sched = new SendScheduler(sink, { onActivity: () => activity++ });
+		sched.setSendOrder(1n, 0);
+		void sched.enqueueStream(1n, frame(1));
+		sched.enqueueControl(frame(99));
+
+		await until(() => false, 5);
+		sink.release(2);
+		await until(() => sink.written.length === 2);
+
+		expect(activity).toBe(2);
+	});
+});

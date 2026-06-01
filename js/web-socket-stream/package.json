@@ -1,8 +1,8 @@
 {
-	"name": "@moq/qmux",
+	"name": "@moq/web-socket-stream",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.1.1",
-	"description": "QMux protocol (draft-ietf-quic-qmux-01) over WebSockets",
+	"version": "0.1.0",
+	"description": "A WebSocketStream polyfill: a plain WebSocket wrapped as { readable, writable } streams with backpressure",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": "github:moq-dev/web-transport",
@@ -13,14 +13,10 @@
 	"files": [
 		"./src"
 	],
-	"dependencies": {
-		"@moq/web-socket-stream": "workspace:*"
-	},
 	"scripts": {
 		"build": "rimraf dist && tsc && tsx ../common/package.ts",
 		"dev": "tsc --watch",
 		"check": "tsc --noEmit",
-		"example": "tsx examples/client.ts",
 		"release": "bun ../common/release.ts"
 	},
 	"devDependencies": {
@@ -31,11 +27,11 @@
 		"typescript": "^5.9.2"
 	},
 	"keywords": [
-		"qmux",
-		"webtransport",
+		"websocketstream",
 		"websocket",
 		"polyfill",
-		"quic",
-		"streams"
+		"ponyfill",
+		"streams",
+		"backpressure"
 	]
 }
