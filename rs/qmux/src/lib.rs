@@ -9,6 +9,7 @@ mod credit;
 mod error;
 pub mod proto;
 mod protocol;
+mod sched;
 mod session;
 mod stream;
 mod transport;

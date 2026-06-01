@@ -197,7 +197,8 @@ pub trait SendStream: MaybeSend {
 
     /// Set the stream's priority.
     ///
-    /// Streams with lower values will be sent first, but are not guaranteed to arrive first.
+    /// Streams with higher values will be sent first, but are not guaranteed to arrive first.
+    /// This matches the W3C WebTransport `sendOrder` convention (and quinn's scheduler).
     fn set_priority(&mut self, order: u8);
 
     /// Mark the stream as finished, erroring on any future writes.
