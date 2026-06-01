@@ -5,6 +5,7 @@ use std::{
 
 use crate::config::Config;
 use crate::credit::Credit;
+use crate::sched::PriorityQueue;
 use crate::transport::Transport;
 use crate::{
     ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
@@ -21,7 +22,7 @@ pub struct Session {
     is_server: bool,
     config: Config,
 
-    outbound: mpsc::Sender<Frame>,
+    outbound: PriorityQueue,
     outbound_priority: mpsc::UnboundedSender<Frame>,
 
     accept_bi: Arc<tokio::sync::Mutex<mpsc::Receiver<(SendStream, RecvStream)>>>,
@@ -48,7 +49,7 @@ struct SessionState<T: Transport> {
     config: Config,
     is_server: bool,
 
-    outbound: (mpsc::Sender<Frame>, mpsc::Receiver<Frame>),
+    outbound: PriorityQueue,
     outbound_priority: (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>),
 
     accept_bi: mpsc::Sender<(SendStream, RecvStream)>,
@@ -142,7 +143,7 @@ impl<T: Transport> SessionState<T> {
                         None => return Err(Error::Closed),
                     };
                 }
-                frame = self.outbound.1.recv() => {
+                frame = self.outbound.pop() => {
                     match frame {
                         Some(frame) => self.send_frame(frame).await?,
                         None => return Err(Error::Closed),
@@ -356,10 +357,11 @@ impl<T: Transport> SessionState<T> {
 
                                 let send_frontend = SendStream {
                                     id: stream.id,
-                                    outbound: self.outbound.0.clone(),
+                                    outbound: self.outbound.clone(),
                                     outbound_priority: self.outbound_priority.0.clone(),
                                     inbound_stopped: rx,
                                     offset: 0,
+                                    priority: 0,
                                     closed: None,
                                     fin: false,
                                     stream_credit: send_backend.stream_credit.clone(),
@@ -527,7 +529,7 @@ impl Session {
         let (create_uni_tx, create_uni_rx) = mpsc::channel(8);
         let (create_bi_tx, create_bi_rx) = mpsc::channel(8);
 
-        let (outbound_tx, outbound_rx) = mpsc::channel(8);
+        let outbound = PriorityQueue::new(8);
         let (outbound_priority_tx, outbound_priority_rx) = mpsc::unbounded_channel();
 
         let closed = watch::Sender::new(None);
@@ -558,7 +560,7 @@ impl Session {
         let mut backend = SessionState {
             transport,
             config: config.clone(),
-            outbound: (outbound_tx.clone(), outbound_rx),
+            outbound: outbound.clone(),
             outbound_priority: (outbound_priority_tx.clone(), outbound_priority_rx),
             accept_bi: accept_bi_tx,
             accept_uni: accept_uni_tx,
@@ -588,6 +590,7 @@ impl Session {
             backend.open_uni_credit.close();
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
+            backend.outbound.close();
             for send in backend.send_streams.values() {
                 if let Some(credit) = &send.stream_credit {
                     credit.close();
@@ -599,7 +602,7 @@ impl Session {
         Session {
             is_server,
             config,
-            outbound: outbound_tx,
+            outbound,
             outbound_priority: outbound_priority_tx,
             accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
             accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
@@ -661,6 +664,7 @@ impl generic::Session for Session {
             outbound_priority: self.outbound_priority.clone(),
             inbound_stopped: rx,
             offset: 0,
+            priority: 0,
             closed: None,
             fin: false,
             stream_credit,
@@ -704,6 +708,7 @@ impl generic::Session for Session {
             outbound_priority: self.outbound_priority.clone(),
             inbound_stopped: rx,
             offset: 0,
+            priority: 0,
             closed: None,
             fin: false,
             stream_credit,
@@ -798,11 +803,14 @@ struct SendState {
 pub struct SendStream {
     id: StreamId,
 
-    outbound: mpsc::Sender<Frame>,                   // STREAM
+    outbound: PriorityQueue,                         // STREAM
     outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
     inbound_stopped: mpsc::UnboundedReceiver<StopSending>,
 
     offset: u64,
+    /// Scheduling priority (higher = sent first). Threaded into the queue on
+    /// every `push` and relayed to the queue on `set_priority`.
+    priority: u8,
     closed: Option<Error>,
     fin: bool,
 
@@ -936,7 +944,7 @@ impl generic::SendStream for SendStream {
             };
 
             tokio::select! {
-                result = self.outbound.send(frame.into()) => {
+                result = self.outbound.push(self.priority, self.id, frame.into()) => {
                     if result.is_err() {
                         // Release credit since data was never sent
                         self.release_credit(to_send as u64);
@@ -956,8 +964,15 @@ impl generic::SendStream for SendStream {
         Ok(total)
     }
 
-    /// No-op: QMux does not support stream prioritization.
-    fn set_priority(&mut self, _priority: u8) {}
+    /// Set the stream's send priority; higher values are sent first.
+    ///
+    /// Re-prioritization is retroactive: already-queued frames for this stream
+    /// move to the new band on the next scheduling decision (the bytes stay put,
+    /// preserving per-stream order).
+    fn set_priority(&mut self, order: u8) {
+        self.priority = order;
+        self.outbound.set_priority(self.id, order);
+    }
 
     fn reset(&mut self, code: u32) {
         if self.fin || self.closed.is_some() {
@@ -986,10 +1001,14 @@ impl generic::SendStream for SendStream {
             fin: true,
         };
 
-        if let Err(e) = self.outbound.try_send(frame.into()) {
+        // The FIN lands in the stream's current band (after its data). If the
+        // queue is full, hand off to a task that awaits room rather than block.
+        if let Err(frame) = self.outbound.try_push(self.priority, self.id, frame.into()) {
             let outbound = self.outbound.clone();
+            let priority = self.priority;
+            let id = self.id;
             tokio::spawn(async move {
-                outbound.send(e.into_inner()).await.ok();
+                outbound.push(priority, id, frame).await.ok();
             });
         }
 
