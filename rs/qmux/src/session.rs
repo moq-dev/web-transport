@@ -825,15 +825,18 @@ impl SendStream {
             return error.clone();
         }
 
-        let frame = ResetStream {
-            id: self.id,
-            code,
-            final_size: self.offset,
-        };
-
         let error = Error::StreamStop(code);
 
-        self.outbound_priority.send(frame.into()).ok();
+        // If we've already sent a FIN, the stream is finished; don't also emit a
+        // RESET_STREAM for it (that would put two terminal frames on one stream).
+        if !self.fin {
+            let frame = ResetStream {
+                id: self.id,
+                code,
+                final_size: self.offset,
+            };
+            self.outbound_priority.send(frame.into()).ok();
+        }
         self.closed = Some(error.clone());
 
         error
@@ -1001,17 +1004,12 @@ impl generic::SendStream for SendStream {
             fin: true,
         };
 
-        // The FIN lands in the stream's current band (after its data). If the
-        // queue is full, hand off to a task that awaits room rather than block.
-        if let Err(frame) = self.outbound.try_push(self.priority, self.id, frame.into()) {
-            let outbound = self.outbound.clone();
-            let priority = self.priority;
-            let id = self.id;
-            tokio::spawn(async move {
-                outbound.push(priority, id, frame).await.ok();
-            });
-        }
-
+        // Enqueue the FIN synchronously into the stream's band (after its data),
+        // bypassing the capacity bound. This avoids detaching it to a task, which
+        // could race a concurrent reset/stop (emitting RESET_STREAM and then a
+        // FIN) and would also hide a closed queue behind a successful return.
+        self.outbound
+            .push_now(self.priority, self.id, frame.into())?;
         self.fin = true;
 
         Ok(())

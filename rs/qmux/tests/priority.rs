@@ -87,34 +87,49 @@ async fn higher_priority_completes_first() {
         hi.write(&vec![b'H'; HI_LEN]).await.unwrap();
         hi.finish().unwrap();
 
-        // Keep the session alive until the peer has drained everything.
-        client.closed().await;
+        // Return the client so the session stays alive and the test can await
+        // this task deterministically rather than detaching it.
+        client
     });
 
     // The server accepts streams in arrival order: lo first, then hi.
-    let mut lo = server.accept_uni().await.unwrap();
+    let lo = server.accept_uni().await.unwrap();
     let mut hi = server.accept_uni().await.unwrap();
 
-    // Drain hi completely; meanwhile lo must NOT have finished yet.
+    // Drain lo in the background while we read hi in the foreground. (We can't
+    // probe lo with lo.closed(): qmux's recv closed() consumes inbound data,
+    // which would corrupt the byte-count assertion below.)
+    let lo_task = tokio::spawn(async move {
+        let mut lo = lo;
+        let mut total = 0usize;
+        while let Some(chunk) = lo.read_chunk(64 * 1024).await.unwrap() {
+            assert!(chunk.iter().all(|&b| b == b'L'));
+            total += chunk.len();
+        }
+        total
+    });
+
     let hi_data = hi.read_all().await.unwrap();
     assert_eq!(hi_data.len(), HI_LEN);
     assert!(hi_data.iter().all(|&b| b == b'H'));
 
-    // Read whatever lo has produced so far. Because hi preempted it, lo should
-    // still have bytes outstanding at the moment hi finished.
-    let mut lo_so_far = 0usize;
-    while let Some(chunk) = lo.read_chunk(64 * 1024).await.unwrap() {
-        lo_so_far += chunk.len();
-        if lo_so_far >= LO_LEN {
-            break;
-        }
-    }
+    // The high-priority stream must finish while the low-priority backlog is
+    // still in-flight — proof that it preempted, not merely that lo arrives.
+    assert!(
+        !lo_task.is_finished(),
+        "low-priority stream should still be in-flight when the high-priority stream completes"
+    );
+
+    let lo_total = lo_task.await.unwrap();
     assert_eq!(
-        lo_so_far, LO_LEN,
+        lo_total, LO_LEN,
         "low-priority stream must still deliver all bytes"
     );
 
-    drop(writer);
+    let _client = tokio::time::timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("writer task should complete")
+        .expect("writer task panicked");
 }
 
 /// Equal-priority streams interleave (round-robin) rather than one draining
@@ -142,7 +157,7 @@ async fn equal_priority_interleaves() {
         };
         tokio::join!(wa, wb);
 
-        client.closed().await;
+        client
     });
 
     let mut a = server.accept_uni().await.unwrap();
@@ -171,7 +186,10 @@ async fn equal_priority_interleaves() {
     assert_eq!(a_total, LEN);
     assert_eq!(b_total, LEN);
 
-    drop(writer);
+    let _client = tokio::time::timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("writer task should complete")
+        .expect("writer task panicked");
 }
 
 /// A control frame (RESET_STREAM, via `reset()`) reaches the peer ahead of a
@@ -245,7 +263,7 @@ async fn mid_stream_set_priority_preserves_order() {
         s.write(&payload[mid..]).await.unwrap();
         s.finish().unwrap();
 
-        client.closed().await;
+        client
     });
 
     let mut filler = server.accept_uni().await.unwrap();
@@ -259,7 +277,11 @@ async fn mid_stream_set_priority_preserves_order() {
     );
 
     let _ = filler.read_all().await;
-    drop(writer);
+
+    let _client = tokio::time::timeout(Duration::from_secs(2), writer)
+        .await
+        .expect("writer task should complete")
+        .expect("writer task panicked");
 }
 
 /// Tearing down the session unblocks a producer parked on a full queue: the

@@ -111,12 +111,15 @@ impl PriorityQueue {
         }
     }
 
-    /// Non-blocking variant of [`push`]. Returns the frame back on `Err` if the
-    /// queue is full or closed.
-    pub fn try_push(&self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Frame> {
+    /// Enqueue a frame synchronously, bypassing the capacity bound — for small,
+    /// must-not-be-dropped control markers like a stream FIN, which would
+    /// otherwise have to either block (impossible from a sync caller) or be
+    /// detached to a task (racing reset/teardown). The frame still lands in the
+    /// stream's band, after its data. Fails only if the queue is closed.
+    pub fn push_now(&self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.closed || inner.len >= self.capacity {
-            return Err(frame);
+        if inner.closed {
+            return Err(Error::Closed);
         }
         self.push_locked(&mut inner, priority, id, frame);
         Ok(())
