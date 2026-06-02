@@ -1,3 +1,20 @@
+/** Decide the new receive-window limit to advertise (MAX_DATA / MAX_STREAM_DATA).
+ *
+ * Replenishes only when the remaining advertised window has dropped to at most
+ * half, and always sets the new limit relative to bytes the application has
+ * actually **consumed** (`consumed` is cumulative) — never relative to bytes
+ * received. That keeps the peer's send credit bounded to one `window` ahead of
+ * the reader: a stalled reader stops advancing `consumed`, so the limit stops
+ * moving and the peer's credit drains.
+ *
+ * Returns the new limit, or `null` if no update is warranted.
+ */
+export function replenishWindow(consumed: bigint, currentMax: bigint, window: bigint): bigint | null {
+	if (window === 0n) return null;
+	if (currentMax - consumed <= window / 2n) return consumed + window;
+	return null;
+}
+
 /** Tracks used/max credit for flow control.
  *
  * Mirrors the Rust `Credit` struct. Callers can synchronously try to claim

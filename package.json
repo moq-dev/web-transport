@@ -5,6 +5,7 @@
 	"workspaces": [
 		"js/qmux",
 		"js/web-demo",
+		"js/web-socket-stream",
 		"js/web-transport"
 	],
 	"scripts": {

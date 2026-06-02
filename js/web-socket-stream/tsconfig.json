@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"lib": ["esnext", "dom", "dom.iterable"],
+		"target": "esnext",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"outDir": "./dist",
+		"declaration": true,
+		"isolatedModules": true,
+		"strict": true,
+		"skipLibCheck": true,
+		"rewriteRelativeImportExtensions": true
+	},
+	"include": ["src/**/*"]
+}
