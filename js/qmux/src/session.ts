@@ -1,8 +1,9 @@
 import { openWebSocketStream, type WebSocketStreamLike } from "@moq/web-socket-stream";
-import { Credit } from "./credit.ts";
+import { Credit, replenishWindow } from "./credit.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD } from "./frame.ts";
+import { RecvStream } from "./recv.ts";
 import { DEFAULT_SEND_ORDER, SendScheduler, type SendSink, WritableStreamSink } from "./scheduler.ts";
 import * as Stream from "./stream.ts";
 import { VarInt } from "./varint.ts";
@@ -259,7 +260,7 @@ export default class Session implements WebTransport {
 	#closeReason?: Error;
 
 	#sendStreams = new Map<bigint, WritableStreamDefaultController>();
-	#recvStreams = new Map<bigint, ReadableStreamDefaultController<Uint8Array>>();
+	#recvStreams = new Map<bigint, RecvStream>();
 
 	#nextUniStreamId = 0n;
 	#nextBiStreamId = 0n;
@@ -653,32 +654,33 @@ export default class Session implements WebTransport {
 		return true;
 	}
 
-	#accountConsumed(streamId: bigint, bytes: number) {
+	/** Connection-level credit. Accounted at receipt: MAX_DATA is a coarse
+	 *  aggregate limit, and per-stream backpressure (below) is what throttles a
+	 *  slow reader. `recvDataConsumed` is cumulative. */
+	#accountConnConsumed(bytes: number) {
 		if (!isQmux(this.#version) || bytes === 0) return;
-
-		// Track connection-level consumed (stable, not reset by per-stream updates)
 		this.#recvDataConsumed += BigInt(bytes);
+		this.#maybeSendMaxData();
+	}
 
+	/** Stream-level credit. Accounted on *delivery* to the application (driven by
+	 *  RecvStream.onConsume), so MAX_STREAM_DATA tracks the read rate and the peer
+	 *  can't buffer more than one window ahead of a slow reader. `recvConsumed`
+	 *  is cumulative. */
+	#accountStreamConsumed(streamId: bigint, bytes: number) {
+		if (!isQmux(this.#version) || bytes === 0) return;
 		const flow = this.#streamFlow.get(streamId);
 		if (flow) {
 			flow.recvConsumed += BigInt(bytes);
 			this.#maybeSendMaxStreamData(streamId, flow);
 		}
-		this.#maybeSendMaxData();
 	}
 
 	#maybeSendMaxData() {
-		const window = this.#ourParams.initialMaxData;
-		if (window === 0n) return;
-
-		const threshold = window / 2n;
-		if (this.#recvDataConsumed >= threshold) {
-			const newMax = this.#recvDataOffset + window;
-			if (newMax > this.#recvDataMax) {
-				this.#recvDataMax = newMax;
-				this.#recvDataConsumed = 0n;
-				this.#sendPriorityFrame({ type: "max_data", max: newMax });
-			}
+		const newMax = replenishWindow(this.#recvDataConsumed, this.#recvDataMax, this.#ourParams.initialMaxData);
+		if (newMax !== null) {
+			this.#recvDataMax = newMax;
+			this.#sendPriorityFrame({ type: "max_data", max: newMax });
 		}
 	}
 
@@ -696,16 +698,12 @@ export default class Session implements WebTransport {
 			initialWindow = this.#ourParams.initialMaxStreamDataUni;
 		}
 
-		if (initialWindow === 0n) return;
-
-		const threshold = initialWindow / 2n;
-		if (flow.recvConsumed >= threshold) {
-			const newMax = flow.recvOffset + initialWindow;
-			if (newMax > flow.recvMax) {
-				flow.recvMax = newMax;
-				flow.recvConsumed = 0n;
-				this.#sendPriorityFrame({ type: "max_stream_data", id, max: newMax });
-			}
+		// `recvConsumed` only grows on delivery to the application, so a stalled
+		// reader stops replenishing and the peer's send credit drains to the window.
+		const newMax = replenishWindow(flow.recvConsumed, flow.recvMax, initialWindow);
+		if (newMax !== null) {
+			flow.recvMax = newMax;
+			this.#sendPriorityFrame({ type: "max_stream_data", id, max: newMax });
 		}
 	}
 
@@ -747,8 +745,8 @@ export default class Session implements WebTransport {
 			throw new Error("Invalid stream ID direction");
 		}
 
-		let stream = this.#recvStreams.get(streamId);
-		if (!stream) {
+		let recv = this.#recvStreams.get(streamId);
+		if (!recv) {
 			// We created the stream, we can skip it.
 			if (frame.id.serverInitiated === this.#isServer) {
 				return;
@@ -792,12 +790,9 @@ export default class Session implements WebTransport {
 				return;
 			}
 
-			const reader = new ReadableStream<Uint8Array>({
-				start: (controller) => {
-					stream = controller;
-					this.#recvStreams.set(streamId, controller);
-				},
-				cancel: () => {
+			const recvStream = new RecvStream(
+				(bytes) => this.#accountStreamConsumed(streamId, bytes),
+				() => {
 					this.#sendPriorityFrame({
 						type: "stop_sending",
 						id: frame.id,
@@ -808,11 +803,10 @@ export default class Session implements WebTransport {
 					this.#replenishStreamCredit(frame.id.dir);
 					this.#maybeDeleteStreamFlow(streamId);
 				},
-			});
-
-			if (!stream) {
-				throw new Error("ReadableStream didn't call start");
-			}
+			);
+			this.#recvStreams.set(streamId, recvStream);
+			recv = recvStream;
+			const reader = recvStream.readable;
 
 			if (frame.id.dir === Stream.Dir.Bi) {
 				// Incoming bidirectional stream
@@ -858,13 +852,14 @@ export default class Session implements WebTransport {
 		}
 
 		if (frame.data.byteLength > 0) {
-			stream.enqueue(frame.data);
-			// Account consumed when data is enqueued to the reader
-			this.#accountConsumed(streamId, frame.data.byteLength);
+			recv.push(frame.data);
+			// Connection-level credit at receipt; stream-level credit is deferred to
+			// delivery (RecvStream.onConsume) so a slow reader backpressures the peer.
+			this.#accountConnConsumed(frame.data.byteLength);
 		}
 
 		if (frame.fin) {
-			stream.close();
+			recv.finish();
 			this.#recvStreams.delete(streamId);
 			if (frame.id.serverInitiated !== this.#isServer) {
 				this.#replenishStreamCredit(frame.id.dir);
@@ -875,10 +870,10 @@ export default class Session implements WebTransport {
 
 	#handleResetStream(frame: Frame.ResetStream) {
 		const streamId = frame.id.value.value;
-		const stream = this.#recvStreams.get(streamId);
-		if (!stream) return;
+		const recv = this.#recvStreams.get(streamId);
+		if (!recv) return;
 
-		stream.error(new Error(`RESET_STREAM: ${frame.code.value}`));
+		recv.error(new Error(`RESET_STREAM: ${frame.code.value}`));
 		this.#recvStreams.delete(streamId);
 		if (frame.id.serverInitiated !== this.#isServer) {
 			this.#replenishStreamCredit(frame.id.dir);
@@ -1064,11 +1059,9 @@ export default class Session implements WebTransport {
 		});
 		this.#attachSendOrder(writer, streamIdVal, sendOrder);
 
-		const reader = new ReadableStream<Uint8Array>({
-			start: (controller) => {
-				this.#recvStreams.set(streamIdVal, controller);
-			},
-			cancel: async () => {
+		const recvStream = new RecvStream(
+			(bytes) => this.#accountStreamConsumed(streamIdVal, bytes),
+			() => {
 				this.#sendPriorityFrame({
 					type: "stop_sending",
 					id: streamId,
@@ -1078,9 +1071,10 @@ export default class Session implements WebTransport {
 				this.#recvStreams.delete(streamIdVal);
 				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
-		});
+		);
+		this.#recvStreams.set(streamIdVal, recvStream);
 
-		return { readable: reader, writable: writer };
+		return { readable: recvStream.readable, writable: writer };
 	}
 
 	async createUnidirectionalStream(options?: WebTransportSendStreamOptions): Promise<WritableStream<Uint8Array>> {
@@ -1164,9 +1158,10 @@ export default class Session implements WebTransport {
 				c.error(this.#closed);
 			} catch {}
 		}
-		for (const c of this.#recvStreams.values()) {
+		const closeErr = this.#closed ?? this.#closeReason ?? new Error("Connection closed");
+		for (const recv of this.#recvStreams.values()) {
 			try {
-				c.error(this.#closed);
+				recv.error(closeErr);
 			} catch {}
 		}
 		this.#sendStreams.clear();
