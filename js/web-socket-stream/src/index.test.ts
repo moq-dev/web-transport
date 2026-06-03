@@ -59,8 +59,9 @@ class FakeWebSocket implements WebSocketLike {
 
 const ctor = FakeWebSocket as unknown as WebSocketConstructor;
 
-async function until(fn: () => boolean, tries = 200): Promise<void> {
-	for (let i = 0; i < tries && !fn(); i++) {
+/** Yield to the event loop `n` times to let queued work run. */
+async function tick(n = 1): Promise<void> {
+	for (let i = 0; i < n; i++) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
 }
@@ -111,7 +112,7 @@ describe("WebSocketStream ponyfill", () => {
 		void pending.then(() => {
 			settled = true;
 		});
-		await until(() => false, 5);
+		await tick(5);
 		expect(settled).toBe(false); // still backpressured
 		expect(ws.sent.length).toBe(2); // but the bytes were already sent
 
@@ -133,7 +134,7 @@ describe("WebSocketStream ponyfill", () => {
 		void pending.then(() => {
 			settled = true;
 		});
-		await until(() => false, 5);
+		await tick(5);
 		expect(settled).toBe(false); // backpressured at 100
 
 		// Raise the mark above the buffered amount — the in-progress drain resolves
@@ -178,9 +179,33 @@ describe("WebSocketStream ponyfill", () => {
 		expect(ws2.closeArgs).toEqual({ code: 1000, reason: "ok" });
 	});
 
+	test("closing the writable closes the underlying socket", async () => {
+		const wss = new WebSocketStream("wss://x", { webSocket: ctor });
+		const ws = FakeWebSocket.last as FakeWebSocket;
+		ws.open();
+		const { writable } = await wss.opened;
+		await writable.getWriter().close();
+		expect(ws.closeArgs).toBeDefined();
+	});
+
 	test("openWebSocketStream uses the ponyfill when there's no native global", () => {
 		const wss = openWebSocketStream("wss://x", { webSocket: ctor });
 		expect(wss).toBeInstanceOf(WebSocketStream);
+	});
+
+	test("openWebSocketStream keeps ponyfill-only options after install()", () => {
+		const g = globalThis as { WebSocket?: WebSocketConstructor; WebSocketStream?: unknown };
+		const prevWS = g.WebSocket;
+		g.WebSocket = ctor; // the ponyfill's default constructor — avoids real network
+		install(); // installs this very ponyfill as globalThis.WebSocketStream
+		try {
+			// Must NOT take the "native" branch and drop highWaterMark.
+			const wss = openWebSocketStream("wss://x", { highWaterMark: 4096 }) as WebSocketStream;
+			expect(wss.highWaterMark).toBe(4096);
+		} finally {
+			delete g.WebSocketStream;
+			g.WebSocket = prevWS;
+		}
 	});
 
 	test("install sets the global only when absent", () => {

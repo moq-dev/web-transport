@@ -143,6 +143,9 @@ export class WebSocketStream implements WebSocketStreamLike {
 				ws.send(chunk);
 				return drain(ws, () => this.#highWaterMark);
 			},
+			// A WebSocket has no half-close, so closing/aborting the writable closes
+			// the whole socket. Without this, `writer.close()` would leave it open.
+			close: () => ws.close(),
 			abort: () => ws.close(),
 		});
 
@@ -215,7 +218,10 @@ export class WebSocketStream implements WebSocketStreamLike {
 export function openWebSocketStream(url: string | URL, options: WebSocketStreamOptions = {}): WebSocketStreamLike {
 	const href = typeof url === "string" ? url : url.toString();
 	const Native = (globalThis as { WebSocketStream?: typeof WebSocketStream }).WebSocketStream;
-	if (Native && !options.webSocket) {
+	// Only delegate to a *genuinely* native global — if `install()` put this very
+	// ponyfill on the global, fall through so ponyfill-only options (e.g.
+	// highWaterMark) aren't dropped on the floor.
+	if (Native && Native !== WebSocketStream && !options.webSocket) {
 		return new Native(href, { protocols: options.protocols, signal: options.signal });
 	}
 	return new WebSocketStream(href, options);

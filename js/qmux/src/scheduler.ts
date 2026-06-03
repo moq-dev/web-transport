@@ -17,8 +17,10 @@ export interface SendSink {
 	/** Resolve once the sink can accept another write without exceeding its
 	 *  high-water mark. Rejects if the socket is closed/errored. */
 	ready(): Promise<void>;
-	/** Write bytes to the socket now. Call only after {@link ready} resolves. */
-	write(bytes: Uint8Array): void;
+	/** Write bytes to the socket, resolving once the write is accepted. Rejects
+	 *  if the write fails — the scheduler must observe this rather than resolve
+	 *  the frame's promise as if it succeeded. */
+	write(bytes: Uint8Array): Promise<void>;
 	/** Whether a write can proceed right now without buffering past high-water. */
 	readonly hasRoom: boolean;
 }
@@ -43,11 +45,9 @@ export class WritableStreamSink implements SendSink {
 		return this.#writer.ready;
 	}
 
-	write(bytes: Uint8Array): void {
-		// Backpressure is observed via ready(); the write itself is fire-and-forget.
-		void this.#writer.write(bytes).catch(() => {
-			// Surfaced to the loop on the next ready() call, which will reject.
-		});
+	write(bytes: Uint8Array): Promise<void> {
+		// Propagate failures so the scheduler can reject the frame's promise.
+		return this.#writer.write(bytes);
 	}
 }
 
@@ -125,6 +125,11 @@ export class SendScheduler {
 	 *  rejects if the session closes or the stream is dropped first. */
 	enqueueStream(streamId: bigint, bytes: Uint8Array): Promise<void> {
 		if (this.#closed) return Promise.reject(this.#closed);
+		// Enforce the one-frame-per-stream invariant: a producer must await each
+		// enqueue before the next. A duplicate would orphan the previous promise.
+		if (this.#ready.has(streamId)) {
+			return Promise.reject(new Error(`stream ${streamId} already has a queued frame`));
+		}
 		return new Promise<void>((resolve, reject) => {
 			this.#ready.set(streamId, { seq: this.#seq++, bytes, resolve, reject });
 			this.#signal();
@@ -203,7 +208,7 @@ export class SendScheduler {
 				if (this.#control.length > 0) {
 					const bytes = this.#control.shift() as Uint8Array;
 					this.#controlBytes -= bytes.byteLength;
-					this.#sink.write(bytes);
+					await this.#sink.write(bytes);
 					this.#onActivity();
 					continue;
 				}
@@ -214,7 +219,14 @@ export class SendScheduler {
 				const id = this.#pickStream();
 				const waiter = this.#ready.get(id) as Waiter;
 				this.#ready.delete(id);
-				this.#sink.write(waiter.bytes);
+				try {
+					await this.#sink.write(waiter.bytes);
+				} catch (err) {
+					// The frame never made it; reject this stream's promise (it's no
+					// longer in #ready, so #fail wouldn't) and tear down the rest.
+					waiter.reject(err instanceof Error ? err : new Error(String(err)));
+					throw err;
+				}
 				this.#onActivity();
 				waiter.resolve();
 			}

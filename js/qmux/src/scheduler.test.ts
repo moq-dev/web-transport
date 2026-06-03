@@ -33,7 +33,7 @@ class GatedSink implements SendSink {
 		}
 	}
 
-	write(bytes: Uint8Array): void {
+	async write(bytes: Uint8Array): Promise<void> {
 		this.#admits -= 1;
 		this.written.push(bytes[0]);
 		this.#onWrite?.();
@@ -46,11 +46,20 @@ class GatedSink implements SendSink {
 	}
 }
 
-/** Spin the microtask/macrotask queue until `fn()` is true or we give up. */
+/** Yield to the event loop `n` times to let queued work run. */
+async function tick(n = 1): Promise<void> {
+	for (let i = 0; i < n; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+}
+
+/** Wait until `fn()` is true, throwing if it never becomes true within budget —
+ *  so a scheduler regression fails the test instead of silently proceeding. */
 async function until(fn: () => boolean, tries = 200): Promise<void> {
 	for (let i = 0; i < tries && !fn(); i++) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
+	if (!fn()) throw new Error("until: condition not met within timeout");
 }
 
 const frame = (tag: number) => new Uint8Array([tag]);
@@ -65,7 +74,7 @@ describe("SendScheduler", () => {
 		void sched.enqueueStream(2n, frame(20));
 		sched.enqueueControl(frame(99));
 
-		await until(() => false, 5); // let everything queue
+		await tick(5); // let everything queue
 		sink.release(3);
 		await until(() => sink.written.length === 3);
 
@@ -83,7 +92,7 @@ describe("SendScheduler", () => {
 		void sched.enqueueStream(2n, frame(1));
 		void sched.enqueueStream(3n, frame(9));
 
-		await until(() => false, 5);
+		await tick(5);
 		sink.release(3);
 		await until(() => sink.written.length === 3);
 
@@ -108,7 +117,7 @@ describe("SendScheduler", () => {
 		armA();
 		armB();
 
-		await until(() => false, 5);
+		await tick(5);
 		sink.release(6);
 		await until(() => sink.written.length === 6);
 
@@ -124,7 +133,7 @@ describe("SendScheduler", () => {
 		void sched.enqueueStream(1n, frame(1));
 		void sched.enqueueStream(2n, frame(2));
 
-		await until(() => false, 5);
+		await tick(5);
 		sched.setSendOrder(2n, 100); // promote stream 2 while both are queued
 		sink.release(2);
 		await until(() => sink.written.length === 2);
@@ -142,7 +151,7 @@ describe("SendScheduler", () => {
 			if (left-- > 0) sched.enqueueStream(1n, frame(1)).then(arm);
 		};
 		arm();
-		await until(() => false, 5);
+		await tick(5);
 
 		sink.release(5); // drain a few stream frames
 		await until(() => sink.written.length === 5);
@@ -165,7 +174,7 @@ describe("SendScheduler", () => {
 		);
 		sched.dropStream(1n, new Error("reset"));
 		sink.release(5);
-		await until(() => false, 10);
+		await tick(10);
 
 		expect(await rejected).toBe("rejected");
 		expect(sink.written).toEqual([]); // nothing written
@@ -199,7 +208,7 @@ describe("SendScheduler", () => {
 		void sched.enqueueStream(1n, frame(1));
 		sched.enqueueControl(frame(99));
 
-		await until(() => false, 5);
+		await tick(5);
 		sink.release(2);
 		await until(() => sink.written.length === 2);
 

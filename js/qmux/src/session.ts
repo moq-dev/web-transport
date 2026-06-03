@@ -281,6 +281,7 @@ export default class Session implements WebTransport {
 
 	readonly ready: Promise<void>;
 	#readyResolve: () => void;
+	#readyReject: (err: Error) => void;
 	readonly closed: Promise<WebTransportCloseInfo>;
 	#closedResolve: (info: WebTransportCloseInfo) => void;
 
@@ -366,6 +367,10 @@ export default class Session implements WebTransport {
 		const ready = Promise.withResolvers<void>();
 		this.ready = ready.promise;
 		this.#readyResolve = ready.resolve;
+		this.#readyReject = ready.reject;
+		// Avoid an unhandled rejection if `ready` is rejected (early close) before
+		// the caller attaches a handler; real awaiters still observe the rejection.
+		this.ready.catch(() => {});
 
 		const closed = Promise.withResolvers<WebTransportCloseInfo>();
 		this.closed = closed.promise;
@@ -402,24 +407,23 @@ export default class Session implements WebTransport {
 
 		wss.opened.then(
 			(conn) => {
+				// The session may have been closed before the socket finished opening.
+				if (this.#closed) return;
 				this.#startSession(conn.protocol, new WritableStreamSink(conn.writable));
 				void this.#readLoop(conn.readable.getReader());
 			},
 			(err: unknown) => {
-				if (this.#closed) return;
-				this.#closed = err instanceof Error ? err : new Error("WebSocketStream failed to open");
+				this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream failed to open");
 				this.#close(1006, "WebSocketStream error");
 			},
 		);
 		wss.closed.then(
 			(info) => {
-				if (this.#closed) return;
-				this.#closed = new Error(`Connection closed: ${info.closeCode ?? 0} ${info.reason ?? ""}`);
+				this.#closeReason ??= new Error(`Connection closed: ${info.closeCode ?? 0} ${info.reason ?? ""}`);
 				this.#close(info.closeCode ?? 1006, info.reason ?? "");
 			},
 			() => {
-				if (this.#closed) return;
-				this.#closed = new Error("WebSocketStream closed");
+				this.#closeReason ??= new Error("WebSocketStream closed");
 				this.#close(1006, "WebSocketStream error");
 			},
 		);
@@ -430,12 +434,16 @@ export default class Session implements WebTransport {
 			while (true) {
 				const { value, done } = await reader.read();
 				if (done) break;
-				// QMux is a binary protocol; ignore any text frames.
-				if (typeof value !== "string") this.#onData(value);
+				// QMux is binary-only; a text frame is a protocol error, not something
+				// to silently drop (which would desync the session).
+				if (typeof value === "string") {
+					this.close({ closeCode: 1003, reason: "text frames are not valid for QMux" });
+					return;
+				}
+				this.#onData(value);
 			}
 		} catch (err) {
-			if (this.#closed) return;
-			this.#closed = err instanceof Error ? err : new Error("WebSocketStream read error");
+			this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream read error");
 			this.#close(1006, "WebSocketStream read error");
 		}
 	}
@@ -498,7 +506,8 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "stop_sending") {
 			this.#handleStopSending(frame);
 		} else if (frame.type === "connection_close") {
-			this.#closeReason = new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
+			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
+			this.#close(Number(frame.code.value), frame.reason);
 			this.#transportClose();
 		} else if (frame.type === "transport_parameters") {
 			this.#handleTransportParameters(frame.params);
@@ -579,9 +588,9 @@ export default class Session implements WebTransport {
 		const now = Date.now();
 		if (now - this.#lastRecvAt > timeoutMs) {
 			// Peer has gone silent past the negotiated limit.
-			this.#closeReason = new Error("idle timeout");
+			this.#closeReason ??= new Error("idle timeout");
+			this.#close(0, "idle timeout");
 			this.#transportClose();
-			if (this.#idleTimer) clearInterval(this.#idleTimer);
 			return;
 		}
 		// Keep-alive: nudge the peer when our outbound side has been silent for a third
@@ -1136,11 +1145,21 @@ export default class Session implements WebTransport {
 		return writer;
 	}
 
+	/** The single, idempotent close transition: marks the session closed, settles
+	 *  `ready`/`closed`, and tears down streams, credits, and the scheduler.
+	 *  Protocol-close paths route through here before/while closing the socket. */
 	#close(code: number, reason: string) {
+		if (this.#closed) return;
+		this.#closed = this.#closeReason ?? new Error(`Connection closed: ${code} ${reason}`);
+
 		if (this.#idleTimer) {
 			clearInterval(this.#idleTimer);
 			this.#idleTimer = undefined;
 		}
+
+		// Settle the WebTransport promises. Rejecting `ready` is a no-op once it
+		// has resolved (i.e. after a successful open).
+		this.#readyReject(this.#closed);
 		this.#closedResolve({
 			closeCode: code,
 			reason,
@@ -1206,11 +1225,12 @@ export default class Session implements WebTransport {
 			reason,
 		});
 
+		// Transition state and tear down now; give the queued CONNECTION_CLOSE a
+		// moment to flush before actually closing the socket.
+		this.#close(code, reason);
 		setTimeout(() => {
 			this.#transportClose();
 		}, 100);
-
-		this.#close(code, reason);
 	}
 
 	/** Resize the send-buffer high-water mark (bytes) used for write
