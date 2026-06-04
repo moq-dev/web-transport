@@ -23,7 +23,6 @@ class FakePeer {
 	readonly closed: Promise<{ closeCode?: number; reason?: string }>;
 	#closedResolve!: (info: { closeCode?: number; reason?: string }) => void;
 	#recv!: ReadableStreamDefaultController<Uint8Array | string>;
-	#sentWaiters: Array<() => void> = [];
 
 	/** Raw chunks the Session has written. */
 	sent: Uint8Array[] = [];
@@ -40,7 +39,6 @@ class FakePeer {
 		const writable = new WritableStream<Uint8Array>({
 			write: (chunk) => {
 				this.sent.push(chunk);
-				for (const w of this.#sentWaiters.splice(0)) w();
 			},
 		});
 		this.opened = Promise.resolve({ readable, writable, protocol: "qmux-01", extensions: "" });
@@ -67,6 +65,21 @@ class FakePeer {
 	/** All frames the Session has written so far, decoded. */
 	received(): Frame.Any[] {
 		return this.sent.flatMap((b) => Frame.decodeRecord(b));
+	}
+	has(type: Frame.Any["type"]): boolean {
+		return this.received().some((f) => f.type === type);
+	}
+	count(type: Frame.Any["type"]): number {
+		return this.received().filter((f) => f.type === type).length;
+	}
+}
+
+/** Poll an observable condition with a bounded timeout (no fixed-yield sleeps). */
+async function waitFor(check: () => boolean, timeoutMs = 1000): Promise<void> {
+	const start = Date.now();
+	while (!check()) {
+		if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
 }
 
@@ -95,21 +108,21 @@ function connect(config?: Config): { session: Session; peer: FakePeer } {
 	return { session, peer };
 }
 
-/** Yield repeatedly so the Session's async loops (open, read, scheduler) run. */
-async function settle(): Promise<void> {
-	for (let i = 0; i < 10; i++) await new Promise((resolve) => setTimeout(resolve, 0));
-}
+const ORIGINAL_WSS = (globalThis as { WebSocketStream?: unknown }).WebSocketStream;
 
 describe("Session integration (scripted peer)", () => {
 	afterEach(() => {
-		delete (globalThis as { WebSocketStream?: unknown }).WebSocketStream;
+		if (ORIGINAL_WSS === undefined) {
+			delete (globalThis as { WebSocketStream?: unknown }).WebSocketStream;
+		} else {
+			(globalThis as { WebSocketStream?: unknown }).WebSocketStream = ORIGINAL_WSS;
+		}
 	});
 
 	test("handshake: sends TRANSPORT_PARAMETERS and resolves ready", async () => {
 		const { session, peer } = connect();
 		await session.ready;
-		await settle();
-		expect(peer.received().some((f) => f.type === "transport_parameters")).toBe(true);
+		await waitFor(() => peer.has("transport_parameters"));
 		session.close();
 	});
 
@@ -117,14 +130,14 @@ describe("Session integration (scripted peer)", () => {
 		const { session, peer } = connect();
 		await session.ready;
 		peer.send({ type: "transport_parameters", params: peerParams() });
-		await settle();
 
+		// createUnidirectionalStream blocks until the peer's stream-count credit arrives.
 		const writable = await session.createUnidirectionalStream();
 		await writable.getWriter().write(new Uint8Array([1, 2, 3]));
-		await settle();
 
-		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data | undefined;
-		expect(stream?.data).toEqual(new Uint8Array([1, 2, 3]));
+		await waitFor(() => peer.has("stream"));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data).toEqual(new Uint8Array([1, 2, 3]));
 		session.close();
 	});
 
@@ -133,10 +146,8 @@ describe("Session integration (scripted peer)", () => {
 		await session.ready;
 
 		session.close({ closeCode: 42, reason: "bye" });
-		const info = await session.closed;
-		expect(info).toEqual({ closeCode: 42, reason: "bye" });
-		await settle();
-		expect(peer.received().some((f) => f.type === "connection_close")).toBe(true);
+		expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
+		await waitFor(() => peer.has("connection_close"));
 
 		// Second close is a no-op: the resolved info is unchanged.
 		session.close({ closeCode: 7, reason: "again" });
@@ -152,40 +163,43 @@ describe("Session integration (scripted peer)", () => {
 	});
 
 	test("MAX_STREAM_DATA is extended on delivery to the app, not on receipt", async () => {
-		// Small per-stream window so a few chunks cross the half-window threshold.
+		// Small per-stream window so a few delivered chunks cross the half-window threshold.
 		const { session, peer } = connect({ maxStreamDataUni: 1000n });
 		await session.ready;
 		peer.send({ type: "transport_parameters", params: peerParams() });
-		await settle();
 
 		// Peer opens a server-initiated uni stream and sends 4×200B (=800 ≤ window).
 		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
 		for (let i = 0; i < 4; i++) {
 			peer.send({ type: "stream", id, data: new Uint8Array(200), fin: false });
 		}
-		await settle();
+		// A ping after the data acts as a barrier: the Session processes frames in
+		// order, so once we see the PONG, all four STREAM frames have been received.
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
 
-		const maxStreamDataCount = () => peer.received().filter((f) => f.type === "max_stream_data").length;
-		// Before the app reads, at most the eagerly-pulled first chunk is delivered
-		// (200B < half the 1000B window), so no window update has gone out.
-		expect(maxStreamDataCount()).toBe(0);
+		// All bytes are received but not yet delivered to the app (only the eagerly
+		// pulled first chunk, 200B < half the window). Credit-on-receipt would have
+		// already emitted MAX_STREAM_DATA here; credit-on-delivery has not.
+		expect(peer.count("max_stream_data")).toBe(0);
 
 		// App takes the incoming stream and drains it.
 		const reader = session.incomingUnidirectionalStreams.getReader();
-		const { value: incoming } = await reader.read();
+		const { value: incoming, done } = await reader.read();
 		reader.releaseLock();
-		const streamReader = (incoming as ReadableStream<Uint8Array>).getReader();
+		if (done || !incoming) throw new Error("expected an incoming unidirectional stream");
+
+		const streamReader = incoming.getReader();
 		let got = 0;
 		while (got < 800) {
-			const { value, done } = await streamReader.read();
-			if (done) break;
-			got += value.byteLength;
+			const chunk = await streamReader.read();
+			if (chunk.done) break;
+			got += chunk.value.byteLength;
 		}
-		await settle();
-
-		// Now that the bytes have been delivered, the window has been replenished.
 		expect(got).toBe(800);
-		expect(maxStreamDataCount()).toBeGreaterThan(0);
+
+		// Delivering the buffered bytes replenishes the window.
+		await waitFor(() => peer.count("max_stream_data") > 0);
 		session.close();
 	});
 });
