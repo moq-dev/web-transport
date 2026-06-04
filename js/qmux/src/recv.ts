@@ -44,7 +44,10 @@ export class RecvStream {
 				}
 				const chunk = this.#queue.shift() as Uint8Array;
 				controller.enqueue(chunk);
-				// Credit only now — the application is receiving these bytes.
+				// Credit must track *delivery*, not receipt — do NOT move onConsume
+				// into push(). This is the line that bounds the peer to one receive
+				// window ahead of a slow reader; crediting on receipt would let the
+				// buffer grow without bound.
 				onConsume(chunk.byteLength);
 			},
 			cancel: () => onCancel(),

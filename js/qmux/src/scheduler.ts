@@ -21,8 +21,6 @@ export interface SendSink {
 	 *  if the write fails — the scheduler must observe this rather than resolve
 	 *  the frame's promise as if it succeeded. */
 	write(bytes: Uint8Array): Promise<void>;
-	/** Whether a write can proceed right now without buffering past high-water. */
-	readonly hasRoom: boolean;
 }
 
 /** Backpressure-aware sink over a `WebSocketStream` writable. The writable's
@@ -34,11 +32,6 @@ export class WritableStreamSink implements SendSink {
 
 	constructor(writable: WritableStream<Uint8Array>) {
 		this.#writer = writable.getWriter();
-	}
-
-	get hasRoom(): boolean {
-		// desiredSize is null once the stream errors/closes.
-		return (this.#writer.desiredSize ?? 0) > 0;
 	}
 
 	ready(): Promise<void> {

@@ -23,10 +23,6 @@ class GatedSink implements SendSink {
 	/** When set, the next `write()` rejects with this error. */
 	failNext?: Error;
 
-	get hasRoom(): boolean {
-		return this.#admits > 0;
-	}
-
 	async ready(): Promise<void> {
 		while (this.#admits <= 0) {
 			await this.#gate;
