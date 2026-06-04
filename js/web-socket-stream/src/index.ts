@@ -97,7 +97,9 @@ function drain(ws: WebSocketLike, highWaterMark: () => number): Promise<void> | 
 	if (ws.bufferedAmount <= highWaterMark()) return undefined;
 	return (async () => {
 		while (ws.bufferedAmount > highWaterMark()) {
-			if (ws.readyState > OPEN) return; // CLOSING/CLOSED — stop blocking
+			// The socket closed mid-write: reject so the failure propagates rather
+			// than resolving the write as if it had succeeded.
+			if (ws.readyState > OPEN) throw new Error("WebSocket is closing");
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 	})();

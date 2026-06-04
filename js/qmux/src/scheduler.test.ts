@@ -20,6 +20,9 @@ class GatedSink implements SendSink {
 		this.#onWrite = fn;
 	}
 
+	/** When set, the next `write()` rejects with this error. */
+	failNext?: Error;
+
 	get hasRoom(): boolean {
 		return this.#admits > 0;
 	}
@@ -35,6 +38,11 @@ class GatedSink implements SendSink {
 
 	async write(bytes: Uint8Array): Promise<void> {
 		this.#admits -= 1;
+		if (this.failNext) {
+			const err = this.failNext;
+			this.failNext = undefined;
+			throw err;
+		}
 		this.written.push(bytes[0]);
 		this.#onWrite?.();
 	}
@@ -198,6 +206,42 @@ describe("SendScheduler", () => {
 
 		expect(await settled).toBe("rejected");
 		expect(sink.written).toEqual([99]); // control flushed, stream dropped
+	});
+
+	test("a failed write rejects that stream's promise and tears the scheduler down", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+		sched.setSendOrder(2n, 0);
+
+		const first = sched.enqueueStream(1n, frame(1));
+		const firstSettled = first.then(
+			() => "resolved",
+			(e) => `rejected:${e.message}`,
+		);
+		sink.failNext = new Error("boom");
+		sink.release(1);
+
+		// The in-flight frame's promise rejects with the write error...
+		expect(await firstSettled).toBe("rejected:boom");
+		// ...and the scheduler is now closed, so further enqueues reject too.
+		await expect(sched.enqueueStream(2n, frame(2))).rejects.toThrow("boom");
+		expect(sink.written).toEqual([]);
+	});
+
+	test("enqueueStream rejects a duplicate frame for the same stream", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+		sched.setSendOrder(1n, 0);
+
+		const first = sched.enqueueStream(1n, frame(1));
+		// Second enqueue for the same stream before the first is serviced.
+		await expect(sched.enqueueStream(1n, frame(2))).rejects.toThrow("already has a queued frame");
+
+		// The original frame is untouched and still delivers.
+		sink.release(1);
+		await first;
+		expect(sink.written).toEqual([1]);
 	});
 
 	test("onActivity fires once per written frame", async () => {

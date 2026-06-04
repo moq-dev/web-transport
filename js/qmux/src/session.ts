@@ -544,8 +544,12 @@ export default class Session implements WebTransport {
 		this.#bidiStreamCredit.increaseMax(params.initialMaxStreamsBidi);
 		this.#uniStreamCredit.increaseMax(params.initialMaxStreamsUni);
 
-		// Update per-stream send credits for locally-opened streams created before params arrived.
-		// Peer-opened streams can't exist yet (params are the first frame on the wire).
+		// Update per-stream send credits for streams created before params arrived.
+		// The direction-only limit below is correct for locally-opened streams; we
+		// rely on a conforming peer sending TRANSPORT_PARAMETERS as its first frame,
+		// so no peer-opened stream exists here yet. This is NOT enforced — a peer
+		// that interleaved a STREAM frame ahead of its params would be mis-credited
+		// (a peer-opened bidi stream's send limit is bidi_local, cf. #handleStreamFrame).
 		for (const [streamIdVal, flow] of this.#streamFlow) {
 			const id = new Stream.Id(VarInt.from(streamIdVal));
 			const sendLimit =
@@ -600,8 +604,10 @@ export default class Session implements WebTransport {
 			this.#nextPingSeq = (this.#nextPingSeq + 1) >>> 0;
 			try {
 				this.#sendPriorityFrame({ type: "ping_request", sequence: BigInt(seq) });
-			} catch {
+			} catch (e) {
 				// Best effort — if the send fails, the close path will fire shortly.
+				// Log a breadcrumb so a never-fire encoder bug doesn't vanish silently.
+				console.warn("qmux: keep-alive ping failed", e);
 			}
 		}
 	}
@@ -824,7 +830,7 @@ export default class Session implements WebTransport {
 						this.#sendStreams.set(streamId, controller);
 					},
 					write: async (chunk) => {
-						await Promise.race([this.#sendStreamData(frame.id, chunk), this.closed]);
+						await this.#sendStreamData(frame.id, chunk);
 					},
 					abort: (e) => {
 						console.warn("abort", e);
@@ -839,7 +845,7 @@ export default class Session implements WebTransport {
 						this.#maybeDeleteStreamFlow(streamId);
 					},
 					close: async () => {
-						await Promise.race([this.#sendStreamFin(frame.id), this.closed]);
+						await this.#sendStreamFin(frame.id);
 
 						this.#sendStreams.delete(streamId);
 						this.#scheduler?.forget(streamId);
@@ -992,6 +998,10 @@ export default class Session implements WebTransport {
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {
+		// Once closed, the scheduler rejects new control frames; a late reset/stop
+		// from a stream teardown callback must be a no-op, not a throw. (The
+		// graceful CONNECTION_CLOSE is enqueued before #close sets #closed.)
+		if (this.#closed) return;
 		const bytes = Frame.encode(frame, this.#version);
 		this.#validateRecordSize(bytes);
 		this.#scheduler?.enqueueControl(bytes);
@@ -1044,7 +1054,7 @@ export default class Session implements WebTransport {
 				this.#sendStreams.set(streamIdVal, controller);
 			},
 			write: async (chunk) => {
-				await Promise.race([this.#sendStreamData(streamId, chunk), this.closed]);
+				await this.#sendStreamData(streamId, chunk);
 			},
 			abort: (e) => {
 				console.warn("abort", e);
@@ -1059,7 +1069,7 @@ export default class Session implements WebTransport {
 				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			close: async () => {
-				await Promise.race([this.#sendStreamFin(streamId), this.closed]);
+				await this.#sendStreamFin(streamId);
 
 				this.#sendStreams.delete(streamIdVal);
 				this.#scheduler?.forget(streamIdVal);
@@ -1118,7 +1128,7 @@ export default class Session implements WebTransport {
 				session.#sendStreams.set(streamIdVal, controller);
 			},
 			async write(chunk) {
-				await Promise.race([session.#sendStreamData(streamId, chunk), session.closed]);
+				await session.#sendStreamData(streamId, chunk);
 			},
 			abort(e) {
 				console.warn("abort", e);
@@ -1133,7 +1143,7 @@ export default class Session implements WebTransport {
 				session.#maybeDeleteStreamFlow(streamIdVal);
 			},
 			async close() {
-				await Promise.race([session.#sendStreamFin(streamId), session.closed]);
+				await session.#sendStreamFin(streamId);
 
 				session.#sendStreams.delete(streamIdVal);
 				session.#scheduler?.forget(streamIdVal);
