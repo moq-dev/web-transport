@@ -204,27 +204,16 @@ async def test_stop_cancels_pending_read(session_pair):
         pass
 
 
-@pytest.mark.asyncio
-async def test_send_context_manager_resets_on_exception(session_pair):
-    """async with send: raise -> peer sees StreamClosedByPeer(reset)."""
-    server_session, client_session = session_pair
-
-    send, _recv = await client_session.open_bi()
-
-    async def server_side():
-        _send_s, recv_s = await server_session.accept_bi()
-        with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-            await recv_s.read()
-        assert exc_info.value.kind == "reset"
-        assert exc_info.value.code == 0
-
-    task = asyncio.create_task(server_side())
-
-    with pytest.raises(RuntimeError, match="intentional"):
-        async with send:
-            raise RuntimeError("intentional")
-
-    await asyncio.wait_for(task, timeout=5.0)
+# NOTE: There is no `test_send_context_manager_resets_on_exception` test.
+#
+# `async with send: raise` resets the stream (RESET_STREAM) before any data is
+# written. The WebTransport stream header (signal value + session ID) is still
+# buffered at that point, and an unreliable RESET_STREAM discards it — so the
+# peer can never associate the stream with a session and accept_bi() hangs.
+#
+# draft-ietf-webtrans-http3 §4.4 fixes this by mandating RESET_STREAM_AT with a
+# Reliable Size of at least the header length, but quinn 0.11 does not implement
+# RESET_STREAM_AT. Until it does, this case is inherently racy and untestable.
 
 
 @pytest.mark.asyncio
