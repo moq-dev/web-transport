@@ -115,14 +115,18 @@ export interface SessionOptions extends WebTransportOptions {
 	 */
 	versions?: Record<string, Version | Version[] | null>;
 
-	/** Also offer the bare version ALPNs `qmux-01`, `qmux-00`, and
-	 * `webtransport` (no application protocol attached). Use this when the
-	 * peer might only know a wire-format version and not the application
-	 * protocols you've configured — e.g. when talking to a relay that only
-	 * speaks the legacy `webtransport` wire format. Defaults to `false`,
-	 * which advertises only the configured prefixed pairs.
+	/** Require the peer to negotiate one of the app protocols in `protocols`.
+	 *
+	 * When `false` (the default), the bare version ALPNs `qmux-01`,
+	 * `qmux-00`, and `webtransport` (no application protocol attached) are
+	 * also offered, so a peer that only knows a wire-format version can still
+	 * connect. That covers a relay speaking the legacy `webtransport` format,
+	 * or one that negotiates the app protocol at a higher layer (e.g. moq's
+	 * SETUP message). Set to `true` to advertise only the configured prefixed
+	 * pairs, which makes the handshake fail unless the peer speaks one of your
+	 * app protocols.
 	 */
-	withoutProtocol?: boolean;
+	requireProtocol?: boolean;
 
 	/** QMux flow control configuration. Only used for the QMux wire formats. */
 	config?: Config;
@@ -173,7 +177,7 @@ function toWebSocketUrl(url: string | URL): string {
 	return `${scheme}//${u.host}${u.pathname}${u.search}`;
 }
 
-/** Bare version ALPNs appended when `withoutProtocol` is set. Newest first. */
+/** Bare version ALPNs appended unless `requireProtocol` is set. Newest first. */
 const BARE_ALPNS = ["qmux-01", "qmux-00", "webtransport"] as const;
 
 /** Resolve a `protocols` + `versions` pair to the wire subprotocol list.
@@ -181,16 +185,17 @@ const BARE_ALPNS = ["qmux-01", "qmux-00", "webtransport"] as const;
  * Expansion rules per bare entry's `versions` value: single `Version`
  * emits one pair; an array emits one pair per element; `null` emits one
  * pair per [[QMUX_VERSIONS]] entry. Entries already in `{qmux-VV}.{alpn}`
- * pair form pass through. When `withoutProtocol` is true, the bare version
+ * pair form pass through. Unless `requireProtocol` is true, the bare version
  * ALPNs (`qmux-01`, `qmux-00`, `webtransport`) are appended after the
- * prefixed pairs for peers that don't pin an app protocol.
+ * prefixed pairs so a peer that doesn't pin an app protocol can still
+ * negotiate a wire format.
  *
  * Throws if any bare entry has no matching `versions` mapping.
  */
-function resolveSubprotocols(
+export function resolveSubprotocols(
 	protocols: readonly string[],
 	versions: Readonly<Record<string, Version | Version[] | null>>,
-	withoutProtocol: boolean,
+	requireProtocol: boolean,
 ): string[] {
 	const out: string[] = [];
 	for (const entry of protocols) {
@@ -210,7 +215,7 @@ function resolveSubprotocols(
 			out.push(`${versionPrefix(v)}${entry}`);
 		}
 	}
-	if (withoutProtocol) {
+	if (!requireProtocol) {
 		out.push(...BARE_ALPNS);
 	}
 	return out;
@@ -352,7 +357,7 @@ export default class Session implements WebTransport {
 		const subprotocols = resolveSubprotocols(
 			options?.protocols ?? [],
 			options?.versions ?? {},
-			options?.withoutProtocol ?? false,
+			options?.requireProtocol ?? false,
 		);
 
 		// Merge user config with defaults

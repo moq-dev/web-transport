@@ -7,13 +7,13 @@ export type { Config, SessionOptions, Version } from "./session.ts";
 export interface InstallOptions {
 	/** ALPN -> wire-format version(s). See [[SessionOptions.versions]]. */
 	versions?: Record<string, Version | Version[] | null>;
-	/** Also offer the bare version ALPNs. See [[SessionOptions.withoutProtocol]]. */
-	withoutProtocol?: boolean;
+	/** Require the peer to negotiate an app protocol. See [[SessionOptions.requireProtocol]]. */
+	requireProtocol?: boolean;
 }
 
 /** Install `Session` as the global `WebTransport` if the platform doesn't ship one.
  *
- * The `versions` map and `withoutProtocol` flag are forwarded to every
+ * The `versions` map and `requireProtocol` flag are forwarded to every
  * `Session` constructed via the polyfill. Callers that pass only explicit
  * `{qmux-VV}.{alpn}` pairs in their `protocols` list can omit the map.
  *
@@ -23,11 +23,11 @@ export interface InstallOptions {
 export function install(options?: InstallOptions): boolean {
 	if ("WebTransport" in globalThis) return false;
 	const versions = options?.versions;
-	const withoutProtocol = options?.withoutProtocol;
+	const requireProtocol = options?.requireProtocol;
 	// biome-ignore lint/suspicious/noExplicitAny: polyfill — extending Session to match the WebTransport constructor signature
 	(globalThis as any).WebTransport = class extends Session {
 		constructor(url: string | URL, options?: WebTransportOptions) {
-			super(url, { ...options, versions, withoutProtocol });
+			super(url, { ...options, versions, requireProtocol });
 		}
 	};
 	return true;

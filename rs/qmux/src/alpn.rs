@@ -5,9 +5,10 @@
 //! is emitted once per version, in order. An empty `versions` slice means
 //! "every QMux draft this crate knows about" (see [`QMUX_VERSIONS`]).
 //!
-//! Bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport` — no app protocol
-//! attached) are opt-in via the `without_protocol` flag; without it, only the
-//! configured prefixed pairs are advertised/accepted.
+//! Bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`, no app protocol
+//! attached) are advertised/accepted by default, so a peer that only knows a
+//! wire-format version can still connect. Set the `require_protocol` flag to
+//! suppress them and advertise/accept only the configured prefixed pairs.
 //!
 //! [`parse`] recovers `(Version, Option<String>)` from a negotiated wire-format
 //! ALPN. Only the QMux drafts appear in `{prefix}{alpn}` form; the legacy
@@ -19,8 +20,8 @@ use crate::Version;
 /// QMux versions that can ride under a `{prefix}{alpn}` pair, newest first.
 pub(crate) const QMUX_VERSIONS: &[Version] = &[Version::QMux01, Version::QMux00];
 
-/// Bare version ALPNs added (offered by clients, accepted by servers) when the
-/// caller opts in via `without_protocol`. Newest first.
+/// Bare version ALPNs added (offered by clients, accepted by servers) unless
+/// the caller opts out via `require_protocol`. Newest first.
 pub(crate) const BARE_ALPNS: &[Version] =
     &[Version::QMux01, Version::QMux00, Version::WebTransport];
 
@@ -37,30 +38,30 @@ pub(crate) fn expand_versions(versions: &[Version]) -> &[Version] {
 /// Build the ALPN list from `(alpn, versions)` entries.
 ///
 /// Each entry emits `{v.prefix()}{alpn}` per version in `expand_versions(versions)`.
-/// When `without_protocol` is set, the bare version ALPNs (`qmux-01`,
+/// Unless `require_protocol` is set, the bare version ALPNs (`qmux-01`,
 /// `qmux-00`, `webtransport`) are appended after the prefixed pairs as a
 /// fallback for peers that don't want to commit to an app protocol.
 ///
 /// Suitable for TLS ALPN or WebSocket `Sec-WebSocket-Protocol`.
 ///
 /// Passing `Version::WebTransport` inside an entry's `versions` is a usage
-/// bug (the bare ALPN is opt-in via `without_protocol`) and panics in debug
-/// builds.
+/// bug (the bare ALPN is controlled by `require_protocol`, not by listing it
+/// as a pair version) and panics in debug builds.
 pub(crate) fn build<'a>(
     entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
-    without_protocol: bool,
+    require_protocol: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (alpn, versions) in entries {
         for &version in expand_versions(versions) {
             debug_assert!(
                 version.is_qmux(),
-                "webtransport doesn't use prefixed ALPN; pair entries are qmux only. Bare ALPNs are opt-in via without_protocol."
+                "webtransport doesn't use prefixed ALPN; pair entries are qmux only. Bare ALPNs are controlled by require_protocol."
             );
             out.push(format!("{}{}", version.prefix(), alpn));
         }
     }
-    if without_protocol {
+    if !require_protocol {
         for &v in BARE_ALPNS {
             out.push(v.alpn().to_string());
         }
@@ -102,20 +103,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_emits_only_prefixed_pairs_by_default() {
-        let out = build(
-            [
-                ("moq-lite-04", &[Version::QMux01][..]),
-                ("moq-transport-17", &[Version::QMux00][..]),
-            ],
-            false,
-        );
-        assert_eq!(out, vec!["qmux-01.moq-lite-04", "qmux-00.moq-transport-17"]);
-    }
-
-    #[test]
-    fn build_appends_bare_alpns_when_without_protocol() {
-        let out = build([("moq-lite-04", &[Version::QMux01][..])], true);
+    fn build_appends_bare_alpns_by_default() {
+        let out = build([("moq-lite-04", &[Version::QMux01][..])], false);
         assert_eq!(
             out,
             vec!["qmux-01.moq-lite-04", "qmux-01", "qmux-00", "webtransport"]
@@ -123,8 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn build_emits_only_prefixed_pairs_when_require_protocol() {
+        let out = build(
+            [
+                ("moq-lite-04", &[Version::QMux01][..]),
+                ("moq-transport-17", &[Version::QMux00][..]),
+            ],
+            true,
+        );
+        assert_eq!(out, vec!["qmux-01.moq-lite-04", "qmux-00.moq-transport-17"]);
+    }
+
+    #[test]
     fn build_expands_empty_versions_to_all_qmux_drafts() {
-        let out = build([("moq-lite-04", &[][..])], false);
+        let out = build([("moq-lite-04", &[][..])], true);
         assert_eq!(out, vec!["qmux-01.moq-lite-04", "qmux-00.moq-lite-04"]);
     }
 
@@ -132,22 +133,22 @@ mod tests {
     fn build_emits_one_pair_per_listed_version() {
         let out = build(
             [("moq-lite-04", &[Version::QMux00, Version::QMux01][..])],
-            false,
+            true,
         );
         assert_eq!(out, vec!["qmux-00.moq-lite-04", "qmux-01.moq-lite-04"]);
     }
 
     #[test]
-    fn build_empty_without_protocol_emits_only_bare_alpns() {
+    fn build_empty_by_default_emits_only_bare_alpns() {
         let entries: [(&str, &[Version]); 0] = [];
-        let out = build(entries, true);
+        let out = build(entries, false);
         assert_eq!(out, vec!["qmux-01", "qmux-00", "webtransport"]);
     }
 
     #[test]
-    fn build_empty_with_protocol_required_emits_nothing() {
+    fn build_empty_with_require_protocol_emits_nothing() {
         let entries: [(&str, &[Version]); 0] = [];
-        let out = build(entries, false);
+        let out = build(entries, true);
         assert!(out.is_empty());
     }
 

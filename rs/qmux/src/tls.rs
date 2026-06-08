@@ -10,10 +10,10 @@ use crate::{alpn, Config, Error, Session, Version};
 ///
 /// Each entry's `versions` slice is expanded into the TLS ALPN list as
 /// `{v.prefix()}{alpn}` per version (empty = every QMux draft this crate
-/// knows about). When `without_protocol` is set, the bare version ALPNs
-/// (`qmux-01`, `qmux-00`, `webtransport`) are appended as well; otherwise
-/// only the prefixed pairs are offered. The peer's chosen ALPN determines
-/// the QMux wire-format version; the `alpn_protocols` field on the supplied
+/// knows about). The bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`)
+/// are appended as well unless `require_protocol` is set, in which case only
+/// the prefixed pairs are offered. The peer's chosen ALPN determines the QMux
+/// wire-format version; the `alpn_protocols` field on the supplied
 /// `rustls::ClientConfig` is ignored and rebuilt from `entries`.
 ///
 /// `server_name` is used for SNI and certificate verification.
@@ -22,7 +22,7 @@ pub async fn connect<'a>(
     server_name: &str,
     config: Arc<rustls::ClientConfig>,
     entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
-    without_protocol: bool,
+    require_protocol: bool,
 ) -> Result<Session, Error> {
     let stream = TcpStream::connect(&addr).await?;
 
@@ -30,7 +30,7 @@ pub async fn connect<'a>(
         .map_err(|e| Error::Io(e.to_string()))?
         .to_owned();
 
-    let prefixed = alpn::build(entries, without_protocol);
+    let prefixed = alpn::build(entries, require_protocol);
 
     let mut config = (*config).clone();
     config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -46,6 +46,15 @@ pub async fn connect<'a>(
 
     let (version, protocol) = alpn::parse(negotiated_str);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
+
+    // In strict mode an unrecognized or absent ALPN would otherwise fall
+    // through to the legacy `webtransport` wire format with no app protocol,
+    // silently downgrading the negotiation we promised to enforce.
+    if require_protocol && protocol.is_none() {
+        return Err(Error::InvalidProtocol(
+            negotiated_str.unwrap_or("<none>").to_string(),
+        ));
+    }
 
     let session_config = Config::new(version, protocol);
     let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);

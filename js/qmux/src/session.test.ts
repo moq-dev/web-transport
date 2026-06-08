@@ -100,8 +100,8 @@ function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
 function connect(config?: Config): { session: Session; peer: FakePeer } {
 	(globalThis as { WebSocketStream?: unknown }).WebSocketStream = FakePeer;
 	// Idle timer off so a stray interval can't interfere with the test.
+	// Bare version ALPNs are offered by default (requireProtocol defaults to false).
 	const session = new Session("https://example/test", {
-		withoutProtocol: true,
 		config: { maxIdleTimeout: 0n, ...config },
 	});
 	const peer = FakePeer.last as FakePeer;
