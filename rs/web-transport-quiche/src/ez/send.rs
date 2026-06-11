@@ -114,7 +114,13 @@ impl SendState {
     pub fn flush(&mut self, qconn: &mut QuicheConnection) -> quiche::Result<Option<Waker>> {
         if let Some(code) = self.reset {
             tracing::trace!(stream_id = ?self.id, code, "sending RESET_STREAM");
-            qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code)?;
+            // Resetting a single stream must never tear down the whole connection.
+            // quiche returns Done / InvalidStreamState when the stream is already
+            // finished or gone, which is a benign no-op here, not a fatal error.
+            match qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code) {
+                Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
+                Err(e) => return Err(e),
+            }
             self.closed = true;
             return Ok(self.blocked.take());
         }

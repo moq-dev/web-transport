@@ -124,7 +124,13 @@ impl RecvState {
 
         if let Some(code) = self.stop {
             tracing::trace!(stream_id = ?self.id, code, "sending STOP_SENDING");
-            qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Read, code)?;
+            // Stopping a single stream must never tear down the whole connection.
+            // quiche returns Done / InvalidStreamState when the stream is already
+            // finished or gone, which is a benign no-op here, not a fatal error.
+            match qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Read, code) {
+                Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
+                Err(e) => return Err(e),
+            }
             self.closed = true;
             return Ok(self.blocked.take());
         }
