@@ -27,7 +27,7 @@ pub async fn connect<'a>(
     let stream = TcpStream::connect(&addr).await?;
 
     let server_name = rustls::pki_types::ServerName::try_from(server_name)
-        .map_err(|e| Error::Io(e.to_string()))?
+        .map_err(|_| Error::InvalidServerName)?
         .to_owned();
 
     let prefixed = alpn::build(entries, require_protocol);

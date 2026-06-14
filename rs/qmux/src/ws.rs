@@ -189,9 +189,7 @@ impl Client {
             validate_protocol(a)?;
         }
 
-        let mut request = url
-            .into_client_request()
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let mut request = url.into_client_request().map_err(Error::from)?;
 
         let entries = self
             .protocols
@@ -214,14 +212,14 @@ impl Client {
                 self.connector.clone(),
             )
             .await
-            .map_err(|e| Error::Io(e.to_string()))?
+            .map_err(Error::from)?
         };
 
         #[cfg(not(feature = "wss"))]
         let (ws_stream, response) =
             tokio_tungstenite::connect_async_with_config(request, self.config, false)
                 .await
-                .map_err(|e| Error::Io(e.to_string()))?;
+                .map_err(Error::from)?;
 
         let negotiated = response
             .headers()

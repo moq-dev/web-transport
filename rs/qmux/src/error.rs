@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use web_transport_proto::{VarInt, VarIntBoundsExceeded, VarIntUnexpectedEnd};
 
 /// Errors that can occur during QMux session and stream operations.
@@ -45,8 +47,26 @@ pub enum Error {
     #[error("invalid protocol token: {0:?}")]
     InvalidProtocol(String),
 
-    #[error("io error: {0}")]
-    Io(String),
+    #[error("invalid server name")]
+    InvalidServerName,
+
+    /// The server rejected the handshake with a non-success HTTP status.
+    ///
+    /// Surfaced from the WebSocket upgrade response so callers can distinguish
+    /// terminal failures (e.g. 401/403 auth rejections) from transient I/O
+    /// errors worth retrying.
+    #[error("http error status: {0}")]
+    Http(u16),
+
+    // Foreign error sources aren't `Clone`, but `Error` must be (the session
+    // fans one terminal error out to every waiter). `Arc` bridges the two while
+    // keeping the original error — source chain and all — instead of a string.
+    #[error(transparent)]
+    Io(Arc<std::io::Error>),
+
+    #[cfg(feature = "ws")]
+    #[error(transparent)]
+    WebSocket(Arc<tokio_tungstenite::tungstenite::Error>),
 
     #[error("datagrams not supported")]
     DatagramsUnsupported,
@@ -64,16 +84,25 @@ impl From<VarIntBoundsExceeded> for Error {
     }
 }
 
+// Hand-written rather than `#[from]`: thiserror's `#[from]` would generate
+// `From<Arc<std::io::Error>>`, but `?` call sites yield a bare `std::io::Error`.
+// These wrap it so `?` stays ergonomic.
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Self::Io(err.to_string())
+        Self::Io(Arc::new(err))
     }
 }
 
 #[cfg(feature = "ws")]
 impl From<tokio_tungstenite::tungstenite::Error> for Error {
     fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Io(err.to_string())
+        // A non-101 upgrade response carries the HTTP status; surface it as a
+        // distinct, transport-agnostic variant so callers can act on terminal
+        // rejections (e.g. auth) without downcasting tungstenite.
+        if let tokio_tungstenite::tungstenite::Error::Http(response) = &err {
+            return Self::Http(response.status().as_u16());
+        }
+        Self::WebSocket(Arc::new(err))
     }
 }
 
@@ -93,5 +122,27 @@ impl web_transport_trait::Error for Error {
             Error::StreamReset(code) | Error::StreamStop(code) => code.into_inner().try_into().ok(),
             _ => None,
         }
+    }
+}
+
+#[cfg(all(test, feature = "ws"))]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::{self, http};
+
+    #[test]
+    fn preserves_http_status() {
+        let response = http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .body(None::<Vec<u8>>)
+            .unwrap();
+        let err: Error = tungstenite::Error::Http(Box::new(response)).into();
+        assert!(matches!(err, Error::Http(401)));
+    }
+
+    #[test]
+    fn non_http_preserves_source() {
+        let err: Error = tungstenite::Error::ConnectionClosed.into();
+        assert!(matches!(err, Error::WebSocket(_)));
     }
 }
