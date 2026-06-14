@@ -1,5 +1,6 @@
-use js_sys::Uint8Array;
+use js_sys::{Array, Reflect, Uint8Array};
 use url::Url;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{WebTransport, WebTransportHash, WebTransportOptions};
 
@@ -34,6 +35,25 @@ impl ClientBuilder {
     /// Hint at the required congestion control algorithm
     pub fn with_congestion_control(self, control: CongestionControl) -> Self {
         self.options.set_congestion_control(control);
+        self
+    }
+
+    /// Advertise the application protocols (subprotocols) offered for negotiation.
+    ///
+    /// The server selects one of these, available afterwards via [`Session::protocol`].
+    pub fn with_protocols<I, S>(self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let array = Array::new();
+        for protocol in protocols {
+            array.push(&JsValue::from_str(protocol.as_ref()));
+        }
+
+        // web-sys 0.3 has no binding for `WebTransportOptions.protocols`, so set it via Reflect.
+        // This mirrors how `Session` reads the negotiated `protocol` field.
+        let _ = Reflect::set(&self.options, &JsValue::from_str("protocols"), &array);
         self
     }
 

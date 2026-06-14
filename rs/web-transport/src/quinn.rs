@@ -10,6 +10,7 @@ pub use web_transport_quinn::CongestionControl;
 #[derive(Default, Clone)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,
+    protocols: Vec<String>,
 }
 
 impl ClientBuilder {
@@ -21,13 +22,30 @@ impl ClientBuilder {
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
             inner: self.inner.with_congestion_control(cc),
+            ..self
         }
+    }
+
+    /// Advertise the application protocols (subprotocols) offered for negotiation.
+    ///
+    /// The server selects one of these, available afterwards via [`Session::protocol`].
+    pub fn with_protocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.protocols = protocols
+            .into_iter()
+            .map(|p| p.as_ref().to_string())
+            .collect();
+        self
     }
 
     /// Accept the server's certificate hashes (sha256) instead of using a root CA.
     pub fn with_server_certificate_hashes(self, hashes: Vec<Vec<u8>>) -> Result<Client, Error> {
         Ok(Client {
             inner: self.inner.with_server_certificate_hashes(hashes)?,
+            protocols: self.protocols,
         })
     }
 
@@ -35,6 +53,7 @@ impl ClientBuilder {
     pub fn with_system_roots(self) -> Result<Client, Error> {
         Ok(Client {
             inner: self.inner.with_system_roots()?,
+            protocols: self.protocols,
         })
     }
 }
@@ -43,12 +62,15 @@ impl ClientBuilder {
 #[derive(Clone, Debug)]
 pub struct Client {
     inner: quinn::Client,
+    protocols: Vec<String>,
 }
 
 impl Client {
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, Error> {
-        Ok(self.inner.connect(url).await?.into())
+        let request =
+            quinn::proto::ConnectRequest::new(url).with_protocols(self.protocols.iter().cloned());
+        Ok(self.inner.connect(request).await?.into())
     }
 }
 

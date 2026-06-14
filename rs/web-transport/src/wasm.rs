@@ -29,6 +29,19 @@ impl ClientBuilder {
         }
     }
 
+    /// Advertise the application protocols (subprotocols) offered for negotiation.
+    ///
+    /// The server selects one of these, available afterwards via [`Session::protocol`].
+    pub fn with_protocols<I, S>(self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self {
+            inner: self.inner.with_protocols(protocols),
+        }
+    }
+
     pub fn with_server_certificate_hashes(self, hashes: Vec<Vec<u8>>) -> Result<Client, Error> {
         Ok(Client {
             inner: self.inner.with_server_certificate_hashes(hashes),
