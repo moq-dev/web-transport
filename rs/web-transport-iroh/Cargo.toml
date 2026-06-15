@@ -4,7 +4,7 @@ description = "WebTransport library for Iroh"
 authors = ["Franz Heinzmann <frando@n0.computer>"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 
 keywords = ["quic", "http3", "webtransport", "iroh"]
@@ -21,8 +21,8 @@ qlog = ["iroh/qlog"]
 [dependencies]
 bytes = "1"
 http = "1"
-iroh = { version = "=1.0.0-rc.0", default-features = false, features = ["fast-apple-datapath"] }
-n0-error = "=1.0.0-rc.0"
+iroh = { version = "1", default-features = false, features = ["fast-apple-datapath"] }
+n0-error = "1"
 n0-future = "0.3.1"
 tokio = { version = "1", default-features = false, features = [
     "io-util",
@@ -34,6 +34,6 @@ web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
 [dev-dependencies]
-iroh = { version = "=1.0.0-rc.0", features = ["tls-ring"] }
+iroh = { version = "1", features = ["tls-ring"] }
 n0-tracing-test = "0.3.0"
 tokio = { version = "1", features = ["full"] }

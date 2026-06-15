@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -23,7 +23,7 @@ ring = ["noq/ring", "rustls/ring"]
 bytes = "1"
 futures = "0.3"
 http = "1"
-noq = { version = "=1.0.0-rc.0", default-features = false, features = [
+noq = { version = "1", default-features = false, features = [
     "tracing-log",
     "platform-verifier",
     "runtime-tokio",
