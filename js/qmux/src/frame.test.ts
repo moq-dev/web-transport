@@ -42,40 +42,37 @@ describe("QMux01 record framing", () => {
 		}
 	});
 
-	test("application_protocols round-trips and is omitted when empty", () => {
-		const withProtocols: Frame.TransportParameters = {
-			type: "transport_parameters",
-			params: {
-				maxIdleTimeout: 0n,
-				initialMaxData: 1024n,
-				initialMaxStreamDataBidiLocal: 0n,
-				initialMaxStreamDataBidiRemote: 0n,
-				initialMaxStreamDataUni: 0n,
-				initialMaxStreamsBidi: 0n,
-				initialMaxStreamsUni: 0n,
-				maxRecordSize: 0n,
-				protocols: ["moq-lite-04", "moq-lite-03"],
-			},
-		};
-		const decoded = Frame.decodeRecord(Frame.encode(withProtocols, "qmux-01"));
-		expect(decoded.length).toBe(1);
-		const got = decoded[0];
-		expect(got.type).toBe("transport_parameters");
-		if (got.type === "transport_parameters") {
-			expect(got.params.protocols).toEqual(["moq-lite-04", "moq-lite-03"]);
-			expect(got.params.initialMaxData).toBe(1024n);
-		}
-
-		// No protocols → parameter absent on the wire, decoded as undefined.
-		const empty: Frame.TransportParameters = {
-			type: "transport_parameters",
-			params: { ...withProtocols.params, protocols: [] },
-		};
-		const emptyDecoded = Frame.decodeRecord(Frame.encode(empty, "qmux-01"));
-		const emptyGot = emptyDecoded[0];
-		if (emptyGot?.type === "transport_parameters") {
-			expect(emptyGot.params.protocols).toBeUndefined();
-		}
+	test("application_protocols parameter is rejected (WebSocket negotiates via subprotocol)", () => {
+		// A QX_TRANSPORT_PARAMETERS frame carrying only application_protocols
+		// (id 0x3d4f9c2a8b1e6075, len 0). WebSocket has its own ALPN, so this
+		// parameter must never appear and decoding must throw.
+		const bytes = (...vals: number[]) => new Uint8Array(vals);
+		const record = bytes(
+			// frame type 0x3f5153300d0a0d0a — 8-byte varint, so the high tag bits
+			// make the first wire byte 0xff (the "\xffQS0\r\n\r\n" magic).
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a,
+			// length = 9 (param id 8 bytes + len 1 byte)
+			0x09,
+			// param id 0x3d4f9c2a8b1e6075 — 8-byte varint, first wire byte 0xfd.
+			0xfd,
+			0x4f,
+			0x9c,
+			0x2a,
+			0x8b,
+			0x1e,
+			0x60,
+			0x75,
+			// param length = 0
+			0x00,
+		);
+		expect(() => Frame.decode(record, "qmux-00")).toThrow();
 	});
 
 	test("ping_request and ping_response round-trip preserves the sequence number", () => {

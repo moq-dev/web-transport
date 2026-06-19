@@ -2,61 +2,70 @@ use std::path::Path;
 
 use tokio::net::UnixStream;
 
-use crate::transport::{build_stream_session, protocol_config};
-use crate::{Config, Error, Session, Version};
+use crate::transport::build_stream_session;
+use crate::{Error, Protocol, Session, Version};
 
-/// Connect to a Unix domain socket and speak QMux at `version`.
+/// Builder for a QMux session over a Unix domain socket.
 ///
-/// Unix sockets have no protocol negotiation, so the version is a direct
-/// parameter instead of derived from an ALPN. Use [`connect_protocols`] to also
-/// negotiate an application protocol in-band. Ideal for same-host MoQ where the
-/// TLS/ALPN handshake of a network transport would be pure overhead.
-pub async fn connect(path: impl AsRef<Path>, version: Version) -> Result<Session, Error> {
-    let stream = UnixStream::connect(path).await?;
-    Ok(build_stream_session(
-        stream,
-        Config::new(version, None),
-        false,
-    ))
-}
-
-/// Accept a Unix domain socket connection and speak QMux at `version`.
-pub async fn accept(stream: UnixStream, version: Version) -> Result<Session, Error> {
-    Ok(build_stream_session(
-        stream,
-        Config::new(version, None),
-        true,
-    ))
-}
-
-/// Connect over a Unix domain socket and negotiate an application protocol
-/// in-band.
+/// Like [`crate::tcp::Config`], but over a Unix socket — ideal for same-host MoQ
+/// where the TLS/ALPN handshake of a network transport would be pure overhead.
+/// The application protocol (if any) is negotiated in-band via
+/// [`Config::protocols`].
 ///
-/// Like [`crate::tcp::connect_protocols`], but over a Unix socket: `protocols`
-/// (preference order) are advertised via the `application_protocols` QMux
-/// transport parameter. Awaits the peer's parameters and resolves the agreed
-/// protocol — readable from
-/// [`Session::protocol`](web_transport_trait::Session::protocol) — before
-/// returning.
-pub async fn connect_protocols(
-    path: impl AsRef<Path>,
-    version: Version,
-    protocols: &[&str],
-) -> Result<Session, Error> {
-    let stream = UnixStream::connect(path).await?;
-    let session = build_stream_session(stream, protocol_config(version, protocols)?, false);
-    session.negotiated().await;
-    Ok(session)
+/// ```no_run
+/// # async fn f(path: &str) -> Result<(), qmux::Error> {
+/// use qmux::{uds, Version};
+///
+/// let session = uds::Config::new(Version::QMux01)
+///     .protocols(["moq-lite-04"])
+///     .connect(path)
+///     .await?;
+/// # let _ = session; Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Config {
+    inner: crate::Config,
 }
 
-/// Accept a Unix domain socket connection and negotiate an application protocol
-/// in-band. The server-side counterpart to [`connect_protocols`].
-pub async fn accept_protocols(
+impl Config {
+    /// Start building a Unix-socket session speaking QMux `version`.
+    pub fn new(version: Version) -> Self {
+        Self {
+            inner: crate::Config::new(version),
+        }
+    }
+
+    /// Advertise these application protocols for in-band negotiation, in
+    /// preference order. Omit to run without an application protocol.
+    pub fn protocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inner.protocol = Protocol::Negotiate(protocols.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Connect to the socket at `path` and start a client session.
+    pub async fn connect(self, path: impl AsRef<Path>) -> Result<Session, Error> {
+        let stream = UnixStream::connect(path).await?;
+        finish(stream, self.inner, false).await
+    }
+
+    /// Start a server session over an accepted Unix-socket stream.
+    pub async fn accept(self, stream: UnixStream) -> Result<Session, Error> {
+        finish(stream, self.inner, true).await
+    }
+}
+
+async fn finish(
     stream: UnixStream,
-    version: Version,
-    protocols: &[&str],
+    config: crate::Config,
+    is_server: bool,
 ) -> Result<Session, Error> {
-    let session = build_stream_session(stream, protocol_config(version, protocols)?, true);
+    let session = build_stream_session(stream, config, is_server)?;
+    // Resolve the protocol before returning (instant unless negotiating).
     session.negotiated().await;
     Ok(session)
 }

@@ -3,7 +3,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
-use crate::transport::StreamTransport;
+use crate::transport::Stream;
 use crate::{alpn, Config, Error, Session, Version};
 
 /// Connect over TLS, advertising the given `(alpn, versions)` entries.
@@ -56,8 +56,8 @@ pub async fn connect<'a>(
         ));
     }
 
-    let session_config = Config::new(version, protocol);
-    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    let session_config = Config::negotiated(version, protocol);
+    let transport = Stream::new(tls_stream, version, session_config.max_record_size);
     Ok(Session::connect(transport, session_config))
 }
 
@@ -82,7 +82,7 @@ pub async fn accept(
     let (version, protocol) = alpn::parse(negotiated_str);
     tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-    let session_config = Config::new(version, protocol);
-    let transport = StreamTransport::new(tls_stream, version, session_config.max_record_size);
+    let session_config = Config::negotiated(version, protocol);
+    let transport = Stream::new(tls_stream, version, session_config.max_record_size);
     Ok(Session::accept(transport, session_config))
 }

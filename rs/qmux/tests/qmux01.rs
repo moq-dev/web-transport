@@ -41,7 +41,7 @@ async fn wire_format_size_prefix_qmux01_only() {
             buf
         });
         // The session sends TRANSPORT_PARAMETERS as its first frame on connect.
-        let _client = qmux::tcp::connect(addr, version).await.unwrap();
+        let _client = qmux::tcp::Config::new(version).connect(addr).await.unwrap();
         server.await.unwrap()
     }
 
@@ -130,7 +130,10 @@ async fn qmux00_tcp_round_trip_unchanged() {
 
     let server = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::accept(sock, Version::QMux00).await.unwrap();
+        let session = qmux::tcp::Config::new(Version::QMux00)
+            .accept(sock)
+            .await
+            .unwrap();
 
         let mut recv = session.accept_uni().await.unwrap();
         let payload = recv.read_all().await.unwrap();
@@ -142,7 +145,10 @@ async fn qmux00_tcp_round_trip_unchanged() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
-    let session = qmux::tcp::connect(addr, Version::QMux00).await.unwrap();
+    let session = qmux::tcp::Config::new(Version::QMux00)
+        .connect(addr)
+        .await
+        .unwrap();
     let mut send = session.open_uni().await.unwrap();
     send.write(b"qmux00").await.unwrap();
     send.finish().unwrap();
@@ -166,7 +172,10 @@ async fn qmux01_tcp_stream_and_ping() {
 
     let server_task = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::accept(sock, Version::QMux01).await.unwrap();
+        let session = qmux::tcp::Config::new(Version::QMux01)
+            .accept(sock)
+            .await
+            .unwrap();
 
         // Echo the client's STREAM payload back on a new uni stream.
         let mut recv = session.accept_uni().await.unwrap();
@@ -182,7 +191,10 @@ async fn qmux01_tcp_stream_and_ping() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
-    let session = qmux::tcp::connect(addr, Version::QMux01).await.unwrap();
+    let session = qmux::tcp::Config::new(Version::QMux01)
+        .connect(addr)
+        .await
+        .unwrap();
 
     // Send "ping" over a uni stream.
     let mut send = session.open_uni().await.unwrap();

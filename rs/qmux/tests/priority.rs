@@ -54,7 +54,7 @@ fn pair(delay: Duration) -> (Session, Session) {
         delay,
     };
 
-    let config = Config::new(Version::QMux01, None);
+    let config = Config::new(Version::QMux01);
     let client = Session::connect(client_transport, config.clone());
     let server = Session::accept(server_transport, config);
     (client, server)

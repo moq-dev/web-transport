@@ -18,7 +18,7 @@ pub trait Transport: Send + 'static {
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
-// StreamTransport: message I/O over a byte stream (TCP/TLS).
+// Stream: message I/O over a byte stream (TCP/TLS/Unix).
 // Handles QMux frame delimiting to return complete frames as Bytes.
 //
 // Cancel safety: a dedicated reader task owns the read half and pushes complete
@@ -27,7 +27,7 @@ pub trait Transport: Send + 'static {
 // wins), the buffered frame stays in the channel for the next call. The reader
 // task itself never gets cancelled mid-parse, so the multi-step async reads in
 // `recv_record`/`recv_qmux00_frame` are safe to keep as-is.
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "uds"))]
 mod stream_transport {
     use bytes::{BufMut, Bytes, BytesMut};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -54,15 +54,16 @@ mod stream_transport {
     ///
     /// ```no_run
     /// # async fn f(stream: tokio::net::TcpStream) -> Result<(), qmux::Error> {
-    /// use qmux::{Config, Session, StreamTransport, Version};
+    /// use qmux::transport::Stream;
+    /// use qmux::{Config, Session, Version};
     ///
-    /// let config = Config::new(Version::QMux01, None);
-    /// let transport = StreamTransport::new(stream, config.version, config.max_record_size);
+    /// let config = Config::new(Version::QMux01);
+    /// let transport = Stream::new(stream, config.version, config.max_record_size);
     /// let session = Session::connect(transport, config);
     /// # let _ = session; Ok(())
     /// # }
     /// ```
-    pub struct StreamTransport<T> {
+    pub struct Stream<T> {
         rx: mpsc::Receiver<Result<Bytes, Error>>,
         writer: BufWriter<tokio::io::WriteHalf<T>>,
         version: Version,
@@ -70,7 +71,7 @@ mod stream_transport {
         reader_task: JoinHandle<()>,
     }
 
-    impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamTransport<T> {
+    impl<T: AsyncRead + AsyncWrite + Send + 'static> Stream<T> {
         /// Wrap a byte stream speaking QMux `version`.
         ///
         /// `our_max_record_size` bounds incoming draft-01 records (use
@@ -94,7 +95,7 @@ mod stream_transport {
         }
     }
 
-    impl<T> Drop for StreamTransport<T> {
+    impl<T> Drop for Stream<T> {
         fn drop(&mut self) {
             // Make sure the reader task doesn't outlive the transport; otherwise
             // it would hold the read half open until the connection drops.
@@ -102,7 +103,7 @@ mod stream_transport {
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for StreamTransport<T> {
+    impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for Stream<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             // QMux01 frames travel inside size-prefixed records on byte streams.
             // (Records are implicit on WebSocket, where the message boundary delimits them.)
@@ -357,7 +358,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_is_cancel_safe_across_partial_writes() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
 
             // STREAM frame, type 0x0a (len bit set), id=4, length=5, payload="hello".
             let mut frame = Vec::new();
@@ -385,7 +386,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_qmux01_record_is_cancel_safe() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = StreamTransport::new(client, Version::QMux01, 16 * 1024);
+            let mut transport = Stream::new(client, Version::QMux01, 16 * 1024);
 
             // 1-byte varint length (0x08) followed by 8 bytes of payload.
             let mut record = vec![0x08];
@@ -413,7 +414,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_returns_consecutive_frames_in_order() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
 
             // Two STREAM frames (type 0x0a) for stream ids 4 and 8.
             let frame_a: Vec<u8> = [0x0a, 0x04, 0x05].into_iter().chain(*b"hello").collect();
@@ -435,7 +436,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_propagates_parse_error_then_closes() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = StreamTransport::new(client, Version::QMux00, 16 * 1024);
+            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
 
             // Frame type 0x02 isn't a recognized QMux00 frame type.
             server.write_all(&[0x02]).await.unwrap();
@@ -455,7 +456,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_record_exceeding_max_returns_frame_too_large() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = StreamTransport::new(client, Version::QMux01, 4);
+            let mut transport = Stream::new(client, Version::QMux01, 4);
 
             // 1-byte varint length = 5, which exceeds the configured max of 4.
             server.write_all(&[0x05]).await.unwrap();
@@ -467,46 +468,41 @@ mod stream_transport {
     }
 }
 
-#[cfg(feature = "tcp")]
-pub use stream_transport::StreamTransport;
+#[cfg(any(feature = "tcp", feature = "uds"))]
+pub use stream_transport::Stream;
 
 // Shared plumbing for the byte-stream transports (TCP, Unix sockets).
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "uds"))]
 mod stream_session {
     use tokio::io::{AsyncRead, AsyncWrite};
 
-    use super::StreamTransport;
+    use super::Stream;
     use crate::protocol::validate_protocol;
-    use crate::{Config, Error, Session, Version};
+    use crate::{Config, Error, Protocol, Session};
 
-    /// Build a [`Config`] advertising `protocols` for in-band negotiation,
-    /// rejecting any name that isn't a valid protocol token.
-    pub(crate) fn protocol_config(version: Version, protocols: &[&str]) -> Result<Config, Error> {
-        for protocol in protocols {
-            validate_protocol(protocol)?;
-        }
-        let mut config = Config::new(version, None);
-        config.protocols = protocols.iter().map(|s| s.to_string()).collect();
-        Ok(config)
-    }
-
-    /// Wrap a byte stream in a [`StreamTransport`] and start a session.
+    /// Wrap a byte stream in a [`Stream`] and start a session, validating any
+    /// advertised protocol names first. Used by the `tcp`/`uds` builders.
     pub(crate) fn build<T: AsyncRead + AsyncWrite + Send + 'static>(
         stream: T,
         config: Config,
         is_server: bool,
-    ) -> Session {
-        let transport = StreamTransport::new(stream, config.version, config.max_record_size);
-        if is_server {
+    ) -> Result<Session, Error> {
+        if let Protocol::Negotiate(protocols) = &config.protocol {
+            for protocol in protocols {
+                validate_protocol(protocol)?;
+            }
+        }
+        let transport = Stream::new(stream, config.version, config.max_record_size);
+        Ok(if is_server {
             Session::accept(transport, config)
         } else {
             Session::connect(transport, config)
-        }
+        })
     }
 }
 
-#[cfg(feature = "tcp")]
-pub(crate) use stream_session::{build as build_stream_session, protocol_config};
+#[cfg(any(feature = "tcp", feature = "uds"))]
+pub(crate) use stream_session::build as build_stream_session;
 
 // WsTransport: message I/O over WebSocket.
 #[cfg(feature = "ws")]

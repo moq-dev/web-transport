@@ -85,13 +85,13 @@ where
     /// Wrap as a client-side session.
     pub fn connect(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::connect(self.into_transport(), Config::new(version, protocol))
+        Session::connect(self.into_transport(), Config::negotiated(version, protocol))
     }
 
     /// Wrap as a server-side session.
     pub fn accept(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::accept(self.into_transport(), Config::new(version, protocol))
+        Session::accept(self.into_transport(), Config::negotiated(version, protocol))
     }
 
     fn into_transport(self) -> WsTransport<T> {
@@ -241,7 +241,10 @@ impl Client {
             Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
             None => WsTransport::new(ws_stream),
         };
-        Ok(Session::connect(transport, Config::new(version, protocol)))
+        Ok(Session::connect(
+            transport,
+            Config::negotiated(version, protocol),
+        ))
     }
 }
 
@@ -393,6 +396,9 @@ impl Server {
             Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
             None => WsTransport::new(ws),
         };
-        Ok(Session::accept(transport, Config::new(version, protocol)))
+        Ok(Session::accept(
+            transport,
+            Config::negotiated(version, protocol),
+        ))
     }
 }

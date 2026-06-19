@@ -96,15 +96,6 @@ export interface TransportParams {
 	initialMaxStreamsBidi: bigint;
 	initialMaxStreamsUni: bigint;
 	maxRecordSize: bigint;
-
-	/** Application protocols advertised for in-band negotiation (preference order).
-	 *
-	 * QMux-specific (ID 0x3d4f9c2a8b1e6075): the non-TLS substitute for ALPN on
-	 * byte-stream transports. The browser/WebSocket path negotiates the protocol
-	 * via `Sec-WebSocket-Protocol` instead, so this is normally absent here;
-	 * it's encoded/decoded only for wire parity with the Rust implementation.
-	 * Omitted from the wire when absent or empty. */
-	protocols?: string[];
 }
 
 /** Default max_record_size per draft-01. */
@@ -181,7 +172,9 @@ const QX_PING_REQUEST = 0x348c67529ef8c7bdn;
 const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
 // max_record_size transport parameter ID
 const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
-// application_protocols transport parameter ID (QMux-specific, non-TLS ALPN)
+// application_protocols transport parameter ID (QMux-specific, non-TLS ALPN).
+// This implementation only runs over WebSocket, which negotiates the protocol
+// via its subprotocol (ALPN), so receiving this parameter is a protocol error.
 const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
 
 function encodeWebTransport(frame: Any): Uint8Array {
@@ -383,24 +376,9 @@ function encodeQMux(frame: Any): Uint8Array {
 }
 
 function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
-	// application_protocols: list of length-prefixed UTF-8 names. Encoded up
-	// front so the buffer below can be sized to fit it; omitted when empty.
-	let protocolsValue: Uint8Array<ArrayBuffer> | null = null;
-	if (params.protocols && params.protocols.length > 0) {
-		const names = params.protocols.map((p) => new TextEncoder().encode(p));
-		let value = new Uint8Array(new ArrayBuffer(names.reduce((n, b) => n + 8 + b.byteLength, 0)), 0, 0);
-		for (const name of names) {
-			value = VarInt.from(name.byteLength).encode(value);
-			value = new Uint8Array(value.buffer, value.byteOffset, value.byteLength + name.byteLength);
-			value.set(name, value.byteLength - name.byteLength);
-		}
-		protocolsValue = value;
-	}
-
-	// Each numeric param: id(varint) + length(varint) + value(varint); 8 params * 24 bytes.
-	// Plus the application_protocols header (id + length, <=16 bytes) and its payload.
-	const extra = protocolsValue ? 16 + protocolsValue.byteLength : 0;
-	let buffer = new Uint8Array(new ArrayBuffer(192 + extra), 0, 0);
+	// Each param: id(varint) + length(varint) + value(varint)
+	// Max 8 params * 24 bytes each
+	let buffer = new Uint8Array(new ArrayBuffer(192), 0, 0);
 
 	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number | bigint, value: bigint): Uint8Array<ArrayBuffer> {
 		if (value === 0n) return buf;
@@ -419,13 +397,6 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 	buffer = writeParam(buffer, 0x08, params.initialMaxStreamsBidi);
 	buffer = writeParam(buffer, 0x09, params.initialMaxStreamsUni);
 	buffer = writeParam(buffer, MAX_RECORD_SIZE_ID, params.maxRecordSize);
-
-	if (protocolsValue) {
-		buffer = VarInt.from(APPLICATION_PROTOCOLS_ID).encode(buffer);
-		buffer = VarInt.from(protocolsValue.byteLength).encode(buffer);
-		buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + protocolsValue.byteLength);
-		buffer.set(protocolsValue, buffer.byteLength - protocolsValue.byteLength);
-	}
 
 	return buffer;
 }
@@ -448,11 +419,11 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		const paramData = buffer.slice(0, len);
 		buffer = buffer.slice(len);
 
-		// application_protocols is a list, not a single varint — handle it before
-		// the generic varint decode below.
+		// In-band ALPN negotiation is only valid on transports without their own
+		// (TCP, Unix sockets). This implementation only runs over WebSocket, which
+		// negotiates via its subprotocol, so the parameter must never appear.
 		if (id === APPLICATION_PROTOCOLS_ID) {
-			params.protocols = decodeProtocols(paramData);
-			continue;
+			throw new Error("unexpected application_protocols parameter over WebSocket");
 		}
 
 		if (paramData.byteLength < 1) {
@@ -493,20 +464,6 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 	}
 
 	return params;
-}
-
-/** Decode the application_protocols value: length-prefixed UTF-8 names. */
-function decodeProtocols(buffer: Uint8Array): string[] {
-	const out: string[] = [];
-	let v: VarInt;
-	while (buffer.byteLength > 0) {
-		[v, buffer] = VarInt.decode(buffer);
-		const len = Number(v.value);
-		let name: Uint8Array;
-		[name, buffer] = take(buffer, len);
-		out.push(new TextDecoder().decode(name));
-	}
-	return out;
 }
 
 export function decode(buffer: Uint8Array, version: WireFormat = "webtransport"): Any | null {

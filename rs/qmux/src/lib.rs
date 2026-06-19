@@ -3,6 +3,8 @@
 //! Provides QUIC-style multiplexed streams over TCP, TLS, and WebSocket,
 //! with backwards compatibility for the legacy `webtransport` wire format.
 
+// ALPN/subprotocol negotiation is only used by the TLS and WebSocket transports.
+#[cfg(any(feature = "tls", feature = "ws"))]
 mod alpn;
 mod config;
 mod credit;
@@ -12,14 +14,16 @@ mod protocol;
 mod sched;
 mod session;
 mod stream;
-mod transport;
+
+/// Transport abstraction and the byte-stream [`transport::Stream`] implementation.
+pub mod transport;
 
 /// Plain TCP transport.
 #[cfg(feature = "tcp")]
 pub mod tcp;
 
-/// Unix domain socket transport (reuses the byte-stream machinery behind `tcp`).
-#[cfg(all(unix, feature = "tcp"))]
+/// Unix domain socket transport.
+#[cfg(all(unix, feature = "uds"))]
 pub mod uds;
 
 /// TLS over TCP transport.
@@ -41,16 +45,14 @@ pub use ws::{Client, KeepAlive, Server};
 
 use proto::*;
 
-pub use config::Config;
+pub use config::{Config, Protocol};
 pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
 pub use transport::Transport;
-
-/// Message I/O over a reliable byte stream (TCP, Unix sockets, pipes, …).
-#[cfg(feature = "tcp")]
-pub use transport::StreamTransport;
+// The concrete byte-stream transport lives at `transport::Stream` rather than the
+// crate root, so the name doesn't collide with the STREAM-frame `Stream` type.
 
 /// All supported ALPN identifiers, in preference order.
 ///

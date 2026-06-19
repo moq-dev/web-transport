@@ -489,14 +489,23 @@ impl<T: Transport> SessionState<T> {
         }
         self.params_received = true;
 
-        // Resolve the application protocol now that the peer's offer is known.
-        // Only meaningful when we advertised candidates (otherwise the OnceLock
-        // was already resolved eagerly from `config.protocol`). Server
-        // preference wins, matching RFC 7301 ALPN selection.
-        if self.negotiated.get().is_none() {
-            let agreed =
-                negotiate_protocol(self.is_server, &self.config.protocols, &params.protocols);
-            self.resolve_negotiated(agreed);
+        // Resolve / validate the application protocol now the peer's offer is known.
+        match &self.config.protocol {
+            // In-band negotiation: pick the agreed protocol (server preference
+            // wins, matching RFC 7301). The OnceLock is still pending here.
+            crate::Protocol::Negotiate(ours) => {
+                let agreed = negotiate_protocol(self.is_server, ours, &params.protocols);
+                self.resolve_negotiated(agreed);
+            }
+            // Not negotiating in-band: the peer MUST NOT send the parameter.
+            // TLS/WebSocket already chose a protocol via ALPN, and a session
+            // that didn't opt in has no way to interpret it — either way it's a
+            // protocol error. (The OnceLock was resolved eagerly at construction.)
+            crate::Protocol::None | crate::Protocol::Negotiated(_) => {
+                if !params.protocols.is_empty() {
+                    return Err(Error::UnexpectedProtocols);
+                }
+            }
         }
 
         // Set connection-level send credit from peer's initial_max_data
@@ -550,12 +559,13 @@ impl Session {
 
     /// Wait for the negotiated application protocol.
     ///
-    /// When the protocol was negotiated out of band (TLS/WS ALPN, set via
-    /// [`Config::protocol`]) this resolves immediately. When negotiated in-band
-    /// via the `application_protocols` transport parameter (TCP, Unix sockets,
-    /// or any [`StreamTransport`](crate::StreamTransport)-based session that set
-    /// [`Config::protocols`]), it resolves once the peer's transport parameters
-    /// arrive — or to the out-of-band fallback if the connection closes first.
+    /// For [`Protocol::Negotiated`](crate::Protocol::Negotiated) /
+    /// [`Protocol::None`](crate::Protocol::None) (e.g. TLS/WS ALPN) this resolves
+    /// immediately. For [`Protocol::Negotiate`](crate::Protocol::Negotiate) — the
+    /// in-band path over TCP, Unix sockets, or any
+    /// [`Stream`](crate::transport::Stream)-based session — it resolves once the
+    /// peer's transport parameters arrive, or to `None` if the connection closes
+    /// first.
     ///
     /// [`Session::protocol`](web_transport_trait::Session::protocol) returns the
     /// same value synchronously, but yields `None` until negotiation completes.
@@ -584,15 +594,20 @@ impl Session {
 
         let closed = watch::Sender::new(None);
 
-        // Protocol negotiation. With no advertised candidates there's nothing to
-        // negotiate in-band, so resolve immediately to whatever was set out of
-        // band (TLS/WS ALPN, or `None`). Otherwise stay pending until the peer's
-        // transport parameters arrive.
+        // Protocol negotiation. Only `Negotiate` resolves in-band (once the
+        // peer's params arrive); the out-of-band cases resolve immediately.
         let negotiated: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
         let (negotiated_ready_tx, negotiated_ready_rx) = watch::channel(false);
-        if config.protocols.is_empty() {
-            negotiated.set(config.protocol.clone()).ok();
-            negotiated_ready_tx.send_replace(true);
+        match &config.protocol {
+            crate::Protocol::Negotiate(_) => {} // pending
+            crate::Protocol::Negotiated(name) => {
+                negotiated.set(Some(name.clone())).ok();
+                negotiated_ready_tx.send_replace(true);
+            }
+            crate::Protocol::None => {
+                negotiated.set(None).ok();
+                negotiated_ready_tx.send_replace(true);
+            }
         }
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -649,9 +664,8 @@ impl Session {
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // Unblock any `negotiated()` waiter if the connection died before the
-            // peer's params arrived; fall back to the out-of-band protocol.
-            let fallback = backend.config.protocol.clone();
-            backend.resolve_negotiated(fallback);
+            // peer's params arrived. No-op for the eagerly-resolved cases.
+            backend.resolve_negotiated(None);
             // Close all credits so blocked claim()/claim_index() calls unblock
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
@@ -859,12 +873,9 @@ impl generic::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        // Prefer the in-band negotiated value; fall back to the out-of-band one
-        // (TLS/WS ALPN) while in-band negotiation is still pending.
-        match self.negotiated.get() {
-            Some(protocol) => protocol.as_deref(),
-            None => self.config.protocol.as_deref(),
-        }
+        // The OnceLock holds the resolved protocol (out-of-band cases are set at
+        // construction). `None` here means in-band negotiation is still pending.
+        self.negotiated.get().and_then(|p| p.as_deref())
     }
 }
 
