@@ -208,6 +208,14 @@ fn decode_protocols(data: &mut Bytes) -> Result<Vec<String>, Error> {
             std::str::from_utf8(&name).map_err(|_| Error::InvalidProtocol(format!("{name:?}")))?;
         out.push(protocol.to_string());
     }
+    // The encoder omits the parameter entirely when there's nothing to advertise,
+    // so a present-but-empty list is malformed. Rejecting it keeps "parameter
+    // present" unambiguous, matching the stricter check in the TS implementation.
+    if out.is_empty() {
+        return Err(Error::InvalidProtocol(
+            "empty application_protocols".to_string(),
+        ));
+    }
     Ok(out)
 }
 
@@ -284,6 +292,18 @@ mod tests {
         VarInt::from_u32(2).encode(&mut buf);
         VarInt::from_u32(1).encode(&mut buf);
         buf.put_u8(0xff);
+        assert!(matches!(
+            TransportParams::decode(buf.freeze()),
+            Err(Error::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn empty_protocols_param_rejected() {
+        // id=APPLICATION_PROTOCOLS_ID, len=0 — never produced by the encoder.
+        let mut buf = BytesMut::new();
+        APPLICATION_PROTOCOLS_ID_VI.encode(&mut buf);
+        VarInt::from_u32(0).encode(&mut buf);
         assert!(matches!(
             TransportParams::decode(buf.freeze()),
             Err(Error::InvalidProtocol(_))

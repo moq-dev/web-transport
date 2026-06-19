@@ -115,6 +115,26 @@ mod tcp {
 
         assert!(matches!(err, Error::UnexpectedProtocols), "got {err:?}");
     }
+
+    /// Advertised protocol names are validated before the session starts.
+    #[tokio::test]
+    async fn rejects_invalid_protocol_name() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A space isn't a valid protocol token, so this fails during connect
+        // (after the TCP handshake, before any QMux frames are exchanged).
+        // `Session` isn't `Debug`, so match rather than `unwrap_err`.
+        match qmux::tcp::Config::new(Version::QMux01)
+            .protocols(["bad name"])
+            .connect(addr)
+            .await
+        {
+            Err(Error::InvalidProtocol(_)) => {}
+            Err(other) => panic!("wrong error: {other:?}"),
+            Ok(_) => panic!("expected InvalidProtocol error"),
+        }
+    }
 }
 
 #[cfg(all(unix, feature = "uds"))]

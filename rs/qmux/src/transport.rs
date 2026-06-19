@@ -27,7 +27,7 @@ pub trait Transport: Send + 'static {
 // wins), the buffered frame stays in the channel for the next call. The reader
 // task itself never gets cancelled mid-parse, so the multi-step async reads in
 // `recv_record`/`recv_qmux00_frame` are safe to keep as-is.
-#[cfg(any(feature = "tcp", feature = "uds"))]
+#[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
 mod stream_transport {
     use bytes::{BufMut, Bytes, BytesMut};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
@@ -468,11 +468,11 @@ mod stream_transport {
     }
 }
 
-#[cfg(any(feature = "tcp", feature = "uds"))]
+#[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
 pub use stream_transport::Stream;
 
 // Shared plumbing for the byte-stream transports (TCP, Unix sockets).
-#[cfg(any(feature = "tcp", feature = "uds"))]
+#[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
 mod stream_session {
     use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -501,7 +501,7 @@ mod stream_session {
     }
 }
 
-#[cfg(any(feature = "tcp", feature = "uds"))]
+#[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
 pub(crate) use stream_session::build as build_stream_session;
 
 // WsTransport: message I/O over WebSocket.
