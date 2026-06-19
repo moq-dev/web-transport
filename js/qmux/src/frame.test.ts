@@ -42,6 +42,42 @@ describe("QMux01 record framing", () => {
 		}
 	});
 
+	test("application_protocols round-trips and is omitted when empty", () => {
+		const withProtocols: Frame.TransportParameters = {
+			type: "transport_parameters",
+			params: {
+				maxIdleTimeout: 0n,
+				initialMaxData: 1024n,
+				initialMaxStreamDataBidiLocal: 0n,
+				initialMaxStreamDataBidiRemote: 0n,
+				initialMaxStreamDataUni: 0n,
+				initialMaxStreamsBidi: 0n,
+				initialMaxStreamsUni: 0n,
+				maxRecordSize: 0n,
+				protocols: ["moq-lite-04", "moq-lite-03"],
+			},
+		};
+		const decoded = Frame.decodeRecord(Frame.encode(withProtocols, "qmux-01"));
+		expect(decoded.length).toBe(1);
+		const got = decoded[0];
+		expect(got.type).toBe("transport_parameters");
+		if (got.type === "transport_parameters") {
+			expect(got.params.protocols).toEqual(["moq-lite-04", "moq-lite-03"]);
+			expect(got.params.initialMaxData).toBe(1024n);
+		}
+
+		// No protocols → parameter absent on the wire, decoded as undefined.
+		const empty: Frame.TransportParameters = {
+			type: "transport_parameters",
+			params: { ...withProtocols.params, protocols: [] },
+		};
+		const emptyDecoded = Frame.decodeRecord(Frame.encode(empty, "qmux-01"));
+		const emptyGot = emptyDecoded[0];
+		if (emptyGot?.type === "transport_parameters") {
+			expect(emptyGot.params.protocols).toBeUndefined();
+		}
+	});
+
 	test("ping_request and ping_response round-trip preserves the sequence number", () => {
 		const req: Frame.Any = { type: "ping_request", sequence: 0xdeadbeefn };
 		const reqBytes = Frame.encode(req, "qmux-01");

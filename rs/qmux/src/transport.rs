@@ -44,7 +44,25 @@ mod stream_transport {
     /// is a cheap hand-off rather than a syscall.
     const RECV_CHANNEL_CAPACITY: usize = 16;
 
-    pub(crate) struct StreamTransport<T> {
+    /// QMux message I/O over any reliable byte stream (`AsyncRead + AsyncWrite`).
+    ///
+    /// Handles QMux frame/record delimiting so [`Session`](crate::Session) sees
+    /// complete frames. Pair it with [`Session::connect`](crate::Session::connect)
+    /// or [`Session::accept`](crate::Session::accept) to run QMux over a transport
+    /// the built-in `tcp`/`tls`/`ws` helpers don't cover — a Unix socket, a pipe,
+    /// an in-memory duplex, a custom tunnel, etc.:
+    ///
+    /// ```no_run
+    /// # async fn f(stream: tokio::net::TcpStream) -> Result<(), qmux::Error> {
+    /// use qmux::{Config, Session, StreamTransport, Version};
+    ///
+    /// let config = Config::new(Version::QMux01, None);
+    /// let transport = StreamTransport::new(stream, config.version, config.max_record_size);
+    /// let session = Session::connect(transport, config);
+    /// # let _ = session; Ok(())
+    /// # }
+    /// ```
+    pub struct StreamTransport<T> {
         rx: mpsc::Receiver<Result<Bytes, Error>>,
         writer: BufWriter<tokio::io::WriteHalf<T>>,
         version: Version,
@@ -53,6 +71,11 @@ mod stream_transport {
     }
 
     impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamTransport<T> {
+        /// Wrap a byte stream speaking QMux `version`.
+        ///
+        /// `our_max_record_size` bounds incoming draft-01 records (use
+        /// [`Config::max_record_size`](crate::Config::max_record_size)); it is
+        /// ignored for draft-00 and the legacy `webtransport` wire format.
         pub fn new(stream: T, version: Version, our_max_record_size: u64) -> Self {
             let (read, write) = tokio::io::split(stream);
             let (tx, rx) = mpsc::channel(RECV_CHANNEL_CAPACITY);
@@ -445,7 +468,45 @@ mod stream_transport {
 }
 
 #[cfg(feature = "tcp")]
-pub(crate) use stream_transport::StreamTransport;
+pub use stream_transport::StreamTransport;
+
+// Shared plumbing for the byte-stream transports (TCP, Unix sockets).
+#[cfg(feature = "tcp")]
+mod stream_session {
+    use tokio::io::{AsyncRead, AsyncWrite};
+
+    use super::StreamTransport;
+    use crate::protocol::validate_protocol;
+    use crate::{Config, Error, Session, Version};
+
+    /// Build a [`Config`] advertising `protocols` for in-band negotiation,
+    /// rejecting any name that isn't a valid protocol token.
+    pub(crate) fn protocol_config(version: Version, protocols: &[&str]) -> Result<Config, Error> {
+        for protocol in protocols {
+            validate_protocol(protocol)?;
+        }
+        let mut config = Config::new(version, None);
+        config.protocols = protocols.iter().map(|s| s.to_string()).collect();
+        Ok(config)
+    }
+
+    /// Wrap a byte stream in a [`StreamTransport`] and start a session.
+    pub(crate) fn build<T: AsyncRead + AsyncWrite + Send + 'static>(
+        stream: T,
+        config: Config,
+        is_server: bool,
+    ) -> Session {
+        let transport = StreamTransport::new(stream, config.version, config.max_record_size);
+        if is_server {
+            Session::accept(transport, config)
+        } else {
+            Session::connect(transport, config)
+        }
+    }
+}
+
+#[cfg(feature = "tcp")]
+pub(crate) use stream_session::{build as build_stream_session, protocol_config};
 
 // WsTransport: message I/O over WebSocket.
 #[cfg(feature = "ws")]

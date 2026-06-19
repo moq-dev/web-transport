@@ -18,6 +18,10 @@ mod transport;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 
+/// Unix domain socket transport (reuses the byte-stream machinery behind `tcp`).
+#[cfg(all(unix, feature = "tcp"))]
+pub mod uds;
+
 /// TLS over TCP transport.
 #[cfg(feature = "tls")]
 pub mod tls;
@@ -43,6 +47,10 @@ pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
 pub use transport::Transport;
+
+/// Message I/O over a reliable byte stream (TCP, Unix sockets, pipes, …).
+#[cfg(feature = "tcp")]
+pub use transport::StreamTransport;
 
 /// All supported ALPN identifiers, in preference order.
 ///

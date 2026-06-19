@@ -7,7 +7,17 @@ pub struct Config {
     /// Wire format version.
     pub version: Version,
     /// Negotiated application-level protocol (prefix stripped), if any.
+    ///
+    /// Set directly when the protocol was negotiated out of band (TLS/WS ALPN).
+    /// For transports that negotiate via the `application_protocols` transport
+    /// parameter (TCP, Unix sockets), leave this `None` and populate
+    /// [`Config::protocols`] instead; the agreed protocol is then surfaced by
+    /// [`Session::protocol`](crate::Session::protocol) once params are exchanged.
     pub protocol: Option<String>,
+    /// Application protocols to advertise for in-band negotiation, in preference
+    /// order. Only used by transports without ALPN (TCP, Unix sockets); empty
+    /// means no negotiation (the parameter is omitted from the wire).
+    pub protocols: Vec<String>,
 
     /// Max concurrent bidirectional streams the peer can open.
     pub max_streams_bidi: u64,
@@ -33,6 +43,7 @@ impl Default for Config {
         Self {
             version: Version::QMux01,
             protocol: None,
+            protocols: Vec::new(),
             max_streams_bidi: 100,
             max_streams_uni: 100,
             max_data: 1_048_576,                  // 1 MB
@@ -66,6 +77,7 @@ impl Config {
             initial_max_streams_bidi: self.max_streams_bidi,
             initial_max_streams_uni: self.max_streams_uni,
             max_record_size: self.max_record_size,
+            protocols: self.protocols.clone(),
         }
     }
 }

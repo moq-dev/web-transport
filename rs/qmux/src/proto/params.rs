@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use web_transport_proto::VarInt;
 
 use crate::Error;
@@ -19,6 +19,15 @@ pub struct TransportParams {
     pub initial_max_streams_bidi: u64,            // ID 0x08
     pub initial_max_streams_uni: u64,             // ID 0x09
     pub max_record_size: u64,                     // ID 0x0571c59429cd0845 (default 16382)
+
+    /// Application protocols advertised for negotiation (preference order).
+    ///
+    /// QMux-specific (ID 0x3d4f9c2a8b1e6075). This is the non-TLS substitute
+    /// for ALPN: each side lists the protocols it supports and both derive the
+    /// agreed protocol deterministically (server preference wins). Empty when
+    /// the application protocol was negotiated out of band (e.g. via TLS/WS
+    /// ALPN) or not negotiated at all; the parameter is then omitted entirely.
+    pub protocols: Vec<String>,
 }
 
 /// Default max_record_size per draft-01.
@@ -31,6 +40,17 @@ const MAX_RECORD_SIZE_ID_VI: VarInt = unsafe { VarInt::from_u64_unchecked(MAX_RE
 const _: () = assert!(
     MAX_RECORD_SIZE_ID < (1 << 62),
     "MAX_RECORD_SIZE_ID must fit in VarInt"
+);
+
+// application_protocols parameter ID (QMux-specific, exceeds u32).
+// Not part of QUIC v1; carries the ALPN list on transports without TLS.
+const APPLICATION_PROTOCOLS_ID: u64 = 0x3d4f9c2a8b1e6075;
+// SAFETY: 0x3d4f9c2a8b1e6075 < 2^62 (VarInt max)
+const APPLICATION_PROTOCOLS_ID_VI: VarInt =
+    unsafe { VarInt::from_u64_unchecked(APPLICATION_PROTOCOLS_ID) };
+const _: () = assert!(
+    APPLICATION_PROTOCOLS_ID < (1 << 62),
+    "APPLICATION_PROTOCOLS_ID must fit in VarInt"
 );
 
 impl TransportParams {
@@ -89,6 +109,19 @@ impl TransportParams {
         )?;
         write_param(&mut buf, MAX_RECORD_SIZE_ID_VI, self.max_record_size)?;
 
+        // application_protocols: a list of length-prefixed UTF-8 names. Omitted
+        // entirely when empty so peers that don't negotiate stay byte-identical.
+        if !self.protocols.is_empty() {
+            let mut value = BytesMut::new();
+            for protocol in &self.protocols {
+                VarInt::try_from(protocol.len())?.encode(&mut value);
+                value.put_slice(protocol.as_bytes());
+            }
+            APPLICATION_PROTOCOLS_ID_VI.encode(&mut buf);
+            VarInt::try_from(value.len())?.encode(&mut buf);
+            buf.put_slice(&value);
+        }
+
         Ok(buf.freeze())
     }
 
@@ -113,6 +146,12 @@ impl TransportParams {
             let mut param_data = data.split_to(len);
 
             match id {
+                APPLICATION_PROTOCOLS_ID => {
+                    if !seen.insert(id) {
+                        return Err(Error::DuplicateParam(id));
+                    }
+                    params.protocols = decode_protocols(&mut param_data)?;
+                }
                 0x01 | 0x04..=0x09 | MAX_RECORD_SIZE_ID => {
                     if !seen.insert(id) {
                         return Err(Error::DuplicateParam(id));
@@ -155,6 +194,23 @@ impl TransportParams {
     }
 }
 
+/// Decode the application_protocols value: a sequence of length-prefixed
+/// UTF-8 protocol names that consumes the whole parameter payload.
+fn decode_protocols(data: &mut Bytes) -> Result<Vec<String>, Error> {
+    let mut out = Vec::new();
+    while data.has_remaining() {
+        let len = VarInt::decode(data)?.into_inner() as usize;
+        if data.remaining() < len {
+            return Err(Error::Short);
+        }
+        let name = data.split_to(len);
+        let protocol =
+            std::str::from_utf8(&name).map_err(|_| Error::InvalidProtocol(format!("{name:?}")))?;
+        out.push(protocol.to_string());
+    }
+    Ok(out)
+}
+
 /// Decode a single VarInt parameter, validating that the entire payload is consumed.
 fn decode_varint_param(data: &mut Bytes) -> Result<u64, Error> {
     let value = VarInt::decode(data)?.into_inner();
@@ -174,5 +230,63 @@ fn varint_size(v: u64) -> usize {
         4
     } else {
         8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocols_round_trip() {
+        let params = TransportParams {
+            initial_max_data: 1024,
+            protocols: vec!["moq-lite-04".to_string(), "moq-lite-03".to_string()],
+            ..TransportParams::default()
+        };
+        let decoded = TransportParams::decode(params.encode().unwrap()).unwrap();
+        assert_eq!(decoded.protocols, params.protocols);
+        assert_eq!(decoded.initial_max_data, 1024);
+    }
+
+    #[test]
+    fn protocols_omitted_when_empty() {
+        // No application_protocols param on the wire when the list is empty, so
+        // a peer that never negotiates stays byte-identical to the old format.
+        let bytes = TransportParams::default().encode().unwrap();
+        assert!(!bytes
+            .windows(8)
+            .any(|w| w == APPLICATION_PROTOCOLS_ID.to_be_bytes()));
+        assert!(TransportParams::decode(bytes).unwrap().protocols.is_empty());
+    }
+
+    #[test]
+    fn duplicate_protocols_param_rejected() {
+        let one = TransportParams {
+            protocols: vec!["a".to_string()],
+            ..TransportParams::default()
+        }
+        .encode()
+        .unwrap();
+        let mut doubled = BytesMut::from(&one[..]);
+        doubled.extend_from_slice(&one);
+        assert!(matches!(
+            TransportParams::decode(doubled.freeze()),
+            Err(Error::DuplicateParam(APPLICATION_PROTOCOLS_ID))
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_protocol_rejected() {
+        // id=APPLICATION_PROTOCOLS_ID, len=2, value=[len=1, 0xff]
+        let mut buf = BytesMut::new();
+        APPLICATION_PROTOCOLS_ID_VI.encode(&mut buf);
+        VarInt::from_u32(2).encode(&mut buf);
+        VarInt::from_u32(1).encode(&mut buf);
+        buf.put_u8(0xff);
+        assert!(matches!(
+            TransportParams::decode(buf.freeze()),
+            Err(Error::InvalidProtocol(_))
+        ));
     }
 }
