@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.3...web-transport-node-v0.0.4) - 2026-06-22
+
+### Fixed
+
+- Prevent use-after-free SIGSEGV on process exit ([#260](https://github.com/moq-dev/web-transport/pull/260))
+
 ## [0.0.3](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.2...web-transport-node-v0.0.3) - 2026-05-21
 
 ### Other
