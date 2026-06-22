@@ -1,7 +1,25 @@
+use std::sync::Arc;
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use tokio::sync::Mutex;
+
+// Teardown safety: every `#[napi] async fn` below runs on napi-rs's global tokio
+// runtime. On `process.exit()` napi tears that runtime down with
+// `Runtime::shutdown_background()` (non-blocking) and then finalizes the wrapped
+// Rust objects -- so a worker thread can still be dropping a parked task (e.g. a
+// `read()` blocked on the network) *after* the object it borrowed has been freed.
+// If that task's future borrows `&self`, the drop dereferences freed memory and
+// the process SIGSEGVs on exit (a use-after-free in `tokio-rt-worker`).
+//
+// To make those forced drops memory-safe, each async method clones the handle it
+// needs (an `Arc<Mutex<..>>` for the non-`Clone` streams, or the cheap `Clone`
+// handle for `Session`/`Client`) *before* its first `.await`. The `&self` borrow
+// then ends before any suspension point, so the future owns everything it touches
+// and a teardown-time drop only ever frees live memory. Do not "simplify" these
+// clones back into `self.inner.lock()` across an await -- that reintroduces the
+// crash.
 
 fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiCloseInfo {
     match err {
@@ -69,6 +87,8 @@ impl NapiClient {
         url_str: String,
         options: Option<NapiConnectOptions>,
     ) -> Result<NapiSession> {
+        // Own the client handle for the duration of the future (see module note).
+        let client = self.inner.clone();
         let url: url::Url = url_str
             .parse()
             .map_err(|e: url::ParseError| Error::from_reason(e.to_string()))?;
@@ -78,14 +98,13 @@ impl NapiClient {
                 request = request.with_protocols(protocols);
             }
         }
-        let session = self
-            .inner
+        let session = client
             .connect(request)
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
             inner: session.clone(),
-            closed: Mutex::new(None),
+            closed: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -100,7 +119,7 @@ pub struct NapiConnectOptions {
 /// A WebTransport server that accepts incoming sessions.
 #[napi]
 pub struct NapiServer {
-    inner: Mutex<Option<web_transport_quinn::Server>>,
+    inner: Arc<Mutex<Option<web_transport_quinn::Server>>>,
 }
 
 #[napi]
@@ -126,7 +145,7 @@ impl NapiServer {
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
             Ok(Self {
-                inner: Mutex::new(Some(server)),
+                inner: Arc::new(Mutex::new(Some(server))),
             })
         })
     }
@@ -134,14 +153,16 @@ impl NapiServer {
     /// Accept the next incoming WebTransport session request.
     #[napi]
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
-        let mut guard = self.inner.lock().await;
+        // Own the shared state for the duration of the future (see module note).
+        let inner = self.inner.clone();
+        let mut guard = inner.lock().await;
         let server = match guard.as_mut() {
             Some(server) => server,
             None => return Ok(None),
         };
         match server.accept().await {
             Some(request) => Ok(Some(NapiRequest {
-                inner: Mutex::new(Some(request)),
+                inner: Arc::new(Mutex::new(Some(request))),
             })),
             None => {
                 guard.take();
@@ -163,7 +184,7 @@ impl NapiServer {
 #[napi]
 pub struct NapiRequest {
     // Option so we can take it in ok()/reject() which consume the Request.
-    inner: Mutex<Option<web_transport_quinn::Request>>,
+    inner: Arc<Mutex<Option<web_transport_quinn::Request>>>,
 }
 
 #[napi]
@@ -171,7 +192,8 @@ impl NapiRequest {
     /// Get the URL of the CONNECT request.
     #[napi(getter)]
     pub async fn url(&self) -> Result<String> {
-        let guard = self.inner.lock().await;
+        let inner = self.inner.clone();
+        let guard = inner.lock().await;
         let request = guard
             .as_ref()
             .ok_or_else(|| Error::from_reason("request already consumed"))?;
@@ -181,8 +203,8 @@ impl NapiRequest {
     /// Accept the session with 200 OK.
     #[napi]
     pub async fn ok(&self) -> Result<NapiSession> {
-        let request = self
-            .inner
+        let inner = self.inner.clone();
+        let request = inner
             .lock()
             .await
             .take()
@@ -193,15 +215,15 @@ impl NapiRequest {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
             inner: session.clone(),
-            closed: Mutex::new(None),
+            closed: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Reject the session with the given HTTP status code.
     #[napi]
     pub async fn reject(&self, status: u16) -> Result<()> {
-        let request = self
-            .inner
+        let inner = self.inner.clone();
+        let request = inner
             .lock()
             .await
             .take()
@@ -221,7 +243,7 @@ impl NapiRequest {
 pub struct NapiSession {
     inner: web_transport_quinn::Session,
     // Cache the closed future result so multiple callers can await it.
-    closed: Mutex<Option<NapiCloseInfo>>,
+    closed: Arc<Mutex<Option<NapiCloseInfo>>>,
 }
 
 /// Info about why a session was closed, matching W3C WebTransportCloseInfo.
@@ -269,30 +291,31 @@ impl NapiSession {
     /// Accept an incoming unidirectional stream.
     #[napi]
     pub async fn accept_uni(&self) -> Result<NapiRecvStream> {
-        let recv = self
-            .inner
+        // Own the session handle for the duration of the future (see module note).
+        let session = self.inner.clone();
+        let recv = session
             .accept_uni()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiRecvStream {
-            inner: Mutex::new(recv),
+            inner: Arc::new(Mutex::new(recv)),
         })
     }
 
     /// Accept an incoming bidirectional stream.
     #[napi]
     pub async fn accept_bi(&self) -> Result<NapiBiStream> {
-        let (send, recv) = self
-            .inner
+        let session = self.inner.clone();
+        let (send, recv) = session
             .accept_bi()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiBiStream {
             send: Some(NapiSendStream {
-                inner: Mutex::new(send),
+                inner: Arc::new(Mutex::new(send)),
             }),
             recv: Some(NapiRecvStream {
-                inner: Mutex::new(recv),
+                inner: Arc::new(Mutex::new(recv)),
             }),
         })
     }
@@ -300,30 +323,30 @@ impl NapiSession {
     /// Open a new unidirectional stream.
     #[napi]
     pub async fn open_uni(&self) -> Result<NapiSendStream> {
-        let send = self
-            .inner
+        let session = self.inner.clone();
+        let send = session
             .open_uni()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSendStream {
-            inner: Mutex::new(send),
+            inner: Arc::new(Mutex::new(send)),
         })
     }
 
     /// Open a new bidirectional stream.
     #[napi]
     pub async fn open_bi(&self) -> Result<NapiBiStream> {
-        let (send, recv) = self
-            .inner
+        let session = self.inner.clone();
+        let (send, recv) = session
             .open_bi()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiBiStream {
             send: Some(NapiSendStream {
-                inner: Mutex::new(send),
+                inner: Arc::new(Mutex::new(send)),
             }),
             recv: Some(NapiRecvStream {
-                inner: Mutex::new(recv),
+                inner: Arc::new(Mutex::new(recv)),
             }),
         })
     }
@@ -341,8 +364,8 @@ impl NapiSession {
     /// Receive a datagram.
     #[napi]
     pub async fn recv_datagram(&self) -> Result<Buffer> {
-        let data = self
-            .inner
+        let session = self.inner.clone();
+        let data = session
             .read_datagram()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -366,20 +389,25 @@ impl NapiSession {
     /// Wait for the session to close, returning close info matching W3C WebTransportCloseInfo.
     #[napi]
     pub async fn closed(&self) -> Result<NapiCloseInfo> {
+        // Own the session handle and the cache for the duration of the future
+        // (see module note).
+        let session = self.inner.clone();
+        let cache = self.closed.clone();
+
         // Check if we already have a cached result.
         {
-            let cached = self.closed.lock().await;
+            let cached = cache.lock().await;
             if let Some(info) = cached.as_ref() {
                 return Ok(info.clone());
             }
         }
 
-        let err = self.inner.closed().await;
+        let err = session.closed().await;
         let info = session_error_to_close_info(&err);
 
         // Cache the result.
         {
-            let mut cached = self.closed.lock().await;
+            let mut cached = cache.lock().await;
             *cached = Some(info.clone());
         }
 
@@ -390,7 +418,7 @@ impl NapiSession {
 /// A send stream for writing data.
 #[napi]
 pub struct NapiSendStream {
-    inner: Mutex<web_transport_quinn::SendStream>,
+    inner: Arc<Mutex<web_transport_quinn::SendStream>>,
 }
 
 #[napi]
@@ -398,7 +426,9 @@ impl NapiSendStream {
     /// Write data to the stream.
     #[napi]
     pub async fn write(&self, data: Buffer) -> Result<()> {
-        let mut stream = self.inner.lock().await;
+        // Own the shared stream for the duration of the future (see module note).
+        let inner = self.inner.clone();
+        let mut stream = inner.lock().await;
         stream
             .write_all(&data)
             .await
@@ -408,7 +438,8 @@ impl NapiSendStream {
     /// Signal that no more data will be written.
     #[napi]
     pub async fn finish(&self) -> Result<()> {
-        let mut stream = self.inner.lock().await;
+        let inner = self.inner.clone();
+        let mut stream = inner.lock().await;
         stream
             .finish()
             .map_err(|e| Error::from_reason(e.to_string()))
@@ -417,7 +448,8 @@ impl NapiSendStream {
     /// Abruptly reset the stream with an error code.
     #[napi]
     pub async fn reset(&self, code: u32) -> Result<()> {
-        let mut stream = self.inner.lock().await;
+        let inner = self.inner.clone();
+        let mut stream = inner.lock().await;
         stream
             .reset(code)
             .map_err(|e| Error::from_reason(e.to_string()))
@@ -426,7 +458,8 @@ impl NapiSendStream {
     /// Set the priority of the stream.
     #[napi]
     pub async fn set_priority(&self, priority: i32) -> Result<()> {
-        let stream = self.inner.lock().await;
+        let inner = self.inner.clone();
+        let stream = inner.lock().await;
         stream
             .set_priority(priority)
             .map_err(|e| Error::from_reason(e.to_string()))
@@ -436,7 +469,7 @@ impl NapiSendStream {
 /// A receive stream for reading data.
 #[napi]
 pub struct NapiRecvStream {
-    inner: Mutex<web_transport_quinn::RecvStream>,
+    inner: Arc<Mutex<web_transport_quinn::RecvStream>>,
 }
 
 #[napi]
@@ -444,7 +477,9 @@ impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN.
     #[napi]
     pub async fn read(&self, max_size: u32) -> Result<Option<Buffer>> {
-        let mut stream = self.inner.lock().await;
+        // Own the shared stream for the duration of the future (see module note).
+        let inner = self.inner.clone();
+        let mut stream = inner.lock().await;
         let Some(chunk) = stream
             .read_chunk(max_size as usize, true)
             .await
@@ -459,7 +494,8 @@ impl NapiRecvStream {
     /// Tell the peer to stop sending with the given error code.
     #[napi]
     pub async fn stop(&self, code: u32) -> Result<()> {
-        let mut stream = self.inner.lock().await;
+        let inner = self.inner.clone();
+        let mut stream = inner.lock().await;
         stream
             .stop(code)
             .map_err(|e| Error::from_reason(e.to_string()))
