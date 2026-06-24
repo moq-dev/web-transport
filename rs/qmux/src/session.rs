@@ -723,7 +723,7 @@ impl Session {
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
-            // Unblock any `negotiated()` / `peer_path()` waiter if the connection
+            // Unblock any `negotiated()` / `path()` waiter if the connection
             // died before the peer's params arrived. No-op for already-resolved cases.
             backend.resolve_negotiated(None);
             backend.resolve_peer_path(None);
