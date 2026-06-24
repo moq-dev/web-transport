@@ -41,7 +41,9 @@ async fn wire_format_size_prefix_qmux01_only() {
             buf
         });
         // The session sends TRANSPORT_PARAMETERS as its first frame on connect.
-        let _client = qmux::tcp::Config::new(version).connect(addr).await.unwrap();
+        // We only need that first frame on the wire; this bare server never sends
+        // its own params back, so establishment fails (EOF) — ignore the result.
+        let _ = qmux::tcp::Config::new(version).connect(addr).await;
         server.await.unwrap()
     }
 

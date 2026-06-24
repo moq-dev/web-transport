@@ -59,11 +59,21 @@ impl Config {
         self
     }
 
+    /// Override how long establishment waits for the peer's transport
+    /// parameters before failing with [`Error::HandshakeTimeout`]. Defaults to
+    /// 10s; a zero duration waits indefinitely. See
+    /// [`Config::handshake_timeout`](crate::Config::handshake_timeout).
+    pub fn handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner.handshake_timeout = timeout;
+        self
+    }
+
     /// Connect to `addr` and start a client session.
     ///
-    /// When negotiating, this awaits the peer's transport parameters so
-    /// [`Session::protocol`](web_transport_trait::Session::protocol) is populated
-    /// on return.
+    /// Awaits the peer's transport parameters before returning, so
+    /// [`Session::protocol`](web_transport_trait::Session::protocol) and
+    /// [`Session::path`](crate::Session::path) are populated on the returned
+    /// session (bounded by [`handshake_timeout`](Self::handshake_timeout)).
     pub async fn connect(self, addr: impl ToSocketAddrs) -> Result<Session, Error> {
         let stream = TcpStream::connect(addr).await?;
         finish(stream, self.inner, false).await
@@ -81,8 +91,9 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     let session = build_stream_session(stream, config, is_server)?;
-    // Resolve the protocol before returning (instant unless negotiating). The
-    // peer's path, if any, is awaited lazily by the caller via `Session::path`.
-    session.negotiated().await;
+    // Await the peer's transport parameters before returning, so `protocol()` and
+    // `path()` are resolved on the session we hand back. Bounded by the config's
+    // handshake timeout.
+    session.established().await?;
     Ok(session)
 }

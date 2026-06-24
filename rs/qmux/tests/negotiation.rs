@@ -98,11 +98,12 @@ mod tcp {
 
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            let session = qmux::tcp::Config::new(Version::QMux01)
-                .accept(sock)
-                .await
-                .unwrap();
-            session.closed().await
+            // The client's unexpected `application_protocols` param fails the
+            // handshake, so establishment (awaited inside `accept`) returns it.
+            match qmux::tcp::Config::new(Version::QMux01).accept(sock).await {
+                Err(e) => e,
+                Ok(_) => panic!("expected establishment to fail"),
+            }
         });
 
         // Keep the client alive so its parameters actually reach the server.
@@ -128,9 +129,9 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            // Await the client's params to read the path it advertised. Own it
-            // so the borrow doesn't escape this task.
-            session.path().await.map(str::to_string)
+            // `accept` already awaited the client's params, so `path()` is
+            // resolved here. Own it so the borrow doesn't escape this task.
+            session.path().map(str::to_string)
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -142,7 +143,7 @@ mod tcp {
 
         assert_eq!(server_saw.as_deref(), Some("/broadcast/room-42"));
         // The server set no path of its own, so the client sees none.
-        assert_eq!(client.path().await, None);
+        assert_eq!(client.path(), None);
     }
 
     /// Path and protocol negotiation are independent and can be used together.
@@ -160,7 +161,7 @@ mod tcp {
                 .unwrap();
             (
                 session.protocol().map(str::to_string),
-                session.path().await.map(str::to_string),
+                session.path().map(str::to_string),
             )
         });
 
@@ -189,7 +190,7 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            session.path().await.map(str::to_string)
+            session.path().map(str::to_string)
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -199,7 +200,36 @@ mod tcp {
         let server_saw = server.await.unwrap();
 
         assert_eq!(server_saw, None);
-        assert_eq!(client.path().await, None);
+        assert_eq!(client.path(), None);
+    }
+
+    /// A peer that completes the TCP handshake but never sends its transport
+    /// parameters fails establishment with `HandshakeTimeout` instead of hanging.
+    #[tokio::test]
+    async fn handshake_timeout_fires() {
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept the connection but never speak QMux, holding the socket open so
+        // the client can't short-circuit on an EOF — it must hit the timeout.
+        let server = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let result = qmux::tcp::Config::new(Version::QMux01)
+            .handshake_timeout(Duration::from_millis(100))
+            .connect(addr)
+            .await;
+
+        match result {
+            Err(Error::HandshakeTimeout) => {}
+            Err(other) => panic!("expected HandshakeTimeout, got {other:?}"),
+            Ok(_) => panic!("expected HandshakeTimeout, got an established session"),
+        }
+        server.abort();
     }
 
     /// Advertised protocol names are validated before the session starts.

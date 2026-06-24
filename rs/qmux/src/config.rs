@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::proto::{TransportParams, DEFAULT_MAX_RECORD_SIZE};
 use crate::Version;
 
@@ -14,8 +16,8 @@ pub enum Protocol {
     /// For transports without ALPN (TCP, Unix sockets). Both peers must opt in:
     /// receiving the parameter while *not* in this mode is a protocol error.
     /// The agreed protocol is surfaced by
-    /// [`Session::protocol`](web_transport_trait::Session::protocol) /
-    /// [`Session::negotiated`](crate::Session::negotiated) once params arrive.
+    /// [`Session::protocol`](web_transport_trait::Session::protocol), resolved
+    /// by the time [`Session::established`](crate::Session::established) completes.
     Negotiate(Vec<String>),
 
     /// Already negotiated out of band (TLS / WebSocket ALPN). Reported as-is;
@@ -57,6 +59,13 @@ pub struct Config {
     pub max_idle_timeout: u64,
     /// Maximum QMux Record size in bytes (draft-01). Default: 16382.
     pub max_record_size: u64,
+
+    /// How long [`Session::established`](crate::Session::established) waits for
+    /// the peer's transport parameters before giving up. Bounds the handshake so
+    /// a peer that completes the transport connection but never sends its
+    /// parameters can't hang `connect`/`accept` forever. Default: 10s; a zero
+    /// duration disables the timeout (wait indefinitely).
+    pub handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -73,6 +82,7 @@ impl Default for Config {
             max_stream_data_uni: 262_144,         // 256 KB
             max_idle_timeout: 30_000,             // 30 seconds
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            handshake_timeout: Duration::from_secs(10),
         }
     }
 }

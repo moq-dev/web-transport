@@ -44,6 +44,9 @@ pub enum Error {
     #[error("idle timeout")]
     IdleTimeout,
 
+    #[error("handshake timeout: peer never sent transport parameters")]
+    HandshakeTimeout,
+
     #[error("invalid protocol token: {0:?}")]
     InvalidProtocol(String),
 
