@@ -5,6 +5,7 @@ use crate::Version;
 
 /// How the application-level protocol is determined for a session.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Protocol {
     /// No application protocol.
     #[default]
