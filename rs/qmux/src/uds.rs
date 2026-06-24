@@ -47,6 +47,16 @@ impl Config {
         self
     }
 
+    /// Advertise a requested resource `path`.
+    ///
+    /// A Unix socket has no URL, so a client that needs to address a specific
+    /// resource sends the path in-band. The peer reads it via
+    /// [`Session::path`](crate::Session::path). Omit to send no path.
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.inner.path = Some(path.into());
+        self
+    }
+
     /// Connect to the socket at `path` and start a client session.
     pub async fn connect(self, path: impl AsRef<Path>) -> Result<Session, Error> {
         let stream = UnixStream::connect(path).await?;
@@ -65,7 +75,8 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     let session = build_stream_session(stream, config, is_server)?;
-    // Resolve the protocol before returning (instant unless negotiating).
+    // Resolve the protocol before returning (instant unless negotiating). The
+    // peer's path, if any, is awaited lazily by the caller via `Session::path`.
     session.negotiated().await;
     Ok(session)
 }

@@ -28,6 +28,15 @@ pub struct TransportParams {
     /// the application protocol was negotiated out of band (e.g. via TLS/WS
     /// ALPN) or not negotiated at all; the parameter is then omitted entirely.
     pub protocols: Vec<String>,
+
+    /// Requested resource path, for transports without a URL of their own.
+    ///
+    /// QMux-specific (ID 0x2b9a4c1f6e3d8052). WebTransport over HTTP/3 and
+    /// WebSocket carry the path in the request line (`:path` / the WS URL);
+    /// TCP, TLS, and Unix sockets have no such field, so a client that needs to
+    /// address a specific resource sends it here. `None` (the default) omits the
+    /// parameter entirely, keeping peers that never set a path byte-identical.
+    pub path: Option<String>,
 }
 
 /// Default max_record_size per draft-01.
@@ -52,6 +61,13 @@ const _: () = assert!(
     APPLICATION_PROTOCOLS_ID < (1 << 62),
     "APPLICATION_PROTOCOLS_ID must fit in VarInt"
 );
+
+// path parameter ID (QMux-specific). Carries the requested resource path on
+// transports that lack a request line of their own (TCP, TLS, Unix sockets).
+const PATH_ID: u64 = 0x2b9a4c1f6e3d8052;
+// SAFETY: 0x2b9a4c1f6e3d8052 < 2^62 (VarInt max)
+const PATH_ID_VI: VarInt = unsafe { VarInt::from_u64_unchecked(PATH_ID) };
+const _: () = assert!(PATH_ID < (1 << 62), "PATH_ID must fit in VarInt");
 
 impl TransportParams {
     // Transport parameter IDs
@@ -122,6 +138,15 @@ impl TransportParams {
             buf.put_slice(&value);
         }
 
+        // path: a single UTF-8 string. Omitted entirely when unset so peers that
+        // don't address a resource stay byte-identical to the old format. An
+        // explicitly empty path is a distinct, valid value and is still sent.
+        if let Some(path) = &self.path {
+            PATH_ID_VI.encode(&mut buf);
+            VarInt::try_from(path.len())?.encode(&mut buf);
+            buf.put_slice(path.as_bytes());
+        }
+
         Ok(buf.freeze())
     }
 
@@ -151,6 +176,18 @@ impl TransportParams {
                         return Err(Error::DuplicateParam(id));
                     }
                     params.protocols = decode_protocols(&mut param_data)?;
+                }
+                PATH_ID => {
+                    if !seen.insert(id) {
+                        return Err(Error::DuplicateParam(id));
+                    }
+                    // The whole payload is the path; an empty payload is a valid
+                    // (empty) path, distinct from the parameter being absent.
+                    params.path = Some(
+                        std::str::from_utf8(&param_data)
+                            .map_err(|_| Error::InvalidPath(format!("{param_data:?}")))?
+                            .to_string(),
+                    );
                 }
                 0x01 | 0x04..=0x09 | MAX_RECORD_SIZE_ID => {
                     if !seen.insert(id) {
@@ -295,6 +332,76 @@ mod tests {
         assert!(matches!(
             TransportParams::decode(buf.freeze()),
             Err(Error::InvalidProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn path_round_trip() {
+        let params = TransportParams {
+            initial_max_data: 1024,
+            path: Some("/broadcast/room-42".to_string()),
+            ..TransportParams::default()
+        };
+        let decoded = TransportParams::decode(params.encode().unwrap()).unwrap();
+        assert_eq!(decoded.path.as_deref(), Some("/broadcast/room-42"));
+        assert_eq!(decoded.initial_max_data, 1024);
+    }
+
+    // The PATH_ID as it appears on the wire: an 8-byte varint with the top two
+    // bits set (0b11), i.e. PATH_ID | 0xc000_0000_0000_0000.
+    const PATH_ID_WIRE: [u8; 8] = (PATH_ID | (0b11 << 62)).to_be_bytes();
+
+    #[test]
+    fn path_omitted_when_none() {
+        // No path param on the wire when unset, so a peer that never addresses a
+        // resource stays byte-identical to the old format.
+        let bytes = TransportParams::default().encode().unwrap();
+        assert!(!bytes.windows(8).any(|w| w == PATH_ID_WIRE));
+        assert!(TransportParams::decode(bytes).unwrap().path.is_none());
+    }
+
+    #[test]
+    fn empty_path_round_trips_as_some() {
+        // An explicitly empty path is distinct from an absent one: the parameter
+        // is present on the wire and decodes back to `Some("")`.
+        let params = TransportParams {
+            path: Some(String::new()),
+            ..TransportParams::default()
+        };
+        let bytes = params.encode().unwrap();
+        assert!(bytes.windows(8).any(|w| w == PATH_ID_WIRE));
+        assert_eq!(
+            TransportParams::decode(bytes).unwrap().path.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn duplicate_path_param_rejected() {
+        let one = TransportParams {
+            path: Some("/a".to_string()),
+            ..TransportParams::default()
+        }
+        .encode()
+        .unwrap();
+        let mut doubled = BytesMut::from(&one[..]);
+        doubled.extend_from_slice(&one);
+        assert!(matches!(
+            TransportParams::decode(doubled.freeze()),
+            Err(Error::DuplicateParam(PATH_ID))
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_path_rejected() {
+        // id=PATH_ID, len=1, value=[0xff]
+        let mut buf = BytesMut::new();
+        PATH_ID_VI.encode(&mut buf);
+        VarInt::from_u32(1).encode(&mut buf);
+        buf.put_u8(0xff);
+        assert!(matches!(
+            TransportParams::decode(buf.freeze()),
+            Err(Error::InvalidPath(_))
         ));
     }
 

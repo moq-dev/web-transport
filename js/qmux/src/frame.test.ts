@@ -75,6 +75,40 @@ describe("QMux01 record framing", () => {
 		expect(() => Frame.decode(record, "qmux-00")).toThrow();
 	});
 
+	test("path parameter is rejected (WebSocket carries the path in its URL)", () => {
+		// A QX_TRANSPORT_PARAMETERS frame carrying only the `path` parameter
+		// (id 0x2b9a4c1f6e3d8052, value "/x"). WebSocket addresses the resource
+		// via its URL, so this parameter must never appear and decoding must throw.
+		const bytes = (...vals: number[]) => new Uint8Array(vals);
+		const record = bytes(
+			// frame type 0x3f5153300d0a0d0a — the "\xffQS0\r\n\r\n" magic.
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a,
+			// length = 11 (param id 8 bytes + len 1 byte + value 2 bytes)
+			0x0b,
+			// param id 0x2b9a4c1f6e3d8052 — 8-byte varint, first wire byte 0xeb.
+			0xeb,
+			0x9a,
+			0x4c,
+			0x1f,
+			0x6e,
+			0x3d,
+			0x80,
+			0x52,
+			// param length = 2, value = "/x"
+			0x02,
+			0x2f,
+			0x78,
+		);
+		expect(() => Frame.decode(record, "qmux-00")).toThrow();
+	});
+
 	test("ping_request and ping_response round-trip preserves the sequence number", () => {
 		const req: Frame.Any = { type: "ping_request", sequence: 0xdeadbeefn };
 		const reqBytes = Frame.encode(req, "qmux-01");

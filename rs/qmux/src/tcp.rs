@@ -49,6 +49,16 @@ impl Config {
         self
     }
 
+    /// Advertise a requested resource `path`.
+    ///
+    /// TCP has no URL, so a client that needs to address a specific resource
+    /// sends the path in-band. The peer reads it via
+    /// [`Session::path`](crate::Session::path). Omit to send no path.
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.inner.path = Some(path.into());
+        self
+    }
+
     /// Connect to `addr` and start a client session.
     ///
     /// When negotiating, this awaits the peer's transport parameters so
@@ -71,7 +81,8 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     let session = build_stream_session(stream, config, is_server)?;
-    // Resolve the protocol before returning (instant unless negotiating).
+    // Resolve the protocol before returning (instant unless negotiating). The
+    // peer's path, if any, is awaited lazily by the caller via `Session::path`.
     session.negotiated().await;
     Ok(session)
 }

@@ -1,5 +1,5 @@
-//! In-band application-protocol negotiation over byte-stream transports
-//! (the `application_protocols` QMux transport parameter).
+//! In-band application-protocol negotiation and resource paths over byte-stream
+//! transports (the `application_protocols` and `path` QMux transport parameters).
 
 #![cfg(any(feature = "tcp", feature = "uds"))]
 
@@ -114,6 +114,92 @@ mod tcp {
         let err = server.await.unwrap();
 
         assert!(matches!(err, Error::UnexpectedProtocols), "got {err:?}");
+    }
+
+    /// The client's in-band `path` reaches the server, readable right after accept.
+    #[tokio::test]
+    async fn path_reaches_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let session = qmux::tcp::Config::new(Version::QMux01)
+                .accept(sock)
+                .await
+                .unwrap();
+            // Await the client's params to read the path it advertised. Own it
+            // so the borrow doesn't escape this task.
+            session.path().await.map(str::to_string)
+        });
+
+        let client = qmux::tcp::Config::new(Version::QMux01)
+            .path("/broadcast/room-42")
+            .connect(addr)
+            .await
+            .unwrap();
+        let server_saw = server.await.unwrap();
+
+        assert_eq!(server_saw.as_deref(), Some("/broadcast/room-42"));
+        // The server set no path of its own, so the client sees none.
+        assert_eq!(client.path().await, None);
+    }
+
+    /// Path and protocol negotiation are independent and can be used together.
+    #[tokio::test]
+    async fn path_alongside_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let session = qmux::tcp::Config::new(Version::QMux01)
+                .protocols(["moq-lite-04"])
+                .accept(sock)
+                .await
+                .unwrap();
+            (
+                session.protocol().map(str::to_string),
+                session.path().await.map(str::to_string),
+            )
+        });
+
+        let client = qmux::tcp::Config::new(Version::QMux01)
+            .protocols(["moq-lite-04"])
+            .path("/live")
+            .connect(addr)
+            .await
+            .unwrap();
+        let (server_protocol, server_path) = server.await.unwrap();
+
+        assert_eq!(server_protocol.as_deref(), Some("moq-lite-04"));
+        assert_eq!(server_path.as_deref(), Some("/live"));
+        assert_eq!(client.protocol(), Some("moq-lite-04"));
+    }
+
+    /// No path on either side resolves to `None`, no parameter on the wire.
+    #[tokio::test]
+    async fn without_path_resolves_to_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let session = qmux::tcp::Config::new(Version::QMux01)
+                .accept(sock)
+                .await
+                .unwrap();
+            session.path().await.map(str::to_string)
+        });
+
+        let client = qmux::tcp::Config::new(Version::QMux01)
+            .connect(addr)
+            .await
+            .unwrap();
+        let server_saw = server.await.unwrap();
+
+        assert_eq!(server_saw, None);
+        assert_eq!(client.path().await, None);
     }
 
     /// Advertised protocol names are validated before the session starts.

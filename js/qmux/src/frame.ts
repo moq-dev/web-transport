@@ -176,6 +176,11 @@ const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 // This implementation only runs over WebSocket, which negotiates the protocol
 // via its subprotocol (ALPN), so receiving this parameter is a protocol error.
 const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
+// path transport parameter ID (QMux-specific). Carries the requested resource
+// path on transports without a request line of their own (TCP, TLS, Unix
+// sockets). This implementation only runs over WebSocket, which carries the
+// path in its URL, so receiving this parameter is a protocol error.
+const PATH_ID = 0x2b9a4c1f6e3d8052n;
 
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
@@ -424,6 +429,12 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		// negotiates via its subprotocol, so the parameter must never appear.
 		if (id === APPLICATION_PROTOCOLS_ID) {
 			throw new Error("unexpected application_protocols parameter over WebSocket");
+		}
+
+		// WebSocket carries the path in its URL, so the in-band `path` parameter
+		// (used by TCP/TLS/Unix-socket peers) must never appear here.
+		if (id === PATH_ID) {
+			throw new Error("unexpected path parameter over WebSocket");
 		}
 
 		if (paramData.byteLength < 1) {
