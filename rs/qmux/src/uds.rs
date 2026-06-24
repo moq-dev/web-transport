@@ -73,6 +73,11 @@ impl Config {
     }
 
     /// Start a server session over an accepted Unix-socket stream.
+    ///
+    /// This awaits the QMux handshake (the peer's transport parameters), bounded
+    /// by [`handshake_timeout`](Self::handshake_timeout). Drive each connection
+    /// with `tokio::spawn` so a slow or non-cooperative peer can't stall your
+    /// `listener.accept()` loop.
     pub async fn accept(self, stream: UnixStream) -> Result<Session, Error> {
         finish(stream, self.inner, true).await
     }

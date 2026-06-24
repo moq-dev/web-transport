@@ -143,6 +143,12 @@ impl Server {
     }
 
     /// Accept a TLS connection over an established TCP stream.
+    ///
+    /// This awaits both the TLS handshake and the QMux handshake (the peer's
+    /// transport parameters, bounded by the session's
+    /// [`handshake_timeout`](crate::Config::handshake_timeout)). Drive each
+    /// connection with `tokio::spawn` so a slow or non-cooperative peer can't
+    /// stall your `listener.accept()` loop.
     pub async fn accept(&self, stream: TcpStream) -> Result<Session, Error> {
         let acceptor = TlsAcceptor::from(self.config.clone());
         let tls_stream = acceptor.accept(stream).await?;
