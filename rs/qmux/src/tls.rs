@@ -6,92 +6,157 @@ use tokio_rustls::TlsConnector;
 use crate::transport::Stream;
 use crate::{alpn, Config, Error, Session, Version};
 
-/// Connect over TLS, advertising the given `(alpn, versions)` entries.
+/// A QMux client over TLS that advertises `(alpn, versions)` entries.
 ///
 /// Each entry's `versions` slice is expanded into the TLS ALPN list as
-/// `{v.prefix()}{alpn}` per version (empty = every QMux draft this crate
-/// knows about). The bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`)
-/// are appended as well unless `require_protocol` is set, in which case only
-/// the prefixed pairs are offered. The peer's chosen ALPN determines the QMux
-/// wire-format version; the `alpn_protocols` field on the supplied
-/// `rustls::ClientConfig` is ignored and rebuilt from `entries`.
-///
-/// `server_name` is used for SNI and certificate verification.
-///
-/// `path` is an optional requested resource path. TLS has no request line of
-/// its own, so when set it is sent in-band via the QMux `path` transport
-/// parameter; the server reads it via [`Session::path`]. Pass `None` to send no
-/// path.
-pub async fn connect<'a>(
-    addr: impl ToSocketAddrs,
-    server_name: &str,
+/// `{v.prefix()}{alpn}` per version (empty = every QMux draft this crate knows
+/// about). The bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) are
+/// appended as well unless [`require_protocol`](Client::require_protocol) is
+/// set, in which case only the prefixed pairs are offered. The peer's chosen
+/// ALPN determines the QMux wire-format version; the `alpn_protocols` field on
+/// the supplied `rustls::ClientConfig` is ignored and rebuilt from the entries.
+#[derive(Clone)]
+pub struct Client {
     config: Arc<rustls::ClientConfig>,
-    entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
+    protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
-    path: Option<&str>,
-) -> Result<Session, Error> {
-    let stream = TcpStream::connect(&addr).await?;
-
-    let server_name = rustls::pki_types::ServerName::try_from(server_name)
-        .map_err(|_| Error::InvalidServerName)?
-        .to_owned();
-
-    let prefixed = alpn::build(entries, require_protocol);
-
-    let mut config = (*config).clone();
-    config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
-
-    tracing::debug!(?prefixed, "TLS connecting");
-
-    let connector = TlsConnector::from(Arc::new(config));
-    let tls_stream = connector.connect(server_name, stream).await?;
-
-    let negotiated = tls_stream.get_ref().1.alpn_protocol();
-    let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
-    tracing::debug!(?negotiated_str, "TLS negotiated ALPN");
-
-    let (version, protocol) = alpn::parse(negotiated_str);
-    tracing::debug!(?version, ?protocol, "parsed ALPN");
-
-    // In strict mode an unrecognized or absent ALPN would otherwise fall
-    // through to the legacy `webtransport` wire format with no app protocol,
-    // silently downgrading the negotiation we promised to enforce.
-    if require_protocol && protocol.is_none() {
-        return Err(Error::InvalidProtocol(
-            negotiated_str.unwrap_or("<none>").to_string(),
-        ));
-    }
-
-    let mut session_config = Config::negotiated(version, protocol);
-    session_config.path = path.map(str::to_string);
-    let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-    // `connect` awaits the peer's transport parameters so `path()` is resolved.
-    Session::connect(transport, session_config).await
+    path: Option<String>,
 }
 
-/// Accept a TLS connection.
+impl Client {
+    /// Start building a TLS client with the given `rustls::ClientConfig`.
+    pub fn new(config: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            config,
+            protocols: Vec::new(),
+            require_protocol: false,
+            path: None,
+        }
+    }
+
+    /// Advertise `alpn` under the listed QMux wire-format versions.
+    ///
+    /// Pass `&[v]` to pin to one version, `&[v1, v2]` to enumerate, or `&[]`
+    /// to expand to every QMux draft this crate knows about.
+    pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
+        self.protocols.push((alpn.to_string(), versions.to_vec()));
+        self
+    }
+
+    /// Advertise multiple `(alpn, versions)` entries in preference order.
+    pub fn with_protocols<'a>(
+        mut self,
+        entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
+    ) -> Self {
+        self.protocols.extend(
+            entries
+                .into_iter()
+                .map(|(a, vs)| (a.to_string(), vs.to_vec())),
+        );
+        self
+    }
+
+    /// Offer only the prefixed `(alpn, version)` pairs, suppressing the bare
+    /// version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) offered by default.
+    pub fn require_protocol(mut self) -> Self {
+        self.require_protocol = true;
+        self
+    }
+
+    /// Advertise a requested resource `path`.
+    ///
+    /// TLS has no request line of its own, so when set the path is sent in-band
+    /// via the QMux `path` transport parameter; the server reads it via
+    /// [`Session::path`]. Omit to send no path.
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Connect to `addr` and start a client session. `server_name` is used for
+    /// SNI and certificate verification.
+    pub async fn connect(
+        &self,
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+    ) -> Result<Session, Error> {
+        let stream = TcpStream::connect(&addr).await?;
+
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
+            .map_err(|_| Error::InvalidServerName)?
+            .to_owned();
+
+        let entries = self
+            .protocols
+            .iter()
+            .map(|(a, vs)| (a.as_str(), vs.as_slice()));
+        let prefixed = alpn::build(entries, self.require_protocol);
+
+        let mut config = (*self.config).clone();
+        config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
+
+        tracing::debug!(?prefixed, "TLS connecting");
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let tls_stream = connector.connect(server_name, stream).await?;
+
+        let negotiated = tls_stream.get_ref().1.alpn_protocol();
+        let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
+        tracing::debug!(?negotiated_str, "TLS negotiated ALPN");
+
+        let (version, protocol) = alpn::parse(negotiated_str);
+        tracing::debug!(?version, ?protocol, "parsed ALPN");
+
+        // In strict mode an unrecognized or absent ALPN would otherwise fall
+        // through to the legacy `webtransport` wire format with no app protocol,
+        // silently downgrading the negotiation we promised to enforce.
+        if self.require_protocol && protocol.is_none() {
+            return Err(Error::InvalidProtocol(
+                negotiated_str.unwrap_or("<none>").to_string(),
+            ));
+        }
+
+        let mut session_config = Config::negotiated(version, protocol);
+        session_config.path = self.path.clone();
+        let transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        // `connect` awaits the peer's transport parameters so `path()` is resolved.
+        Session::connect(transport, session_config).await
+    }
+}
+
+/// A QMux server that accepts TLS connections.
 ///
 /// Selection of an offered ALPN happens inside rustls based on the
-/// `alpn_protocols` already set on the supplied `rustls::ServerConfig`; the
-/// QMux wire-format version is then derived from the negotiated ALPN.
-/// Callers building that ALPN list should use `{version.prefix()}{alpn}` for
-/// each supported pair (e.g. `"qmux-01.moq-lite-04"`).
-pub async fn accept(
-    stream: TcpStream,
+/// `alpn_protocols` already set on the supplied `rustls::ServerConfig`; the QMux
+/// wire-format version is then derived from the negotiated ALPN. Callers
+/// building that ALPN list should use `{version.prefix()}{alpn}` for each
+/// supported pair (e.g. `"qmux-01.moq-lite-04"`).
+#[derive(Clone)]
+pub struct Server {
     config: Arc<rustls::ServerConfig>,
-) -> Result<Session, Error> {
-    let acceptor = TlsAcceptor::from(config);
-    let tls_stream = acceptor.accept(stream).await?;
+}
 
-    let negotiated = tls_stream.get_ref().1.alpn_protocol();
-    let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
-    tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
+impl Server {
+    /// Create a TLS server from the given `rustls::ServerConfig`.
+    pub fn new(config: Arc<rustls::ServerConfig>) -> Self {
+        Self { config }
+    }
 
-    let (version, protocol) = alpn::parse(negotiated_str);
-    tracing::debug!(?version, ?protocol, "parsed ALPN");
+    /// Accept a TLS connection over an established TCP stream.
+    pub async fn accept(&self, stream: TcpStream) -> Result<Session, Error> {
+        let acceptor = TlsAcceptor::from(self.config.clone());
+        let tls_stream = acceptor.accept(stream).await?;
 
-    let session_config = Config::negotiated(version, protocol);
-    let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-    // `accept` awaits the peer's transport parameters so `path()` is resolved.
-    Session::accept(transport, session_config).await
+        let negotiated = tls_stream.get_ref().1.alpn_protocol();
+        let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
+        tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
+
+        let (version, protocol) = alpn::parse(negotiated_str);
+        tracing::debug!(?version, ?protocol, "parsed ALPN");
+
+        let session_config = Config::negotiated(version, protocol);
+        let transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        // `accept` awaits the peer's transport parameters so `path()` is resolved.
+        Session::accept(transport, session_config).await
+    }
 }
