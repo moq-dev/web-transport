@@ -28,7 +28,13 @@ pub enum Protocol {
 }
 
 /// Configuration for a QMux session.
+///
+/// Construct with [`Config::new`] (or [`Config::negotiated`]) and set the public
+/// fields you need; the struct is `#[non_exhaustive]` so new fields can be added
+/// without breaking callers. For the common transports, prefer the higher-level
+/// [`tcp`](crate::tcp) / [`uds`](crate::uds) builders, which wrap this.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Config {
     /// Wire format version.
     pub version: Version,
