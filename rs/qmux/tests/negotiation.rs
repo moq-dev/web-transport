@@ -128,8 +128,9 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            // Await the client's params to read the path it advertised.
-            session.path().await
+            // Await the client's params to read the path it advertised. Own it
+            // so the borrow doesn't escape this task.
+            session.path().await.map(str::to_string)
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -157,7 +158,10 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            (session.protocol().map(str::to_string), session.path().await)
+            (
+                session.protocol().map(str::to_string),
+                session.path().await.map(str::to_string),
+            )
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -185,7 +189,7 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            session.path().await
+            session.path().await.map(str::to_string)
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
