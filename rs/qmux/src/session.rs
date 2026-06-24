@@ -40,12 +40,11 @@ pub struct Session {
     negotiated: Arc<OnceLock<Option<String>>>,
     negotiated_ready: watch::Receiver<bool>,
 
-    // Path the peer advertised via the `path` transport parameter. `None` inside
-    // the OnceLock means "no path"; the OnceLock being unset means the peer's
-    // params haven't arrived yet. `peer_path_ready` flips to `true` once it's
-    // set, so `path()` can await it.
-    peer_path: Arc<OnceLock<Option<String>>>,
-    peer_path_ready: watch::Receiver<bool>,
+    // Path the peer advertised via the `path` transport parameter. The watch
+    // holds `None` while unresolved, then `Some(path)` / `Some(None)` once the
+    // peer's params arrive (or the connection closes). `path()` awaits that
+    // transition; the value and the readiness signal live in the one channel.
+    peer_path: watch::Receiver<Option<Option<String>>>,
 
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
@@ -81,9 +80,8 @@ struct SessionState<T: Transport> {
     negotiated: Arc<OnceLock<Option<String>>>,
     negotiated_ready: watch::Sender<bool>,
 
-    // Peer's advertised path — see the matching fields on `Session`.
-    peer_path: Arc<OnceLock<Option<String>>>,
-    peer_path_ready: watch::Sender<bool>,
+    // Peer's advertised path — see the matching field on `Session`.
+    peer_path: watch::Sender<Option<Option<String>>>,
 
     // Flow control state
     conn_send_credit: Credit,
@@ -494,11 +492,17 @@ impl<T: Transport> SessionState<T> {
     }
 
     /// Record the peer's advertised path exactly once and wake any
-    /// `Session::peer_path()` waiters. Later calls are no-ops.
+    /// `Session::path()` waiters. The first resolution — the peer's params or
+    /// the connection closing — wins; later calls are no-ops.
     fn resolve_peer_path(&self, path: Option<String>) {
-        if self.peer_path.set(path).is_ok() {
-            self.peer_path_ready.send_replace(true);
-        }
+        self.peer_path.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(path);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
@@ -613,13 +617,13 @@ impl Session {
     /// closes first. For the legacy `webtransport` wire format — which exchanges
     /// no parameters — it resolves to `None` immediately.
     pub async fn path(&self) -> Option<String> {
-        if self.peer_path.get().is_none() {
-            // `wait_for` checks the current value first, so this can't miss the
-            // transition even if it already happened.
-            let mut ready = self.peer_path_ready.clone();
-            ready.wait_for(|&done| done).await.ok();
-        }
-        self.peer_path.get().cloned().flatten()
+        let mut rx = self.peer_path.clone();
+        // `wait_for` checks the current value first, so this can't miss a
+        // resolution that already happened. `.ok()` covers the sender dropping
+        // without resolving — `flatten()` then yields `None`.
+        rx.wait_for(|slot| slot.is_some()).await.ok();
+        let resolved = rx.borrow().clone();
+        resolved.flatten()
     }
 
     fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
@@ -653,15 +657,12 @@ impl Session {
             }
         }
 
-        // Peer path. Resolved once the peer's transport parameters arrive. Only
-        // QMux versions exchange params; the legacy `webtransport` format never
-        // does, so resolve it to `None` eagerly to keep `peer_path()` from hanging.
-        let peer_path: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
-        let (peer_path_ready_tx, peer_path_ready_rx) = watch::channel(false);
-        if !version.is_qmux() {
-            peer_path.set(None).ok();
-            peer_path_ready_tx.send_replace(true);
-        }
+        // Peer path. Unresolved (`None`) until the peer's transport parameters
+        // arrive. Only QMux versions exchange params; the legacy `webtransport`
+        // format never does, so resolve to `Some(None)` eagerly to keep `path()`
+        // from hanging.
+        let initial_peer_path = if version.is_qmux() { None } else { Some(None) };
+        let (peer_path_tx, peer_path_rx) = watch::channel(initial_peer_path);
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
         let open_uni_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -701,8 +702,7 @@ impl Session {
             closed: closed.clone(),
             negotiated: negotiated.clone(),
             negotiated_ready: negotiated_ready_tx,
-            peer_path: peer_path.clone(),
-            peer_path_ready: peer_path_ready_tx,
+            peer_path: peer_path_tx,
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
             our_params: our_params.clone(),
@@ -753,8 +753,7 @@ impl Session {
             closed,
             negotiated,
             negotiated_ready: negotiated_ready_rx,
-            peer_path,
-            peer_path_ready: peer_path_ready_rx,
+            peer_path: peer_path_rx,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,
