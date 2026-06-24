@@ -51,9 +51,6 @@ pub enum Error {
     #[error("invalid protocol token: {0:?}")]
     InvalidProtocol(String),
 
-    #[error("invalid path: {0:?}")]
-    InvalidPath(String),
-
     /// Peer sent the `application_protocols` transport parameter, but this
     /// session isn't negotiating in-band (e.g. it's a TLS/WebSocket session that
     /// already negotiated via ALPN, or a stream session that didn't opt in).

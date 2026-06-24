@@ -34,15 +34,13 @@ pub struct Session {
     closed: watch::Sender<Option<Error>>,
 
     // Negotiated application protocol (via the application_protocols transport
-    // parameter) and the path the peer advertised (via the `path` parameter).
-    // Both are resolved exactly once, before the session is handed to the caller
-    // (see `established()`), so `protocol()` / `path()` are plain synchronous
-    // getters. `None` inside an OnceLock means "no value"; unset means the peer's
+    // parameter). Resolved exactly once, before the session is handed to the
+    // caller (see `established()`), so `protocol()` is a plain synchronous
+    // getter. `None` inside the OnceLock means "no value"; unset means the peer's
     // params haven't arrived yet (only observable on a session you constructed
-    // without awaiting `established()`). OnceLocks give the resolved values a
-    // stable address so the getters can hand out `&str` borrows.
+    // without awaiting `established()`). The OnceLock gives the resolved value a
+    // stable address so the getter can hand out a `&str` borrow.
     negotiated: Arc<OnceLock<Option<String>>>,
-    peer_path: Arc<OnceLock<Option<String>>>,
 
     // Flips to `true` once the peer's transport parameters have been received and
     // applied (or eagerly for the param-less `webtransport` format). `established()`
@@ -79,10 +77,9 @@ struct SessionState<T: Transport> {
 
     closed: watch::Sender<Option<Error>>,
 
-    // Negotiated protocol, peer path, and handshake-complete signal — see the
-    // matching fields on `Session`.
+    // Negotiated protocol and handshake-complete signal — see the matching
+    // fields on `Session`.
     negotiated: Arc<OnceLock<Option<String>>>,
-    peer_path: Arc<OnceLock<Option<String>>>,
     established: watch::Sender<bool>,
 
     // Flow control state
@@ -511,10 +508,6 @@ impl<T: Transport> SessionState<T> {
             }
         }
 
-        // Surface the peer's path (if any). Unlike protocols this isn't gated on
-        // opt-in: it's optional routing metadata, so an absent param is just None.
-        self.peer_path.set(params.path.clone()).ok();
-
         // Set connection-level send credit from peer's initial_max_data
         self.conn_send_credit
             .increase_max(params.initial_max_data)
@@ -549,8 +542,8 @@ impl<T: Transport> SessionState<T> {
 
         self.peer_params = params;
 
-        // Handshake complete: `negotiated` and `peer_path` are now set, so unblock
-        // `established()` and let the synchronous getters return their final values.
+        // Handshake complete: `negotiated` is now set, so unblock `established()`
+        // and let the synchronous getter return its final value.
         self.established.send_replace(true);
 
         Ok(())
@@ -562,10 +555,9 @@ impl Session {
     /// established before returning.
     ///
     /// "Established" means the peer's transport parameters have been received and
-    /// applied, so [`protocol`](web_transport_trait::Session::protocol) and
-    /// [`path`](Session::path) return their final values. The legacy
-    /// `webtransport` wire format exchanges no parameters, so it is established
-    /// immediately.
+    /// applied, so [`protocol`](web_transport_trait::Session::protocol) returns
+    /// its final value. The legacy `webtransport` wire format exchanges no
+    /// parameters, so it is established immediately.
     ///
     /// Bounded by [`Config::handshake_timeout`](crate::Config::handshake_timeout):
     /// if the peer completes the transport handshake but never sends its
@@ -624,17 +616,6 @@ impl Session {
         }
     }
 
-    /// The path the peer advertised via the `path` transport parameter.
-    ///
-    /// For a server this is the resource path the client requested; for a client
-    /// it's whatever the server advertised (usually `None`). Mirrors
-    /// [`protocol`](web_transport_trait::Session::protocol): a synchronous getter
-    /// that returns the resolved value, since [`connect`](Session::connect) /
-    /// [`accept`](Session::accept) only return once the handshake has completed.
-    pub fn path(&self) -> Option<&str> {
-        self.peer_path.get().and_then(|p| p.as_deref())
-    }
-
     /// Construct a session over the transport and start its run loop, without
     /// waiting for the handshake. The public entry points are the async
     /// [`connect`](Session::connect) / [`accept`](Session::accept), which await
@@ -668,16 +649,10 @@ impl Session {
             }
         }
 
-        // Peer path. Resolved once the peer's transport parameters arrive.
-        let peer_path: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
-
         // Handshake-complete signal. QMux versions flip it once the peer's params
         // arrive; the legacy `webtransport` format exchanges none, so it (and the
-        // resolved getters) are established eagerly.
+        // resolved getter) are established eagerly.
         let (established_tx, established_rx) = watch::channel(!version.is_qmux());
-        if !version.is_qmux() {
-            peer_path.set(None).ok();
-        }
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
         let open_uni_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -716,7 +691,6 @@ impl Session {
             recv_streams: HashMap::new(),
             closed: closed.clone(),
             negotiated: negotiated.clone(),
-            peer_path: peer_path.clone(),
             established: established_tx,
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
@@ -735,8 +709,8 @@ impl Session {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // Dropping `backend` drops the `established` sender; an `established()`
             // waiter that was still pending then observes the channel close and
-            // reports this terminal error. The OnceLocks stay unset, so the
-            // synchronous getters report `None` on a never-established session.
+            // reports this terminal error. The OnceLock stays unset, so the
+            // synchronous getter reports `None` on a never-established session.
             // Close all credits so blocked claim()/claim_index() calls unblock
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
@@ -751,7 +725,7 @@ impl Session {
             // `send_replace`, not `send`: the latter drops the value when there
             // are no receivers, which loses the close reason for any `closed()`
             // call made after the session has already finished closing (e.g. after
-            // awaiting `path()` on a peer that closed without sending params).
+            // awaiting establishment on a peer that closed without sending params).
             // Storing it unconditionally keeps late waiters correct.
             backend.closed.send_replace(Some(err));
         });
@@ -767,7 +741,6 @@ impl Session {
             create_bi: create_bi_tx,
             closed,
             negotiated,
-            peer_path,
             established: established_rx,
             open_bi_credit,
             open_uni_credit,

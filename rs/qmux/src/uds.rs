@@ -47,16 +47,6 @@ impl Config {
         self
     }
 
-    /// Advertise a requested resource `path`.
-    ///
-    /// A Unix socket has no URL, so a client that needs to address a specific
-    /// resource sends the path in-band. The peer reads it via
-    /// [`Session::path`](crate::Session::path). Omit to send no path.
-    pub fn path(mut self, path: impl Into<String>) -> Self {
-        self.inner.path = Some(path.into());
-        self
-    }
-
     /// Override how long establishment waits for the peer's transport
     /// parameters before failing with [`Error::HandshakeTimeout`]. Defaults to
     /// 10s; a zero duration waits indefinitely. See
@@ -89,7 +79,7 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     // `build_stream_session` awaits the peer's transport parameters before
-    // returning, so `protocol()` and `path()` are resolved on the session we hand
-    // back (bounded by the config's handshake timeout).
+    // returning, so `protocol()` is resolved on the session we hand back
+    // (bounded by the config's handshake timeout).
     build_stream_session(stream, config, is_server).await
 }

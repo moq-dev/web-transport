@@ -49,16 +49,6 @@ impl Config {
         self
     }
 
-    /// Advertise a requested resource `path`.
-    ///
-    /// TCP has no URL, so a client that needs to address a specific resource
-    /// sends the path in-band. The peer reads it via
-    /// [`Session::path`](crate::Session::path). Omit to send no path.
-    pub fn path(mut self, path: impl Into<String>) -> Self {
-        self.inner.path = Some(path.into());
-        self
-    }
-
     /// Override how long establishment waits for the peer's transport
     /// parameters before failing with [`Error::HandshakeTimeout`]. Defaults to
     /// 10s; a zero duration waits indefinitely. See
@@ -71,9 +61,9 @@ impl Config {
     /// Connect to `addr` and start a client session.
     ///
     /// Awaits the peer's transport parameters before returning, so
-    /// [`Session::protocol`](web_transport_trait::Session::protocol) and
-    /// [`Session::path`](crate::Session::path) are populated on the returned
-    /// session (bounded by [`handshake_timeout`](Self::handshake_timeout)).
+    /// [`Session::protocol`](web_transport_trait::Session::protocol) is populated
+    /// on the returned session (bounded by
+    /// [`handshake_timeout`](Self::handshake_timeout)).
     pub async fn connect(self, addr: impl ToSocketAddrs) -> Result<Session, Error> {
         let stream = TcpStream::connect(addr).await?;
         finish(stream, self.inner, false).await
@@ -96,7 +86,7 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     // `build_stream_session` awaits the peer's transport parameters before
-    // returning, so `protocol()` and `path()` are resolved on the session we hand
-    // back (bounded by the config's handshake timeout).
+    // returning, so `protocol()` is resolved on the session we hand back
+    // (bounded by the config's handshake timeout).
     build_stream_session(stream, config, is_server).await
 }
