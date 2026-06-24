@@ -5,7 +5,7 @@
 //! *fail* the handshake, not silently connect.
 
 use std::{
-    net::{Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     time::Duration,
 };
 
@@ -88,7 +88,13 @@ async fn spawn_server(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-    let bind: SocketAddr = (Ipv6Addr::LOCALHOST, 0).into();
+    // Bind to whatever `localhost` resolves to first. The client connects to the
+    // same name, so server and client agree on the address family regardless of
+    // the host's v4/v6 ordering (otherwise CI flakes when ::1 vs 127.0.0.1 differ).
+    let bind = ("localhost", 0)
+        .to_socket_addrs()?
+        .next()
+        .context("localhost did not resolve")?;
     let mut server = ServerBuilder::default()
         .with_bind(bind)?
         .with_single_cert(chain, key)?;
@@ -109,10 +115,19 @@ async fn spawn_server(
     Ok((addr, handle))
 }
 
-// Connect by hostname so root-based verification sees a matching DNS SAN.
-// `localhost` resolves to `::1` first on the test hosts, matching the IPv6 bind.
+// Connect by hostname so root-based verification sees a matching DNS SAN. Both
+// the server bind and this connect resolve `localhost`, so they pick the same
+// address; only the port from the bound socket is needed here.
 fn url_for(addr: SocketAddr) -> Result<Url> {
     Ok(Url::parse(&format!("https://localhost:{}/", addr.port()))?)
+}
+
+/// Loopback bind address matching the family of `addr`, for the client socket.
+fn loopback_for(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(_) => (Ipv4Addr::LOCALHOST, 0).into(),
+        SocketAddr::V6(_) => (Ipv6Addr::LOCALHOST, 0).into(),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -124,7 +139,7 @@ async fn cert_hash_accept() -> Result<()> {
     let (addr, server) = spawn_server(chain, key).await?;
 
     let session = ClientBuilder::default()
-        .with_bind((Ipv6Addr::LOCALHOST, 0))?
+        .with_bind(loopback_for(addr))?
         .with_server_certificate_hashes(vec![hash])
         .connect(url_for(addr)?)
         .await?
@@ -160,10 +175,11 @@ async fn cert_hash_reject() -> Result<()> {
     // A hash that does not match any certificate.
     let wrong = [0xAB; 32];
     let url = url_for(addr)?;
+    let client_bind = loopback_for(addr);
 
     let result = tokio::time::timeout(Duration::from_secs(5), async move {
         ClientBuilder::default()
-            .with_bind((Ipv6Addr::LOCALHOST, 0))?
+            .with_bind(client_bind)?
             .with_server_certificate_hashes(vec![wrong])
             .connect(url)
             .await?
@@ -190,7 +206,7 @@ async fn custom_roots_accept() -> Result<()> {
     let (addr, server) = spawn_server(chain, key).await?;
 
     let session = ClientBuilder::default()
-        .with_bind((Ipv6Addr::LOCALHOST, 0))?
+        .with_bind(loopback_for(addr))?
         .with_root_certificates(vec![ca_root])
         .connect(url_for(addr)?)
         .await?
@@ -200,6 +216,40 @@ async fn custom_roots_accept() -> Result<()> {
 
     session.close(0, "bye");
     session.closed().await;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_roots_reject() -> Result<()> {
+    init_tracing();
+
+    // Server presents a leaf from one CA; the client trusts a *different* CA.
+    // Verification must fail rather than fall back to accepting the peer.
+    let (_server_ca, chain, key) = make_ca_chain()?;
+    let (other_ca, _other_chain, _other_key) = make_ca_chain()?;
+    let (addr, server) = spawn_server(chain, key).await?;
+
+    let url = url_for(addr)?;
+    let client_bind = loopback_for(addr);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async move {
+        ClientBuilder::default()
+            .with_bind(client_bind)?
+            .with_root_certificates(vec![other_ca])
+            .connect(url)
+            .await?
+            .established()
+            .await
+    })
+    .await
+    .context("handshake neither succeeded nor failed within the timeout")?;
+
+    assert!(
+        result.is_err(),
+        "handshake must fail when the server cert chains to an untrusted root"
+    );
+
     server.abort();
     Ok(())
 }

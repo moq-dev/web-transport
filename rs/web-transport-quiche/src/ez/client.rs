@@ -167,14 +167,14 @@ impl<M: Metrics> ClientBuilder<M> {
         }
 
         // Install a TLS hook whenever we present a client certificate or need a
-        // non-default verification policy. ALPN is left to tokio-quiche, which
-        // applies it at the config level after the hook runs.
+        // non-default verification policy. The SSL context is built (and the
+        // certificate material validated) here so a bad cert/key/root fails the
+        // connection rather than silently dropping the policy inside the hook.
+        // ALPN is left to tokio-quiche, which applies it after the hook runs.
         let needs_hook = self.tls.is_some() || !matches!(self.verify, ClientVerify::Default);
         let (tls_cert, hooks) = if needs_hook {
-            let hook = ClientHook {
-                cert: self.tls,
-                verify: self.verify,
-            };
+            let ctx = crate::ez::tls::build_client_context(self.tls.as_ref(), &self.verify)?;
+            let hook = ClientHook::new(ctx);
             // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
             let dummy_tls = TlsCertificatePaths {
                 cert: "",

@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::Arc;
 
 use boring::ec::EcKey;
@@ -216,11 +217,57 @@ pub(crate) enum ClientVerify {
     Hashes(Vec<[u8; 32]>),
 }
 
-/// Client-side TLS hook: optionally presents a client certificate (mTLS) and
-/// installs the requested server-verification policy.
-pub(crate) struct ClientHook {
-    pub cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-    pub verify: ClientVerify,
+/// Build the client SSL context: optionally present a client certificate
+/// (mTLS) and install the requested server-verification policy.
+///
+/// Fallible up front (at connect time) so a malformed certificate, key, or
+/// root surfaces as a connection error. The [ConnectionHook] returns
+/// `Option<SslContextBuilder>` and `None` silently falls back to tokio-quiche's
+/// default (unverified) config, so the policy must never be dropped there.
+pub(crate) fn build_client_context(
+    cert: Option<&(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    verify: &ClientVerify,
+) -> io::Result<SslContextBuilder> {
+    let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(io::Error::other)?;
+
+    if let Some((chain, key)) = cert {
+        apply_client_cert(&mut builder, chain, key)?;
+    }
+
+    match verify {
+        ClientVerify::Default => {}
+        ClientVerify::Roots(roots) => {
+            let mut store = X509StoreBuilder::new().map_err(io::Error::other)?;
+            for der in roots {
+                let cert = X509::from_der(der.as_ref()).map_err(io::Error::other)?;
+                store.add_cert(cert).map_err(io::Error::other)?;
+            }
+            builder.set_cert_store_builder(store);
+            builder.set_verify(SslVerifyMode::PEER);
+        }
+        ClientVerify::Hashes(hashes) => {
+            let hashes = hashes.clone();
+            // Fully replaces standard verification: accept the peer iff the
+            // SHA-256 of its leaf DER is in the allow-list.
+            builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
+                let cert = ssl
+                    .peer_certificate()
+                    .ok_or(SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN))?;
+                let digest = cert
+                    .digest(MessageDigest::sha256())
+                    .map_err(|_| SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))?;
+                if hashes.iter().any(|h| h.as_slice() == digest.as_ref()) {
+                    Ok(())
+                } else {
+                    Err(SslVerifyError::Invalid(
+                        SslAlert::BAD_CERTIFICATE_HASH_VALUE,
+                    ))
+                }
+            });
+        }
+    }
+
+    Ok(builder)
 }
 
 /// Set the leaf, intermediates, and private key on the builder for mTLS.
@@ -228,42 +275,43 @@ fn apply_client_cert(
     builder: &mut SslContextBuilder,
     chain: &[CertificateDer<'static>],
     key: &PrivateKeyDer<'static>,
-) -> Option<()> {
-    let leaf = X509::from_der(
-        chain
-            .first()
-            .or_else(|| {
-                tracing::warn!("empty client certificate chain");
-                None
-            })?
-            .as_ref(),
-    )
-    .inspect_err(|err| tracing::warn!(%err, "failed to parse client leaf certificate DER"))
-    .ok()?;
-    builder
-        .set_certificate(&leaf)
-        .inspect_err(|err| tracing::warn!(%err, "failed to set client leaf certificate"))
-        .ok()?;
+) -> io::Result<()> {
+    let leaf_der = chain.first().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty client certificate chain",
+        )
+    })?;
+    let leaf = X509::from_der(leaf_der.as_ref()).map_err(io::Error::other)?;
+    builder.set_certificate(&leaf).map_err(io::Error::other)?;
 
     for cert_der in chain.iter().skip(1) {
-        let cert = X509::from_der(cert_der.as_ref())
-            .inspect_err(|err| tracing::warn!(%err, "failed to parse client intermediate DER"))
-            .ok()?;
+        let cert = X509::from_der(cert_der.as_ref()).map_err(io::Error::other)?;
         builder
             .add_extra_chain_cert(cert)
-            .inspect_err(|err| tracing::warn!(%err, "failed to add client intermediate"))
-            .ok()?;
+            .map_err(io::Error::other)?;
     }
 
-    let key = der_to_boring_key(key)
-        .inspect_err(|err| tracing::warn!(%err, "failed to parse client private key"))
-        .ok()?;
-    builder
-        .set_private_key(&key)
-        .inspect_err(|err| tracing::warn!(%err, "failed to set client private key"))
-        .ok()?;
+    let key = der_to_boring_key(key).map_err(io::Error::other)?;
+    builder.set_private_key(&key).map_err(io::Error::other)?;
 
-    Some(())
+    Ok(())
+}
+
+/// Client-side TLS hook holding a pre-built, pre-validated SSL context.
+///
+/// The context is built once at connect time (see [build_client_context]); the
+/// hook just hands it over. tokio-quiche calls this once per socket.
+pub(crate) struct ClientHook {
+    builder: std::sync::Mutex<Option<SslContextBuilder>>,
+}
+
+impl ClientHook {
+    pub fn new(builder: SslContextBuilder) -> Self {
+        Self {
+            builder: std::sync::Mutex::new(Some(builder)),
+        }
+    }
 }
 
 impl ConnectionHook for ClientHook {
@@ -271,56 +319,13 @@ impl ConnectionHook for ClientHook {
         &self,
         _settings: TlsCertificatePaths<'_>,
     ) -> Option<SslContextBuilder> {
-        let mut builder = SslContextBuilder::new(SslMethod::tls())
-            .inspect_err(|err| tracing::warn!(%err, "failed to create SSL context"))
-            .ok()?;
-
-        if let Some((chain, key)) = &self.cert {
-            apply_client_cert(&mut builder, chain, key)?;
+        let builder = self.builder.lock().unwrap().take();
+        if builder.is_none() {
+            // Should be unreachable: the hook is invoked once per socket. Falling
+            // back to the default config would drop the verification policy, so
+            // refuse loudly rather than silently downgrading.
+            tracing::error!("client SSL context requested more than once; refusing to reuse");
         }
-
-        match &self.verify {
-            ClientVerify::Default => {}
-            ClientVerify::Roots(roots) => {
-                let mut store = X509StoreBuilder::new()
-                    .inspect_err(|err| tracing::warn!(%err, "failed to create cert store"))
-                    .ok()?;
-                for der in roots {
-                    let cert = X509::from_der(der.as_ref())
-                        .inspect_err(
-                            |err| tracing::warn!(%err, "failed to parse root certificate DER"),
-                        )
-                        .ok()?;
-                    store
-                        .add_cert(cert)
-                        .inspect_err(|err| tracing::warn!(%err, "failed to add root certificate"))
-                        .ok()?;
-                }
-                builder.set_cert_store_builder(store);
-                builder.set_verify(SslVerifyMode::PEER);
-            }
-            ClientVerify::Hashes(hashes) => {
-                let hashes = hashes.clone();
-                // Fully replaces standard verification: accept the peer iff the
-                // SHA-256 of its leaf DER is in the allow-list.
-                builder.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
-                    let cert = ssl
-                        .peer_certificate()
-                        .ok_or(SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN))?;
-                    let digest = cert
-                        .digest(MessageDigest::sha256())
-                        .map_err(|_| SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))?;
-                    if hashes.iter().any(|h| h.as_slice() == digest.as_ref()) {
-                        Ok(())
-                    } else {
-                        Err(SslVerifyError::Invalid(
-                            SslAlert::BAD_CERTIFICATE_HASH_VALUE,
-                        ))
-                    }
-                });
-            }
-        }
-
-        Some(builder)
+        builder
     }
 }
