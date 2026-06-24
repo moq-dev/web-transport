@@ -17,7 +17,8 @@ pub enum Protocol {
     /// receiving the parameter while *not* in this mode is a protocol error.
     /// The agreed protocol is surfaced by
     /// [`Session::protocol`](web_transport_trait::Session::protocol), resolved
-    /// by the time [`Session::established`](crate::Session::established) completes.
+    /// by the time [`Session::connect`](crate::Session::connect) /
+    /// [`accept`](crate::Session::accept) returns.
     Negotiate(Vec<String>),
 
     /// Already negotiated out of band (TLS / WebSocket ALPN). Reported as-is;
@@ -60,11 +61,12 @@ pub struct Config {
     /// Maximum QMux Record size in bytes (draft-01). Default: 16382.
     pub max_record_size: u64,
 
-    /// How long [`Session::established`](crate::Session::established) waits for
-    /// the peer's transport parameters before giving up. Bounds the handshake so
-    /// a peer that completes the transport connection but never sends its
-    /// parameters can't hang `connect`/`accept` forever. Default: 10s; a zero
-    /// duration disables the timeout (wait indefinitely).
+    /// How long [`Session::connect`](crate::Session::connect) /
+    /// [`accept`](crate::Session::accept) waits for the peer's transport
+    /// parameters before giving up. Bounds the handshake so a peer that completes
+    /// the transport connection but never sends its parameters can't hang
+    /// establishment forever. Default: 10s; a zero duration disables the timeout
+    /// (wait indefinitely).
     pub handshake_timeout: Duration,
 }
 

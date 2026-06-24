@@ -65,10 +65,8 @@ pub async fn connect<'a>(
     let mut session_config = Config::negotiated(version, protocol);
     session_config.path = path.map(str::to_string);
     let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-    let session = Session::connect(transport, session_config);
-    // Await the peer's transport parameters so `path()` is resolved on return.
-    session.established().await?;
-    Ok(session)
+    // `connect` awaits the peer's transport parameters so `path()` is resolved.
+    Session::connect(transport, session_config).await
 }
 
 /// Accept a TLS connection.
@@ -94,8 +92,6 @@ pub async fn accept(
 
     let session_config = Config::negotiated(version, protocol);
     let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-    let session = Session::accept(transport, session_config);
-    // Await the peer's transport parameters so `path()` is resolved on return.
-    session.established().await?;
-    Ok(session)
+    // `accept` awaits the peer's transport parameters so `path()` is resolved.
+    Session::accept(transport, session_config).await
 }

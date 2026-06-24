@@ -83,10 +83,8 @@ async fn finish(
     config: crate::Config,
     is_server: bool,
 ) -> Result<Session, Error> {
-    let session = build_stream_session(stream, config, is_server)?;
-    // Await the peer's transport parameters before returning, so `protocol()` and
-    // `path()` are resolved on the session we hand back. Bounded by the config's
-    // handshake timeout.
-    session.established().await?;
-    Ok(session)
+    // `build_stream_session` awaits the peer's transport parameters before
+    // returning, so `protocol()` and `path()` are resolved on the session we hand
+    // back (bounded by the config's handshake timeout).
+    build_stream_session(stream, config, is_server).await
 }

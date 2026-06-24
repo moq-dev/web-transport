@@ -83,15 +83,29 @@ where
     }
 
     /// Wrap as a client-side session.
+    ///
+    /// The protocol is already known from the negotiated subprotocol (ALPN), so
+    /// this returns synchronously without awaiting in-band parameters.
     pub fn connect(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::connect(self.into_transport(), Config::negotiated(version, protocol))
+        Session::new(
+            self.into_transport(),
+            false,
+            Config::negotiated(version, protocol),
+        )
     }
 
     /// Wrap as a server-side session.
+    ///
+    /// As with [`connect`](Self::connect), the protocol is known from the
+    /// negotiated subprotocol, so this returns synchronously.
     pub fn accept(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::accept(self.into_transport(), Config::negotiated(version, protocol))
+        Session::new(
+            self.into_transport(),
+            true,
+            Config::negotiated(version, protocol),
+        )
     }
 
     fn into_transport(self) -> WsTransport<T> {
@@ -241,8 +255,10 @@ impl Client {
             Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
             None => WsTransport::new(ws_stream),
         };
-        Ok(Session::connect(
+        // Protocol came from the negotiated subprotocol, so no in-band wait.
+        Ok(Session::new(
             transport,
+            false,
             Config::negotiated(version, protocol),
         ))
     }
@@ -396,8 +412,10 @@ impl Server {
             Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
             None => WsTransport::new(ws),
         };
-        Ok(Session::accept(
+        // Protocol came from the negotiated subprotocol, so no in-band wait.
+        Ok(Session::new(
             transport,
+            true,
             Config::negotiated(version, protocol),
         ))
     }

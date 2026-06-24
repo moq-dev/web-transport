@@ -59,7 +59,7 @@ mod stream_transport {
     ///
     /// let config = Config::new(Version::QMux01);
     /// let transport = Stream::new(stream, config.version, config.max_record_size);
-    /// let session = Session::connect(transport, config);
+    /// let session = Session::connect(transport, config).await?;
     /// # let _ = session; Ok(())
     /// # }
     /// ```
@@ -482,7 +482,7 @@ mod stream_session {
 
     /// Wrap a byte stream in a [`Stream`] and start a session, validating any
     /// advertised protocol names first. Used by the `tcp`/`uds` builders.
-    pub(crate) fn build<T: AsyncRead + AsyncWrite + Send + 'static>(
+    pub(crate) async fn build<T: AsyncRead + AsyncWrite + Send + 'static>(
         stream: T,
         config: Config,
         is_server: bool,
@@ -493,11 +493,11 @@ mod stream_session {
             }
         }
         let transport = Stream::new(stream, config.version, config.max_record_size);
-        Ok(if is_server {
-            Session::accept(transport, config)
+        if is_server {
+            Session::accept(transport, config).await
         } else {
-            Session::connect(transport, config)
-        })
+            Session::connect(transport, config).await
+        }
     }
 }
 

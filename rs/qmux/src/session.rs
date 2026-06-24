@@ -558,38 +558,37 @@ impl<T: Transport> SessionState<T> {
 }
 
 impl Session {
-    /// Create a client-side session over the given transport.
-    pub fn connect<T: Transport>(transport: T, config: Config) -> Self {
-        Self::new(transport, false, config)
-    }
-
-    /// Create a server-side session over the given transport.
-    pub fn accept<T: Transport>(transport: T, config: Config) -> Self {
-        Self::new(transport, true, config)
-    }
-
-    /// Wait until the session is established — the peer's transport parameters
-    /// have been received and applied, so [`protocol`] and [`path`] return their
-    /// final values.
+    /// Open a client-side session over the given transport, waiting until it is
+    /// established before returning.
     ///
-    /// The transport builders ([`tcp`], [`uds`], [`tls`]) await this internally,
-    /// so a session they hand back is already established. Call it yourself only
-    /// when you built the [`Session`] directly via [`Session::connect`] /
-    /// [`Session::accept`]. For the legacy `webtransport` wire format — which
-    /// exchanges no parameters — it resolves immediately.
+    /// "Established" means the peer's transport parameters have been received and
+    /// applied, so [`protocol`](web_transport_trait::Session::protocol) and
+    /// [`path`](Session::path) return their final values. The legacy
+    /// `webtransport` wire format exchanges no parameters, so it is established
+    /// immediately.
     ///
     /// Bounded by [`Config::handshake_timeout`](crate::Config::handshake_timeout):
     /// if the peer completes the transport handshake but never sends its
-    /// parameters, this closes the session and returns [`Error::HandshakeTimeout`]
-    /// rather than hanging. If the connection drops mid-handshake, the close
-    /// reason is returned instead.
-    ///
-    /// [`protocol`]: web_transport_trait::Session::protocol
-    /// [`path`]: Session::path
-    /// [`tcp`]: crate::tcp
-    /// [`uds`]: crate::uds
-    /// [`tls`]: crate::tls
-    pub async fn established(&self) -> Result<(), Error> {
+    /// parameters, this returns [`Error::HandshakeTimeout`] rather than hanging;
+    /// a mid-handshake disconnect returns the close reason.
+    pub async fn connect<T: Transport>(transport: T, config: Config) -> Result<Session, Error> {
+        let session = Self::new(transport, false, config);
+        session.established().await?;
+        Ok(session)
+    }
+
+    /// Open a server-side session over the given transport, waiting until it is
+    /// established before returning. See [`Session::connect`] for the semantics.
+    pub async fn accept<T: Transport>(transport: T, config: Config) -> Result<Session, Error> {
+        let session = Self::new(transport, true, config);
+        session.established().await?;
+        Ok(session)
+    }
+
+    /// Wait until the peer's transport parameters have been received and applied.
+    /// Folded into [`connect`](Session::connect) / [`accept`](Session::accept);
+    /// see those for the timeout and error semantics.
+    async fn established(&self) -> Result<(), Error> {
         let mut established = self.established.clone();
         if *established.borrow() {
             return Ok(());
@@ -630,13 +629,18 @@ impl Session {
     /// For a server this is the resource path the client requested; for a client
     /// it's whatever the server advertised (usually `None`). Mirrors
     /// [`protocol`](web_transport_trait::Session::protocol): a synchronous getter
-    /// that returns the resolved value, since a session is only handed back once
-    /// [`established`](Session::established) has completed.
+    /// that returns the resolved value, since [`connect`](Session::connect) /
+    /// [`accept`](Session::accept) only return once the handshake has completed.
     pub fn path(&self) -> Option<&str> {
         self.peer_path.get().and_then(|p| p.as_deref())
     }
 
-    fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
+    /// Construct a session over the transport and start its run loop, without
+    /// waiting for the handshake. The public entry points are the async
+    /// [`connect`](Session::connect) / [`accept`](Session::accept), which await
+    /// establishment; this is for callers that resolve their protocol out of band
+    /// (e.g. the WebSocket transport, which negotiates via the subprotocol).
+    pub(crate) fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
         let version = config.version;
         let our_params = config.to_transport_params();
 

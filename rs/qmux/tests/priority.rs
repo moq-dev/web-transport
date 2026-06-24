@@ -39,7 +39,7 @@ impl Transport for ThrottledTransport {
 }
 
 /// Build a connected client/server session pair over throttled in-memory pipes.
-fn pair(delay: Duration) -> (Session, Session) {
+async fn pair(delay: Duration) -> (Session, Session) {
     let (c2s_tx, c2s_rx) = mpsc::channel(64);
     let (s2c_tx, s2c_rx) = mpsc::channel(64);
 
@@ -55,9 +55,13 @@ fn pair(delay: Duration) -> (Session, Session) {
     };
 
     let config = Config::new(Version::QMux01);
-    let client = Session::connect(client_transport, config.clone());
-    let server = Session::accept(server_transport, config);
-    (client, server)
+    // `connect`/`accept` await establishment, so drive both ends concurrently —
+    // each side's handshake needs the other's transport parameters.
+    let (client, server) = tokio::join!(
+        Session::connect(client_transport, config.clone()),
+        Session::accept(server_transport, config),
+    );
+    (client.unwrap(), server.unwrap())
 }
 
 /// Higher-priority stream data jumps ahead of a low-priority backlog.
@@ -68,7 +72,7 @@ fn pair(delay: Duration) -> (Session, Session) {
 /// trickling through.
 #[tokio::test]
 async fn higher_priority_completes_first() {
-    let (client, server) = pair(Duration::from_millis(5));
+    let (client, server) = pair(Duration::from_millis(5)).await;
 
     const LO_LEN: usize = 200 * 1024;
     const HI_LEN: usize = 4 * 1024;
@@ -136,7 +140,7 @@ async fn higher_priority_completes_first() {
 /// fully before the other starts.
 #[tokio::test]
 async fn equal_priority_interleaves() {
-    let (client, server) = pair(Duration::from_millis(2));
+    let (client, server) = pair(Duration::from_millis(2)).await;
 
     const LEN: usize = 128 * 1024;
 
@@ -196,7 +200,7 @@ async fn equal_priority_interleaves() {
 /// large data backlog queued on another stream.
 #[tokio::test]
 async fn control_precedes_data_backlog() {
-    let (client, server) = pair(Duration::from_millis(5));
+    let (client, server) = pair(Duration::from_millis(5)).await;
 
     const LO_LEN: usize = 200 * 1024;
 
@@ -240,7 +244,7 @@ async fn control_precedes_data_backlog() {
 /// the receiver reassembles exactly what was written, in order.
 #[tokio::test]
 async fn mid_stream_set_priority_preserves_order() {
-    let (client, server) = pair(Duration::from_millis(2));
+    let (client, server) = pair(Duration::from_millis(2)).await;
 
     // A distinctive, position-encoded payload so any reorder/loss is detectable.
     let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
@@ -289,7 +293,7 @@ async fn mid_stream_set_priority_preserves_order() {
 #[tokio::test]
 async fn teardown_unblocks_blocked_writer() {
     // Long delay so the queue stays full and `write` blocks.
-    let (client, server) = pair(Duration::from_millis(500));
+    let (client, server) = pair(Duration::from_millis(500)).await;
 
     let mut s = client.open_uni().await.unwrap();
 
