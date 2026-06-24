@@ -40,6 +40,13 @@ pub struct Session {
     negotiated: Arc<OnceLock<Option<String>>>,
     negotiated_ready: watch::Receiver<bool>,
 
+    // Path the peer advertised via the `path` transport parameter. `None` inside
+    // the OnceLock means "no path"; the OnceLock being unset means the peer's
+    // params haven't arrived yet. `peer_path_ready` flips to `true` once it's
+    // set, so `peer_path()` can await it.
+    peer_path: Arc<OnceLock<Option<String>>>,
+    peer_path_ready: watch::Receiver<bool>,
+
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
     open_uni_credit: Credit,
@@ -73,6 +80,10 @@ struct SessionState<T: Transport> {
     // Negotiated application protocol — see the matching fields on `Session`.
     negotiated: Arc<OnceLock<Option<String>>>,
     negotiated_ready: watch::Sender<bool>,
+
+    // Peer's advertised path — see the matching fields on `Session`.
+    peer_path: Arc<OnceLock<Option<String>>>,
+    peer_path_ready: watch::Sender<bool>,
 
     // Flow control state
     conn_send_credit: Credit,
@@ -482,6 +493,14 @@ impl<T: Transport> SessionState<T> {
         }
     }
 
+    /// Record the peer's advertised path exactly once and wake any
+    /// `Session::peer_path()` waiters. Later calls are no-ops.
+    fn resolve_peer_path(&self, path: Option<String>) {
+        if self.peer_path.set(path).is_ok() {
+            self.peer_path_ready.send_replace(true);
+        }
+    }
+
     fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
         if self.params_received {
             // Duplicate transport parameters
@@ -507,6 +526,10 @@ impl<T: Transport> SessionState<T> {
                 }
             }
         }
+
+        // Surface the peer's path (if any). Unlike protocols this isn't gated on
+        // opt-in: it's optional routing metadata, so an absent param is just None.
+        self.resolve_peer_path(params.path.clone());
 
         // Set connection-level send credit from peer's initial_max_data
         self.conn_send_credit
@@ -579,6 +602,33 @@ impl Session {
         self.negotiated.get().cloned().flatten()
     }
 
+    /// The path the peer advertised via the `path` transport parameter, if any.
+    ///
+    /// Returns `None` either because the peer set no path or because its
+    /// transport parameters haven't arrived yet. Use [`Session::peer_path`] to
+    /// await them. The TCP and Unix-socket builders resolve this before they
+    /// return, so a server reading `path()` right after `accept` sees the
+    /// client's value; TLS sessions should `await` [`Session::peer_path`].
+    pub fn path(&self) -> Option<&str> {
+        self.peer_path.get().and_then(|p| p.as_deref())
+    }
+
+    /// Wait for the peer's advertised path.
+    ///
+    /// Resolves once the peer's transport parameters arrive (carrying its `path`
+    /// or nothing), or to `None` if the connection closes first. For the legacy
+    /// `webtransport` wire format — which exchanges no parameters — this resolves
+    /// to `None` immediately.
+    pub async fn peer_path(&self) -> Option<String> {
+        if self.peer_path.get().is_none() {
+            // `wait_for` checks the current value first, so this can't miss the
+            // transition even if it already happened.
+            let mut ready = self.peer_path_ready.clone();
+            ready.wait_for(|&done| done).await.ok();
+        }
+        self.peer_path.get().cloned().flatten()
+    }
+
     fn new<T: Transport>(transport: T, is_server: bool, config: Config) -> Self {
         let version = config.version;
         let our_params = config.to_transport_params();
@@ -608,6 +658,16 @@ impl Session {
                 negotiated.set(None).ok();
                 negotiated_ready_tx.send_replace(true);
             }
+        }
+
+        // Peer path. Resolved once the peer's transport parameters arrive. Only
+        // QMux versions exchange params; the legacy `webtransport` format never
+        // does, so resolve it to `None` eagerly to keep `peer_path()` from hanging.
+        let peer_path: Arc<OnceLock<Option<String>>> = Arc::new(OnceLock::new());
+        let (peer_path_ready_tx, peer_path_ready_rx) = watch::channel(false);
+        if !version.is_qmux() {
+            peer_path.set(None).ok();
+            peer_path_ready_tx.send_replace(true);
         }
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -648,6 +708,8 @@ impl Session {
             closed: closed.clone(),
             negotiated: negotiated.clone(),
             negotiated_ready: negotiated_ready_tx,
+            peer_path: peer_path.clone(),
+            peer_path_ready: peer_path_ready_tx,
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
             our_params: our_params.clone(),
@@ -663,9 +725,10 @@ impl Session {
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
-            // Unblock any `negotiated()` waiter if the connection died before the
-            // peer's params arrived. No-op for the eagerly-resolved cases.
+            // Unblock any `negotiated()` / `peer_path()` waiter if the connection
+            // died before the peer's params arrived. No-op for already-resolved cases.
             backend.resolve_negotiated(None);
+            backend.resolve_peer_path(None);
             // Close all credits so blocked claim()/claim_index() calls unblock
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
@@ -677,7 +740,12 @@ impl Session {
                     credit.close();
                 }
             }
-            backend.closed.send(Some(err)).ok();
+            // `send_replace`, not `send`: the latter drops the value when there
+            // are no receivers, which loses the close reason for any `closed()`
+            // call made after the session has already finished closing (e.g. when
+            // a builder resolves the session only once the peer's params — or the
+            // close — arrive). Storing it unconditionally keeps late waiters correct.
+            backend.closed.send_replace(Some(err));
         });
 
         Session {
@@ -692,6 +760,8 @@ impl Session {
             closed,
             negotiated,
             negotiated_ready: negotiated_ready_rx,
+            peer_path,
+            peer_path_ready: peer_path_ready_rx,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,

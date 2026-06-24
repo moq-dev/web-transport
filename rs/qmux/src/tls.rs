@@ -17,12 +17,18 @@ use crate::{alpn, Config, Error, Session, Version};
 /// `rustls::ClientConfig` is ignored and rebuilt from `entries`.
 ///
 /// `server_name` is used for SNI and certificate verification.
+///
+/// `path` is an optional requested resource path. TLS has no request line of
+/// its own, so when set it is sent in-band via the QMux `path` transport
+/// parameter; the server reads it via [`Session::peer_path`]. Pass `None` to
+/// send no path.
 pub async fn connect<'a>(
     addr: impl ToSocketAddrs,
     server_name: &str,
     config: Arc<rustls::ClientConfig>,
     entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
     require_protocol: bool,
+    path: Option<&str>,
 ) -> Result<Session, Error> {
     let stream = TcpStream::connect(&addr).await?;
 
@@ -56,7 +62,8 @@ pub async fn connect<'a>(
         ));
     }
 
-    let session_config = Config::negotiated(version, protocol);
+    let mut session_config = Config::negotiated(version, protocol);
+    session_config.path = path.map(str::to_string);
     let transport = Stream::new(tls_stream, version, session_config.max_record_size);
     Ok(Session::connect(transport, session_config))
 }
