@@ -4,7 +4,7 @@ use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::ez::tls::StaticCertHook;
+use crate::ez::tls::{ClientHook, ClientVerify};
 use crate::ez::DriverState;
 
 use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
@@ -23,6 +23,7 @@ pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     settings: Settings,
     socket: Option<tokio::net::UdpSocket>,
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    verify: ClientVerify,
     metrics: M,
 }
 
@@ -43,6 +44,7 @@ impl<M: Metrics> ClientBuilder<M> {
             metrics: m,
             socket: None,
             tls: None,
+            verify: ClientVerify::Default,
         }
     }
 
@@ -53,19 +55,12 @@ impl<M: Metrics> ClientBuilder<M> {
         socket.set_nonblocking(true)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
 
-        /*
-        // TODO Modify quiche to add other platform support.
-        #[cfg(target_os = "linux")]
-        let capabilities = SocketCapabilities::apply_all_and_get_compatibility(&socket);
-        #[cfg(not(target_os = "linux"))]
-        let capabilities = SocketCapabilities::default();
-        */
-
         Ok(Self {
             socket: Some(socket),
             settings: self.settings,
             metrics: self.metrics,
             tls: self.tls,
+            verify: self.verify,
         })
     }
 
@@ -98,7 +93,25 @@ impl<M: Metrics> ClientBuilder<M> {
             settings: self.settings,
             metrics: self.metrics,
             socket: self.socket,
+            verify: self.verify,
         }
+    }
+
+    /// Verify the server certificate against an explicit set of root
+    /// certificates instead of the system trust store.
+    pub fn with_root_certificates(mut self, roots: Vec<CertificateDer<'static>>) -> Self {
+        self.verify = ClientVerify::Roots(roots);
+        self
+    }
+
+    /// Accept the server certificate only if the SHA-256 of its DER encoding
+    /// matches one of the provided hashes, bypassing CA verification.
+    ///
+    /// This mirrors the browser's `serverCertificateHashes` option and is the
+    /// usual way to reach a relay using a short-lived self-signed certificate.
+    pub fn with_server_certificate_hashes(mut self, hashes: Vec<[u8; 32]>) -> Self {
+        self.verify = ClientVerify::Hashes(hashes);
+        self
     }
 
     /// Connect to the QUIC server at the given host and port.
@@ -135,35 +148,45 @@ impl<M: Metrics> ClientBuilder<M> {
         socket.connect(remote).await?;
 
         // Connect to the server using the addr we just resolved.
-        let socket = tokio_quiche::socket::Socket::<
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut socket = tokio_quiche::socket::Socket::<
             Arc<tokio::net::UdpSocket>,
             Arc<tokio::net::UdpSocket>,
         >::from_udp(socket)?;
 
-        if !self.settings.verify_peer {
+        // Enable UDP GSO/GRO offload where the kernel supports it (Linux only).
+        // This mirrors the server listener and cuts syscall overhead at high
+        // throughput; it's a no-op if send/recv don't share one FD.
+        #[cfg(target_os = "linux")]
+        socket.apply_max_capabilities();
+
+        // Only the fully-insecure path (no verification of any kind) deserves a
+        // warning; hash- and root-based verification still authenticate the peer.
+        if !self.settings.verify_peer && matches!(self.verify, ClientVerify::Default) {
             tracing::warn!("TLS certificate verification is disabled, a MITM attack is possible");
         }
 
-        let (tls_cert, hooks) = match self.tls {
-            Some((chain, key)) => {
-                // ALPN is left empty; tokio-quiche sets h3 at the config level after the hook.
-                let hook = StaticCertHook {
-                    chain,
-                    key,
-                    alpn: Vec::new(),
-                };
-                // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
-                let dummy_tls = TlsCertificatePaths {
-                    cert: "",
-                    private_key: "",
-                    kind: CertificateKind::X509,
-                };
-                let hooks = Hooks {
-                    connection_hook: Some(Arc::new(hook)),
-                };
-                (Some(dummy_tls), hooks)
-            }
-            None => (None, Hooks::default()),
+        // Install a TLS hook whenever we present a client certificate or need a
+        // non-default verification policy. ALPN is left to tokio-quiche, which
+        // applies it at the config level after the hook runs.
+        let needs_hook = self.tls.is_some() || !matches!(self.verify, ClientVerify::Default);
+        let (tls_cert, hooks) = if needs_hook {
+            let hook = ClientHook {
+                cert: self.tls,
+                verify: self.verify,
+            };
+            // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
+            let dummy_tls = TlsCertificatePaths {
+                cert: "",
+                private_key: "",
+                kind: CertificateKind::X509,
+            };
+            let hooks = Hooks {
+                connection_hook: Some(Arc::new(hook)),
+            };
+            (Some(dummy_tls), hooks)
+        } else {
+            (None, Hooks::default())
         };
 
         let params = tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);

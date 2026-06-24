@@ -17,8 +17,8 @@ use tokio_quiche::{
 use crate::ez::Lock;
 
 use super::{
-    ConnectionClosed, ConnectionError, Metrics, RecvState, RecvStream, SendState, SendStream,
-    StreamId,
+    ConnectionClosed, ConnectionError, ConnectionStats, Metrics, RecvState, RecvStream, SendState,
+    SendStream, StreamId,
 };
 
 // "drop" in ascii; if you see this then close(code)
@@ -47,6 +47,9 @@ pub(super) struct DriverState {
 
     /// Wakers waiting for the handshake to complete.
     handshake_wakers: Vec<Waker>,
+
+    /// Latest connection statistics, refreshed by the driver each poll.
+    stats: ConnectionStats,
 }
 
 impl DriverState {
@@ -71,7 +74,13 @@ impl DriverState {
             alpn: None,
             server_name: None,
             handshake_wakers: Vec::new(),
+            stats: ConnectionStats::default(),
         }
+    }
+
+    /// Returns the most recent connection statistics snapshot.
+    pub fn stats(&self) -> ConnectionStats {
+        self.stats
     }
 
     pub fn close(&mut self, err: ConnectionError) -> Vec<Waker> {
@@ -431,8 +440,12 @@ impl Driver {
             return Poll::Pending;
         }
 
+        // Snapshot stats while we hold an immutable view; stored under the lock below.
+        let stats = ConnectionStats::from_quiche(qconn);
+
         let (sleep, send, recv, bi_wakers, uni_wakers) = {
             let mut driver = self.state.lock();
+            driver.stats = stats;
             // Park the waker before checking for work. `send_datagram` pushes
             // to the channel first, then takes this waker — observing the
             // queue after we publish the waker means any racing producer is

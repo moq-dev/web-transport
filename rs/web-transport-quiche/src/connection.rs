@@ -335,6 +335,45 @@ impl Connection {
     pub fn response(&self) -> &ConnectResponse {
         &self.response
     }
+
+    /// Returns the most recent connection statistics snapshot.
+    pub fn stats(&self) -> ez::ConnectionStats {
+        self.conn.stats()
+    }
+}
+
+impl web_transport_trait::Stats for ez::ConnectionStats {
+    fn bytes_sent(&self) -> Option<u64> {
+        Some(self.bytes_sent)
+    }
+
+    fn bytes_received(&self) -> Option<u64> {
+        Some(self.bytes_received)
+    }
+
+    fn bytes_lost(&self) -> Option<u64> {
+        Some(self.bytes_lost)
+    }
+
+    fn packets_sent(&self) -> Option<u64> {
+        Some(self.packets_sent)
+    }
+
+    fn packets_received(&self) -> Option<u64> {
+        Some(self.packets_received)
+    }
+
+    fn packets_lost(&self) -> Option<u64> {
+        Some(self.packets_lost)
+    }
+
+    fn rtt(&self) -> Option<std::time::Duration> {
+        self.rtt
+    }
+
+    fn estimated_send_rate(&self) -> Option<u64> {
+        self.send_rate
+    }
 }
 
 impl web_transport_trait::Session for Connection {
@@ -380,6 +419,10 @@ impl web_transport_trait::Session for Connection {
 
     async fn closed(&self) -> SessionError {
         self.closed().await
+    }
+
+    fn stats(&self) -> impl web_transport_trait::Stats {
+        self.conn.stats()
     }
 }
 

@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{
     future::poll_fn,
     ops::Deref,
@@ -15,6 +16,51 @@ use tokio_quiche::quiche;
 use crate::ez::DriverState;
 
 use super::{Lock, RecvStream, SendStream};
+
+/// A point-in-time snapshot of QUIC connection statistics.
+///
+/// The driver refreshes this each event loop iteration once the connection is
+/// established, so reads are cheap and lock-free of quiche internals.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConnectionStats {
+    /// Total bytes sent, including retransmissions and overhead.
+    pub bytes_sent: u64,
+    /// Total bytes received, including duplicates and overhead.
+    pub bytes_received: u64,
+    /// Total bytes detected as lost.
+    pub bytes_lost: u64,
+    /// Total QUIC packets sent.
+    pub packets_sent: u64,
+    /// Total QUIC packets received.
+    pub packets_received: u64,
+    /// Total QUIC packets detected as lost.
+    pub packets_lost: u64,
+    /// Smoothed round-trip time for the active path, if one is established.
+    pub rtt: Option<Duration>,
+    /// Estimated send rate in bits per second (from the congestion controller),
+    /// if a path is established.
+    pub send_rate: Option<u64>,
+}
+
+impl ConnectionStats {
+    /// Snapshot the current stats from a live quiche connection.
+    pub(super) fn from_quiche(conn: &tokio_quiche::quic::QuicheConnection) -> Self {
+        let stats = conn.stats();
+        // The first (active) path carries RTT and the delivery-rate estimate.
+        let path = conn.path_stats().next();
+        Self {
+            bytes_sent: stats.sent_bytes,
+            bytes_received: stats.recv_bytes,
+            bytes_lost: stats.lost_bytes,
+            packets_sent: stats.sent as u64,
+            packets_received: stats.recv as u64,
+            packets_lost: stats.lost as u64,
+            rtt: path.as_ref().map(|p| p.rtt),
+            // quiche reports the delivery rate in bytes/sec; the trait wants bits/sec.
+            send_rate: path.as_ref().map(|p| p.delivery_rate.saturating_mul(8)),
+        }
+    }
+}
 
 /// An errors returned by [Connection].
 #[derive(Clone, Error, Debug)]
@@ -284,6 +330,11 @@ impl Connection {
     /// Returns the SNI server name from the TLS ClientHello, if the handshake has completed.
     pub fn server_name(&self) -> Option<String> {
         self.driver.lock().server_name().map(|s| s.to_string())
+    }
+
+    /// Returns the most recent connection statistics snapshot.
+    pub fn stats(&self) -> ConnectionStats {
+        self.driver.lock().stats()
     }
 }
 

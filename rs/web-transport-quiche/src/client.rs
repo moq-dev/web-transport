@@ -83,6 +83,21 @@ impl<M: Metrics> ClientBuilder<M> {
         Self(self.0.with_single_cert(chain, key))
     }
 
+    /// Verify the server certificate against an explicit set of root
+    /// certificates instead of the system trust store.
+    pub fn with_root_certificates(self, roots: Vec<ez::CertificateDer<'static>>) -> Self {
+        Self(self.0.with_root_certificates(roots))
+    }
+
+    /// Accept the server certificate only if the SHA-256 of its DER encoding
+    /// matches one of the provided hashes, bypassing CA verification.
+    ///
+    /// This mirrors the browser's `serverCertificateHashes` option and is the
+    /// usual way to reach a relay using a short-lived self-signed certificate.
+    pub fn with_server_certificate_hashes(self, hashes: Vec<[u8; 32]>) -> Self {
+        Self(self.0.with_server_certificate_hashes(hashes))
+    }
+
     /// Connect to the WebTransport server at the given URL.
     ///
     /// DNS resolution and socket setup happen eagerly. The returned [Connecting]
