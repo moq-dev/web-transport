@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.0) - 2026-06-24
+
+### Added
+
+- *(qmux)* resolve protocol/path during establishment; sync getters ([#265](https://github.com/moq-dev/web-transport/pull/265))
+- *(qmux)* optional in-band path for TCP, TLS, and Unix sockets ([#263](https://github.com/moq-dev/web-transport/pull/263))
+
 ## [0.2.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.1.3...qmux-v0.2.0) - 2026-06-19
 
 ### Added
