@@ -128,8 +128,8 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            // The builder awaits the peer's params, so `path()` is ready here.
-            session.path().map(str::to_string)
+            // Await the client's params to read the path it advertised.
+            session.path().await
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -141,7 +141,7 @@ mod tcp {
 
         assert_eq!(server_saw.as_deref(), Some("/broadcast/room-42"));
         // The server set no path of its own, so the client sees none.
-        assert_eq!(client.path(), None);
+        assert_eq!(client.path().await, None);
     }
 
     /// Path and protocol negotiation are independent and can be used together.
@@ -157,10 +157,7 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            (
-                session.protocol().map(str::to_string),
-                session.path().map(str::to_string),
-            )
+            (session.protocol().map(str::to_string), session.path().await)
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -188,7 +185,7 @@ mod tcp {
                 .accept(sock)
                 .await
                 .unwrap();
-            session.path().map(str::to_string)
+            session.path().await
         });
 
         let client = qmux::tcp::Config::new(Version::QMux01)
@@ -198,7 +195,7 @@ mod tcp {
         let server_saw = server.await.unwrap();
 
         assert_eq!(server_saw, None);
-        assert_eq!(client.path(), None);
+        assert_eq!(client.path().await, None);
     }
 
     /// Advertised protocol names are validated before the session starts.

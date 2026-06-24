@@ -20,8 +20,8 @@ use crate::{alpn, Config, Error, Session, Version};
 ///
 /// `path` is an optional requested resource path. TLS has no request line of
 /// its own, so when set it is sent in-band via the QMux `path` transport
-/// parameter; the server reads it via [`Session::peer_path`]. Pass `None` to
-/// send no path.
+/// parameter; the server reads it via [`Session::path`]. Pass `None` to send no
+/// path.
 pub async fn connect<'a>(
     addr: impl ToSocketAddrs,
     server_name: &str,

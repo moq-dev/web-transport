@@ -81,10 +81,8 @@ async fn finish(
     is_server: bool,
 ) -> Result<Session, Error> {
     let session = build_stream_session(stream, config, is_server)?;
-    // Resolve the protocol and peer path before returning. Both arrive in the
-    // peer's transport parameters, so awaiting one (or the params/close) is
-    // enough for a server to read `path()` right after `accept`.
+    // Resolve the protocol before returning (instant unless negotiating). The
+    // peer's path, if any, is awaited lazily by the caller via `Session::path`.
     session.negotiated().await;
-    session.peer_path().await;
     Ok(session)
 }

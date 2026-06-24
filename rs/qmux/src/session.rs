@@ -43,7 +43,7 @@ pub struct Session {
     // Path the peer advertised via the `path` transport parameter. `None` inside
     // the OnceLock means "no path"; the OnceLock being unset means the peer's
     // params haven't arrived yet. `peer_path_ready` flips to `true` once it's
-    // set, so `peer_path()` can await it.
+    // set, so `path()` can await it.
     peer_path: Arc<OnceLock<Option<String>>>,
     peer_path_ready: watch::Receiver<bool>,
 
@@ -602,24 +602,17 @@ impl Session {
         self.negotiated.get().cloned().flatten()
     }
 
-    /// The path the peer advertised via the `path` transport parameter, if any.
+    /// The path the peer advertised via the `path` transport parameter.
     ///
-    /// Returns `None` either because the peer set no path or because its
-    /// transport parameters haven't arrived yet. Use [`Session::peer_path`] to
-    /// await them. The TCP and Unix-socket builders resolve this before they
-    /// return, so a server reading `path()` right after `accept` sees the
-    /// client's value; TLS sessions should `await` [`Session::peer_path`].
-    pub fn path(&self) -> Option<&str> {
-        self.peer_path.get().and_then(|p| p.as_deref())
-    }
-
-    /// Wait for the peer's advertised path.
+    /// For a server this is the resource path the client requested; for a client
+    /// it's whatever the server advertised (usually `None`).
     ///
-    /// Resolves once the peer's transport parameters arrive (carrying its `path`
-    /// or nothing), or to `None` if the connection closes first. For the legacy
-    /// `webtransport` wire format — which exchanges no parameters — this resolves
-    /// to `None` immediately.
-    pub async fn peer_path(&self) -> Option<String> {
+    /// This is async because the value rides in the peer's transport parameters,
+    /// which arrive after the connection is established. It resolves once those
+    /// params arrive (carrying a path or nothing), or to `None` if the connection
+    /// closes first. For the legacy `webtransport` wire format — which exchanges
+    /// no parameters — it resolves to `None` immediately.
+    pub async fn path(&self) -> Option<String> {
         if self.peer_path.get().is_none() {
             // `wait_for` checks the current value first, so this can't miss the
             // transition even if it already happened.
@@ -742,9 +735,9 @@ impl Session {
             }
             // `send_replace`, not `send`: the latter drops the value when there
             // are no receivers, which loses the close reason for any `closed()`
-            // call made after the session has already finished closing (e.g. when
-            // a builder resolves the session only once the peer's params — or the
-            // close — arrive). Storing it unconditionally keeps late waiters correct.
+            // call made after the session has already finished closing (e.g. after
+            // awaiting `path()` on a peer that closed without sending params).
+            // Storing it unconditionally keeps late waiters correct.
             backend.closed.send_replace(Some(err));
         });
 
