@@ -7,12 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.0) - 2026-06-24
+## [0.3.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.1) - 2026-06-25
 
 ### Added
 
-- *(qmux)* resolve protocol/path during establishment; sync getters ([#265](https://github.com/moq-dev/web-transport/pull/265))
-- *(qmux)* optional in-band path for TCP, TLS, and Unix sockets ([#263](https://github.com/moq-dev/web-transport/pull/263))
+- *(qmux)* resolve the application protocol during establishment so `Session::protocol` is a synchronous getter; fold establishment into async `connect`/`accept` and add `Config::handshake_timeout` ([#265](https://github.com/moq-dev/web-transport/pull/265))
+- *(qmux)* mark `Config`, `Error`, and `Protocol` `#[non_exhaustive]`; replace the `tls` free functions with `tls::Client`/`tls::Server` builders ([#265](https://github.com/moq-dev/web-transport/pull/265))
 
 ## [0.2.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.1.3...qmux-v0.2.0) - 2026-06-19
 
