@@ -876,6 +876,10 @@ impl web_transport_trait::Session for Session {
         self.response.protocol.as_deref()
     }
 
+    fn path(&self) -> Option<&str> {
+        Some(self.request.url.path())
+    }
+
     #[allow(refining_impl_trait)]
     fn stats(&self) -> SessionStats {
         Self::stats(self)

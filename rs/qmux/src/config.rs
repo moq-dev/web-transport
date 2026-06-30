@@ -42,6 +42,14 @@ pub struct Config {
     /// How the application protocol is determined. See [`Protocol`].
     pub protocol: Protocol,
 
+    /// Requested resource path, sent in-band for transports without a URL of
+    /// their own (TCP, TLS, Unix sockets). `None` omits it from the wire.
+    ///
+    /// The peer's value is surfaced by [`Session::path`](crate::Session::path)
+    /// once its transport parameters arrive. WebTransport / WebSocket sessions
+    /// carry the path in the request line instead and ignore this field.
+    pub path: Option<String>,
+
     /// Max concurrent bidirectional streams the peer can open.
     pub max_streams_bidi: u64,
     /// Max concurrent unidirectional streams the peer can open.
@@ -74,6 +82,7 @@ impl Default for Config {
         Self {
             version: Version::QMux01,
             protocol: Protocol::None,
+            path: None,
             max_streams_bidi: 100,
             max_streams_uni: 100,
             max_data: 1_048_576,                  // 1 MB
@@ -126,6 +135,7 @@ impl Config {
                 Protocol::Negotiate(list) => list.clone(),
                 Protocol::None | Protocol::Negotiated(_) => Vec::new(),
             },
+            path: self.path.clone(),
         }
     }
 }

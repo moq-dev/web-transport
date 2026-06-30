@@ -20,6 +20,7 @@ pub struct Client {
     config: Arc<rustls::ClientConfig>,
     protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
+    path: Option<String>,
 }
 
 impl Client {
@@ -29,6 +30,7 @@ impl Client {
             config,
             protocols: Vec::new(),
             require_protocol: false,
+            path: None,
         }
     }
 
@@ -58,6 +60,16 @@ impl Client {
     /// version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) offered by default.
     pub fn require_protocol(mut self) -> Self {
         self.require_protocol = true;
+        self
+    }
+
+    /// Advertise a requested resource `path`.
+    ///
+    /// TLS has no request line of its own, so when set the path is sent in-band
+    /// via the QMux `path` transport parameter; the server reads it via
+    /// [`Session::path`]. Omit to send no path.
+    pub fn path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
         self
     }
 
@@ -104,9 +116,10 @@ impl Client {
             ));
         }
 
-        let session_config = Config::negotiated(version, protocol);
+        let mut session_config = Config::negotiated(version, protocol);
+        session_config.path = self.path.clone();
         let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-        // `connect` awaits the peer's transport parameters so `protocol()` is resolved.
+        // `connect` awaits the peer's transport parameters so `path()` is resolved.
         Session::connect(transport, session_config).await
     }
 }
@@ -149,7 +162,7 @@ impl Server {
 
         let session_config = Config::negotiated(version, protocol);
         let transport = Stream::new(tls_stream, version, session_config.max_record_size);
-        // `accept` awaits the peer's transport parameters so `protocol()` is resolved.
+        // `accept` awaits the peer's transport parameters so `path()` is resolved.
         Session::accept(transport, session_config).await
     }
 }

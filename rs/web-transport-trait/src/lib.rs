@@ -119,6 +119,16 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
         None
     }
 
+    /// Return the request path the peer connected to, if the transport carries one.
+    ///
+    /// This is the path component of the request URI for transports that have one
+    /// (WebTransport's CONNECT `:path`, the qmux path parameter). Transports without
+    /// an in-band path (e.g. raw QUIC) return `None`; callers that need a path there
+    /// must convey it at a higher layer.
+    fn path(&self) -> Option<&str> {
+        None
+    }
+
     /// Close the connection immediately with a code and reason.
     fn close(&self, code: u32, reason: &str);
 

@@ -574,6 +574,11 @@ impl web_transport_trait::Session for Session {
         }
     }
 
+    fn path(&self) -> Option<&str> {
+        // Only the HTTP/3 path carries a request URI; raw iroh sessions have none.
+        self.request().map(|r| r.url.path())
+    }
+
     fn stats(&self) -> impl web_transport_trait::Stats {
         let selected_path_stats = self
             .conn

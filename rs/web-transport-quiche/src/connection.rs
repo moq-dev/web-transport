@@ -413,6 +413,10 @@ impl web_transport_trait::Session for Connection {
         self.response().protocol.as_deref()
     }
 
+    fn path(&self) -> Option<&str> {
+        Some(self.request().url.path())
+    }
+
     fn close(&self, code: u32, reason: &str) {
         self.close(code, reason)
     }
