@@ -2,7 +2,7 @@
 	"name": "web-demo",
 	"private": true,
 	"devDependencies": {
-		"@parcel/transformer-inline-string": "^2.10.3",
-		"parcel": "^2.10.3"
+		"@parcel/transformer-inline-string": "^2.16.4",
+		"parcel": "^2.16.4"
 	}
 }
