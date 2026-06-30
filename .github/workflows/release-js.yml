@@ -11,6 +11,10 @@ on:
     paths:
       - "js/**"
       - "rs/web-transport-node/**"
+  # Allow re-running the release jobs on demand (e.g. to publish a package that
+  # was added but never released). The release scripts skip already-published
+  # versions, so a manual run is safe to repeat.
+  workflow_dispatch:
 
 concurrency:
   group: release-js
@@ -79,6 +83,12 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - run: nix develop --command bun install
+
+      # Publish dependencies before dependents: qmux depends on web-socket-stream,
+      # so the latter must already be on npm for qmux's published range to resolve.
+      - name: Release @moq/web-socket-stream
+        working-directory: js/web-socket-stream
+        run: nix develop --command bun run release
 
       - name: Release @moq/qmux
         working-directory: js/qmux
