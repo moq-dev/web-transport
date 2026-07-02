@@ -62,6 +62,11 @@ export interface SchedulerOptions {
 /** Default `sendOrder` for streams that don't set one. */
 export const DEFAULT_SEND_ORDER = 0;
 
+/** How many outbound datagrams to buffer before dropping. Datagrams are
+ *  unreliable, so a backpressured transport sheds them here rather than growing
+ *  an unbounded queue. */
+const DATAGRAM_QUEUE_LIMIT = 1024;
+
 export class SendScheduler {
 	#sink: SendSink;
 	#onActivity: () => void;
@@ -71,6 +76,10 @@ export class SendScheduler {
 	// Control frames preempt all stream data, FIFO among themselves.
 	#control: Uint8Array[] = [];
 	#controlBytes = 0;
+
+	// Datagrams: serviced after control, ahead of stream data. Bounded and lossy
+	// (unlike #control) since unreliable datagrams are meant to be droppable.
+	#datagrams: Uint8Array[] = [];
 
 	// Per-stream send priority and the single pending frame per ready stream.
 	// Invariant: a stream has at most one Waiter at a time, because its writer
@@ -103,6 +112,17 @@ export class SendScheduler {
 			// reset frames would corrupt the session.
 			console.warn(`qmux: control backlog ${this.#controlBytes} bytes exceeds high-water`);
 		}
+		this.#signal();
+	}
+
+	/** Queue a datagram frame — best-effort, serviced after control but ahead of
+	 *  stream data. Bounded and lossy: dropped when the buffer is full (transport
+	 *  backpressured) or the scheduler is closed, since an unreliable datagram is
+	 *  meant to be droppable rather than queued without bound. */
+	enqueueDatagram(bytes: Uint8Array): void {
+		if (this.#closed) return;
+		if (this.#datagrams.length >= DATAGRAM_QUEUE_LIMIT) return; // shed load under backpressure
+		this.#datagrams.push(bytes);
 		this.#signal();
 	}
 
@@ -153,6 +173,8 @@ export class SendScheduler {
 		for (const waiter of this.#ready.values()) waiter.reject(err);
 		this.#ready.clear();
 		this.#sendOrders.clear();
+		// Drop any queued datagrams — best-effort, and they must not outlive close.
+		this.#datagrams.length = 0;
 		this.#signal();
 	}
 
@@ -186,7 +208,7 @@ export class SendScheduler {
 	async #run(): Promise<void> {
 		try {
 			while (true) {
-				if (this.#control.length === 0 && this.#ready.size === 0) {
+				if (this.#control.length === 0 && this.#datagrams.length === 0 && this.#ready.size === 0) {
 					if (this.#closed) return;
 					await new Promise<void>((resolve) => {
 						this.#wake = resolve;
@@ -201,6 +223,13 @@ export class SendScheduler {
 				if (this.#control.length > 0) {
 					const bytes = this.#control.shift() as Uint8Array;
 					this.#controlBytes -= bytes.byteLength;
+					await this.#sink.write(bytes);
+					this.#onActivity();
+					continue;
+				}
+
+				if (this.#datagrams.length > 0) {
+					const bytes = this.#datagrams.shift() as Uint8Array;
 					await this.#sink.write(bytes);
 					this.#onActivity();
 					continue;
@@ -234,5 +263,6 @@ export class SendScheduler {
 		this.#ready.clear();
 		this.#control.length = 0;
 		this.#controlBytes = 0;
+		this.#datagrams.length = 0;
 	}
 }

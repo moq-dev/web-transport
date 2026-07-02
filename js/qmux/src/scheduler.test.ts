@@ -166,6 +166,39 @@ describe("SendScheduler", () => {
 		expect(sink.written[5]).toBe(99); // served on the very next write
 	});
 
+	test("datagrams are sent after control but ahead of stream data", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		sched.setSendOrder(1n, 0);
+		void sched.enqueueStream(1n, frame(10));
+		sched.enqueueDatagram(frame(50));
+		sched.enqueueControl(frame(99));
+
+		await tick(5);
+		sink.release(3);
+		await until(() => sink.written.length === 3);
+
+		expect(sink.written).toEqual([99, 50, 10]); // control, then datagram, then stream
+	});
+
+	test("datagrams are dropped once the buffer is full under backpressure", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		// Transport is backpressured (no release), so nothing drains and the queue
+		// fills. Enqueue past the internal DATAGRAM_QUEUE_LIMIT (1024).
+		const total = 1030;
+		for (let i = 0; i < total; i++) sched.enqueueDatagram(frame(1));
+
+		await tick(2);
+		sink.release(total); // admit more than were retained
+		await tick(10);
+
+		// At most the queue limit was retained; the excess was shed, not queued.
+		expect(sink.written.length).toBe(1024);
+	});
+
 	test("dropStream discards queued data and rejects its promise", async () => {
 		const sink = new GatedSink();
 		const sched = new SendScheduler(sink);

@@ -1082,11 +1082,15 @@ export default class Session implements WebTransport {
 		await this.#enqueueStreamFrame(id.value.value, { type: "stream", id, data: new Uint8Array(), fin: true });
 	}
 
-	/** Enqueue a DATAGRAM frame. Best-effort: dropped once the session is closed.
-	 *  Size/support checks happen in {@link Datagrams} before we get here. */
+	/** Enqueue a DATAGRAM frame on the scheduler's bounded, lossy datagram lane —
+	 *  dropped under transport backpressure or once closed, rather than piling up
+	 *  on the (lossless, unbounded) control lane. Size/support checks happen in
+	 *  {@link Datagrams} before we get here. */
 	#sendDatagram(data: Uint8Array) {
 		if (this.#closed) return;
-		this.#sendPriorityFrame({ type: "datagram", data });
+		const bytes = Frame.encode({ type: "datagram", data }, this.#version);
+		this.#validateRecordSize(bytes);
+		this.#scheduler?.enqueueDatagram(bytes);
 	}
 
 	#sendPriorityFrame(frame: Frame.Any) {

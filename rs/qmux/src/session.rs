@@ -24,6 +24,11 @@ use web_transport_trait as generic;
 /// applying backpressure to the whole session.
 const DATAGRAM_RECV_BUFFER: usize = 1024;
 
+/// How many outbound datagrams to buffer before dropping. When the transport is
+/// backpressured, `send_datagram` sheds datagrams here rather than growing an
+/// unbounded queue — droppable is the whole point of an unreliable datagram.
+const DATAGRAM_SEND_BUFFER: usize = 1024;
+
 /// A multiplexed session over a reliable transport.
 #[derive(Clone)]
 pub struct Session {
@@ -69,6 +74,12 @@ pub struct Session {
     // channel; `recv_datagram` drains it. Bounded and lossy — a slow reader
     // drops datagrams rather than stalling the session.
     recv_datagram: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
+
+    // Outbound datagrams. `send_datagram` pushes payloads here; the backend loop
+    // frames and writes them. Bounded and lossy so a backpressured transport
+    // drops datagrams instead of queueing them unboundedly. Kept off the
+    // (lossless) control lane, which must never drop RESET/STOP/CLOSE frames.
+    outbound_datagram: mpsc::Sender<Bytes>,
 
     // The largest datagram payload we may send, i.e. `max_datagram_size()`.
     // Resolved from the peer's transport parameters before the session is handed
@@ -122,6 +133,9 @@ struct SessionState<T: Transport> {
     // shared send-limit cell resolved from the peer's params.
     recv_datagram: mpsc::Sender<Bytes>,
     datagram_max_size: Arc<AtomicUsize>,
+
+    // Receiver for outbound datagrams enqueued by `send_datagram`.
+    outbound_datagram: mpsc::Receiver<Bytes>,
 }
 
 impl<T: Transport> SessionState<T> {
@@ -184,6 +198,10 @@ impl<T: Transport> SessionState<T> {
                         Some(frame) => self.send_frame(frame).await?,
                         None => return Err(Error::Closed),
                     };
+                }
+                Some(payload) = self.outbound_datagram.recv() => {
+                    // Ahead of bulk stream data for low latency, behind control.
+                    self.send_frame(Frame::Datagram(payload)).await?;
                 }
                 frame = self.outbound.pop() => {
                     match frame {
@@ -697,6 +715,7 @@ impl Session {
         // Bounded, lossy inbound-datagram channel: the backend drops on a full
         // buffer rather than stalling, matching QUIC's unreliable semantics.
         let (recv_datagram_tx, recv_datagram_rx) = mpsc::channel(DATAGRAM_RECV_BUFFER);
+        let (outbound_datagram_tx, outbound_datagram_rx) = mpsc::channel(DATAGRAM_SEND_BUFFER);
         let datagram_max_size = Arc::new(AtomicUsize::new(0));
 
         let closed = watch::Sender::new(None);
@@ -771,6 +790,7 @@ impl Session {
             next_ping_seq: 0,
             recv_datagram: recv_datagram_tx,
             datagram_max_size: datagram_max_size.clone(),
+            outbound_datagram: outbound_datagram_rx,
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
@@ -815,6 +835,7 @@ impl Session {
             conn_recv_credit,
             recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
             datagram_max_size,
+            outbound_datagram: outbound_datagram_tx,
         }
     }
 }
@@ -988,12 +1009,16 @@ impl generic::Session for Session {
         if payload.len() > max {
             return Err(Error::FrameTooLarge);
         }
-        // Route through the control lane so datagrams aren't held behind queued
-        // stream data. Unbounded and synchronous, matching the trait's
-        // fire-and-forget contract; a closed session surfaces as `Closed`.
-        self.outbound_priority
-            .send(Frame::Datagram(payload))
-            .map_err(|_| Error::Closed)
+        // Best-effort and synchronous, matching the trait's fire-and-forget
+        // contract. A full buffer means the transport is backpressured: drop the
+        // datagram (returning `Ok`) rather than block or grow without bound — an
+        // unreliable datagram is meant to be droppable. A closed session (the
+        // receiver is gone) surfaces as `Closed`.
+        match self.outbound_datagram.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     fn max_datagram_size(&self) -> usize {
