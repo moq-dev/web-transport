@@ -218,6 +218,17 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("datagrams: readable closes cleanly on a graceful session close", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const reader = session.datagrams.readable.getReader();
+		session.close(); // graceful: no #closeReason, so the readable must not error
+		const { done } = await reader.read();
+		expect(done).toBe(true);
+	});
+
 	test("MAX_STREAM_DATA is extended on delivery to the app, not on receipt", async () => {
 		// Small per-stream window so a few delivered chunks cross the half-window threshold.
 		const { session, peer } = connect({ maxStreamDataUni: 1000n });

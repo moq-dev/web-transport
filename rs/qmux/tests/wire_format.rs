@@ -265,6 +265,41 @@ fn qmux_datagram_no_length_decodes() {
 }
 
 #[test]
+fn record_datagram_then_stream_decodes_both() {
+    // The length-prefixed datagram (0x31) must stop consumption at its payload
+    // boundary so a following frame in the same record still decodes — the exact
+    // reason we always emit 0x31 rather than the no-length 0x30 form.
+    let datagram = Frame::Datagram(Bytes::from_static(b"hi"))
+        .encode(Version::QMux01)
+        .unwrap();
+    let stream = Frame::Stream(Stream {
+        id: sid(4),
+        data: Bytes::from_static(b"bye"),
+        fin: false,
+    })
+    .encode(Version::QMux01)
+    .unwrap();
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&datagram);
+    record.extend_from_slice(&stream);
+
+    let frames = Frame::decode_record(Bytes::from(record)).expect("record decodes");
+    assert_eq!(frames.len(), 2, "both frames decode");
+    match &frames[0] {
+        Frame::Datagram(p) => assert_eq!(p.as_ref(), b"hi"),
+        other => panic!("expected datagram, got {other:?}"),
+    }
+    match &frames[1] {
+        Frame::Stream(s) => {
+            assert_eq!(s.id.0.into_inner(), 4);
+            assert_eq!(s.data.as_ref(), b"bye");
+        }
+        other => panic!("expected stream, got {other:?}"),
+    }
+}
+
+#[test]
 fn qmux00_application_close() {
     // 0x1d (APPLICATION_CLOSE) + code(=42) + frame_type(=0) + reason_len(=3) + "bye".
     let bytes = [0x1d, 0x2a, 0x00, 0x03, b'b', b'y', b'e'];

@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use web_transport_proto::VarInt;
 
+use super::varint_size;
 use crate::Error;
 
 /// Transport parameters exchanged during QMux connection setup.
@@ -236,19 +237,6 @@ fn decode_varint_param(data: &mut Bytes) -> Result<u64, Error> {
         return Err(Error::Short);
     }
     Ok(value)
-}
-
-/// Returns the encoded size of a varint value.
-fn varint_size(v: u64) -> usize {
-    if v < (1 << 6) {
-        1
-    } else if v < (1 << 14) {
-        2
-    } else if v < (1 << 30) {
-        4
-    } else {
-        8
-    }
 }
 
 #[cfg(test)]

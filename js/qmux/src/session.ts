@@ -1274,7 +1274,11 @@ export default class Session implements WebTransport {
 		try {
 			this.#incomingUnidirectionalStreams.close();
 		} catch {}
-		this.datagrams.close(this.#closed);
+		// Pass the *reason*, not `#closed` (always an Error): a graceful
+		// app-initiated close leaves `#closeReason` unset, so the datagram
+		// readable closes cleanly instead of erroring, matching the incoming
+		// stream controllers below.
+		this.datagrams.close(this.#closeReason);
 		for (const c of this.#sendStreams.values()) {
 			try {
 				c.error(this.#closed);

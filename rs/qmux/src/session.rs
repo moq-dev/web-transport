@@ -11,8 +11,8 @@ use crate::credit::Credit;
 use crate::sched::PriorityQueue;
 use crate::transport::Transport;
 use crate::{
-    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
-    TransportParams, Version, MAX_FRAME_PAYLOAD,
+    proto::varint_size, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
+    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -23,19 +23,6 @@ use web_transport_trait as generic;
 /// unreliable, so a slow `recv_datagram` consumer sheds load here rather than
 /// applying backpressure to the whole session.
 const DATAGRAM_RECV_BUFFER: usize = 1024;
-
-/// Number of bytes a QUIC varint occupies when encoding `v`.
-const fn varint_size(v: u64) -> u64 {
-    if v < (1 << 6) {
-        1
-    } else if v < (1 << 14) {
-        2
-    } else if v < (1 << 30) {
-        4
-    } else {
-        8
-    }
-}
 
 /// A multiplexed session over a reliable transport.
 #[derive(Clone)]
@@ -513,12 +500,16 @@ impl<T: Transport> SessionState<T> {
                     self.outbound_priority.0.send(response).ok();
                 }
             }
-            // DATAGRAM: fan out to the receive channel. We only accept datagrams
-            // if we advertised support (a conforming peer won't send otherwise);
-            // delivery is best-effort, so drop the datagram if the channel is
-            // full rather than blocking the session loop.
+            // DATAGRAM: fan out to the receive channel. Accept only if we
+            // advertised support (a conforming peer won't send otherwise) and the
+            // payload fits within the frame size we advertised — reject oversized
+            // ones rather than buffering them, mirroring the STREAM check above.
+            // Delivery is best-effort past that, so drop the datagram if the
+            // channel is full rather than blocking the session loop.
             Frame::Datagram(payload) => {
-                if self.our_params.max_datagram_frame_size != 0 {
+                if self.our_params.max_datagram_frame_size != 0
+                    && payload.len() as u64 <= self.our_params.max_datagram_frame_size
+                {
                     let _ = self.recv_datagram.try_send(payload);
                 }
             }
