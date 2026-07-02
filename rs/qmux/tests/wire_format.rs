@@ -113,6 +113,9 @@ fn assert_frames_eq(got: &Frame, want: &Frame, version: Version) {
         (Frame::StreamsBlockedUni(a), Frame::StreamsBlockedUni(b)) => {
             assert_eq!(a, b, "streams_blocked_uni")
         }
+        (Frame::Datagram(a), Frame::Datagram(b)) => {
+            assert_eq!(a.as_ref(), b.as_ref(), "datagram payload")
+        }
         (a, b) => panic!("frame variants don't match: got {a:?}, want {b:?}"),
     }
 }
@@ -236,6 +239,29 @@ fn qmux00_stop_sending() {
         code: code(42),
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
+}
+
+#[test]
+fn qmux00_datagram() {
+    // 0x31 = DATAGRAM | LEN; len=2, payload "hi". We always emit the
+    // length-prefixed form so the frame is self-delimiting on a byte stream.
+    let bytes = [0x31, 0x02, b'h', b'i'];
+    let frame = Frame::Datagram(Bytes::from_static(b"hi"));
+    assert_round_trip(Version::QMux00, &bytes, &frame);
+}
+
+#[test]
+fn qmux_datagram_no_length_decodes() {
+    // A peer may use the no-length form (0x30 + payload), where the payload runs
+    // to the end of the record. We never emit it, but must decode it.
+    let bytes = [0x30, b'h', b'i'];
+    let decoded = Frame::decode(Bytes::copy_from_slice(&bytes), Version::QMux00)
+        .expect("decode succeeds")
+        .expect("datagram is not an ignored frame");
+    match decoded {
+        Frame::Datagram(payload) => assert_eq!(payload.as_ref(), b"hi"),
+        other => panic!("expected datagram, got {other:?}"),
+    }
 }
 
 #[test]
