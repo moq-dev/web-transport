@@ -63,14 +63,7 @@ struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.closed.send_if_modified(|slot| {
-            if slot.is_none() {
-                *slot = Some(Error::Closed);
-                true
-            } else {
-                false
-            }
-        });
+        note_closed(&self.closed, Error::Closed);
     }
 }
 
@@ -315,6 +308,20 @@ fn instant_at(base: tokio::time::Instant, ms: u64) -> tokio::time::Instant {
     base + std::time::Duration::from_millis(ms)
 }
 
+/// Record `err` as the session's terminal close reason, but only if none is set
+/// yet — the first reason wins. The reader, writer, timer, and [`SessionGuard`] all
+/// funnel through this so teardown reports a single, stable cause.
+fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
+    closed.send_if_modified(|slot| {
+        if slot.is_none() {
+            *slot = Some(err);
+            true
+        } else {
+            false
+        }
+    });
+}
+
 /// Writer-side task state: owns the transport send half and is the sole producer
 /// on the wire. It pulls the outbound queues in strict priority order via
 /// [`next_outbound`], retires the stream a terminal frame closes and encodes it
@@ -365,14 +372,7 @@ enum Transmitted {
 impl<W: Writer> WriterState<W> {
     /// Record the first terminal error so the reader's `closed` branch unblocks.
     fn note_closed(&self, err: Error) {
-        self.closed.send_if_modified(|slot| {
-            if slot.is_none() {
-                *slot = Some(err);
-                true
-            } else {
-                false
-            }
-        });
+        note_closed(&self.closed, err);
     }
 
     async fn run(&mut self) {
@@ -640,14 +640,7 @@ impl TimerState {
             }
 
             tracing::debug!("idle timeout fired");
-            self.closed.send_if_modified(|slot| {
-                if slot.is_none() {
-                    *slot = Some(Error::IdleTimeout);
-                    true
-                } else {
-                    false
-                }
-            });
+            note_closed(&self.closed, Error::IdleTimeout);
             return;
         }
     }
