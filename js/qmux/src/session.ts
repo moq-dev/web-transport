@@ -65,7 +65,10 @@ function configToTransportParams(config: Required<Config>): TransportParams {
 		initialMaxStreamDataUni: config.maxStreamDataUni,
 		initialMaxStreamsBidi: config.maxStreamsBidi,
 		initialMaxStreamsUni: config.maxStreamsUni,
-		maxDatagramFrameSize: config.maxDatagramFrameSize,
+		// Clamp to maxRecordSize so we never advertise a datagram larger than our
+		// record layer accepts.
+		maxDatagramFrameSize:
+			config.maxDatagramFrameSize < config.maxRecordSize ? config.maxDatagramFrameSize : config.maxRecordSize,
 		maxRecordSize: config.maxRecordSize,
 	};
 }
@@ -593,8 +596,12 @@ export default class Session implements WebTransport {
 			this.#uniStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "datagram") {
 			// Only accept datagrams if we advertised support (a conforming peer
-			// won't send otherwise); delivery is best-effort past that.
-			if (this.#ourParams.maxDatagramFrameSize > 0n) {
+			// won't send otherwise) and the payload fits the frame size we
+			// advertised — drop oversized ones rather than delivering them.
+			if (
+				this.#ourParams.maxDatagramFrameSize > 0n &&
+				BigInt(frame.data.byteLength) <= this.#ourParams.maxDatagramFrameSize
+			) {
 				this.datagrams.push(frame.data);
 			}
 		} else if (frame.type === "ping_request") {

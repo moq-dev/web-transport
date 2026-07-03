@@ -137,9 +137,11 @@ impl Config {
             initial_max_streams_uni: self.max_streams_uni,
             // Datagrams are a QMux01 feature (they rely on the record layer to be
             // framed): only advertise the parameter on QMux01. Elsewhere it stays
-            // 0 — "unsupported" — which the encoder omits.
+            // 0 — "unsupported" — which the encoder omits. Clamp to max_record_size
+            // so we never invite a datagram larger than our record layer accepts
+            // (recv_record would reject it as FrameTooLarge and kill the session).
             max_datagram_frame_size: if self.version == Version::QMux01 {
-                self.max_datagram_frame_size
+                self.max_datagram_frame_size.min(self.max_record_size)
             } else {
                 0
             },
