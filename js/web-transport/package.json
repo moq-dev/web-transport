@@ -32,8 +32,8 @@
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "^3",
-		"typescript": "^5.9.2",
-		"@types/node": "^24.3.0"
+		"typescript": "^6.0.3",
+		"@types/node": "^26.0.1"
 	},
 	"optionalDependencies": {
 		"@moq/web-transport-darwin-x64": "0.1.3",
