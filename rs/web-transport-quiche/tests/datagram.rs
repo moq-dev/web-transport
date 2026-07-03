@@ -19,12 +19,12 @@ fn make_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'st
     // SANs cover both hostname and loopback literal — rustls refuses to verify
     // "localhost" against a cert with only a 127.0.0.1 SAN and vice versa, even
     // with verify_peer off on the client we still want a real usable cert.
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .context("rcgen self-signed")?;
 
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_bytes = KeyPair::serialize_der(&key_pair);
+    let key_bytes = KeyPair::serialize_der(&signing_key);
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes));
 
     Ok((vec![cert_der], key_der))

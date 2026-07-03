@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedKey, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    Issuer, KeyPair, KeyUsagePurpose,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
@@ -20,12 +20,12 @@ use url::Url;
 use web_transport_quiche::{ClientBuilder, ServerBuilder};
 
 fn make_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .context("rcgen self-signed")?;
 
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_bytes = KeyPair::serialize_der(&key_pair);
+    let key_bytes = KeyPair::serialize_der(&signing_key);
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes));
 
     Ok((vec![cert_der], key_der))
@@ -54,8 +54,9 @@ fn make_ca_chain() -> Result<(
         .distinguished_name
         .push(DnType::CommonName, "localhost");
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
     let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .signed_by(&leaf_key, &ca_issuer)
         .context("sign leaf")?;
 
     let ca_der = CertificateDer::from(ca_cert.der().to_vec());
