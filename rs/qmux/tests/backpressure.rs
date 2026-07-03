@@ -10,7 +10,8 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use qmux::{Config, Error, Session, Transport, TransportReader, TransportWriter, Version};
+use qmux::transport::{Reader, Writer};
+use qmux::{Config, Error, Session, Transport, Version};
 use tokio::sync::{mpsc, watch};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
@@ -47,7 +48,7 @@ impl Transport for GatedTransport {
     }
 }
 
-impl TransportWriter for GatedWriter {
+impl Writer for GatedWriter {
     async fn send(&mut self, data: Bytes) -> Result<(), Error> {
         // Block while the gate is closed — the test's stand-in for a full socket.
         if let Some(gate) = &mut self.gate {
@@ -63,7 +64,7 @@ impl TransportWriter for GatedWriter {
     }
 }
 
-impl TransportReader for GatedReader {
+impl Reader for GatedReader {
     async fn recv(&mut self) -> Result<Bytes, Error> {
         self.rx.recv().await.ok_or(Error::Closed)
     }

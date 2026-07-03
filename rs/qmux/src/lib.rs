@@ -50,9 +50,11 @@ pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
-pub use transport::{Transport, TransportReader, TransportWriter};
-// The concrete byte-stream transport lives at `transport::Stream` rather than the
-// crate root, so the name doesn't collide with the STREAM-frame `Stream` type.
+pub use transport::Transport;
+// The transport half-traits live at `transport::{Reader, Writer}` and the concrete
+// byte-stream transport at `transport::Stream`, rather than the crate root — the
+// bare `Reader`/`Writer`/`Stream` names would be too generic (and `Stream` would
+// collide with the STREAM-frame `Stream` type) alongside the rest of the API.
 
 /// All supported ALPN identifiers, in preference order.
 ///
