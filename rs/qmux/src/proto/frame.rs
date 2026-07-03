@@ -16,11 +16,14 @@ const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
 const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
-// DATAGRAM frames (RFC 9221). 0x30 has no length (payload runs to the end of the
-// record); 0x31 prefixes the payload with a length varint. We always emit the
-// length-prefixed form: it is self-delimiting, so it decodes both inside a
-// QMux01 record and on the QMux00 byte stream (which can't bound a trailing
-// no-length datagram). The no-length form is still accepted on decode.
+// DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
+// the record); 0x31 prefixes a length varint. We always emit 0x31 because it is
+// self-delimiting regardless of framing: it is *required* on the QMux00 byte
+// stream (no record layer to bound a trailing no-length datagram), and inside a
+// QMux01 record whenever another frame follows it. On WebSocket / a lone QMux01
+// record the length is redundant — the record boundary already delimits it, so
+// 0x30 would do — but we emit one form everywhere to keep a single code path and
+// stay correct if frames are ever batched into a record. Both forms decode.
 const DATAGRAM_LEN: VarInt = VarInt::from_u32(0x31);
 
 const PADDING: VarInt = VarInt::from_u32(0x00);
@@ -442,8 +445,8 @@ impl Frame {
                 VarInt::try_from(ping.sequence)?.encode(buf);
             }
             Frame::Datagram(payload) => {
-                // Length-prefixed form (0x31) so the frame is self-delimiting on
-                // both the QMux00 byte stream and inside a QMux01 record.
+                // Length-prefixed form (0x31): self-delimiting regardless of
+                // framing. See DATAGRAM_LEN for why we emit it uniformly.
                 DATAGRAM_LEN.encode(buf);
                 VarInt::try_from(payload.len())?.encode(buf);
                 buf.put_slice(payload);

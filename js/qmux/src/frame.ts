@@ -386,8 +386,11 @@ function encodeQMux(frame: Any): Uint8Array {
 		}
 
 		case "datagram": {
-			// Length-prefixed form (0x31) so the frame is self-delimiting on both
-			// the QMux00 byte stream and inside a QMux01 record.
+			// Length-prefixed form (0x31): self-delimiting regardless of framing.
+			// The length is redundant on WebSocket, where the record (WS message)
+			// boundary already delimits a lone datagram and 0x30 would do — but we
+			// emit one form everywhere so the encoding is also correct on the
+			// QMux00 byte stream and if frames are ever batched into a record.
 			const lengthVi = VarInt.from(frame.data.length);
 			let buffer = new Uint8Array(new ArrayBuffer(8 + 8 + frame.data.length), 0, 0);
 			buffer = VarInt.from(0x31).encode(buffer);
