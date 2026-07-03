@@ -16,6 +16,13 @@ const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
 const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
+// DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
+// the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
+// QMux01, where each rides its own record, so the record boundary would already
+// delimit a lone 0x30 datagram. We still emit 0x31 so the frame stays
+// self-delimiting even if a record ever carries a frame after it — the length
+// varint costs 1-2 bytes. Both forms decode.
+const DATAGRAM_LEN: VarInt = VarInt::from_u32(0x31);
 
 const PADDING: VarInt = VarInt::from_u32(0x00);
 
@@ -102,15 +109,24 @@ pub enum Frame {
     ConnectionClose(ConnectionClose),
     Stream(Stream),
     MaxData(u64),
-    MaxStreamData { id: StreamId, max: u64 },
+    MaxStreamData {
+        id: StreamId,
+        max: u64,
+    },
     MaxStreamsBidi(u64),
     MaxStreamsUni(u64),
     DataBlocked(u64),
-    StreamDataBlocked { id: StreamId, limit: u64 },
+    StreamDataBlocked {
+        id: StreamId,
+        limit: u64,
+    },
     StreamsBlockedBidi(u64),
     StreamsBlockedUni(u64),
     TransportParameters(TransportParams),
     Ping(Ping),
+    /// An unreliable datagram (RFC 9221). The payload carries no length prefix
+    /// on the wire; it is delimited by the enclosing record boundary.
+    Datagram(Bytes),
 }
 
 impl Frame {
@@ -274,8 +290,8 @@ impl Frame {
             }
             // DATAGRAM without length — rest of record is payload
             0x30 => {
-                let _payload = data.split_to(data.remaining());
-                Ok(None)
+                let payload = data.split_to(data.remaining());
+                Ok(Some(Frame::Datagram(payload)))
             }
             // DATAGRAM with length
             0x31 => {
@@ -283,8 +299,8 @@ impl Frame {
                 if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                let _payload = data.split_to(len as usize);
-                Ok(None)
+                let payload = data.split_to(len as usize);
+                Ok(Some(Frame::Datagram(payload)))
             }
             // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {
@@ -425,6 +441,13 @@ impl Frame {
                     QX_PING_REQUEST_VI.encode(buf);
                 }
                 VarInt::try_from(ping.sequence)?.encode(buf);
+            }
+            Frame::Datagram(payload) => {
+                // Length-prefixed form (0x31): self-delimiting regardless of
+                // framing. See DATAGRAM_LEN for why we emit it uniformly.
+                DATAGRAM_LEN.encode(buf);
+                VarInt::try_from(payload.len())?.encode(buf);
+                buf.put_slice(payload);
             }
         }
 
@@ -600,8 +623,8 @@ impl Frame {
             }
             // DATAGRAM without length — rest of message is payload
             0x30 => {
-                let _payload = data.split_to(data.remaining());
-                Ok(None)
+                let payload = data.split_to(data.remaining());
+                Ok(Some(Frame::Datagram(payload)))
             }
             // DATAGRAM with length
             0x31 => {
@@ -609,8 +632,8 @@ impl Frame {
                 if (data.remaining() as u64) < len {
                     return Err(Error::Short);
                 }
-                let _payload = data.split_to(len as usize);
-                Ok(None)
+                let payload = data.split_to(len as usize);
+                Ok(Some(Frame::Datagram(payload)))
             }
             // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {

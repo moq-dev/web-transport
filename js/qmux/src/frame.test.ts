@@ -89,6 +89,42 @@ describe("QMux01 record framing", () => {
 		expect(respDecoded[0]).toEqual({ type: "ping_response", sequence: 0xdeadbeefn });
 	});
 
+	test("datagram round-trips via the length-prefixed (0x31) form", () => {
+		const frame: Frame.Any = { type: "datagram", data: new Uint8Array([1, 2, 3, 4]) };
+		const bytes = Frame.encode(frame, "qmux-01");
+		// 0x31, len=4, then payload.
+		expect(bytes[0]).toBe(0x31);
+		const decoded = Frame.decodeRecord(bytes);
+		expect(decoded.length).toBe(1);
+		expect(decoded[0].type).toBe("datagram");
+		if (decoded[0].type === "datagram") {
+			expect(Array.from(decoded[0].data)).toEqual([1, 2, 3, 4]);
+		}
+	});
+
+	test("datagram no-length (0x30) form decodes (payload runs to end of record)", () => {
+		// We never emit 0x30, but must accept it: 0x30 followed by the payload.
+		const wire = new Uint8Array([0x30, 0x68, 0x69]);
+		const decoded = Frame.decode(wire, "qmux-00");
+		expect(decoded?.type).toBe("datagram");
+		if (decoded?.type === "datagram") {
+			expect(Array.from(decoded.data)).toEqual([0x68, 0x69]);
+		}
+	});
+
+	test("max_datagram_frame_size transport parameter round-trips", () => {
+		const params: Frame.Any = {
+			type: "transport_parameters",
+			params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, initialMaxData: 1024n, maxDatagramFrameSize: 1201n },
+		};
+		const decoded = Frame.decodeRecord(Frame.encode(params, "qmux-01"));
+		expect(decoded.length).toBe(1);
+		if (decoded[0].type === "transport_parameters") {
+			expect(decoded[0].params.maxDatagramFrameSize).toBe(1201n);
+			expect(decoded[0].params.initialMaxData).toBe(1024n);
+		}
+	});
+
 	test("decodeTransportParams seeds maxRecordSize with the draft-01 default when the parameter is omitted", () => {
 		// Empty params buffer → all values default; maxRecordSize must be 16382, not 0.
 		const params: Frame.TransportParameters = {
@@ -101,6 +137,7 @@ describe("QMux01 record framing", () => {
 				initialMaxStreamDataUni: 0n,
 				initialMaxStreamsBidi: 0n,
 				initialMaxStreamsUni: 0n,
+				maxDatagramFrameSize: 0n,
 				// Deliberately set to 0 — exercises the encoder's "skip-if-zero" + decoder's default seeding.
 				maxRecordSize: 0n,
 			},

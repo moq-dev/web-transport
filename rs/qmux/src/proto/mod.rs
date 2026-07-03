@@ -19,3 +19,16 @@ pub const MAX_FRAME_SIZE: usize = 16384;
 /// Maximum payload size for a STREAM frame, accounting for frame overhead.
 /// Overhead: frame_type (up to 8) + stream_id (up to 8) + length (up to 8) = 24 bytes.
 pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 24;
+
+/// Number of bytes a QUIC varint occupies when encoding `v`.
+pub(crate) const fn varint_size(v: u64) -> u64 {
+    if v < (1 << 6) {
+        1
+    } else if v < (1 << 14) {
+        2
+    } else if v < (1 << 30) {
+        4
+    } else {
+        8
+    }
+}

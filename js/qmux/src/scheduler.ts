@@ -21,6 +21,11 @@ export interface SendSink {
 	 *  if the write fails — the scheduler must observe this rather than resolve
 	 *  the frame's promise as if it succeeded. */
 	write(bytes: Uint8Array): Promise<void>;
+	/** Synchronous backpressure probe: true when the sink can take a write now
+	 *  without buffering past its high-water mark. Used to drop datagrams the
+	 *  instant the transport starts queuing, rather than letting them pile up
+	 *  behind a stream/control backlog and arrive stale. */
+	wantsMore(): boolean;
 }
 
 /** Backpressure-aware sink over a `WebSocketStream` writable. The writable's
@@ -42,6 +47,15 @@ export class WritableStreamSink implements SendSink {
 		// Propagate failures so the scheduler can reject the frame's promise.
 		return this.#writer.write(bytes);
 	}
+
+	wantsMore(): boolean {
+		// desiredSize > 0 means below the high-water mark (room to write); 0 or
+		// negative means backpressured; null means the stream errored/closed.
+		// Native WebSocketStream ties this to the real send buffer; the ponyfill
+		// derives it from bufferedAmount, so both report true backpressure.
+		const desired = this.#writer.desiredSize;
+		return desired !== null && desired > 0;
+	}
 }
 
 /** One stream's single in-flight frame, awaiting its turn on the wire. */
@@ -62,6 +76,11 @@ export interface SchedulerOptions {
 /** Default `sendOrder` for streams that don't set one. */
 export const DEFAULT_SEND_ORDER = 0;
 
+/** How many outbound datagrams to buffer before dropping. Datagrams are
+ *  unreliable, so a backpressured transport sheds them here rather than growing
+ *  an unbounded queue. */
+const DATAGRAM_QUEUE_LIMIT = 1024;
+
 export class SendScheduler {
 	#sink: SendSink;
 	#onActivity: () => void;
@@ -71,6 +90,11 @@ export class SendScheduler {
 	// Control frames preempt all stream data, FIFO among themselves.
 	#control: Uint8Array[] = [];
 	#controlBytes = 0;
+
+	// Datagrams: serviced after control, ahead of stream data. Bounded and lossy
+	// (unlike #control) since unreliable datagrams are meant to be droppable —
+	// shed on transport backpressure or a full lane.
+	#datagrams: Uint8Array[] = [];
 
 	// Per-stream send priority and the single pending frame per ready stream.
 	// Invariant: a stream has at most one Waiter at a time, because its writer
@@ -103,6 +127,23 @@ export class SendScheduler {
 			// reset frames would corrupt the session.
 			console.warn(`qmux: control backlog ${this.#controlBytes} bytes exceeds high-water`);
 		}
+		this.#signal();
+	}
+
+	/** Queue a datagram frame — best-effort, serviced after control but ahead of
+	 *  stream data. Dropped (rather than queued) when:
+	 *   - the scheduler is closed;
+	 *   - the transport is backpressured — the socket is already queuing stream/
+	 *     control data, so a datagram behind it would arrive stale; or
+	 *   - the datagram lane is full, bounding a synchronous burst that outruns the
+	 *     writer loop even while the transport has room.
+	 *  An unreliable datagram is meant to be droppable, so this sheds rather than
+	 *  applying backpressure to the caller. */
+	enqueueDatagram(bytes: Uint8Array): void {
+		if (this.#closed) return;
+		if (!this.#sink.wantsMore()) return; // transport is queuing — drop, don't delay
+		if (this.#datagrams.length >= DATAGRAM_QUEUE_LIMIT) return; // burst cap
+		this.#datagrams.push(bytes);
 		this.#signal();
 	}
 
@@ -153,6 +194,8 @@ export class SendScheduler {
 		for (const waiter of this.#ready.values()) waiter.reject(err);
 		this.#ready.clear();
 		this.#sendOrders.clear();
+		// Drop any queued datagrams — best-effort, and they must not outlive close.
+		this.#datagrams.length = 0;
 		this.#signal();
 	}
 
@@ -186,7 +229,7 @@ export class SendScheduler {
 	async #run(): Promise<void> {
 		try {
 			while (true) {
-				if (this.#control.length === 0 && this.#ready.size === 0) {
+				if (this.#control.length === 0 && this.#datagrams.length === 0 && this.#ready.size === 0) {
 					if (this.#closed) return;
 					await new Promise<void>((resolve) => {
 						this.#wake = resolve;
@@ -201,6 +244,13 @@ export class SendScheduler {
 				if (this.#control.length > 0) {
 					const bytes = this.#control.shift() as Uint8Array;
 					this.#controlBytes -= bytes.byteLength;
+					await this.#sink.write(bytes);
+					this.#onActivity();
+					continue;
+				}
+
+				if (this.#datagrams.length > 0) {
+					const bytes = this.#datagrams.shift() as Uint8Array;
 					await this.#sink.write(bytes);
 					this.#onActivity();
 					continue;
@@ -234,5 +284,6 @@ export class SendScheduler {
 		this.#ready.clear();
 		this.#control.length = 0;
 		this.#controlBytes = 0;
+		this.#datagrams.length = 0;
 	}
 }

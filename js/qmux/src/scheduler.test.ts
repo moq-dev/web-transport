@@ -48,6 +48,11 @@ class GatedSink implements SendSink {
 		this.#admits += n;
 		this.#open();
 	}
+
+	/** Synchronous backpressure probe: room iff there's an unused admit. */
+	wantsMore(): boolean {
+		return this.#admits > 0;
+	}
 }
 
 /** Yield to the event loop `n` times to let queued work run. */
@@ -164,6 +169,51 @@ describe("SendScheduler", () => {
 		await until(() => sink.written.length === 6);
 
 		expect(sink.written[5]).toBe(99); // served on the very next write
+	});
+
+	test("datagrams are sent after control but ahead of stream data", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		// Give the transport room first, so the datagram is admitted (a datagram
+		// enqueued under backpressure would be dropped — see the next test).
+		sink.release(3);
+		sched.setSendOrder(1n, 0);
+		void sched.enqueueStream(1n, frame(10));
+		sched.enqueueDatagram(frame(50));
+		sched.enqueueControl(frame(99));
+
+		await until(() => sink.written.length === 3);
+		expect(sink.written).toEqual([99, 50, 10]); // control, then datagram, then stream
+	});
+
+	test("a datagram enqueued under transport backpressure is dropped", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		// Sink is gated (no room): the datagram is shed on enqueue...
+		sched.enqueueDatagram(frame(50));
+		// ...but a control frame still queues (lossless) and flushes once released.
+		sched.enqueueControl(frame(99));
+
+		sink.release(5);
+		await until(() => sink.written.length === 1);
+		await tick(3); // give any wrongly-queued datagram a chance to appear
+		expect(sink.written).toEqual([99]); // datagram dropped, control sent
+	});
+
+	test("datagrams are dropped once the lane is full even with room", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		// Plenty of room, so wantsMore() stays true across the synchronous burst;
+		// the lane cap (DATAGRAM_QUEUE_LIMIT = 1024) is what sheds the excess.
+		sink.release(2000);
+		for (let i = 0; i < 1030; i++) sched.enqueueDatagram(frame(1));
+
+		await until(() => sink.written.length === 1024, 500);
+		await tick(3);
+		expect(sink.written.length).toBe(1024);
 	});
 
 	test("dropStream discards queued data and rejects its promise", async () => {

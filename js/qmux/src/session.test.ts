@@ -92,6 +92,7 @@ function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
 		initialMaxStreamDataUni: 100_000n,
 		initialMaxStreamsBidi: 100n,
 		initialMaxStreamsUni: 100n,
+		maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 		maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
 		...overrides,
 	};
@@ -160,6 +161,72 @@ describe("Session integration (scripted peer)", () => {
 		peer.sendText("not binary");
 		const info = await session.closed;
 		expect(info.closeCode).toBe(1003);
+	});
+
+	test("datagrams: an app write produces a DATAGRAM frame on the wire", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		await waitFor(() => session.datagrams.maxDatagramSize > 0);
+		await session.datagrams.writable.getWriter().write(new Uint8Array([1, 2, 3]));
+
+		await waitFor(() => peer.has("datagram"));
+		const dg = peer.received().find((f) => f.type === "datagram") as Frame.Datagram;
+		expect(Array.from(dg.data)).toEqual([1, 2, 3]);
+		session.close();
+	});
+
+	test("datagrams: an incoming DATAGRAM frame is delivered to the readable", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array([9, 8, 7]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([9, 8, 7]);
+		session.close();
+	});
+
+	test("datagrams: maxDatagramSize reflects the peer's advertised frame size", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		// frame size 1201 → payload 1201 - (1 type byte + 2-byte length varint) = 1198.
+		peer.send({ type: "transport_parameters", params: peerParams({ maxDatagramFrameSize: 1201n }) });
+
+		await waitFor(() => session.datagrams.maxDatagramSize > 0);
+		expect(session.datagrams.maxDatagramSize).toBe(1198);
+		session.close();
+	});
+
+	test("datagrams: a peer that disables datagrams leaves maxDatagramSize at 0 and drops writes", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams({ maxDatagramFrameSize: 0n }) });
+
+		// A ping barrier confirms the params have been processed.
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+
+		expect(session.datagrams.maxDatagramSize).toBe(0);
+
+		// Writing is dropped, not errored: no DATAGRAM frame reaches the wire.
+		await session.datagrams.writable.getWriter().write(new Uint8Array([1, 2, 3]));
+		peer.send({ type: "ping_request", sequence: 2n });
+		await waitFor(() => peer.count("ping_response") === 2);
+		expect(peer.has("datagram")).toBe(false);
+		session.close();
+	});
+
+	test("datagrams: readable closes cleanly on a graceful session close", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const reader = session.datagrams.readable.getReader();
+		session.close(); // graceful: no #closeReason, so the readable must not error
+		const { done } = await reader.read();
+		expect(done).toBe(true);
 	});
 
 	test("MAX_STREAM_DATA is extended on delivery to the app, not on receipt", async () => {

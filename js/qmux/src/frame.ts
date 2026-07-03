@@ -87,6 +87,13 @@ export interface TransportParameters {
 	params: TransportParams;
 }
 
+/** An unreliable datagram (RFC 9221). The payload carries no length prefix in
+ * the frame struct here; on the wire it is length-delimited (0x31). */
+export interface Datagram {
+	type: "datagram";
+	data: Uint8Array;
+}
+
 export interface TransportParams {
 	maxIdleTimeout: bigint;
 	initialMaxData: bigint;
@@ -95,6 +102,8 @@ export interface TransportParams {
 	initialMaxStreamDataUni: bigint;
 	initialMaxStreamsBidi: bigint;
 	initialMaxStreamsUni: bigint;
+	/** RFC 9221 max_datagram_frame_size (ID 0x20); 0 = datagrams unsupported. */
+	maxDatagramFrameSize: bigint;
 	maxRecordSize: bigint;
 }
 
@@ -109,6 +118,7 @@ export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamDataUni: 0n,
 	initialMaxStreamsBidi: 0n,
 	initialMaxStreamsUni: 0n,
+	maxDatagramFrameSize: 0n,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
 };
 
@@ -120,6 +130,7 @@ export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamDataUni: 262_144n,
 	initialMaxStreamsBidi: 100n,
 	initialMaxStreamsUni: 100n,
+	maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
 };
 
@@ -153,7 +164,8 @@ export type Any =
 	| StreamsBlockedUni
 	| TransportParameters
 	| PingRequest
-	| PingResponse;
+	| PingResponse
+	| Datagram;
 
 export function encode(frame: Any, version: WireFormat = "webtransport"): Uint8Array {
 	if (version === "webtransport") {
@@ -372,13 +384,27 @@ function encodeQMux(frame: Any): Uint8Array {
 			buffer = VarInt.from(frame.sequence).encode(buffer);
 			return buffer;
 		}
+
+		case "datagram": {
+			// Length-prefixed form (0x31). Datagrams are only sent on QMux01, where
+			// the record (WS message) boundary would already delimit a lone 0x30
+			// datagram — but we emit 0x31 so it stays self-delimiting even if a
+			// record ever carries a frame after it. The length costs 1-2 bytes.
+			const lengthVi = VarInt.from(frame.data.length);
+			let buffer = new Uint8Array(new ArrayBuffer(8 + 8 + frame.data.length), 0, 0);
+			buffer = VarInt.from(0x31).encode(buffer);
+			buffer = lengthVi.encode(buffer);
+			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + frame.data.length);
+			buffer.set(frame.data, buffer.byteLength - frame.data.length);
+			return buffer;
+		}
 	}
 }
 
 function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
 	// Each param: id(varint) + length(varint) + value(varint)
-	// Max 8 params * 24 bytes each
-	let buffer = new Uint8Array(new ArrayBuffer(192), 0, 0);
+	// Max 9 params * 24 bytes each
+	let buffer = new Uint8Array(new ArrayBuffer(216), 0, 0);
 
 	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number | bigint, value: bigint): Uint8Array<ArrayBuffer> {
 		if (value === 0n) return buf;
@@ -396,6 +422,7 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 	buffer = writeParam(buffer, 0x07, params.initialMaxStreamDataUni);
 	buffer = writeParam(buffer, 0x08, params.initialMaxStreamsBidi);
 	buffer = writeParam(buffer, 0x09, params.initialMaxStreamsUni);
+	buffer = writeParam(buffer, 0x20, params.maxDatagramFrameSize);
 	buffer = writeParam(buffer, MAX_RECORD_SIZE_ID, params.maxRecordSize);
 
 	return buffer;
@@ -455,6 +482,9 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 				break;
 			case 0x09n:
 				params.initialMaxStreamsUni = paramValue;
+				break;
+			case 0x20n:
+				params.maxDatagramFrameSize = paramValue;
 				break;
 			case MAX_RECORD_SIZE_ID:
 				params.maxRecordSize = paramValue;
@@ -706,15 +736,18 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "ping_response", sequence: v.value };
 	}
 
-	// DATAGRAM without length
+	// DATAGRAM without length — payload runs to the end of the record
 	if (frameType === 0x30n) {
-		return null;
+		return { type: "datagram", data: buffer };
 	}
 
 	// DATAGRAM with length
 	if (frameType === 0x31n) {
 		[v, buffer] = VarInt.decode(buffer);
-		return null;
+		const len = Number(v.value);
+		let data: Uint8Array;
+		[data, buffer] = take(buffer, len);
+		return { type: "datagram", data };
 	}
 
 	// Unknown frame type
@@ -868,19 +901,19 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		return [{ type: "ping_response", sequence: v.value }, buffer];
 	}
 
-	// DATAGRAM without length
+	// DATAGRAM without length — payload runs to the end of the record
 	if (frameType === 0x30n) {
-		return [null, buffer.slice(buffer.byteLength)];
+		const data = buffer;
+		return [{ type: "datagram", data }, buffer.slice(buffer.byteLength)];
 	}
 
 	// DATAGRAM with length
 	if (frameType === 0x31n) {
 		[v, buffer] = VarInt.decode(buffer);
 		const len = Number(v.value);
-		// Validate the declared length even though we discard the payload —
-		// a peer-supplied size larger than what's in the buffer is a protocol error.
-		[, buffer] = take(buffer, len);
-		return [null, buffer];
+		let data: Uint8Array;
+		[data, buffer] = take(buffer, len);
+		return [{ type: "datagram", data }, buffer];
 	}
 
 	// Unknown: skip remaining (can't delimit)

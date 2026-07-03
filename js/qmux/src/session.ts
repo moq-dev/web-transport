@@ -34,6 +34,13 @@ export interface Config {
 	maxIdleTimeout?: bigint;
 	/** Maximum QMux Record size in bytes (draft-01). */
 	maxRecordSize?: bigint;
+	/** Largest DATAGRAM *frame* (RFC 9221: type + length + payload) we advertise
+	 *  willingness to receive; 0 disables datagrams. This is a frame size, not a
+	 *  payload size — {@link Datagrams.maxDatagramSize} reports the usable payload
+	 *  (this value less framing overhead). Keep it at or below `maxRecordSize`.
+	 *  Datagrams are a QMux01 feature; this is ignored on qmux-00. Defaults to a
+	 *  full record. */
+	maxDatagramFrameSize?: bigint;
 }
 
 const DEFAULT_CONFIG: Required<Config> = {
@@ -45,6 +52,8 @@ const DEFAULT_CONFIG: Required<Config> = {
 	maxStreamDataUni: 262_144n,
 	maxIdleTimeout: 30_000n,
 	maxRecordSize: Frame.DEFAULT_MAX_RECORD_SIZE,
+	// Fill a full record by default; the record layer bounds the size.
+	maxDatagramFrameSize: Frame.DEFAULT_MAX_RECORD_SIZE,
 };
 
 function configToTransportParams(config: Required<Config>): TransportParams {
@@ -56,28 +65,82 @@ function configToTransportParams(config: Required<Config>): TransportParams {
 		initialMaxStreamDataUni: config.maxStreamDataUni,
 		initialMaxStreamsBidi: config.maxStreamsBidi,
 		initialMaxStreamsUni: config.maxStreamsUni,
+		// Clamp to maxRecordSize so we never advertise a datagram larger than our
+		// record layer accepts.
+		maxDatagramFrameSize:
+			config.maxDatagramFrameSize < config.maxRecordSize ? config.maxDatagramFrameSize : config.maxRecordSize,
 		maxRecordSize: config.maxRecordSize,
 	};
 }
 
-// TODO Implement this
+/** `WebTransportDatagramDuplexStream` (RFC 9221) backed by QMux DATAGRAM frames.
+ *
+ * Datagrams are unreliable: the inbound `readable` is a fixed-capacity queue that
+ * drops when a slow reader lets it fill, and an outbound payload larger than
+ * {@link maxDatagramSize} (or one sent before the peer advertised support) is
+ * silently discarded, matching the W3C WebTransport semantics.
+ */
 export class Datagrams implements WebTransportDatagramDuplexStream {
-	incomingHighWaterMark: number;
-	incomingMaxAge: number | null;
-	readonly maxDatagramSize: number;
-	outgoingHighWaterMark: number;
-	outgoingMaxAge: number | null;
-	readonly readable: ReadableStream;
-	readonly writable: WritableStream;
+	incomingHighWaterMark = 1024;
+	incomingMaxAge: number | null = null;
+	outgoingHighWaterMark = 1024;
+	outgoingMaxAge: number | null = null;
 
-	constructor() {
-		this.incomingHighWaterMark = 1024;
-		this.incomingMaxAge = null;
-		this.maxDatagramSize = 1200;
-		this.outgoingHighWaterMark = 1024;
-		this.outgoingMaxAge = null;
-		this.readable = new ReadableStream<Uint8Array>({});
-		this.writable = new WritableStream<Uint8Array>({});
+	readonly readable: ReadableStream<Uint8Array>;
+	readonly writable: WritableStream<Uint8Array>;
+
+	#incoming!: ReadableStreamDefaultController<Uint8Array>;
+	// Resolved from the peer's transport parameters once the handshake completes;
+	// 0 until then (and forever if the peer doesn't accept datagrams).
+	#maxDatagramSize = 0;
+
+	/** @param send Enqueue a datagram payload onto the wire (best-effort). */
+	constructor(private send: (data: Uint8Array) => void) {
+		// A bounded queue: `pull` is a no-op, so `desiredSize` reflects the
+		// backlog and #push drops once it's full rather than buffering unboundedly.
+		this.readable = new ReadableStream<Uint8Array>(
+			{
+				start: (controller) => {
+					this.#incoming = controller;
+				},
+			},
+			{ highWaterMark: this.incomingHighWaterMark },
+		);
+
+		this.writable = new WritableStream<Uint8Array>({
+			write: (chunk) => {
+				// Oversized or unsupported datagrams are discarded, not errored:
+				// the writable stays usable, matching unreliable-datagram semantics.
+				if (this.#maxDatagramSize > 0 && chunk.byteLength <= this.#maxDatagramSize) {
+					this.send(chunk);
+				}
+			},
+		});
+	}
+
+	get maxDatagramSize(): number {
+		return this.#maxDatagramSize;
+	}
+
+	/** Resolve the send-payload limit from the negotiated parameters. */
+	setMaxDatagramSize(size: number): void {
+		this.#maxDatagramSize = size;
+	}
+
+	/** Deliver an inbound datagram to the reader, dropping it if the queue is full. */
+	push(data: Uint8Array): void {
+		if (this.#incoming.desiredSize !== null && this.#incoming.desiredSize <= 0) {
+			return; // reader is behind — shed load
+		}
+		this.#incoming.enqueue(data);
+	}
+
+	/** Close the inbound readable when the session ends. */
+	close(err?: Error): void {
+		try {
+			if (err) this.#incoming.error(err);
+			else this.#incoming.close();
+		} catch {}
 	}
 }
 
@@ -295,8 +358,7 @@ export default class Session implements WebTransport {
 	readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 	#incomingUnidirectionalStreams!: ReadableStreamDefaultController<ReadableStream<Uint8Array>>;
 
-	// TODO: Implement datagrams
-	readonly datagrams = new Datagrams();
+	readonly datagrams = new Datagrams((data) => this.#sendDatagram(data));
 
 	// Flow control state
 	#config: Required<Config>;
@@ -460,6 +522,13 @@ export default class Session implements WebTransport {
 		this.#version = version;
 		this.#protocol = parseProtocol(rawProtocol, version);
 
+		// Datagrams are a QMux01 feature (they rely on the record layer for
+		// framing): don't advertise the parameter — or accept datagrams — on any
+		// other wire format. The recv path gates on #ourParams.maxDatagramFrameSize.
+		if (version !== "qmux-01") {
+			this.#ourParams = { ...this.#ourParams, maxDatagramFrameSize: 0n };
+		}
+
 		this.#scheduler = new SendScheduler(sink, {
 			onActivity: () => {
 				this.#lastSendAt = Date.now();
@@ -525,6 +594,16 @@ export default class Session implements WebTransport {
 			this.#bidiStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_streams_uni") {
 			this.#uniStreamCredit.increaseMax(frame.max);
+		} else if (frame.type === "datagram") {
+			// Only accept datagrams if we advertised support (a conforming peer
+			// won't send otherwise) and the payload fits the frame size we
+			// advertised — drop oversized ones rather than delivering them.
+			if (
+				this.#ourParams.maxDatagramFrameSize > 0n &&
+				BigInt(frame.data.byteLength) <= this.#ourParams.maxDatagramFrameSize
+			) {
+				this.datagrams.push(frame.data);
+			}
 		} else if (frame.type === "ping_request") {
 			// Respond to ping requests
 			this.#sendPriorityFrame({ type: "ping_response", sequence: frame.sequence });
@@ -548,6 +627,22 @@ export default class Session implements WebTransport {
 		this.#connCredit.increaseMax(params.initialMaxData);
 		this.#bidiStreamCredit.increaseMax(params.initialMaxStreamsBidi);
 		this.#uniStreamCredit.increaseMax(params.initialMaxStreamsUni);
+
+		// Resolve the datagram send limit. Datagrams are a QMux01-only feature, so
+		// they stay disabled on any other wire format. Otherwise whether we may
+		// *send* depends solely on the peer's willingness to receive (RFC 9221):
+		// 0 means unsupported.
+		if (this.#version === "qmux-01" && params.maxDatagramFrameSize > 0n) {
+			// A datagram must fit in one record, so the frame is capped by the
+			// smaller of the peer's datagram-frame limit and its record size.
+			const cap =
+				params.maxRecordSize < params.maxDatagramFrameSize ? params.maxRecordSize : params.maxDatagramFrameSize;
+			// We encode the length-prefixed form (0x31): one type byte plus a length
+			// varint sized for `cap`. Subtracting it keeps the frame within the limit.
+			const overhead = BigInt(1 + VarInt.from(cap).size());
+			const payload = cap > overhead ? cap - overhead : 0n;
+			this.datagrams.setMaxDatagramSize(Number(payload));
+		}
 
 		// Update per-stream send credits for streams created before params arrived.
 		// The direction-only limit below is correct for locally-opened streams; we
@@ -1002,6 +1097,17 @@ export default class Session implements WebTransport {
 		await this.#enqueueStreamFrame(id.value.value, { type: "stream", id, data: new Uint8Array(), fin: true });
 	}
 
+	/** Enqueue a DATAGRAM frame on the scheduler's bounded, lossy datagram lane —
+	 *  dropped under transport backpressure or once closed, rather than piling up
+	 *  on the (lossless, unbounded) control lane. Size/support checks happen in
+	 *  {@link Datagrams} before we get here. */
+	#sendDatagram(data: Uint8Array) {
+		if (this.#closed) return;
+		const bytes = Frame.encode({ type: "datagram", data }, this.#version);
+		this.#validateRecordSize(bytes);
+		this.#scheduler?.enqueueDatagram(bytes);
+	}
+
 	#sendPriorityFrame(frame: Frame.Any) {
 		// Once closed, the scheduler rejects new control frames; a late reset/stop
 		// from a stream teardown callback must be a no-op, not a throw. (The
@@ -1187,6 +1293,11 @@ export default class Session implements WebTransport {
 		try {
 			this.#incomingUnidirectionalStreams.close();
 		} catch {}
+		// Pass the *reason*, not `#closed` (always an Error): a graceful
+		// app-initiated close leaves `#closeReason` unset, so the datagram
+		// readable closes cleanly instead of erroring, matching the incoming
+		// stream controllers below.
+		this.datagrams.close(this.#closeReason);
 		for (const c of this.#sendStreams.values()) {
 			try {
 				c.error(this.#closed);

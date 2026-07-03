@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use web_transport_proto::VarInt;
 
+use super::varint_size;
 use crate::Error;
 
 /// Transport parameters exchanged during QMux connection setup.
@@ -18,6 +19,7 @@ pub struct TransportParams {
     pub initial_max_stream_data_uni: u64,         // ID 0x07
     pub initial_max_streams_bidi: u64,            // ID 0x08
     pub initial_max_streams_uni: u64,             // ID 0x09
+    pub max_datagram_frame_size: u64,             // ID 0x20 (RFC 9221; 0 = datagrams unsupported)
     pub max_record_size: u64,                     // ID 0x0571c59429cd0845 (default 16382)
 
     /// Application protocols advertised for negotiation (preference order).
@@ -62,6 +64,7 @@ impl TransportParams {
     const INITIAL_MAX_STREAM_DATA_UNI: VarInt = VarInt::from_u32(0x07);
     const INITIAL_MAX_STREAMS_BIDI: VarInt = VarInt::from_u32(0x08);
     const INITIAL_MAX_STREAMS_UNI: VarInt = VarInt::from_u32(0x09);
+    const MAX_DATAGRAM_FRAME_SIZE: VarInt = VarInt::from_u32(0x20);
 
     /// Encode transport parameters as a series of ID-length-value tuples.
     pub fn encode(&self) -> Result<Bytes, Error> {
@@ -106,6 +109,11 @@ impl TransportParams {
             &mut buf,
             Self::INITIAL_MAX_STREAMS_UNI,
             self.initial_max_streams_uni,
+        )?;
+        write_param(
+            &mut buf,
+            Self::MAX_DATAGRAM_FRAME_SIZE,
+            self.max_datagram_frame_size,
         )?;
         write_param(&mut buf, MAX_RECORD_SIZE_ID_VI, self.max_record_size)?;
 
@@ -152,7 +160,7 @@ impl TransportParams {
                     }
                     params.protocols = decode_protocols(&mut param_data)?;
                 }
-                0x01 | 0x04..=0x09 | MAX_RECORD_SIZE_ID => {
+                0x01 | 0x04..=0x09 | 0x20 | MAX_RECORD_SIZE_ID => {
                     if !seen.insert(id) {
                         return Err(Error::DuplicateParam(id));
                     }
@@ -177,6 +185,9 @@ impl TransportParams {
                         }
                         0x09 => {
                             params.initial_max_streams_uni = decode_varint_param(&mut param_data)?
+                        }
+                        0x20 => {
+                            params.max_datagram_frame_size = decode_varint_param(&mut param_data)?
                         }
                         MAX_RECORD_SIZE_ID => {
                             params.max_record_size = decode_varint_param(&mut param_data)?
@@ -228,19 +239,6 @@ fn decode_varint_param(data: &mut Bytes) -> Result<u64, Error> {
     Ok(value)
 }
 
-/// Returns the encoded size of a varint value.
-fn varint_size(v: u64) -> usize {
-    if v < (1 << 6) {
-        1
-    } else if v < (1 << 14) {
-        2
-    } else if v < (1 << 30) {
-        4
-    } else {
-        8
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +253,38 @@ mod tests {
         let decoded = TransportParams::decode(params.encode().unwrap()).unwrap();
         assert_eq!(decoded.protocols, params.protocols);
         assert_eq!(decoded.initial_max_data, 1024);
+    }
+
+    #[test]
+    fn max_datagram_frame_size_round_trip() {
+        let params = TransportParams {
+            initial_max_data: 1024,
+            max_datagram_frame_size: 1201,
+            ..TransportParams::default()
+        };
+        let decoded = TransportParams::decode(params.encode().unwrap()).unwrap();
+        assert_eq!(decoded.max_datagram_frame_size, 1201);
+        assert_eq!(decoded.initial_max_data, 1024);
+    }
+
+    #[test]
+    fn max_datagram_frame_size_omitted_when_zero() {
+        // A zero value means "datagrams unsupported" and must not appear on the
+        // wire, so a peer that doesn't enable datagrams stays byte-identical.
+        let params = TransportParams {
+            initial_max_streams_uni: 100, // some non-datagram content on the wire
+            max_datagram_frame_size: 0,
+            ..TransportParams::default()
+        };
+        let bytes = params.encode().unwrap();
+        // Param id 0x20 encodes to a single 0x20 byte; the zero value omits it.
+        assert!(!bytes.contains(&0x20));
+        assert_eq!(
+            TransportParams::decode(bytes)
+                .unwrap()
+                .max_datagram_frame_size,
+            0
+        );
     }
 
     #[test]

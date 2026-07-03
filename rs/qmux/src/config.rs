@@ -60,6 +60,20 @@ pub struct Config {
     /// Maximum QMux Record size in bytes (draft-01). Default: 16382.
     pub max_record_size: u64,
 
+    /// Largest DATAGRAM *frame* (RFC 9221: frame type + length + payload) we
+    /// advertise willingness to receive, in bytes; `0` disables datagrams. Sent
+    /// verbatim as the `max_datagram_frame_size` transport parameter.
+    ///
+    /// This is a frame size, not a payload size: the usable payload reported by
+    /// [`max_datagram_size`](web_transport_trait::Session::max_datagram_size) is
+    /// this value less the per-frame overhead. A datagram must fit within a
+    /// single record, so keep it at or below
+    /// [`max_record_size`](Config::max_record_size). Datagrams are a QMux01
+    /// feature (they rely on the record layer); this is ignored on QMux00 and the
+    /// legacy `webtransport` format. Default:
+    /// [`DEFAULT_MAX_RECORD_SIZE`](crate::proto::DEFAULT_MAX_RECORD_SIZE).
+    pub max_datagram_frame_size: u64,
+
     /// How long [`Session::connect`](crate::Session::connect) /
     /// [`accept`](crate::Session::accept) waits for the peer's transport
     /// parameters before giving up. Bounds the handshake so a peer that completes
@@ -82,6 +96,8 @@ impl Default for Config {
             max_stream_data_uni: 262_144,         // 256 KB
             max_idle_timeout: 30_000,             // 30 seconds
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            // Fill a full record by default; the record layer bounds the size.
+            max_datagram_frame_size: DEFAULT_MAX_RECORD_SIZE,
             handshake_timeout: Duration::from_secs(10),
         }
     }
@@ -119,6 +135,16 @@ impl Config {
             initial_max_stream_data_uni: self.max_stream_data_uni,
             initial_max_streams_bidi: self.max_streams_bidi,
             initial_max_streams_uni: self.max_streams_uni,
+            // Datagrams are a QMux01 feature (they rely on the record layer to be
+            // framed): only advertise the parameter on QMux01. Elsewhere it stays
+            // 0 — "unsupported" — which the encoder omits. Clamp to max_record_size
+            // so we never invite a datagram larger than our record layer accepts
+            // (recv_record would reject it as FrameTooLarge and kill the session).
+            max_datagram_frame_size: if self.version == Version::QMux01 {
+                self.max_datagram_frame_size.min(self.max_record_size)
+            } else {
+                0
+            },
             max_record_size: self.max_record_size,
             // Only advertise protocols when negotiating in-band; TLS/WS already
             // chose one via ALPN and must not send this parameter.

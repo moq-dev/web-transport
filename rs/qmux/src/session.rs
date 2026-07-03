@@ -1,6 +1,9 @@
 use std::{
     collections::{hash_map, HashMap},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 
 use crate::config::Config;
@@ -8,13 +11,23 @@ use crate::credit::Credit;
 use crate::sched::PriorityQueue;
 use crate::transport::Transport;
 use crate::{
-    ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir, StreamId,
-    TransportParams, Version, MAX_FRAME_PAYLOAD,
+    proto::varint_size, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
+    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
+
+/// How many inbound datagrams to buffer before dropping. Datagrams are
+/// unreliable, so a slow `recv_datagram` consumer sheds load here rather than
+/// applying backpressure to the whole session.
+const DATAGRAM_RECV_BUFFER: usize = 1024;
+
+/// How many outbound datagrams to buffer before dropping. When the transport is
+/// backpressured, `send_datagram` sheds datagrams here rather than growing an
+/// unbounded queue — droppable is the whole point of an unreliable datagram.
+const DATAGRAM_SEND_BUFFER: usize = 1024;
 
 /// A multiplexed session over a reliable transport.
 #[derive(Clone)]
@@ -56,6 +69,22 @@ pub struct Session {
 
     // Shared connection-level recv credit (shared with RecvStreams)
     conn_recv_credit: Credit,
+
+    // Inbound datagrams (RFC 9221). The backend fans DATAGRAM frames into this
+    // channel; `recv_datagram` drains it. Bounded and lossy — a slow reader
+    // drops datagrams rather than stalling the session.
+    recv_datagram: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
+
+    // Outbound datagrams. `send_datagram` pushes payloads here; the backend loop
+    // frames and writes them. Bounded and lossy so a backpressured transport
+    // drops datagrams instead of queueing them unboundedly. Kept off the
+    // (lossless) control lane, which must never drop RESET/STOP/CLOSE frames.
+    outbound_datagram: mpsc::Sender<Bytes>,
+
+    // The largest datagram payload we may send, i.e. `max_datagram_size()`.
+    // Resolved from the peer's transport parameters before the session is handed
+    // to the caller (0 = the peer doesn't accept datagrams).
+    datagram_max_size: Arc<AtomicUsize>,
 }
 
 struct SessionState<T: Transport> {
@@ -99,6 +128,14 @@ struct SessionState<T: Transport> {
     last_recv_at: tokio::time::Instant,
     last_send_at: tokio::time::Instant,
     next_ping_seq: u64,
+
+    // Inbound datagram sink (see the matching field on `Session`) plus the
+    // shared send-limit cell resolved from the peer's params.
+    recv_datagram: mpsc::Sender<Bytes>,
+    datagram_max_size: Arc<AtomicUsize>,
+
+    // Receiver for outbound datagrams enqueued by `send_datagram`.
+    outbound_datagram: mpsc::Receiver<Bytes>,
 }
 
 impl<T: Transport> SessionState<T> {
@@ -161,6 +198,10 @@ impl<T: Transport> SessionState<T> {
                         Some(frame) => self.send_frame(frame).await?,
                         None => return Err(Error::Closed),
                     };
+                }
+                Some(payload) = self.outbound_datagram.recv() => {
+                    // Ahead of bulk stream data for low latency, behind control.
+                    self.send_frame(Frame::Datagram(payload)).await?;
                 }
                 frame = self.outbound.pop() => {
                     match frame {
@@ -477,6 +518,19 @@ impl<T: Transport> SessionState<T> {
                     self.outbound_priority.0.send(response).ok();
                 }
             }
+            // DATAGRAM: fan out to the receive channel. Accept only if we
+            // advertised support (a conforming peer won't send otherwise) and the
+            // payload fits within the frame size we advertised — reject oversized
+            // ones rather than buffering them, mirroring the STREAM check above.
+            // Delivery is best-effort past that, so drop the datagram if the
+            // channel is full rather than blocking the session loop.
+            Frame::Datagram(payload) => {
+                if self.our_params.max_datagram_frame_size != 0
+                    && payload.len() as u64 <= self.our_params.max_datagram_frame_size
+                {
+                    let _ = self.recv_datagram.try_send(payload);
+                }
+            }
         }
 
         Ok(())
@@ -539,6 +593,30 @@ impl<T: Transport> SessionState<T> {
                 credit.increase_max(initial).ok();
             }
         }
+
+        // Resolve the datagram send limit. Datagrams are a QMux01-only feature
+        // (they rely on the record layer for framing), so they stay disabled on
+        // any other wire format. Otherwise whether we may *send* depends solely on
+        // the peer's willingness to receive (RFC 9221): 0 means the peer omitted
+        // (or zeroed) max_datagram_frame_size.
+        let datagram_max =
+            if self.config.version != Version::QMux01 || params.max_datagram_frame_size == 0 {
+                0
+            } else {
+                // A datagram must fit in one record, so the frame is capped by the
+                // smaller of the peer's datagram-frame limit and its record size.
+                let cap = params.max_datagram_frame_size.min(params.max_record_size);
+                // We encode the length-prefixed form (0x31): one type byte plus a
+                // length varint. `varint_size(cap)` bounds the varint for any payload
+                // that fits in `cap`, so subtracting it keeps the encoded frame within
+                // the peer's limit regardless of the exact payload length.
+                let overhead = 1 + varint_size(cap);
+                usize::try_from(cap.saturating_sub(overhead)).unwrap_or(usize::MAX)
+            };
+        // Store before signalling establishment so `connect`/`accept` callers
+        // observe the resolved value via `max_datagram_size()`.
+        self.datagram_max_size
+            .store(datagram_max, Ordering::Release);
 
         self.peer_params = params;
 
@@ -634,6 +712,12 @@ impl Session {
         let outbound = PriorityQueue::new(8);
         let (outbound_priority_tx, outbound_priority_rx) = mpsc::unbounded_channel();
 
+        // Bounded, lossy inbound-datagram channel: the backend drops on a full
+        // buffer rather than stalling, matching QUIC's unreliable semantics.
+        let (recv_datagram_tx, recv_datagram_rx) = mpsc::channel(DATAGRAM_RECV_BUFFER);
+        let (outbound_datagram_tx, outbound_datagram_rx) = mpsc::channel(DATAGRAM_SEND_BUFFER);
+        let datagram_max_size = Arc::new(AtomicUsize::new(0));
+
         let closed = watch::Sender::new(None);
 
         // Protocol negotiation. Only `Negotiate` resolves in-band (once the
@@ -704,6 +788,9 @@ impl Session {
             last_recv_at: tokio::time::Instant::now(),
             last_send_at: tokio::time::Instant::now(),
             next_ping_seq: 0,
+            recv_datagram: recv_datagram_tx,
+            datagram_max_size: datagram_max_size.clone(),
+            outbound_datagram: outbound_datagram_rx,
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
@@ -746,6 +833,9 @@ impl Session {
             open_uni_credit,
             conn_send_credit,
             conn_recv_credit,
+            recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
+            datagram_max_size,
+            outbound_datagram: outbound_datagram_tx,
         }
     }
 }
@@ -910,16 +1000,38 @@ impl generic::Session for Session {
             .unwrap_or(Error::Closed)
     }
 
-    fn send_datagram(&self, _payload: Bytes) -> Result<(), Self::Error> {
-        Err(Error::DatagramsUnsupported)
+    fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
+        let max = self.datagram_max_size.load(Ordering::Acquire);
+        if max == 0 {
+            // The peer never advertised max_datagram_frame_size (or zeroed it).
+            return Err(Error::DatagramsUnsupported);
+        }
+        if payload.len() > max {
+            return Err(Error::FrameTooLarge);
+        }
+        // Best-effort and synchronous, matching the trait's fire-and-forget
+        // contract. A full buffer means the transport is backpressured: drop the
+        // datagram (returning `Ok`) rather than block or grow without bound — an
+        // unreliable datagram is meant to be droppable. A closed session (the
+        // receiver is gone) surfaces as `Closed`.
+        match self.outbound_datagram.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     fn max_datagram_size(&self) -> usize {
-        0
+        self.datagram_max_size.load(Ordering::Acquire)
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        Err(Error::DatagramsUnsupported)
+        self.recv_datagram
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(Error::Closed)
     }
 
     fn protocol(&self) -> Option<&str> {
