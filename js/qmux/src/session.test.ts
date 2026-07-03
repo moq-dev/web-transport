@@ -206,19 +206,27 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
-	test("datagrams: a DATAGRAM whose frame overflows our advertised size is dropped", async () => {
-		// ourParams.maxDatagramFrameSize = 10. A 10-byte payload passes the old
-		// payload-only check but its encoded frame is 1 + 1 + 10 = 12 > 10, so it
-		// must be dropped. The following in-limit datagram is what the reader sees.
+	test("datagrams: a DATAGRAM whose frame overflows our advertised size is fatal", async () => {
+		// ourParams.maxDatagramFrameSize = 10. A 10-byte payload encodes to a
+		// 1 + 1 + 10 = 12-byte frame > 10 — a peer exceeding the size we negotiated
+		// is a PROTOCOL_VIOLATION (RFC 9221), so the session must close, not drop.
 		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
 		await session.ready;
 		peer.send({ type: "transport_parameters", params: peerParams() });
 
 		peer.send({ type: "datagram", data: new Uint8Array(10) });
-		peer.send({ type: "datagram", data: new Uint8Array([9, 9]) });
-		const { value } = await session.datagrams.readable.getReader().read();
-		expect(Array.from(value as Uint8Array)).toEqual([9, 9]);
-		session.close();
+		expect(await session.closed).toEqual({ closeCode: 1002, reason: "Protocol violation" });
+	});
+
+	test("datagrams: a DATAGRAM we never advertised support for is fatal", async () => {
+		// ourParams.maxDatagramFrameSize = 0 → we advertised no datagram support, so
+		// receiving one at all is a PROTOCOL_VIOLATION (RFC 9221), not a droppable frame.
+		const { session, peer } = connect({ maxDatagramFrameSize: 0n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array([1, 2, 3]) });
+		expect(await session.closed).toEqual({ closeCode: 1002, reason: "Protocol violation" });
 	});
 
 	test("datagrams: a no-length (0x30) DATAGRAM is sized without a length varint", async () => {
