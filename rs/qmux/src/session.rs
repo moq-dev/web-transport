@@ -1491,6 +1491,8 @@ impl SendStream {
                 code,
                 final_size: self.offset,
             };
+            // Flush queued STREAM data so none trails the RESET_STREAM on the wire.
+            self.outbound.remove(self.id);
             self.outbound_priority.send(frame.into()).ok();
         }
         self.closed = Some(error.clone());
@@ -1645,6 +1647,10 @@ impl generic::SendStream for SendStream {
             final_size: self.offset,
         };
 
+        // Flush any STREAM data still queued for this stream: it must not go out
+        // after the RESET_STREAM, where it would be post-terminal data burning
+        // congestion window on a stream the peer has abandoned.
+        self.outbound.remove(self.id);
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
