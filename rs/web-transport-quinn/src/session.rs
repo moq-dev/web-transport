@@ -303,6 +303,32 @@ impl Session {
         Ok(())
     }
 
+    /// Sends an application datagram, waiting for buffer space if the send buffer is full.
+    ///
+    /// Unlike [`send_datagram`](Self::send_datagram), this applies backpressure instead of
+    /// returning an error when there are too many outstanding datagrams.
+    ///
+    /// Datagrams are unreliable and may be dropped or delivered out of order.
+    /// The data must be smaller than [`max_datagram_size`](Self::max_datagram_size).
+    pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), SessionError> {
+        let result = if !self.header_datagram.is_empty() {
+            // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
+            // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
+            let mut buf = BytesMut::with_capacity(self.header_datagram.len() + data.len());
+
+            // Prepend the datagram with the header indicating the session ID.
+            buf.extend_from_slice(&self.header_datagram);
+            buf.extend_from_slice(&data);
+
+            self.conn.send_datagram_wait(buf.into()).await
+        } else {
+            self.conn.send_datagram_wait(data).await
+        };
+
+        result.map_err(|e| self.map_error(e))?;
+        Ok(())
+    }
+
     /// Computes the maximum size of datagrams that may be passed to
     /// [`send_datagram`](Self::send_datagram).
     pub fn max_datagram_size(&self) -> usize {
@@ -311,6 +337,16 @@ impl Session {
             .max_datagram_size()
             .expect("datagram support is required");
         mtu.saturating_sub(self.header_datagram.len())
+    }
+
+    /// The number of bytes of available space in the outgoing datagram buffer.
+    ///
+    /// The session-ID header is subtracted, so this reflects the payload bytes that may be
+    /// passed to [`send_datagram`](Self::send_datagram) before it starts dropping datagrams.
+    pub fn datagram_send_buffer_space(&self) -> usize {
+        self.conn
+            .datagram_send_buffer_space()
+            .saturating_sub(self.header_datagram.len())
     }
 
     /// Close the session with an error code and reason.
