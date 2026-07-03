@@ -39,6 +39,17 @@ const DATAGRAM_SEND_BUFFER: usize = 64;
 struct Streams {
     send: HashMap<StreamId, SendState>,
     recv: HashMap<StreamId, RecvState>,
+
+    // The peer's initial per-stream send-credit limits, applied to the streams
+    // we open. Zero until the peer's transport parameters arrive;
+    // `recv_transport_parameters` publishes them here under this lock, and
+    // `open_uni`/`open_bi` seed a freshly opened stream's credit from them under
+    // the same lock. That serialization credits a stream opened concurrently with
+    // the handshake exactly once — either here at open time, or by the params
+    // handler when it walks the map (whichever takes the lock second sees the
+    // other's effect).
+    peer_initial_max_stream_data_uni: u64,
+    peer_initial_max_stream_data_bidi_remote: u64,
 }
 
 /// Closes the connection once the last [`Session`] handle is dropped. Held in an
@@ -75,8 +86,12 @@ pub struct Session {
     accept_bi: Arc<tokio::sync::Mutex<mpsc::Receiver<(SendStream, RecvStream)>>>,
     accept_uni: Arc<tokio::sync::Mutex<mpsc::Receiver<RecvStream>>>,
 
-    create_uni: mpsc::Sender<(StreamId, SendState)>,
-    create_bi: mpsc::Sender<(StreamId, SendState, RecvState)>,
+    // Shared per-stream backend state (with the reader and writer tasks). The
+    // frontend registers the streams it opens directly under this lock — see
+    // `open_uni`/`open_bi` — rather than handing them to the reader over a
+    // channel, so the backend exists before the returned stream can enqueue a
+    // frame (no open-vs-writer race) and there's no message-passing hop.
+    streams: Arc<Mutex<Streams>>,
 
     closed: watch::Sender<Option<Error>>,
 
@@ -191,10 +206,8 @@ struct SessionState<R: TransportReader> {
     accept_bi: mpsc::Sender<(SendStream, RecvStream)>,
     accept_uni: mpsc::Sender<RecvStream>,
 
-    create_uni: mpsc::Receiver<(StreamId, SendState)>,
-    create_bi: mpsc::Receiver<(StreamId, SendState, RecvState)>,
-
-    // Shared per-stream backend state (with the writer task).
+    // Shared per-stream backend state (with the frontend and writer). The
+    // frontend inserts streams it opens; the reader inserts peer-initiated ones.
     streams: Arc<Mutex<Streams>>,
 
     closed: watch::Sender<Option<Error>>,
@@ -417,25 +430,6 @@ impl<R: TransportReader> SessionState<R> {
                     } else if let Some(frame) = Frame::decode(data, self.config.version)? {
                         self.recv_frame(frame).await?;
                     }
-                }
-                Some((id, send)) = self.create_uni.recv() => {
-                    // Apply peer's stream credit if transport params already received
-                    if self.params_received {
-                        if let Some(credit) = &send.stream_credit {
-                            credit.increase_max(self.peer_params.initial_max_stream_data_uni).ok();
-                        }
-                    }
-                    self.streams.lock().unwrap().send.insert(id, send);
-                }
-                Some((id, send, recv)) = self.create_bi.recv() => {
-                    if self.params_received {
-                        if let Some(credit) = &send.stream_credit {
-                            credit.increase_max(self.peer_params.initial_max_stream_data_bidi_remote).ok();
-                        }
-                    }
-                    let mut streams = self.streams.lock().unwrap();
-                    streams.send.insert(id, send);
-                    streams.recv.insert(id, recv);
                 }
                 _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
                     tracing::debug!("idle timeout fired");
@@ -820,22 +814,32 @@ impl<R: TransportReader> SessionState<R> {
             .increase_max(params.initial_max_streams_uni)
             .ok();
 
-        // Update per-stream send credits for already-opened streams
-        for (id, send) in &self.streams.lock().unwrap().send {
-            if let Some(credit) = &send.stream_credit {
-                let initial = match id.dir() {
-                    StreamDir::Bi => {
-                        if id.server_initiated() == self.is_server {
-                            // We initiated this stream — peer's bidi_remote applies
-                            params.initial_max_stream_data_bidi_remote
-                        } else {
-                            // Peer initiated this stream — peer's bidi_local applies
-                            params.initial_max_stream_data_bidi_local
+        // Publish the peer's initial per-stream send limits and credit the streams
+        // we've already opened — both under one lock, so a stream being opened
+        // concurrently is credited exactly once: either it's already in the map and
+        // this walk credits it, or it's not yet inserted and `open_uni`/`open_bi`
+        // reads the values we just published and credits itself.
+        {
+            let mut streams = self.streams.lock().unwrap();
+            streams.peer_initial_max_stream_data_uni = params.initial_max_stream_data_uni;
+            streams.peer_initial_max_stream_data_bidi_remote =
+                params.initial_max_stream_data_bidi_remote;
+            for (id, send) in &streams.send {
+                if let Some(credit) = &send.stream_credit {
+                    let initial = match id.dir() {
+                        StreamDir::Bi => {
+                            if id.server_initiated() == self.is_server {
+                                // We initiated this stream — peer's bidi_remote applies
+                                params.initial_max_stream_data_bidi_remote
+                            } else {
+                                // Peer initiated this stream — peer's bidi_local applies
+                                params.initial_max_stream_data_bidi_local
+                            }
                         }
-                    }
-                    StreamDir::Uni => params.initial_max_stream_data_uni,
-                };
-                credit.increase_max(initial).ok();
+                        StreamDir::Uni => params.initial_max_stream_data_uni,
+                    };
+                    credit.increase_max(initial).ok();
+                }
             }
         }
 
@@ -969,9 +973,6 @@ impl Session {
         let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
 
-        let (create_uni_tx, create_uni_rx) = mpsc::channel(8);
-        let (create_bi_tx, create_bi_rx) = mpsc::channel(8);
-
         let outbound = PriorityQueue::new(8);
         // Control lane (lossless): RESET/STOP/CLOSE, window updates, pings, and the
         // initial TRANSPORT_PARAMETERS. The reader and stream frontends produce;
@@ -1073,8 +1074,6 @@ impl Session {
             control: control_tx.clone(),
             accept_bi: accept_bi_tx,
             accept_uni: accept_uni_tx,
-            create_uni: create_uni_rx,
-            create_bi: create_bi_rx,
             streams: streams.clone(),
             closed: closed.clone(),
             negotiated: negotiated.clone(),
@@ -1133,8 +1132,7 @@ impl Session {
             outbound_priority: control_tx,
             accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
             accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
-            create_uni: create_uni_tx,
-            create_bi: create_bi_tx,
+            streams,
             closed,
             negotiated,
             established: established_rx,
@@ -1208,10 +1206,20 @@ impl generic::Session for Session {
             },
         };
 
-        self.create_uni
-            .send((id, send_backend))
-            .await
-            .map_err(|_| Error::Closed)?;
+        // Register the backend before returning the frontend, so the stream exists
+        // in the shared map before it can enqueue a frame. Seed its send credit
+        // from the peer's params if they've already arrived (otherwise it's still
+        // zero here and `recv_transport_parameters` will credit it later) — see the
+        // note on `Streams::peer_initial_max_stream_data_uni`.
+        {
+            let mut streams = self.streams.lock().unwrap();
+            if let Some(credit) = &send_backend.stream_credit {
+                credit
+                    .increase_max(streams.peer_initial_max_stream_data_uni)
+                    .ok();
+            }
+            streams.send.insert(id, send_backend);
+        }
 
         Ok(send_frontend)
     }
@@ -1278,10 +1286,18 @@ impl generic::Session for Session {
             recv_streams_credit: None, // We initiated this stream, no stream count tracking
         };
 
-        self.create_bi
-            .send((id, send_backend, recv_backend))
-            .await
-            .map_err(|_| Error::Closed)?;
+        // Register both backends before returning the frontends (see `open_uni`).
+        // A bidi stream we initiate sends under the peer's `bidi_remote` limit.
+        {
+            let mut streams = self.streams.lock().unwrap();
+            if let Some(credit) = &send_backend.stream_credit {
+                credit
+                    .increase_max(streams.peer_initial_max_stream_data_bidi_remote)
+                    .ok();
+            }
+            streams.send.insert(id, send_backend);
+            streams.recv.insert(id, recv_backend);
+        }
 
         Ok((send_frontend, recv_frontend))
     }
