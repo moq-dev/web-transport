@@ -330,6 +330,17 @@ struct WriterState<W: Writer> {
     next_ping_seq: u64,
 }
 
+/// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
+enum Transmitted {
+    /// The frame was written; keep running.
+    Ok,
+    /// The transport failed mid-write; record the error and stop.
+    Failed(Error),
+    /// The session tore down while the write was in flight — the frame was
+    /// abandoned, possibly mid-frame, so the transport must not be touched again.
+    Interrupted,
+}
+
 impl<W: Writer> WriterState<W> {
     /// Record the first terminal error so the reader's `closed` branch unblocks.
     fn note_closed(&self, err: Error) {
@@ -345,6 +356,9 @@ impl<W: Writer> WriterState<W> {
 
     async fn run(&mut self) {
         let mut closed_rx = self.closed.subscribe();
+        // Set if a write was abandoned mid-flight because the session tore down.
+        // The transport may be parked mid-frame, so we must not touch it again.
+        let mut interrupted = false;
         loop {
             // Keep-alive: send a QX_PING once we've been silent for a third of the
             // idle timeout. 0 = disabled (non-QMux01, or params not yet exchanged).
@@ -358,12 +372,17 @@ impl<W: Writer> WriterState<W> {
                 biased;
                 frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
                     match frame {
-                        Some(frame) => {
-                            if let Err(err) = self.transmit(frame).await {
+                        Some(frame) => match self.transmit_or_teardown(frame, &mut closed_rx).await {
+                            Transmitted::Ok => {}
+                            Transmitted::Failed(err) => {
                                 self.note_closed(err);
                                 break;
                             }
-                        }
+                            Transmitted::Interrupted => {
+                                interrupted = true;
+                                break;
+                            }
+                        },
                         // The stream queue was closed on teardown.
                         None => break,
                     }
@@ -372,9 +391,16 @@ impl<W: Writer> WriterState<W> {
                     let seq = self.next_ping_seq;
                     self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
                     let ping = Frame::Ping(crate::Ping { sequence: seq, response: false });
-                    if let Err(err) = self.transmit(ping).await {
-                        self.note_closed(err);
-                        break;
+                    match self.transmit_or_teardown(ping, &mut closed_rx).await {
+                        Transmitted::Ok => {}
+                        Transmitted::Failed(err) => {
+                            self.note_closed(err);
+                            break;
+                        }
+                        Transmitted::Interrupted => {
+                            interrupted = true;
+                            break;
+                        }
                     }
                 }
                 // Transport-level maintenance (WebSocket keep-alive Ping); never
@@ -389,8 +415,10 @@ impl<W: Writer> WriterState<W> {
                 // resolves — otherwise it (non-`Send`), held across a `send` await,
                 // would make the task non-`Send`.
                 _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
-                    // Session tearing down: best-effort flush of any queued control
-                    // frames (e.g. a ConnectionClose) before we stop.
+                    // Session tearing down while we were parked between writes (not
+                    // mid-frame), so the transport is at a frame boundary: best-effort
+                    // flush of any queued control frames (e.g. a ConnectionClose)
+                    // before we stop.
                     while let Ok(frame) = self.control.try_recv() {
                         if self.transmit(frame).await.is_err() {
                             break;
@@ -400,7 +428,39 @@ impl<W: Writer> WriterState<W> {
                 }
             }
         }
-        let _ = self.writer.close().await;
+        // Skip the graceful close if a write was interrupted mid-frame: the
+        // transport framing may be desynced, and a transport wedged enough to
+        // strand a `send` would wedge `close` just the same. Dropping the writer
+        // hard-closes the socket, which is what prompt teardown needs.
+        if !interrupted {
+            let _ = self.writer.close().await;
+        }
+    }
+
+    /// Transmit `frame`, but abandon the write if the session tears down while it
+    /// is in flight. The writer loop only polls `closed` *between* writes, so
+    /// without this race a `send` wedged on a dead-but-not-yet-errored transport
+    /// would pin the writer task alive long after the last `Session` handle
+    /// dropped. Cancelling a partial `send` can desync the transport framing, so an
+    /// `Interrupted` result means the caller must stop writing and not close the
+    /// transport gracefully (see `run`).
+    async fn transmit_or_teardown(
+        &mut self,
+        frame: Frame,
+        closed_rx: &mut watch::Receiver<Option<Error>>,
+    ) -> Transmitted {
+        tokio::select! {
+            biased;
+            result = self.transmit(frame) => match result {
+                Ok(()) => Transmitted::Ok,
+                Err(err) => Transmitted::Failed(err),
+            },
+            // Wrapped so the non-`Send` `watch::Ref` is dropped before the branch
+            // resolves (same reason as the `closed` branch in `run`).
+            _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
+                Transmitted::Interrupted
+            }
+        }
     }
 
     /// Retire the stream a terminal frame closes, encode the frame (validating its
@@ -2187,5 +2247,111 @@ mod datagram_recv_tests {
         raw.flush().await.unwrap();
 
         assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    use super::{Reader, Session, Transport, Writer};
+    use crate::{Config, Error, Version};
+
+    /// A transport whose `send` never completes or errors — a stand-in for a dead
+    /// peer whose receive window is full, so the OS/transport neither drains nor
+    /// resets. `recv` parks forever too. It reports when the writer enters `send`
+    /// and when the writer half is dropped, letting the test prove the writer task
+    /// tears down rather than staying parked in the wedged write.
+    struct WedgedTransport {
+        entered_send: mpsc::UnboundedSender<()>,
+        dropped: mpsc::UnboundedSender<()>,
+    }
+
+    struct WedgedWriter {
+        entered_send: mpsc::UnboundedSender<()>,
+        // Fires on drop; the writer half is owned solely by the writer task, so a
+        // drop signal means that task has exited.
+        _dropped: DropSignal,
+    }
+
+    struct DropSignal(mpsc::UnboundedSender<()>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    struct WedgedReader;
+
+    impl Transport for WedgedTransport {
+        type Writer = WedgedWriter;
+        type Reader = WedgedReader;
+
+        fn split(self) -> (WedgedWriter, WedgedReader) {
+            (
+                WedgedWriter {
+                    entered_send: self.entered_send,
+                    _dropped: DropSignal(self.dropped),
+                },
+                WedgedReader,
+            )
+        }
+    }
+
+    impl Writer for WedgedWriter {
+        async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
+            // Announce we're parked in a write, then block forever.
+            let _ = self.entered_send.send(());
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Reader for WedgedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            std::future::pending().await
+        }
+    }
+
+    /// A writer parked inside `send()` on a wedged transport must still observe
+    /// teardown when the last `Session` clone drops, cancelling the in-flight
+    /// write instead of staying alive until the transport eventually errors.
+    #[tokio::test]
+    async fn wedged_writer_tears_down_on_last_drop() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+
+        let session = Session::new(
+            WedgedTransport {
+                entered_send: entered_tx,
+                dropped: dropped_tx,
+            },
+            false,
+            Config::new(Version::QMux01),
+        );
+
+        // The writer's first act is flushing our TRANSPORT_PARAMETERS, so it parks
+        // in `send()` almost immediately. Wait for that so we're exercising the
+        // in-flight-write race, not a teardown observed between writes.
+        tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("writer never entered send()")
+            .expect("entered_send channel closed unexpectedly");
+
+        // Drop the only `Session` handle. `SessionGuard` flips `closed`, which must
+        // cancel the wedged write and let the writer task return.
+        drop(session);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .expect("writer task did not tear down while wedged in send()")
+            .expect("dropped channel closed unexpectedly");
     }
 }
