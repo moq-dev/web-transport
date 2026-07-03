@@ -116,8 +116,9 @@ impl RecvOpen {
         matches!(self.created_max, Some(max) if index <= max) && !self.holes.contains(&index)
     }
 
-    /// Record that we've instantiated a frontend for `index`, advancing the
-    /// high-water mark and filling in the holes it implicitly opened.
+    /// Record that `index` has been opened — a STREAM frontend instantiated for
+    /// it, or a RESET_STREAM consuming it — advancing the high-water mark and
+    /// filling in the holes it implicitly opened.
     fn record(&mut self, index: u64) {
         match self.created_max {
             // Filling a previously-implicit hole below the high-water mark.
@@ -556,9 +557,32 @@ impl<T: Transport> SessionState<T> {
                     return Err(Error::InvalidStreamId);
                 }
 
-                if let hash_map::Entry::Occupied(mut e) = self.recv_streams.entry(reset.id) {
-                    e.get_mut().inbound_reset.send(reset).ok();
-                    e.remove();
+                if let Some(recv) = self.recv_streams.remove(&reset.id) {
+                    // Live stream: deliver the reset and drop it. It was recorded
+                    // in `recv_open` at creation, so it now reads as closed.
+                    recv.inbound_reset.send(reset).ok();
+                } else if self.config.version.is_qmux()
+                    && reset.id.server_initiated() != self.is_server
+                {
+                    // RESET_STREAM can be the *first* frame for a peer-initiated
+                    // stream (it implicitly opens the id). Record it as closed so a
+                    // later STREAM on the same id is recognized as retired rather
+                    // than resurrected into a new accepted stream. Gate on the
+                    // stream limit first, mirroring the STREAM path, so the hole set
+                    // stays bounded by MAX_STREAMS. Locally-initiated ids are left
+                    // to the `is_server` guard on the STREAM path.
+                    let credit = match reset.id.dir() {
+                        StreamDir::Bi => &self.recv_bi_credit,
+                        StreamDir::Uni => &self.recv_uni_credit,
+                    };
+                    if !credit.receive_up_to(reset.id.index() + 1) {
+                        return Err(Error::StreamLimitExceeded);
+                    }
+                    match reset.id.dir() {
+                        StreamDir::Bi => &mut self.recv_open_bi,
+                        StreamDir::Uni => &mut self.recv_open_uni,
+                    }
+                    .record(reset.id.index());
                 }
             }
             Frame::StopSending(stop) => {
@@ -1610,8 +1634,10 @@ mod recv_open_tests {
     use tokio::sync::mpsc;
     use web_transport_trait::{RecvStream as _, Session as _};
 
+    use web_transport_proto::VarInt;
+
     use super::{Session, Transport};
-    use crate::proto::{Frame, Stream};
+    use crate::proto::{Frame, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
     /// A transport whose inbound frames are scripted through a channel; outbound
@@ -1658,6 +1684,17 @@ mod recv_open_tests {
             id: StreamId::new(index, StreamDir::Uni, true),
             data: Bytes::from_static(data),
             fin,
+        })
+        .encode(Version::QMux01)
+        .unwrap()
+    }
+
+    /// Encode a RESET_STREAM frame on a server-initiated uni stream.
+    fn uni_reset(index: u64) -> Bytes {
+        Frame::ResetStream(ResetStream {
+            id: StreamId::new(index, StreamDir::Uni, true),
+            code: VarInt::from_u32(0),
+            final_size: 0,
         })
         .encode(Version::QMux01)
         .unwrap()
@@ -1717,6 +1754,24 @@ mod recv_open_tests {
             .expect("stream 6 was wrongly dropped as already-closed")
             .expect("accept_uni failed");
         assert_eq!(second.read_all().await.unwrap().as_ref(), b"hello");
+    }
+
+    /// A RESET_STREAM can be the first frame for a peer-initiated stream. It must
+    /// still retire the id, so a later STREAM frame on it isn't accepted as a
+    /// brand-new stream. (Guards the RESET-first resurrection path.)
+    #[tokio::test]
+    async fn reset_as_first_frame_prevents_resurrection() {
+        let (session, tx) = scripted_session();
+
+        // RESET arrives before any STREAM frame for this id, then a STREAM does.
+        tx.send(uni_reset(5)).unwrap();
+        tx.send(uni_stream(5, b"late", false)).unwrap();
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), session.accept_uni()).await;
+        assert!(
+            accepted.is_err(),
+            "a STREAM after a RESET-first stream resurrected a new accepted stream"
+        );
     }
 }
 
