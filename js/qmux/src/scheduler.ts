@@ -21,6 +21,11 @@ export interface SendSink {
 	 *  if the write fails — the scheduler must observe this rather than resolve
 	 *  the frame's promise as if it succeeded. */
 	write(bytes: Uint8Array): Promise<void>;
+	/** Synchronous backpressure probe: true when the sink can take a write now
+	 *  without buffering past its high-water mark. Used to drop datagrams the
+	 *  instant the transport starts queuing, rather than letting them pile up
+	 *  behind a stream/control backlog and arrive stale. */
+	wantsMore(): boolean;
 }
 
 /** Backpressure-aware sink over a `WebSocketStream` writable. The writable's
@@ -41,6 +46,15 @@ export class WritableStreamSink implements SendSink {
 	write(bytes: Uint8Array): Promise<void> {
 		// Propagate failures so the scheduler can reject the frame's promise.
 		return this.#writer.write(bytes);
+	}
+
+	wantsMore(): boolean {
+		// desiredSize > 0 means below the high-water mark (room to write); 0 or
+		// negative means backpressured; null means the stream errored/closed.
+		// Native WebSocketStream ties this to the real send buffer; the ponyfill
+		// derives it from bufferedAmount, so both report true backpressure.
+		const desired = this.#writer.desiredSize;
+		return desired !== null && desired > 0;
 	}
 }
 
@@ -78,7 +92,8 @@ export class SendScheduler {
 	#controlBytes = 0;
 
 	// Datagrams: serviced after control, ahead of stream data. Bounded and lossy
-	// (unlike #control) since unreliable datagrams are meant to be droppable.
+	// (unlike #control) since unreliable datagrams are meant to be droppable —
+	// shed on transport backpressure or a full lane.
 	#datagrams: Uint8Array[] = [];
 
 	// Per-stream send priority and the single pending frame per ready stream.
@@ -116,12 +131,18 @@ export class SendScheduler {
 	}
 
 	/** Queue a datagram frame — best-effort, serviced after control but ahead of
-	 *  stream data. Bounded and lossy: dropped when the buffer is full (transport
-	 *  backpressured) or the scheduler is closed, since an unreliable datagram is
-	 *  meant to be droppable rather than queued without bound. */
+	 *  stream data. Dropped (rather than queued) when:
+	 *   - the scheduler is closed;
+	 *   - the transport is backpressured — the socket is already queuing stream/
+	 *     control data, so a datagram behind it would arrive stale; or
+	 *   - the datagram lane is full, bounding a synchronous burst that outruns the
+	 *     writer loop even while the transport has room.
+	 *  An unreliable datagram is meant to be droppable, so this sheds rather than
+	 *  applying backpressure to the caller. */
 	enqueueDatagram(bytes: Uint8Array): void {
 		if (this.#closed) return;
-		if (this.#datagrams.length >= DATAGRAM_QUEUE_LIMIT) return; // shed load under backpressure
+		if (!this.#sink.wantsMore()) return; // transport is queuing — drop, don't delay
+		if (this.#datagrams.length >= DATAGRAM_QUEUE_LIMIT) return; // burst cap
 		this.#datagrams.push(bytes);
 		this.#signal();
 	}

@@ -48,6 +48,11 @@ class GatedSink implements SendSink {
 		this.#admits += n;
 		this.#open();
 	}
+
+	/** Synchronous backpressure probe: room iff there's an unused admit. */
+	wantsMore(): boolean {
+		return this.#admits > 0;
+	}
 }
 
 /** Yield to the event loop `n` times to let queued work run. */
@@ -170,32 +175,44 @@ describe("SendScheduler", () => {
 		const sink = new GatedSink();
 		const sched = new SendScheduler(sink);
 
+		// Give the transport room first, so the datagram is admitted (a datagram
+		// enqueued under backpressure would be dropped — see the next test).
+		sink.release(3);
 		sched.setSendOrder(1n, 0);
 		void sched.enqueueStream(1n, frame(10));
 		sched.enqueueDatagram(frame(50));
 		sched.enqueueControl(frame(99));
 
-		await tick(5);
-		sink.release(3);
 		await until(() => sink.written.length === 3);
-
 		expect(sink.written).toEqual([99, 50, 10]); // control, then datagram, then stream
 	});
 
-	test("datagrams are dropped once the buffer is full under backpressure", async () => {
+	test("a datagram enqueued under transport backpressure is dropped", async () => {
 		const sink = new GatedSink();
 		const sched = new SendScheduler(sink);
 
-		// Transport is backpressured (no release), so nothing drains and the queue
-		// fills. Enqueue past the internal DATAGRAM_QUEUE_LIMIT (1024).
-		const total = 1030;
-		for (let i = 0; i < total; i++) sched.enqueueDatagram(frame(1));
+		// Sink is gated (no room): the datagram is shed on enqueue...
+		sched.enqueueDatagram(frame(50));
+		// ...but a control frame still queues (lossless) and flushes once released.
+		sched.enqueueControl(frame(99));
 
-		await tick(2);
-		sink.release(total); // admit more than were retained
-		await tick(10);
+		sink.release(5);
+		await until(() => sink.written.length === 1);
+		await tick(3); // give any wrongly-queued datagram a chance to appear
+		expect(sink.written).toEqual([99]); // datagram dropped, control sent
+	});
 
-		// At most the queue limit was retained; the excess was shed, not queued.
+	test("datagrams are dropped once the lane is full even with room", async () => {
+		const sink = new GatedSink();
+		const sched = new SendScheduler(sink);
+
+		// Plenty of room, so wantsMore() stays true across the synchronous burst;
+		// the lane cap (DATAGRAM_QUEUE_LIMIT = 1024) is what sheds the excess.
+		sink.release(2000);
+		for (let i = 0; i < 1030; i++) sched.enqueueDatagram(frame(1));
+
+		await until(() => sink.written.length === 1024, 500);
+		await tick(3);
 		expect(sink.written.length).toBe(1024);
 	});
 
