@@ -189,9 +189,10 @@ impl RecvOpen {
 }
 
 /// Reader-side task state: owns the transport receive half and processes inbound
-/// frames. The outbound path (scheduling, encoding, sending, keep-alive) lives in
-/// [`WriterState`]; the two tasks share `streams` and the record-limit / idle
-/// atomics instead of passing messages.
+/// frames. The outbound path (scheduling, encoding, sending) lives in
+/// [`WriterState`], and the idle timeout / keep-alive ping in [`TimerState`]; the
+/// tasks share `streams`, the record-limit / idle atomics, and the last-activity
+/// clocks instead of passing messages.
 struct SessionState<R: Reader> {
     reader: R,
     config: Config,
@@ -238,9 +239,21 @@ struct SessionState<R: Reader> {
     recv_open_bi: RecvOpen,
     recv_open_uni: RecvOpen,
 
-    // QMux01 idle-timeout state: the reader closes the session if no frame arrives
-    // within the window (the writer handles the keep-alive ping side).
-    last_recv_at: tokio::time::Instant,
+    // Origin for the millis last-activity timestamps below. Captured once in
+    // `Session::new` and shared with the writer and timer tasks.
+    base: tokio::time::Instant,
+
+    // Millis (since `base`) of our last receive, published for the timer's idle
+    // deadline. Written after every `reader.recv()`; the timer closes the session
+    // once it falls more than the idle window behind. See [`TimerState`].
+    last_recv_at: Arc<AtomicU64>,
+
+    // Set while the reader is parked handing a peer-initiated stream to the
+    // application (`accept_*.send().await` is full). The timer treats this like
+    // writer backpressure: the peer is likely alive, we're just not reading its
+    // frames, so it defers the idle close for one bounded window rather than
+    // mistaking application backpressure for a dead peer.
+    reader_backpressured: Arc<AtomicBool>,
 
     // Inbound datagram sink (see the matching field on `Session`) plus the
     // shared send-limit cell resolved from the peer's params.
@@ -248,22 +261,10 @@ struct SessionState<R: Reader> {
     datagram_max_size: Arc<AtomicUsize>,
 
     // Effective outbound record-size limit and idle-timeout (ms), shared with the
-    // writer. Both are written once, when the peer's transport parameters arrive.
+    // writer and timer. Both are written once, when the peer's transport
+    // parameters arrive.
     record_limit: Arc<AtomicU64>,
     idle_timeout_ms: Arc<AtomicU64>,
-
-    // Set by the writer while a `send` is in flight (see `WriterState`). The reader
-    // consults it before firing the idle timeout, so transport backpressure isn't
-    // mistaken for a dead peer.
-    writer_backpressured: Arc<AtomicBool>,
-
-    // When the reader started deferring the idle timeout because the writer was
-    // backpressured, or `None` if it isn't currently deferring. Bounds the deferral:
-    // backpressure buys the connection at most one extra idle window before it's
-    // reclaimed anyway, so a peer that dies with our send buffer full is still
-    // idle-closed (just later) rather than hanging until the transport times out.
-    // Reset on any receive.
-    backpressure_suppressed_since: Option<tokio::time::Instant>,
 }
 
 /// Pick the next outbound frame in strict priority order: control (lossless,
@@ -290,8 +291,8 @@ async fn next_outbound(
 
 /// RFC 9000 §10.1 effective idle timeout in ms: the smaller of the two advertised
 /// values, ignoring a zero (disabled) side. Returns 0 when both are disabled.
-/// Shared by the reader's idle deadline and the writer's keep-alive cadence so the
-/// two never drift.
+/// Shared by the timer's idle deadline and its keep-alive cadence so the two never
+/// drift.
 fn negotiated_idle_timeout_ms(ours: u64, peer: u64) -> u64 {
     match (ours, peer) {
         (0, 0) => 0,
@@ -300,12 +301,31 @@ fn negotiated_idle_timeout_ms(ours: u64, peer: u64) -> u64 {
     }
 }
 
+/// Encode an `Instant` as whole milliseconds since the session's shared `base`,
+/// for storing a last-activity timestamp in an `AtomicU64`. The reader and writer
+/// publish their progress this way; the [`TimerState`] task reads it back with
+/// [`instant_at`]. Millisecond resolution is plenty — idle timeouts are in ms.
+fn millis_since(base: tokio::time::Instant, now: tokio::time::Instant) -> u64 {
+    now.saturating_duration_since(base).as_millis() as u64
+}
+
+/// Inverse of [`millis_since`]: reconstruct the `Instant` a stored millis value
+/// refers to, so the timer can `sleep_until` a deadline relative to it.
+fn instant_at(base: tokio::time::Instant, ms: u64) -> tokio::time::Instant {
+    base + std::time::Duration::from_millis(ms)
+}
+
 /// Writer-side task state: owns the transport send half and is the sole producer
 /// on the wire. It pulls the outbound queues in strict priority order via
 /// [`next_outbound`], retires the stream a terminal frame closes and encodes it
 /// under the shared `streams` lock, then writes it. Runs on its own task so a
-/// write blocked on transport backpressure never stalls the reader. It also owns
-/// the QMux keep-alive ping (it's the side that knows when we last sent).
+/// write blocked on transport backpressure never stalls the reader.
+///
+/// The QMux keep-alive ping is *not* driven here — the timer task ([`TimerState`])
+/// owns the cadence and enqueues `QX_PING` on the control lane like any other
+/// frame. The writer only records *when* a send last landed (`last_send_at`) so
+/// the timer can decide whether a ping is due, independently of where this task is
+/// parked.
 struct WriterState<W: Writer> {
     writer: W,
     version: Version,
@@ -317,17 +337,18 @@ struct WriterState<W: Writer> {
     // Shared with the reader task.
     streams: Arc<Mutex<Streams>>,
     record_limit: Arc<AtomicU64>,
-    idle_timeout_ms: Arc<AtomicU64>,
 
-    // Set while a `send` is in flight so the reader can tell a wedged-on-
+    // Set while a `send` is in flight so the timer can tell a wedged-on-
     // backpressure connection (peer alive, its recv window full) apart from a
     // genuinely dead one, and not idle-close the former. See `transmit`.
     writer_backpressured: Arc<AtomicBool>,
 
     closed: watch::Sender<Option<Error>>,
 
-    last_send_at: tokio::time::Instant,
-    next_ping_seq: u64,
+    // Origin shared with the reader and timer, plus the millis (since `base`) at
+    // which our last send landed — published for the timer's keep-alive cadence.
+    base: tokio::time::Instant,
+    last_send_at: Arc<AtomicU64>,
 }
 
 /// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
@@ -360,14 +381,6 @@ impl<W: Writer> WriterState<W> {
         // The transport may be parked mid-frame, so we must not touch it again.
         let mut interrupted = false;
         loop {
-            // Keep-alive: send a QX_PING once we've been silent for a third of the
-            // idle timeout. 0 = disabled (non-QMux01, or params not yet exchanged).
-            // Clamp to 1ms so a tiny timeout doesn't yield a zero-duration deadline.
-            let idle_ms = self.idle_timeout_ms.load(Ordering::Acquire);
-            let ping_deadline = (idle_ms != 0).then(|| {
-                self.last_send_at + std::time::Duration::from_millis((idle_ms / 3).max(1))
-            });
-
             tokio::select! {
                 biased;
                 frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
@@ -385,22 +398,6 @@ impl<W: Writer> WriterState<W> {
                         },
                         // The stream queue was closed on teardown.
                         None => break,
-                    }
-                }
-                _ = async { tokio::time::sleep_until(ping_deadline.unwrap()).await }, if ping_deadline.is_some() => {
-                    let seq = self.next_ping_seq;
-                    self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
-                    let ping = Frame::Ping(crate::Ping { sequence: seq, response: false });
-                    match self.transmit_or_teardown(ping, &mut closed_rx).await {
-                        Transmitted::Ok => {}
-                        Transmitted::Failed(err) => {
-                            self.note_closed(err);
-                            break;
-                        }
-                        Transmitted::Interrupted => {
-                            interrupted = true;
-                            break;
-                        }
                     }
                 }
                 // Transport-level maintenance (WebSocket keep-alive Ping); never
@@ -489,7 +486,7 @@ impl<W: Writer> WriterState<W> {
                 return Err(Error::FrameTooLarge);
             }
         }
-        // Flag the in-flight write so the reader won't idle-close a connection
+        // Flag the in-flight write so the timer won't idle-close a connection
         // that's merely backpressured: a `send` stuck here proves the peer is
         // still there (its receive window is just full). Cleared as soon as the
         // write lands. Only the session idle timeout consults this — a WebSocket
@@ -498,8 +495,161 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
-        self.last_send_at = tokio::time::Instant::now();
+        // Publish send progress for the timer's keep-alive cadence.
+        self.last_send_at.store(
+            millis_since(self.base, tokio::time::Instant::now()),
+            Ordering::Release,
+        );
         Ok(())
+    }
+}
+
+/// Timer task: the sole owner of the QMux01 idle timeout and keep-alive ping.
+///
+/// Runs on its own task, decoupled from where the reader and writer are parked, so
+/// neither transport backpressure (writer wedged in `send`) nor application
+/// backpressure (reader wedged handing a stream to `accept_*`) can starve the
+/// deadline and fire a spurious close. It reads the `last_recv_at` / `last_send_at`
+/// timestamps the reader and writer publish and:
+///
+///  - enqueues a `QX_PING` on the control lane once we've been silent on send for a
+///    third of the idle window (the keep-alive cadence), and
+///  - closes the session once we've been silent on receive for a full idle window,
+///    deferred by at most one extra window while the reader or writer is
+///    backpressured — that's evidence the peer is alive and we simply can't get a
+///    keep-alive through (or aren't reading its replies).
+///
+/// Only meaningful for QMux01 — the sole version that negotiates an idle timeout —
+/// so it isn't spawned otherwise.
+struct TimerState {
+    // Origin shared with the reader/writer for interpreting the millis timestamps.
+    base: tokio::time::Instant,
+    last_recv_at: Arc<AtomicU64>,
+    last_send_at: Arc<AtomicU64>,
+    reader_backpressured: Arc<AtomicBool>,
+    writer_backpressured: Arc<AtomicBool>,
+    idle_timeout_ms: Arc<AtomicU64>,
+
+    // Enqueues keep-alive pings; the writer transmits them like any control frame.
+    control: mpsc::UnboundedSender<Frame>,
+    closed: watch::Sender<Option<Error>>,
+    // Gates arming: the idle timeout only applies once params are exchanged.
+    established: watch::Receiver<bool>,
+}
+
+impl TimerState {
+    async fn run(mut self) {
+        let mut closed_rx = self.closed.subscribe();
+
+        // The idle timeout only applies once the peer's params have been exchanged.
+        // Wait for establishment — or teardown — before arming anything.
+        tokio::select! {
+            biased;
+            _ = closed_rx.wait_for(|s| s.is_some()) => return,
+            res = self.established.wait_for(|&e| e) => {
+                if res.is_err() {
+                    return; // session dropped before establishing
+                }
+            }
+        }
+
+        // Negotiated idle timeout, published by `recv_transport_parameters` before
+        // establishment was signalled. 0 = disabled (both sides opted out), leaving
+        // the timer with nothing to do.
+        let idle_ms = self.idle_timeout_ms.load(Ordering::Acquire);
+        if idle_ms == 0 {
+            return;
+        }
+        let idle = std::time::Duration::from_millis(idle_ms);
+        // Keep-alive cadence: a third of the idle window, clamped so a tiny timeout
+        // doesn't yield a zero-duration interval.
+        let ping_every = std::time::Duration::from_millis((idle_ms / 3).max(1));
+
+        // When we began deferring the idle close for backpressure, or `None` when
+        // not deferring. Bounds the deferral to one extra idle window.
+        let mut deferred_since: Option<tokio::time::Instant> = None;
+        // Millis at which we last enqueued a ping, so a wedged writer (its
+        // `last_send_at` frozen) doesn't make us re-enqueue one on every wake-up.
+        let mut last_ping_ms = self.last_send_at.load(Ordering::Acquire);
+        let mut next_ping_seq: u64 = 0;
+
+        loop {
+            let last_recv = instant_at(self.base, self.last_recv_at.load(Ordering::Acquire));
+            let ping_ref = instant_at(
+                self.base,
+                self.last_send_at.load(Ordering::Acquire).max(last_ping_ms),
+            );
+
+            // While deferring, wait out the remaining grace rather than the (stale)
+            // idle deadline, so we don't busy-spin on an already-elapsed instant.
+            let idle_wake = match deferred_since {
+                Some(since) => since + idle,
+                None => last_recv + idle,
+            };
+            let wake = idle_wake.min(ping_ref + ping_every);
+
+            tokio::select! {
+                biased;
+                _ = closed_rx.wait_for(|s| s.is_some()) => return,
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+
+            let now = tokio::time::Instant::now();
+
+            // Keep-alive ping: due once we've been silent on send for `ping_every`.
+            // Skip the actual enqueue while the writer is wedged — a ping can't get
+            // out anyway, and we mustn't pile them behind a stalled socket — but
+            // still advance the marker so we don't spin.
+            if now >= ping_ref + ping_every {
+                if !self.writer_backpressured.load(Ordering::Acquire) {
+                    let ping = Frame::Ping(crate::Ping {
+                        sequence: next_ping_seq,
+                        response: false,
+                    });
+                    next_ping_seq = next_ping_seq.wrapping_add(1);
+                    if self.control.send(ping).is_err() {
+                        return; // writer gone
+                    }
+                }
+                last_ping_ms = millis_since(self.base, now);
+            }
+
+            // Idle close: due once we've been silent on receive for a full window.
+            let last_recv = instant_at(self.base, self.last_recv_at.load(Ordering::Acquire));
+            if now < last_recv + idle {
+                deferred_since = None; // receive progressed — not idle
+                continue;
+            }
+
+            let backpressured = self.writer_backpressured.load(Ordering::Acquire)
+                || self.reader_backpressured.load(Ordering::Acquire);
+            match deferred_since {
+                // Still within the one-window grace: keep the connection alive.
+                Some(since) if now.duration_since(since) < idle => continue,
+                // Grace exhausted: reclaim it even if still backpressured — a peer
+                // that died with our buffers full must not hang here forever.
+                Some(_) => {}
+                // First notice the window elapsed while backpressured: start the
+                // bounded grace.
+                None if backpressured => {
+                    deferred_since = Some(now);
+                    continue;
+                }
+                // Genuinely idle with no backpressure — close.
+                None => {}
+            }
+
+            tracing::debug!("idle timeout fired");
+            self.closed.send_if_modified(|slot| {
+                if slot.is_none() {
+                    *slot = Some(Error::IdleTimeout);
+                    true
+                } else {
+                    false
+                }
+            });
+            return;
+        }
     }
 }
 
@@ -508,20 +658,20 @@ impl<R: Reader> SessionState<R> {
         let mut closed = self.closed.subscribe();
 
         loop {
-            // Close the session if the peer goes silent past the idle timeout. The
-            // writer owns the keep-alive ping that keeps this from firing while a
-            // healthy peer is merely idle. Disabled until the params are exchanged.
-            let idle_deadline = self
-                .effective_idle_timeout_ms()
-                .map(|ms| self.last_recv_at + std::time::Duration::from_millis(ms));
-
+            // The idle timeout and keep-alive ping are owned by the timer task,
+            // which reads the `last_recv_at` we publish below. Keeping the deadline
+            // off this select is what stops application backpressure — parking in
+            // `recv_frame`'s `accept_*.send().await` — from starving the deadline
+            // and firing a spurious idle close on re-entry.
             tokio::select! {
                 biased;
                 result = self.reader.recv() => {
                     let data = result?;
-                    self.last_recv_at = tokio::time::Instant::now();
-                    // Real progress ends any backpressure deferral window.
-                    self.backpressure_suppressed_since = None;
+                    // Publish receive progress for the timer's idle deadline.
+                    self.last_recv_at.store(
+                        millis_since(self.base, tokio::time::Instant::now()),
+                        Ordering::Release,
+                    );
                     if self.config.version == Version::QMux01 {
                         // QMux01: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
@@ -531,59 +681,10 @@ impl<R: Reader> SessionState<R> {
                         self.recv_frame(frame).await?;
                     }
                 }
-                _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
-                    let now = tokio::time::Instant::now();
-                    // One idle window of grace (the deadline is armed, so this is Some).
-                    let grace = std::time::Duration::from_millis(
-                        self.effective_idle_timeout_ms().unwrap_or(0),
-                    );
-                    match self.backpressure_suppressed_since {
-                        // Already deferring: keep the connection alive until the grace
-                        // window elapses, then reclaim it even if still backpressured —
-                        // a peer that died with our send buffer full must not hang here.
-                        Some(since) if now.duration_since(since) < grace => {
-                            self.last_recv_at = now; // re-arm the deadline; avoid a busy spin
-                            continue;
-                        }
-                        // Grace exhausted — fall through and idle-close.
-                        Some(_) => {}
-                        None => {
-                            if self.writer_backpressured.load(Ordering::Acquire) {
-                                // Writer wedged on transport backpressure: the peer's
-                                // receive window is full, which is evidence it's alive
-                                // and that we simply can't get a keep-alive out. Defer
-                                // the close, but only for the bounded grace above.
-                                self.backpressure_suppressed_since = Some(now);
-                                self.last_recv_at = now;
-                                continue;
-                            }
-                        }
-                    }
-                    tracing::debug!("idle timeout fired");
-                    return Err(Error::IdleTimeout);
-                }
                 _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
                     return Err(closed.borrow().clone().unwrap_or(Error::Closed))
                 }
             }
-        }
-    }
-
-    /// Effective idle timeout in milliseconds, or `None` if disabled.
-    ///
-    /// Only kicks in for QMux01 after both sides have exchanged transport parameters.
-    /// Per RFC 9000 §10.1, the effective timeout is `min(our, peer)` of the non-zero values
-    /// (or the single non-zero one). If both are zero, idle timeouts are disabled.
-    fn effective_idle_timeout_ms(&self) -> Option<u64> {
-        if self.config.version != Version::QMux01 || !self.params_received {
-            return None;
-        }
-        match negotiated_idle_timeout_ms(
-            self.our_params.max_idle_timeout,
-            self.peer_params.max_idle_timeout,
-        ) {
-            0 => None,
-            ms => Some(ms),
         }
     }
 
@@ -727,10 +828,13 @@ impl<R: Reader> SessionState<R> {
 
                 match stream.id.dir() {
                     StreamDir::Uni => {
-                        self.accept_uni
-                            .send(recv_frontend)
-                            .await
-                            .map_err(|_| Error::Closed)?;
+                        // Flag the reader backpressured while the bounded `accept`
+                        // channel is full, so the timer defers the idle close rather
+                        // than mistaking a slow `accept_uni` consumer for a dead peer.
+                        self.reader_backpressured.store(true, Ordering::Release);
+                        let result = self.accept_uni.send(recv_frontend).await;
+                        self.reader_backpressured.store(false, Ordering::Release);
+                        result.map_err(|_| Error::Closed)?;
                     }
                     StreamDir::Bi => {
                         let (tx, rx) = mpsc::unbounded_channel();
@@ -769,10 +873,12 @@ impl<R: Reader> SessionState<R> {
                             .unwrap()
                             .send
                             .insert(stream.id, send_backend);
-                        self.accept_bi
-                            .send((send_frontend, recv_frontend))
-                            .await
-                            .map_err(|_| Error::Closed)?;
+                        // See the uni arm: defer the idle close while a slow
+                        // `accept_bi` consumer keeps the bounded channel full.
+                        self.reader_backpressured.store(true, Ordering::Release);
+                        let result = self.accept_bi.send((send_frontend, recv_frontend)).await;
+                        self.reader_backpressured.store(false, Ordering::Release);
+                        result.map_err(|_| Error::Closed)?;
                     }
                 };
 
@@ -1109,14 +1215,22 @@ impl Session {
         let datagram_max_size = Arc::new(AtomicUsize::new(0));
 
         // Shared with the writer task: per-stream backend state, plus the two
-        // scalars the writer needs — the outbound record-size limit (QMux01 seeds
-        // it with the draft-01 default) and the effective idle timeout for its
+        // scalars the writer/timer need — the outbound record-size limit (QMux01
+        // seeds it with the draft-01 default) and the effective idle timeout for the
         // keep-alive ping (0 until the peer's params arrive).
         let streams: Arc<Mutex<Streams>> = Arc::new(Mutex::new(Streams::default()));
         let record_limit = Arc::new(AtomicU64::new(crate::proto::DEFAULT_MAX_RECORD_SIZE));
         let idle_timeout_ms = Arc::new(AtomicU64::new(0));
-        // True while the writer is blocked in a `send`; lets the reader distinguish
-        // transport backpressure from a dead peer when the idle timeout fires.
+
+        // Last-activity clocks for the timer task. `base` is the shared origin; the
+        // reader/writer publish their progress as millis since it (see
+        // `millis_since` / `instant_at`). `*_backpressured` let the timer defer the
+        // idle close while a `send`/`accept_*` is legitimately wedged rather than
+        // mistake it for a dead peer.
+        let base = tokio::time::Instant::now();
+        let last_recv_at = Arc::new(AtomicU64::new(0));
+        let last_send_at = Arc::new(AtomicU64::new(0));
+        let reader_backpressured = Arc::new(AtomicBool::new(false));
         let writer_backpressured = Arc::new(AtomicBool::new(false));
 
         let closed = watch::Sender::new(None);
@@ -1142,11 +1256,10 @@ impl Session {
             outbound: outbound.clone(),
             streams: streams.clone(),
             record_limit: record_limit.clone(),
-            idle_timeout_ms: idle_timeout_ms.clone(),
             writer_backpressured: writer_backpressured.clone(),
             closed: closed.clone(),
-            last_send_at: tokio::time::Instant::now(),
-            next_ping_seq: 0,
+            base,
+            last_send_at: last_send_at.clone(),
         };
         tokio::spawn(async move { writer.run().await });
 
@@ -1214,14 +1327,33 @@ impl Session {
             recv_uni_credit: recv_uni_credit.clone(),
             recv_open_bi: RecvOpen::default(),
             recv_open_uni: RecvOpen::default(),
-            last_recv_at: tokio::time::Instant::now(),
+            base,
+            last_recv_at: last_recv_at.clone(),
+            reader_backpressured: reader_backpressured.clone(),
             recv_datagram: recv_datagram_tx,
             datagram_max_size: datagram_max_size.clone(),
             record_limit: record_limit.clone(),
             idle_timeout_ms: idle_timeout_ms.clone(),
-            writer_backpressured,
-            backpressure_suppressed_since: None,
         };
+
+        // Timer task: owns the QMux01 idle timeout + keep-alive ping, reading the
+        // last-activity clocks the reader/writer publish. Only QMux01 negotiates an
+        // idle timeout, so there's nothing for it to do on other wire formats.
+        if version == Version::QMux01 {
+            let timer = TimerState {
+                base,
+                last_recv_at: last_recv_at.clone(),
+                last_send_at: last_send_at.clone(),
+                reader_backpressured: reader_backpressured.clone(),
+                writer_backpressured: writer_backpressured.clone(),
+                idle_timeout_ms: idle_timeout_ms.clone(),
+                control: control_tx.clone(),
+                closed: closed.clone(),
+                established: established_rx.clone(),
+            };
+            tokio::spawn(timer.run());
+        }
+
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // Dropping `backend` drops the `established` sender; an `established()`
@@ -1925,6 +2057,125 @@ impl generic::RecvStream for RecvStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, watch};
+
+    use super::TimerState;
+    use crate::Error;
+
+    /// Handles for driving a `TimerState` in isolation, without a real transport.
+    struct Harness {
+        reader_backpressured: Arc<AtomicBool>,
+        last_recv_at: Arc<AtomicU64>,
+        closed: watch::Sender<Option<Error>>,
+        // Kept alive so the control lane the timer pings on doesn't close under it.
+        _control_rx: mpsc::UnboundedReceiver<crate::Frame>,
+    }
+
+    /// Spawn a timer with `idle_ms`, already established, its last-activity clocks
+    /// pinned at the shared base (so the first idle window elapses `idle_ms` from now).
+    fn spawn_timer(idle_ms: u64) -> Harness {
+        let base = tokio::time::Instant::now();
+        let last_recv_at = Arc::new(AtomicU64::new(0));
+        let last_send_at = Arc::new(AtomicU64::new(0));
+        let reader_backpressured = Arc::new(AtomicBool::new(false));
+        let writer_backpressured = Arc::new(AtomicBool::new(false));
+        let idle_timeout_ms = Arc::new(AtomicU64::new(idle_ms));
+        let (control, _control_rx) = mpsc::unbounded_channel();
+        let closed = watch::Sender::new(None);
+        let (_est_tx, established) = watch::channel(true);
+
+        let timer = TimerState {
+            base,
+            last_recv_at: last_recv_at.clone(),
+            last_send_at,
+            reader_backpressured: reader_backpressured.clone(),
+            writer_backpressured: writer_backpressured.clone(),
+            idle_timeout_ms,
+            control,
+            closed: closed.clone(),
+            established,
+        };
+        tokio::spawn(timer.run());
+
+        Harness {
+            reader_backpressured,
+            last_recv_at,
+            closed,
+            _control_rx,
+        }
+    }
+
+    async fn closed_reason(h: &Harness) -> Error {
+        let mut rx = h.closed.subscribe();
+        rx.wait_for(|s| s.is_some()).await.unwrap();
+        let reason = rx.borrow().clone().unwrap();
+        reason
+    }
+
+    /// A genuinely idle peer (no backpressure) is closed once the idle window
+    /// elapses — the timer, not the reader/writer select, owns this now.
+    #[tokio::test]
+    async fn idle_close_when_silent() {
+        let h = spawn_timer(100);
+
+        let reason = tokio::time::timeout(Duration::from_millis(400), closed_reason(&h))
+            .await
+            .expect("silent session must idle-close");
+        assert!(matches!(reason, Error::IdleTimeout), "got {reason:?}");
+    }
+
+    /// While the reader is parked handing a stream to a full `accept_*` channel, the
+    /// idle close is deferred — the peer is likely alive, we're just not reading it —
+    /// but only for one bounded extra window, after which it's reclaimed regardless.
+    /// This is the read-side twin of the writer-backpressure deferral.
+    #[tokio::test]
+    async fn idle_close_deferred_while_reader_backpressured() {
+        let h = spawn_timer(100);
+        h.reader_backpressured.store(true, Ordering::Release);
+
+        // Past the raw 100ms window but within the one-window grace: still open.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            h.closed.borrow().is_none(),
+            "idle-close must be deferred while the reader is backpressured"
+        );
+
+        // Past the grace (~2×): reclaimed even though still backpressured.
+        let reason = tokio::time::timeout(Duration::from_millis(400), closed_reason(&h))
+            .await
+            .expect("bounded deferral must eventually idle-close");
+        assert!(matches!(reason, Error::IdleTimeout), "got {reason:?}");
+    }
+
+    /// Receive progress clears a pending deferral: a reader that catches up (its
+    /// `last_recv_at` advances) before the grace elapses is not closed.
+    #[tokio::test]
+    async fn receive_progress_averts_idle_close() {
+        let h = spawn_timer(100);
+
+        // Keep publishing receive progress across several idle windows; the peer is
+        // plainly alive, so the timer must never close it.
+        let base = tokio::time::Instant::now();
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let elapsed = base.elapsed().as_millis() as u64;
+            h.last_recv_at.store(elapsed, Ordering::Release);
+        }
+        assert!(
+            h.closed.borrow().is_none(),
+            "a peer that keeps sending must not be idle-closed"
+        );
     }
 }
 

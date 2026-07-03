@@ -564,7 +564,9 @@ mod ws_transport {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use futures::stream::{SplitSink, SplitStream};
+    use futures::stream::SplitSink;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
     use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
     use tokio_tungstenite::tungstenite;
 
@@ -573,6 +575,12 @@ mod ws_transport {
     use crate::Error;
 
     type Message = tungstenite::Message;
+
+    /// Bound on WS frames the pump task reads ahead of the session. Small: the pump
+    /// only stages already-flow-control-covered frames; a full channel makes the
+    /// pump park on delivery, which is exactly the backpressure signal the deadline
+    /// logic keys off. Mirrors the byte-stream reader's `RECV_CHANNEL_CAPACITY`.
+    const WS_RECV_CHANNEL_CAPACITY: usize = 16;
 
     /// The combined `Stream + Sink` bound every WebSocket half requires.
     pub(crate) trait WsStream:
@@ -660,17 +668,31 @@ mod ws_transport {
         ping: Option<PingState>,
     }
 
-    /// The receive half of a [`WsTransport`]: owns the stream and the idle deadline.
-    pub(crate) struct WsReader<T: WsStream> {
-        stream: SplitStream<T>,
-        deadline: Option<DeadlineState>,
+    /// The receive half of a [`WsTransport`].
+    ///
+    /// A dedicated pump task owns the socket and the idle deadline; `recv` is just a
+    /// hand-off from its channel. Reading on its own task is what makes the keep-alive
+    /// deadline robust: it advances (and resets on the peer's Pong replies) regardless
+    /// of where the *session* is parked — in particular while the session is wedged
+    /// handing a stream to a slow `accept_*`, which would otherwise starve a deadline
+    /// polled inline in `recv` and fire a spurious timeout. Mirrors [`StreamReader`].
+    pub(crate) struct WsReader {
+        rx: mpsc::Receiver<Result<Bytes, Error>>,
+        /// Aborted on drop so the pump can't outlive the transport.
+        pump: JoinHandle<()>,
+    }
+
+    impl Drop for WsReader {
+        fn drop(&mut self) {
+            self.pump.abort();
+        }
     }
 
     impl<T: WsStream> Transport for WsTransport<T> {
         type Writer = WsWriter<T>;
-        type Reader = WsReader<T>;
+        type Reader = WsReader;
 
-        fn split(self) -> (WsWriter<T>, WsReader<T>) {
+        fn split(self) -> (WsWriter<T>, WsReader) {
             use futures::StreamExt;
             // BiLock-backed halves: the sink and stream can be polled concurrently
             // on separate tasks, briefly serializing on the shared socket.
@@ -679,7 +701,9 @@ mod ws_transport {
                 Some(ka) => (Some(PingState::new(ka)), Some(DeadlineState::new(ka))),
                 None => (None, None),
             };
-            (WsWriter { sink, ping }, WsReader { stream, deadline })
+            let (tx, rx) = mpsc::channel(WS_RECV_CHANNEL_CAPACITY);
+            let pump = tokio::spawn(ws_pump(stream, deadline, tx));
+            (WsWriter { sink, ping }, WsReader { rx, pump })
         }
     }
 
@@ -721,50 +745,192 @@ mod ws_transport {
         }
     }
 
-    impl<T: WsStream> Reader for WsReader<T> {
+    impl Reader for WsReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
-            use futures::StreamExt;
+            // The pump task pushes complete Binary frames (or a terminal error)
+            // here; `None` means it exited without sending — treat as a clean close.
+            self.rx.recv().await.unwrap_or(Err(Error::Closed))
+        }
+    }
 
-            // Destructure so we can take separate &mut borrows of `stream` and `deadline`.
-            let Self { stream, deadline } = self;
+    /// Pump task: read WS messages off the socket independently of the session,
+    /// resetting the keep-alive deadline on every message (including the peer's Pong
+    /// replies) and shipping Binary frames to the session over `tx`. On a timeout,
+    /// clean close, or socket error it sends a terminal `Err` and exits; if `tx` is
+    /// closed (the transport was dropped) it exits silently.
+    ///
+    /// Why a task rather than an inline deadline in `recv`: the deadline must keep
+    /// advancing even while the session is parked (e.g. handing a stream to a slow
+    /// `accept_*`), and the peer's liveness must not be judged while we're merely
+    /// backpressured. So the deadline is reset both when a message arrives *and*
+    /// after each delivery to the session — a long delivery park (session
+    /// backpressure) therefore isn't charged against the peer.
+    async fn ws_pump<S>(
+        mut stream: S,
+        mut deadline: Option<DeadlineState>,
+        tx: mpsc::Sender<Result<Bytes, Error>>,
+    ) where
+        S: futures::Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
+    {
+        use futures::StreamExt;
 
-            loop {
-                enum Event<M> {
-                    Message(M),
-                    Timeout,
-                }
-
-                let event = match deadline {
-                    Some(d) => tokio::select! {
-                        msg = stream.next() => Event::Message(msg),
-                        _ = d.deadline.as_mut() => Event::Timeout,
-                    },
-                    None => Event::Message(stream.next().await),
-                };
-
-                let message = match event {
-                    Event::Message(msg) => msg.ok_or(Error::Closed)??,
-                    Event::Timeout => {
+        loop {
+            // Prefer a real message over the deadline (`biased`): if both are ready,
+            // the peer is alive, so don't spuriously time out.
+            let message = match &mut deadline {
+                Some(d) => tokio::select! {
+                    biased;
+                    msg = stream.next() => msg,
+                    _ = d.deadline.as_mut() => {
                         tracing::debug!("websocket keep_alive timeout");
-                        return Err(Error::Closed);
+                        let _ = tx.send(Err(Error::Closed)).await;
+                        return;
                     }
-                };
+                },
+                None => stream.next().await,
+            };
 
-                if let Some(d) = deadline.as_mut() {
-                    d.observe_recv();
+            // Any read — data or control — proves the peer is alive; reset the deadline.
+            if let Some(d) = deadline.as_mut() {
+                d.observe_recv();
+            }
+
+            let message = match message {
+                Some(Ok(message)) => message,
+                // Stream ended or errored: a clean/dirty close either way.
+                Some(Err(_)) | None => {
+                    let _ = tx.send(Err(Error::Closed)).await;
+                    return;
                 }
+            };
 
-                match message {
-                    Message::Binary(data) => return Ok(data),
-                    Message::Close(_) => return Err(Error::Closed),
-                    Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
-                        // tungstenite auto-queues a Pong reply when it reads a Ping;
-                        // the writer half flushes it on its next send/ping. The reader
-                        // owns no sink, so there's nothing to reply with here.
-                        continue;
+            match message {
+                Message::Binary(data) => {
+                    if tx.send(Ok(data)).await.is_err() {
+                        return; // session gone
                     }
+                    // Delivered. Reset the deadline again so a long delivery park
+                    // (the session backpressured on `accept_*`) isn't charged
+                    // against the peer — we only judge liveness while actively
+                    // reading, not while wedged handing data to the app.
+                    if let Some(d) = deadline.as_mut() {
+                        d.observe_recv();
+                    }
+                }
+                Message::Close(_) => {
+                    let _ = tx.send(Err(Error::Closed)).await;
+                    return;
+                }
+                Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
+                    // tungstenite auto-queues a Pong reply when it reads a Ping; the
+                    // writer half flushes it on its next send/ping. The pump owns no
+                    // sink, so there's nothing to reply with here.
+                    continue;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use tokio::sync::mpsc;
+
+        use super::{ws_pump, DeadlineState, Message};
+        use crate::ws::KeepAlive;
+        use crate::Error;
+
+        type WsResult = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        /// A `Stream` of WS messages backed by a `futures` channel. Holding the
+        /// returned sender keeps the stream "open but silent" (`next()` pends) when
+        /// empty; dropping it ends the stream. Standing in for a live peer.
+        fn mock_stream() -> (
+            futures::channel::mpsc::UnboundedSender<WsResult>,
+            futures::channel::mpsc::UnboundedReceiver<WsResult>,
+        ) {
+            futures::channel::mpsc::unbounded()
+        }
+
+        /// The pump must not spuriously time out a *healthy* peer just because the
+        /// session is too busy to drain it — the exact failure the split reader had,
+        /// where the keep-alive deadline was only polled inside `recv` and went stale
+        /// while the session parked handing a stream to a full `accept_*` channel.
+        ///
+        /// Here a capacity-1 channel stands in for that full `accept_*`: the pump
+        /// parks delivering the second frame while we sit idle well past the
+        /// keep-alive `timeout`, then we drain — and both frames must arrive intact,
+        /// with no `Error::Closed` from a phantom timeout.
+        #[tokio::test]
+        async fn survives_a_slow_consumer() {
+            let (feed, stream) = mock_stream();
+            feed.unbounded_send(Ok(Message::Binary(Bytes::from_static(b"one"))))
+                .unwrap();
+            feed.unbounded_send(Ok(Message::Binary(Bytes::from_static(b"two"))))
+                .unwrap();
+            // Keep `feed` alive: the peer stays connected and silent after these two.
+            let _feed = feed;
+
+            let ka = KeepAlive::new(Duration::from_millis(10), Duration::from_millis(50));
+            let (tx, mut rx) = mpsc::channel(1);
+            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), tx));
+
+            // Model a session wedged on a full accept channel: don't read for well
+            // over the 50ms keep-alive timeout while the pump is parked on delivery.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            assert_eq!(
+                rx.recv().await.expect("channel open").expect("no timeout"),
+                Bytes::from_static(b"one"),
+            );
+            assert_eq!(
+                rx.recv().await.expect("channel open").expect("no timeout"),
+                Bytes::from_static(b"two"),
+            );
+
+            pump.abort();
+        }
+
+        /// The deadline must still fire for a genuinely silent peer: once the pump is
+        /// caught up and reading (not parked on delivery), `timeout` of silence is a
+        /// dead peer, surfaced as `Error::Closed`.
+        #[tokio::test]
+        async fn times_out_a_silent_peer() {
+            // Held open but never fed — `stream.next()` pends forever.
+            let (_feed, stream) = mock_stream();
+
+            let ka = KeepAlive::new(Duration::from_millis(10), Duration::from_millis(50));
+            let (tx, mut rx) = mpsc::channel(4);
+            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), tx));
+
+            let result = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("keep-alive deadline should fire on a silent peer");
+            assert!(
+                matches!(result, Some(Err(Error::Closed))),
+                "expected a keep-alive timeout, got {result:?}"
+            );
+
+            pump.abort();
+        }
+
+        /// With no keep-alive configured the pump never times out: a silent-but-open
+        /// peer just leaves `recv` pending rather than closing.
+        #[tokio::test]
+        async fn no_keep_alive_never_times_out() {
+            let (feed, stream) = mock_stream();
+            let _feed = feed;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let pump = tokio::spawn(ws_pump(stream, None, tx));
+
+            // No deadline, so recv stays pending well past any keep-alive window.
+            let pending = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+            assert!(pending.is_err(), "recv must not resolve without activity");
+
+            pump.abort();
         }
     }
 }

@@ -211,3 +211,54 @@ async fn qmux01_tcp_stream_and_ping() {
     session.close(0, "done");
     server_task.await.unwrap();
 }
+
+/// Two idle QMux01 peers keep each other alive with no application traffic: the
+/// timer task emits a QX_PING every idle/3, the peer answers, and each response
+/// resets the other's idle deadline. So the connection survives well past the idle
+/// window instead of self-closing — and the timer keeps pinging regardless of where
+/// the reader/writer happen to be parked.
+#[tokio::test]
+async fn qmux01_ping_keeps_idle_session_alive() {
+    use qmux::transport::Stream;
+    use qmux::{Config, Session};
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    // Short idle window so the test is quick; the ping cadence is a third of it.
+    let mut config = Config::new(Version::QMux01);
+    config.max_idle_timeout = 150;
+
+    let ta = Stream::new(a, config.version, config.max_record_size);
+    let tb = Stream::new(b, config.version, config.max_record_size);
+    let (client, server) = tokio::join!(
+        Session::connect(ta, config.clone()),
+        Session::accept(tb, config),
+    );
+    let client = client.unwrap();
+    let server = server.unwrap();
+
+    // Watch both close reasons without consuming the sessions.
+    let (c, s) = (client.clone(), server.clone());
+    let client_closed = tokio::spawn(async move { c.closed().await });
+    let server_closed = tokio::spawn(async move { s.closed().await });
+
+    // Idle for well over 2× the 150ms window: without the keep-alive, both would
+    // have long since idle-closed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !client_closed.is_finished(),
+        "client idle-closed despite the keep-alive ping"
+    );
+    assert!(
+        !server_closed.is_finished(),
+        "server idle-closed despite the keep-alive ping"
+    );
+
+    // And the link is genuinely still usable, not merely un-closed.
+    let mut send = client.open_uni().await.unwrap();
+    send.write(b"alive").await.unwrap();
+    send.finish().unwrap();
+    let mut recv = server.accept_uni().await.unwrap();
+    assert_eq!(recv.read_all().await.unwrap().as_ref(), b"alive");
+
+    client.close(0, "done");
+}
