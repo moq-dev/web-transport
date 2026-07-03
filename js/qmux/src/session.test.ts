@@ -62,6 +62,11 @@ class FakePeer {
 	sendText(text: string) {
 		this.#recv.enqueue(text);
 	}
+	/** Inject a raw binary record — bytes the encoder wouldn't normally emit
+	 * (e.g. the no-length 0x30 datagram form). */
+	sendRaw(bytes: Uint8Array) {
+		this.#recv.enqueue(bytes);
+	}
 	/** All frames the Session has written so far, decoded. */
 	received(): Frame.Any[] {
 		return this.sent.flatMap((b) => Frame.decodeRecord(b));
@@ -185,6 +190,50 @@ describe("Session integration (scripted peer)", () => {
 		peer.send({ type: "datagram", data: new Uint8Array([9, 8, 7]) });
 		const { value } = await session.datagrams.readable.getReader().read();
 		expect(Array.from(value as Uint8Array)).toEqual([9, 8, 7]);
+		session.close();
+	});
+
+	test("datagrams: a DATAGRAM whose frame exactly fits our advertised size is delivered", async () => {
+		// ourParams.maxDatagramFrameSize = 10; an 8-byte payload encodes to a
+		// 1 (type) + 1 (length varint) + 8 = 10-byte frame — exactly the limit.
+		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+		session.close();
+	});
+
+	test("datagrams: a DATAGRAM whose frame overflows our advertised size is dropped", async () => {
+		// ourParams.maxDatagramFrameSize = 10. A 10-byte payload passes the old
+		// payload-only check but its encoded frame is 1 + 1 + 10 = 12 > 10, so it
+		// must be dropped. The following in-limit datagram is what the reader sees.
+		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array(10) });
+		peer.send({ type: "datagram", data: new Uint8Array([9, 9]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([9, 9]);
+		session.close();
+	});
+
+	test("datagrams: a no-length (0x30) DATAGRAM is sized without a length varint", async () => {
+		// ourParams.maxDatagramFrameSize = 10. A 0x30 datagram carries no length
+		// varint, so a 9-byte payload is a 1 + 9 = 10-byte frame — exactly the
+		// limit — even though the length-prefixed reconstruction (1 + 1 + 9 = 11)
+		// would wrongly drop it. Hand-build the record: a 0x30 type byte + payload.
+		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+		peer.sendRaw(new Uint8Array([0x30, ...payload]));
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 		session.close();
 	});
 

@@ -596,12 +596,16 @@ export default class Session implements WebTransport {
 			this.#uniStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "datagram") {
 			// Only accept datagrams if we advertised support (a conforming peer
-			// won't send otherwise) and the payload fits the frame size we
+			// won't send otherwise) and the encoded frame fits the size we
 			// advertised — drop oversized ones rather than delivering them.
-			if (
-				this.#ourParams.maxDatagramFrameSize > 0n &&
-				BigInt(frame.data.byteLength) <= this.#ourParams.maxDatagramFrameSize
-			) {
+			// `maxDatagramFrameSize` limits the whole frame, whose size depends on
+			// the wire form: the no-length `0x30` form is just a type byte plus
+			// payload, while `0x31` adds a length varint. The decoder records which
+			// arrived so we can size it exactly.
+			const len = frame.data.byteLength;
+			const header = frame.lengthPrefixed === false ? 1 : 1 + VarInt.from(len).size();
+			const frameSize = BigInt(header + len);
+			if (this.#ourParams.maxDatagramFrameSize > 0n && frameSize <= this.#ourParams.maxDatagramFrameSize) {
 				this.datagrams.push(frame.data);
 			}
 		} else if (frame.type === "ping_request") {

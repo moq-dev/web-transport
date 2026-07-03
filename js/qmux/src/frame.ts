@@ -87,11 +87,16 @@ export interface TransportParameters {
 	params: TransportParams;
 }
 
-/** An unreliable datagram (RFC 9221). The payload carries no length prefix in
- * the frame struct here; on the wire it is length-delimited (0x31). */
+/** An unreliable datagram (RFC 9221). */
 export interface Datagram {
 	type: "datagram";
 	data: Uint8Array;
+	/** Whether the frame carried an explicit length varint on the wire (the
+	 * `0x31` form) rather than the no-length `0x30` form, whose payload is
+	 * delimited by the enclosing record. We always *emit* `0x31`; decoders set
+	 * this so the receive path can size the frame exactly for
+	 * `max_datagram_frame_size` validation. Absent (encode side) means `0x31`. */
+	lengthPrefixed?: boolean;
 }
 
 export interface TransportParams {
@@ -738,7 +743,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 
 	// DATAGRAM without length — payload runs to the end of the record
 	if (frameType === 0x30n) {
-		return { type: "datagram", data: buffer };
+		return { type: "datagram", data: buffer, lengthPrefixed: false };
 	}
 
 	// DATAGRAM with length
@@ -747,7 +752,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		const len = Number(v.value);
 		let data: Uint8Array;
 		[data, buffer] = take(buffer, len);
-		return { type: "datagram", data };
+		return { type: "datagram", data, lengthPrefixed: true };
 	}
 
 	// Unknown frame type
@@ -904,7 +909,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 	// DATAGRAM without length — payload runs to the end of the record
 	if (frameType === 0x30n) {
 		const data = buffer;
-		return [{ type: "datagram", data }, buffer.slice(buffer.byteLength)];
+		return [{ type: "datagram", data, lengthPrefixed: false }, buffer.slice(buffer.byteLength)];
 	}
 
 	// DATAGRAM with length
@@ -913,7 +918,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		const len = Number(v.value);
 		let data: Uint8Array;
 		[data, buffer] = take(buffer, len);
-		return [{ type: "datagram", data }, buffer];
+		return [{ type: "datagram", data, lengthPrefixed: true }, buffer];
 	}
 
 	// Unknown: skip remaining (can't delimit)

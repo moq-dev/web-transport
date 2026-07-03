@@ -256,7 +256,7 @@ impl<T: Transport> SessionState<T> {
                 }
                 Some(payload) = self.outbound_datagram.recv() => {
                     // Ahead of bulk stream data for low latency, behind control.
-                    self.send_frame(Frame::Datagram(payload)).await?;
+                    self.send_frame(Frame::Datagram(payload.into())).await?;
                 }
                 frame = self.outbound.pop() => {
                     match frame {
@@ -613,18 +613,24 @@ impl<T: Transport> SessionState<T> {
                     self.outbound_priority.0.send(response).ok();
                 }
             }
-            // DATAGRAM: fan out to the receive channel. Accept only if we
-            // advertised support (a conforming peer won't send otherwise) and the
-            // payload fits within the frame size we advertised — reject oversized
-            // ones rather than buffering them, mirroring the STREAM check above.
-            // Delivery is best-effort past that, so drop the datagram if the
-            // channel is full rather than blocking the session loop.
-            Frame::Datagram(payload) => {
-                if self.our_params.max_datagram_frame_size != 0
-                    && payload.len() as u64 <= self.our_params.max_datagram_frame_size
-                {
-                    let _ = self.recv_datagram.try_send(payload);
+            // DATAGRAM: fan out to the receive channel. `max_datagram_frame_size`
+            // caps the whole *frame* (type byte + length varint + payload), not
+            // just the payload, so compare against the frame's exact encoded size
+            // — which depends on the wire form (`Datagram::frame_size` accounts
+            // for the 0x30 no-length form having no length varint). A peer that
+            // sends a datagram we never advertised support for, or one that
+            // overflows the negotiated limit, is a protocol violation — surface it
+            // rather than silently dropping. Delivery past that is best-effort, so
+            // drop the datagram if the channel is full rather than blocking the
+            // session loop.
+            Frame::Datagram(datagram) => {
+                if self.our_params.max_datagram_frame_size == 0 {
+                    return Err(Error::DatagramsUnsupported);
                 }
+                if datagram.frame_size() > self.our_params.max_datagram_frame_size {
+                    return Err(Error::FrameTooLarge);
+                }
+                let _ = self.recv_datagram.try_send(datagram.data);
             }
         }
 
@@ -1711,5 +1717,125 @@ mod recv_open_tests {
             .expect("stream 6 was wrongly dropped as already-closed")
             .expect("accept_uni failed");
         assert_eq!(second.read_all().await.unwrap().as_ref(), b"hello");
+    }
+}
+
+// Receive-side DATAGRAM validation. A conforming peer self-limits, so these
+// drive a real server `Session` from a hand-crafted raw peer that injects the
+// records a conforming client never would.
+#[cfg(all(test, feature = "tcp"))]
+mod datagram_recv_tests {
+    use super::*;
+    use crate::transport::Stream;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use web_transport_trait::Session as _;
+
+    /// Wrap a QMux01 frame in its size-prefixed record — the byte-stream framing
+    /// [`Stream`] delimits on the wire.
+    fn record(frame: Bytes) -> Bytes {
+        let mut buf = bytes::BytesMut::new();
+        VarInt::try_from(frame.len()).unwrap().encode(&mut buf);
+        buf.extend_from_slice(&frame);
+        buf.freeze()
+    }
+
+    /// Establish a real server `Session` opposite a raw peer over an in-memory
+    /// duplex, returning the server plus the raw write half so the test can inject
+    /// arbitrary records. The raw peer sends its `TRANSPORT_PARAMETERS` first, as a
+    /// real QMux01 client would, so the server reaches "established".
+    async fn raw_peer(server_cfg: Config) -> (Session, DuplexStream) {
+        let (server_io, mut raw) = tokio::io::duplex(1024 * 1024);
+        let transport = Stream::new(server_io, Version::QMux01, server_cfg.max_record_size);
+        let accept = tokio::spawn(Session::accept(transport, server_cfg));
+
+        let client_params = Config::new(Version::QMux01).to_transport_params();
+        let params = Frame::TransportParameters(client_params)
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(params)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        let server = accept.await.unwrap().unwrap();
+        (server, raw)
+    }
+
+    /// A DATAGRAM whose *frame* size (type byte + length varint + payload) exceeds
+    /// the advertised `max_datagram_frame_size` is a protocol violation, not
+    /// something to silently drop.
+    #[tokio::test]
+    async fn oversized_frame_closes_session() {
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 100;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        // Usable payload is 97 (100 - 1 type byte - 2 length-varint bytes); a
+        // 98-byte payload tips the encoded frame to 101 > 100.
+        let datagram = Frame::Datagram(Bytes::from(vec![0u8; 98]).into())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::FrameTooLarge));
+    }
+
+    /// A DATAGRAM on a session that advertised `max_datagram_frame_size = 0` was
+    /// never negotiated; reject the session rather than accept the frame.
+    #[tokio::test]
+    async fn unnegotiated_datagram_closes_session() {
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 0;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        let datagram = Frame::Datagram(Bytes::from_static(b"hi").into())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::DatagramsUnsupported));
+    }
+
+    /// A DATAGRAM whose encoded frame exactly hits the advertised limit is
+    /// delivered — the bound is inclusive.
+    #[tokio::test]
+    async fn frame_at_limit_delivered() {
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 100;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        // 97-byte payload → 1 + 2 + 97 == 100 == the limit.
+        let payload = vec![7u8; 97];
+        let datagram = Frame::Datagram(Bytes::from(payload.clone()).into())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);
+    }
+
+    /// The no-length (0x30) form carries no length varint, so its frame is only
+    /// `1 + payload`. The size check must use that exact size, not the larger
+    /// length-prefixed reconstruction — otherwise a conforming 0x30 datagram at
+    /// the boundary is wrongly rejected.
+    #[tokio::test]
+    async fn no_length_datagram_uses_exact_frame_size() {
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 100;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        // A 99-byte 0x30 payload is a 1 + 99 = 100-byte frame — exactly the limit
+        // — even though the length-prefixed reconstruction (1 + 2 + 99 = 102)
+        // would overshoot it. We never emit 0x30, so hand-build the frame: a
+        // single 0x30 type byte (a 1-byte varint) followed by the payload.
+        let payload = vec![3u8; 99];
+        let mut frame = bytes::BytesMut::new();
+        frame.put_u8(0x30);
+        frame.extend_from_slice(&payload);
+        raw.write_all(&record(frame.freeze())).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);
     }
 }
