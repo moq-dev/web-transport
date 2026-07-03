@@ -8,7 +8,8 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use qmux::{Config, Error, Session, Transport, TransportReader, TransportWriter, Version};
+use qmux::transport::{Reader, Writer};
+use qmux::{Config, Error, Session, Transport, Version};
 use tokio::sync::mpsc;
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
@@ -46,7 +47,7 @@ impl Transport for ThrottledTransport {
     }
 }
 
-impl TransportWriter for ThrottledWriter {
+impl Writer for ThrottledWriter {
     async fn send(&mut self, data: Bytes) -> Result<(), Error> {
         // The delay is what fills the session's outbound priority queue: while
         // we're sleeping here, the writer task can't pull the next frame, so
@@ -60,7 +61,7 @@ impl TransportWriter for ThrottledWriter {
     }
 }
 
-impl TransportReader for ThrottledReader {
+impl Reader for ThrottledReader {
     async fn recv(&mut self) -> Result<Bytes, Error> {
         self.rx.recv().await.ok_or(Error::Closed)
     }

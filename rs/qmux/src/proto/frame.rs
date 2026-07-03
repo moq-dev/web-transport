@@ -102,6 +102,7 @@ pub struct Ping {
 
 /// An unreliable datagram (RFC 9221).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Datagram {
     /// The payload bytes.
     pub data: Bytes,
@@ -143,6 +144,7 @@ impl From<Bytes> for Datagram {
 
 /// A QUIC-compatible frame for multiplexed transport.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Frame {
     Padding,
     ResetStream(ResetStream),

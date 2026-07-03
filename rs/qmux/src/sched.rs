@@ -224,6 +224,38 @@ impl PriorityQueue {
         }
     }
 
+    /// Drop every queued frame for `id`, unscheduling it and freeing the
+    /// capacity they held. Used when a stream is reset: any STREAM data still
+    /// buffered here must not reach the wire *after* the RESET_STREAM, or it's
+    /// post-terminal data that wastes congestion window on a stream the peer has
+    /// already abandoned. No-op if the stream has nothing queued.
+    pub fn remove(&self, id: StreamId) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(slot) = inner.streams.remove(&id) else {
+            return;
+        };
+        let removed = slot.frames.len();
+
+        // Unschedule it from its band (it's scheduled iff it had frames, which it
+        // did). `slot.priority` is the single source of truth for which band.
+        if let Some(queue) = inner.bands.get_mut(&slot.priority) {
+            if let Some(pos) = queue.iter().position(|&s| s == id) {
+                queue.remove(pos);
+            }
+            if queue.is_empty() {
+                inner.bands.remove(&slot.priority);
+            }
+        }
+
+        inner.len -= removed;
+        drop(inner);
+        // Freed `removed` slots; wake that many blocked producers (mirrors the
+        // per-slot notify in `pop_locked`).
+        for _ in 0..removed {
+            self.has_space.notify_one();
+        }
+    }
+
     /// Close the queue, unblocking any blocked producers and the consumer.
     pub fn close(&self) {
         {
@@ -377,5 +409,50 @@ mod tests {
         // Draining one frame makes room.
         q.pop().await.unwrap();
         pushing.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_drops_a_streams_queued_frames() {
+        let q = PriorityQueue::new(8);
+        let a = sid(0);
+        let b = sid(1);
+
+        q.push(5, a, frame(a, 1)).await.unwrap();
+        q.push(5, a, frame(a, 2)).await.unwrap();
+        q.push(5, b, frame(b, 9)).await.unwrap();
+
+        // Reset `a`: its queued frames vanish, `b`'s survive.
+        q.remove(a);
+
+        assert_eq!(id_of(&q.pop().await.unwrap()), b);
+        // Nothing left: the next pop blocks, so a closed-drain returns None.
+        q.close();
+        assert!(q.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_frees_capacity_for_blocked_producers() {
+        let q = PriorityQueue::new(2);
+        let a = sid(0);
+        let b = sid(1);
+        q.push(5, a, frame(a, 1)).await.unwrap();
+        q.push(5, a, frame(a, 2)).await.unwrap();
+
+        // Queue is full; a push for `b` blocks.
+        let q2 = q.clone();
+        let pushing = tokio::spawn(async move { q2.push(5, b, frame(b, 1)).await });
+        tokio::task::yield_now().await;
+        assert!(!pushing.is_finished(), "push should block while full");
+
+        // Removing `a` frees both slots and wakes the blocked producer.
+        q.remove(a);
+        pushing.await.unwrap().unwrap();
+        assert_eq!(id_of(&q.pop().await.unwrap()), b);
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_stream_is_noop() {
+        let q = PriorityQueue::new(8);
+        q.remove(sid(99)); // must not panic or underflow
     }
 }

@@ -11,6 +11,7 @@ use crate::Error;
 /// All values default to 0 (per QUIC), meaning no data/streams allowed
 /// until the peer advertises its limits.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct TransportParams {
     pub max_idle_timeout: u64,                    // ID 0x01 (milliseconds)
     pub initial_max_data: u64,                    // ID 0x04

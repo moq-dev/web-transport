@@ -9,7 +9,7 @@ use std::{
 use crate::config::Config;
 use crate::credit::Credit;
 use crate::sched::PriorityQueue;
-use crate::transport::{Transport, TransportReader, TransportWriter};
+use crate::transport::{Reader, Transport, Writer};
 use crate::{
     proto::varint_size, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
     StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
@@ -192,7 +192,7 @@ impl RecvOpen {
 /// frames. The outbound path (scheduling, encoding, sending, keep-alive) lives in
 /// [`WriterState`]; the two tasks share `streams` and the record-limit / idle
 /// atomics instead of passing messages.
-struct SessionState<R: TransportReader> {
+struct SessionState<R: Reader> {
     reader: R,
     config: Config,
     is_server: bool,
@@ -306,7 +306,7 @@ fn negotiated_idle_timeout_ms(ours: u64, peer: u64) -> u64 {
 /// under the shared `streams` lock, then writes it. Runs on its own task so a
 /// write blocked on transport backpressure never stalls the reader. It also owns
 /// the QMux keep-alive ping (it's the side that knows when we last sent).
-struct WriterState<W: TransportWriter> {
+struct WriterState<W: Writer> {
     writer: W,
     version: Version,
 
@@ -330,7 +330,7 @@ struct WriterState<W: TransportWriter> {
     next_ping_seq: u64,
 }
 
-impl<W: TransportWriter> WriterState<W> {
+impl<W: Writer> WriterState<W> {
     /// Record the first terminal error so the reader's `closed` branch unblocks.
     fn note_closed(&self, err: Error) {
         self.closed.send_if_modified(|slot| {
@@ -443,7 +443,7 @@ impl<W: TransportWriter> WriterState<W> {
     }
 }
 
-impl<R: TransportReader> SessionState<R> {
+impl<R: Reader> SessionState<R> {
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
@@ -1491,6 +1491,8 @@ impl SendStream {
                 code,
                 final_size: self.offset,
             };
+            // Flush queued STREAM data so none trails the RESET_STREAM on the wire.
+            self.outbound.remove(self.id);
             self.outbound_priority.send(frame.into()).ok();
         }
         self.closed = Some(error.clone());
@@ -1645,6 +1647,10 @@ impl generic::SendStream for SendStream {
             final_size: self.offset,
         };
 
+        // Flush any STREAM data still queued for this stream: it must not go out
+        // after the RESET_STREAM, where it would be post-terminal data burning
+        // congestion window on a stream the peer has abandoned.
+        self.outbound.remove(self.id);
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
@@ -1903,7 +1909,7 @@ mod recv_open_tests {
 
     use web_transport_proto::VarInt;
 
-    use super::{Session, Transport, TransportReader, TransportWriter};
+    use super::{Reader, Session, Transport, Writer};
     use crate::proto::{Frame, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
@@ -1935,7 +1941,7 @@ mod recv_open_tests {
         }
     }
 
-    impl TransportWriter for ScriptedWriter {
+    impl Writer for ScriptedWriter {
         async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
             Ok(())
         }
@@ -1945,7 +1951,7 @@ mod recv_open_tests {
         }
     }
 
-    impl TransportReader for ScriptedReader {
+    impl Reader for ScriptedReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             match self.incoming.recv().await {
                 Some(bytes) => Ok(bytes),

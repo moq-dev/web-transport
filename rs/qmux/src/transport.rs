@@ -15,16 +15,16 @@ use crate::Error;
 /// of buffering them behind a stalled socket.
 pub trait Transport: Send + 'static {
     /// The independently-owned send half.
-    type Writer: TransportWriter;
+    type Writer: Writer;
     /// The independently-owned receive half.
-    type Reader: TransportReader;
+    type Reader: Reader;
 
     /// Split into send and receive halves.
     fn split(self) -> (Self::Writer, Self::Reader);
 }
 
 /// The send half of a [`Transport`].
-pub trait TransportWriter: Send + 'static {
+pub trait Writer: Send + 'static {
     /// Send a single complete message.
     fn send(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
@@ -42,7 +42,7 @@ pub trait TransportWriter: Send + 'static {
 }
 
 /// The receive half of a [`Transport`].
-pub trait TransportReader: Send + 'static {
+pub trait Reader: Send + 'static {
     /// Receive the next complete message.
     fn recv(&mut self) -> impl std::future::Future<Output = Result<Bytes, Error>> + Send;
 }
@@ -64,7 +64,7 @@ mod stream_transport {
     use tokio::task::JoinHandle;
     use web_transport_proto::VarInt;
 
-    use super::{Transport, TransportReader, TransportWriter};
+    use super::{Reader, Transport, Writer};
     use crate::{Error, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
 
     /// Bound on queued frames waiting for the session to drain them. Bytes the
@@ -153,7 +153,7 @@ mod stream_transport {
         }
     }
 
-    impl<T: AsyncWrite + Send + 'static> TransportWriter for StreamWriter<T> {
+    impl<T: AsyncWrite + Send + 'static> Writer for StreamWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             // QMux01 frames travel inside size-prefixed records on byte streams.
             // (Records are implicit on WebSocket, where the message boundary delimits them.)
@@ -173,7 +173,7 @@ mod stream_transport {
         }
     }
 
-    impl TransportReader for StreamReader {
+    impl Reader for StreamReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             // mpsc::Receiver::recv is cancel safe, so dropping this future never
             // loses a buffered frame. `None` means the reader task exited without
@@ -401,7 +401,7 @@ mod stream_transport {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::transport::{Transport, TransportReader};
+        use crate::transport::{Reader, Transport};
         use tokio::io::AsyncWriteExt;
 
         // Drip a frame in one byte at a time, racing each `recv` against an
@@ -568,7 +568,7 @@ mod ws_transport {
     use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
     use tokio_tungstenite::tungstenite;
 
-    use super::{Transport, TransportReader, TransportWriter};
+    use super::{Reader, Transport, Writer};
     use crate::ws::KeepAlive;
     use crate::Error;
 
@@ -683,7 +683,7 @@ mod ws_transport {
         }
     }
 
-    impl<T: WsStream> TransportWriter for WsWriter<T> {
+    impl<T: WsStream> Writer for WsWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             use futures::SinkExt;
             self.sink
@@ -721,7 +721,7 @@ mod ws_transport {
         }
     }
 
-    impl<T: WsStream> TransportReader for WsReader<T> {
+    impl<T: WsStream> Reader for WsReader<T> {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             use futures::StreamExt;
 

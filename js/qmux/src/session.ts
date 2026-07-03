@@ -129,8 +129,11 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 
 	/** Deliver an inbound datagram to the reader, dropping it if the queue is full. */
 	push(data: Uint8Array): void {
-		if (this.#incoming.desiredSize !== null && this.#incoming.desiredSize <= 0) {
-			return; // reader is behind — shed load
+		// `desiredSize` is null once the readable is closed/errored (e.g. a datagram
+		// arriving in a WS message the read loop delivers just after the session
+		// closed); enqueue would throw, so drop silently — matching Rust's try_send.
+		if (this.#incoming.desiredSize === null || this.#incoming.desiredSize <= 0) {
+			return; // reader is behind or gone — shed load
 		}
 		this.#incoming.enqueue(data);
 	}
@@ -567,7 +570,8 @@ export default class Session implements WebTransport {
 				}
 			}
 		} catch (error) {
-			console.error("Failed to decode frame:", error);
+			// A decode failure or a frame that violates a negotiated limit is fatal.
+			console.error("Protocol violation:", error);
 			this.close({ closeCode: 1002, reason: "Protocol violation" });
 		}
 	}
@@ -595,19 +599,27 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "max_streams_uni") {
 			this.#uniStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "datagram") {
-			// Only accept datagrams if we advertised support (a conforming peer
-			// won't send otherwise) and the encoded frame fits the size we
-			// advertised — drop oversized ones rather than delivering them.
-			// `maxDatagramFrameSize` limits the whole frame, whose size depends on
-			// the wire form: the no-length `0x30` form is just a type byte plus
-			// payload, while `0x31` adds a length varint. The decoder records which
-			// arrived so we can size it exactly.
+			// `max_datagram_frame_size` is negotiated: we advertised the largest
+			// DATAGRAM frame we're willing to receive, so a peer that sends one we
+			// never accepted — or one larger than we advertised — has violated the
+			// contract. Per RFC 9221 that's a fatal PROTOCOL_VIOLATION, not a
+			// droppable frame; throwing here closes the session via #onData (matching
+			// the Rust implementation's DatagramsUnsupported / FrameTooLarge).
+			//
+			// The limit bounds the whole frame, whose size depends on the wire form:
+			// the no-length `0x30` form is just a type byte plus payload, while `0x31`
+			// adds a length varint. The decoder records which arrived so we can size
+			// it exactly.
+			if (this.#ourParams.maxDatagramFrameSize === 0n) {
+				throw new Error("received a DATAGRAM but did not advertise datagram support");
+			}
 			const len = frame.data.byteLength;
 			const header = frame.lengthPrefixed === false ? 1 : 1 + VarInt.from(len).size();
 			const frameSize = BigInt(header + len);
-			if (this.#ourParams.maxDatagramFrameSize > 0n && frameSize <= this.#ourParams.maxDatagramFrameSize) {
-				this.datagrams.push(frame.data);
+			if (frameSize > this.#ourParams.maxDatagramFrameSize) {
+				throw new Error("received a DATAGRAM larger than our advertised max_datagram_frame_size");
 			}
+			this.datagrams.push(frame.data);
 		} else if (frame.type === "ping_request") {
 			// Respond to ping requests
 			this.#sendPriorityFrame({ type: "ping_response", sequence: frame.sequence });
