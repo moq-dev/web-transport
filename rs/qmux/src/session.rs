@@ -1,15 +1,15 @@
 use std::{
-    collections::{hash_map, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
 };
 
 use crate::config::Config;
 use crate::credit::Credit;
 use crate::sched::PriorityQueue;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportReader, TransportWriter};
 use crate::{
     proto::varint_size, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
     StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
@@ -24,10 +24,44 @@ use web_transport_trait as generic;
 /// applying backpressure to the whole session.
 const DATAGRAM_RECV_BUFFER: usize = 1024;
 
-/// How many outbound datagrams to buffer before dropping. When the transport is
-/// backpressured, `send_datagram` sheds datagrams here rather than growing an
-/// unbounded queue — droppable is the whole point of an unreliable datagram.
-const DATAGRAM_SEND_BUFFER: usize = 1024;
+/// How many outbound datagrams to buffer before dropping. The writer pulls from
+/// this lane; when it stalls on transport backpressure it stops pulling, the lane
+/// fills, and `send_datagram` drops on a full lane. Kept small so shedding tracks
+/// real backpressure closely rather than after a deep buffer of stale datagrams.
+const DATAGRAM_SEND_BUFFER: usize = 64;
+
+/// Shared, lock-guarded per-stream backend state. The reader task inserts/looks
+/// up entries as inbound frames arrive; the writer task retires an entry when it
+/// emits that stream's terminal frame (FIN/RESET/STOP_SENDING). Guarded by a
+/// plain `std::sync::Mutex` — never held across an `.await` — so both tasks share
+/// it without message passing, the way a QUIC endpoint shares connection state.
+#[derive(Default)]
+struct Streams {
+    send: HashMap<StreamId, SendState>,
+    recv: HashMap<StreamId, RecvState>,
+}
+
+/// Closes the connection once the last [`Session`] handle is dropped. Held in an
+/// `Arc` cloned with every `Session`, so its `Drop` runs only when they're all
+/// gone — at which point it flips `closed`, tearing the backend tasks down
+/// promptly rather than waiting for the transport to notice. Mirrors how a QUIC
+/// endpoint's connection handle owns the connection's lifetime.
+struct SessionGuard {
+    closed: watch::Sender<Option<Error>>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.closed.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(Error::Closed);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
 
 /// A multiplexed session over a reliable transport.
 #[derive(Clone)]
@@ -85,6 +119,9 @@ pub struct Session {
     // Resolved from the peer's transport parameters before the session is handed
     // to the caller (0 = the peer doesn't accept datagrams).
     datagram_max_size: Arc<AtomicUsize>,
+
+    // Closes the connection when the last `Session` clone drops. Never read.
+    _guard: Arc<SessionGuard>,
 }
 
 /// Tracks which peer-initiated recv-stream indices (in one direction) are open,
@@ -136,13 +173,20 @@ impl RecvOpen {
     }
 }
 
-struct SessionState<T: Transport> {
-    transport: T,
+/// Reader-side task state: owns the transport receive half and processes inbound
+/// frames. The outbound path (scheduling, encoding, sending, keep-alive) lives in
+/// [`WriterState`]; the two tasks share `streams` and the record-limit / idle
+/// atomics instead of passing messages.
+struct SessionState<R: TransportReader> {
+    reader: R,
     config: Config,
     is_server: bool,
 
+    // Handed (cloned) to newly-created peer-initiated stream frontends so they can
+    // enqueue their own data (`outbound`) and control frames (`control`). The
+    // reader never pulls from these — the writer does.
     outbound: PriorityQueue,
-    outbound_priority: (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>),
+    control: mpsc::UnboundedSender<Frame>,
 
     accept_bi: mpsc::Sender<(SendStream, RecvStream)>,
     accept_uni: mpsc::Sender<RecvStream>,
@@ -150,8 +194,8 @@ struct SessionState<T: Transport> {
     create_uni: mpsc::Receiver<(StreamId, SendState)>,
     create_bi: mpsc::Receiver<(StreamId, SendState, RecvState)>,
 
-    send_streams: HashMap<StreamId, SendState>,
-    recv_streams: HashMap<StreamId, RecvState>,
+    // Shared per-stream backend state (with the writer task).
+    streams: Arc<Mutex<Streams>>,
 
     closed: watch::Sender<Option<Error>>,
 
@@ -175,51 +219,194 @@ struct SessionState<T: Transport> {
 
     // Open/closed bookkeeping for peer-initiated recv streams, per direction, so a
     // post-terminal frame on a retired id is ignored rather than resurrecting a
-    // brand-new accepted stream. See `RecvOpen`. QMux only: MAX_STREAMS flow
-    // control bounds the hole set to at most the peer's stream limit.
+    // brand-new accepted stream. See `RecvOpen`. Reader-only (not shared with the
+    // writer). QMux only: MAX_STREAMS flow control bounds the hole set to at most
+    // the peer's stream limit.
     recv_open_bi: RecvOpen,
     recv_open_uni: RecvOpen,
 
-    // QMux01 idle-timeout state (engaged once we've received the peer's params)
+    // QMux01 idle-timeout state: the reader closes the session if no frame arrives
+    // within the window (the writer handles the keep-alive ping side).
     last_recv_at: tokio::time::Instant,
-    last_send_at: tokio::time::Instant,
-    next_ping_seq: u64,
 
     // Inbound datagram sink (see the matching field on `Session`) plus the
     // shared send-limit cell resolved from the peer's params.
     recv_datagram: mpsc::Sender<Bytes>,
     datagram_max_size: Arc<AtomicUsize>,
 
-    // Receiver for outbound datagrams enqueued by `send_datagram`.
-    outbound_datagram: mpsc::Receiver<Bytes>,
+    // Effective outbound record-size limit and idle-timeout (ms), shared with the
+    // writer. Both are written once, when the peer's transport parameters arrive.
+    record_limit: Arc<AtomicU64>,
+    idle_timeout_ms: Arc<AtomicU64>,
 }
 
-impl<T: Transport> SessionState<T> {
-    async fn run(&mut self) -> Result<(), Error> {
-        // QMux requires TRANSPORT_PARAMETERS as the first frame on the connection.
-        if self.config.version.is_qmux() {
-            self.send_transport_parameters().await?;
-        }
+/// Pick the next outbound frame in strict priority order: control (lossless,
+/// e.g. RESET/STOP/CLOSE/window updates) first, then datagrams (low-latency but
+/// droppable), then bulk stream data scheduled by [`PriorityQueue`]. Returns
+/// `None` only once the stream queue is closed, which drives session teardown.
+///
+/// Each source's future is cancel-safe (`mpsc::recv` and `PriorityQueue::pop`
+/// remove nothing until they resolve), so losing this race in the caller's
+/// `select!` never drops a frame.
+async fn next_outbound(
+    control: &mut mpsc::UnboundedReceiver<Frame>,
+    datagram: &mut mpsc::Receiver<Bytes>,
+    stream: &PriorityQueue,
+) -> Option<Frame> {
+    tokio::select! {
+        biased;
+        Some(frame) = control.recv() => Some(frame),
+        // `.into()` builds the length-prefixed (0x31) form we always emit.
+        Some(payload) = datagram.recv() => Some(Frame::Datagram(payload.into())),
+        frame = stream.pop() => frame,
+    }
+}
 
-        let mut closed = self.closed.subscribe();
+/// Writer-side task state: owns the transport send half and is the sole producer
+/// on the wire. It pulls the outbound queues in strict priority order via
+/// [`next_outbound`], retires the stream a terminal frame closes and encodes it
+/// under the shared `streams` lock, then writes it. Runs on its own task so a
+/// write blocked on transport backpressure never stalls the reader. It also owns
+/// the QMux keep-alive ping (it's the side that knows when we last sent).
+struct WriterState<W: TransportWriter> {
+    writer: W,
+    version: Version,
 
+    control: mpsc::UnboundedReceiver<Frame>,
+    datagrams: mpsc::Receiver<Bytes>,
+    outbound: PriorityQueue,
+
+    // Shared with the reader task.
+    streams: Arc<Mutex<Streams>>,
+    record_limit: Arc<AtomicU64>,
+    idle_timeout_ms: Arc<AtomicU64>,
+
+    closed: watch::Sender<Option<Error>>,
+
+    last_send_at: tokio::time::Instant,
+    next_ping_seq: u64,
+}
+
+impl<W: TransportWriter> WriterState<W> {
+    /// Record the first terminal error so the reader's `closed` branch unblocks.
+    fn note_closed(&self, err: Error) {
+        self.closed.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(err);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    async fn run(&mut self) {
+        let mut closed_rx = self.closed.subscribe();
         loop {
-            // Compute the effective idle timeout — the smaller of the two non-zero values.
-            // While we're still waiting on the peer's transport parameters, treat the
-            // timeout as disabled so we don't tear the connection down before negotiation.
-            let idle_timeout_ms = self.effective_idle_timeout_ms();
-            let idle_deadline =
-                idle_timeout_ms.map(|ms| self.last_recv_at + std::time::Duration::from_millis(ms));
-            // Keep-alive: send a QX_PING when we've been silent for a third of the timeout.
-            // (Any frame counts as activity; this fires only when both sides are idle.)
-            // Clamp to 1ms so a tiny configured timeout doesn't yield a zero-duration
-            // deadline that fires every loop iteration.
-            let ping_deadline = idle_timeout_ms
-                .map(|ms| self.last_send_at + std::time::Duration::from_millis((ms / 3).max(1)));
+            // Keep-alive: send a QX_PING once we've been silent for a third of the
+            // idle timeout. 0 = disabled (non-QMux01, or params not yet exchanged).
+            // Clamp to 1ms so a tiny timeout doesn't yield a zero-duration deadline.
+            let idle_ms = self.idle_timeout_ms.load(Ordering::Acquire);
+            let ping_deadline = (idle_ms != 0).then(|| {
+                self.last_send_at + std::time::Duration::from_millis((idle_ms / 3).max(1))
+            });
 
             tokio::select! {
                 biased;
-                result = self.transport.recv() => {
+                frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
+                    match frame {
+                        Some(frame) => {
+                            if let Err(err) = self.transmit(frame).await {
+                                self.note_closed(err);
+                                break;
+                            }
+                        }
+                        // The stream queue was closed on teardown.
+                        None => break,
+                    }
+                }
+                _ = async { tokio::time::sleep_until(ping_deadline.unwrap()).await }, if ping_deadline.is_some() => {
+                    let seq = self.next_ping_seq;
+                    self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
+                    let ping = Frame::Ping(crate::Ping { sequence: seq, response: false });
+                    if let Err(err) = self.transmit(ping).await {
+                        self.note_closed(err);
+                        break;
+                    }
+                }
+                // Transport-level maintenance (WebSocket keep-alive Ping); never
+                // resolves for transports without timer-driven work.
+                result = self.writer.maintain() => {
+                    if let Err(err) = result {
+                        self.note_closed(err);
+                        break;
+                    }
+                }
+                // Wrapped so the `watch::Ref` guard is dropped before the branch
+                // resolves — otherwise it (non-`Send`), held across a `send` await,
+                // would make the task non-`Send`.
+                _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
+                    // Session tearing down: best-effort flush of any queued control
+                    // frames (e.g. a ConnectionClose) before we stop.
+                    while let Ok(frame) = self.control.try_recv() {
+                        if self.transmit(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        let _ = self.writer.close().await;
+    }
+
+    /// Retire the stream a terminal frame closes, encode the frame (validating its
+    /// size for QMux01), and write it. The `streams` lock is only held for the
+    /// synchronous retirement, never across the `send` await.
+    async fn transmit(&mut self, frame: Frame) -> Result<(), Error> {
+        match &frame {
+            Frame::ResetStream(reset) => {
+                self.streams.lock().unwrap().send.remove(&reset.id);
+            }
+            Frame::Stream(stream) if stream.fin => {
+                self.streams.lock().unwrap().send.remove(&stream.id);
+            }
+            Frame::StopSending(stop) => {
+                self.streams.lock().unwrap().recv.remove(&stop.id);
+            }
+            _ => {}
+        }
+
+        let bytes = frame.encode(self.version)?;
+        if self.version == Version::QMux01 {
+            // `record_limit` holds the draft-01 default until the peer's params
+            // arrive, then the peer's `max_record_size`.
+            let limit = self.record_limit.load(Ordering::Acquire);
+            if bytes.len() as u64 > limit {
+                return Err(Error::FrameTooLarge);
+            }
+        }
+        self.writer.send(bytes).await?;
+        self.last_send_at = tokio::time::Instant::now();
+        Ok(())
+    }
+}
+
+impl<R: TransportReader> SessionState<R> {
+    async fn run(&mut self) -> Result<(), Error> {
+        let mut closed = self.closed.subscribe();
+
+        loop {
+            // Close the session if the peer goes silent past the idle timeout. The
+            // writer owns the keep-alive ping that keeps this from firing while a
+            // healthy peer is merely idle. Disabled until the params are exchanged.
+            let idle_deadline = self
+                .effective_idle_timeout_ms()
+                .map(|ms| self.last_recv_at + std::time::Duration::from_millis(ms));
+
+            tokio::select! {
+                biased;
+                result = self.reader.recv() => {
                     let data = result?;
                     self.last_recv_at = tokio::time::Instant::now();
                     if self.config.version == Version::QMux01 {
@@ -238,7 +425,7 @@ impl<T: Transport> SessionState<T> {
                             credit.increase_max(self.peer_params.initial_max_stream_data_uni).ok();
                         }
                     }
-                    self.send_streams.insert(id, send);
+                    self.streams.lock().unwrap().send.insert(id, send);
                 }
                 Some((id, send, recv)) = self.create_bi.recv() => {
                     if self.params_received {
@@ -246,34 +433,13 @@ impl<T: Transport> SessionState<T> {
                             credit.increase_max(self.peer_params.initial_max_stream_data_bidi_remote).ok();
                         }
                     }
-                    self.send_streams.insert(id, send);
-                    self.recv_streams.insert(id, recv);
-                }
-                frame = self.outbound_priority.1.recv() => {
-                    match frame {
-                        Some(frame) => self.send_frame(frame).await?,
-                        None => return Err(Error::Closed),
-                    };
-                }
-                Some(payload) = self.outbound_datagram.recv() => {
-                    // Ahead of bulk stream data for low latency, behind control.
-                    self.send_frame(Frame::Datagram(payload.into())).await?;
-                }
-                frame = self.outbound.pop() => {
-                    match frame {
-                        Some(frame) => self.send_frame(frame).await?,
-                        None => return Err(Error::Closed),
-                    };
+                    let mut streams = self.streams.lock().unwrap();
+                    streams.send.insert(id, send);
+                    streams.recv.insert(id, recv);
                 }
                 _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
                     tracing::debug!("idle timeout fired");
                     return Err(Error::IdleTimeout);
-                }
-                _ = async { tokio::time::sleep_until(ping_deadline.unwrap()).await }, if ping_deadline.is_some() => {
-                    // Periodic keep-alive: send a QX_PING so the peer's idle timer resets.
-                    let seq = self.next_ping_seq;
-                    self.next_ping_seq = self.next_ping_seq.wrapping_add(1);
-                    self.send_frame(Frame::Ping(crate::Ping { sequence: seq, response: false })).await?;
                 }
                 _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
                     return Err(closed.borrow().clone().unwrap_or(Error::Closed))
@@ -301,51 +467,6 @@ impl<T: Transport> SessionState<T> {
         }
     }
 
-    /// Send a QX_TRANSPORT_PARAMETERS frame with our defaults.
-    async fn send_transport_parameters(&mut self) -> Result<(), Error> {
-        let frame = Frame::TransportParameters(self.our_params.clone());
-        self.send_encoded(frame.encode(self.config.version)?).await
-    }
-
-    /// Send pre-encoded frame bytes, validating against the peer's
-    /// `max_record_size` for QMux01. The transport handles any
-    /// transport-level framing (size varint on TCP/TLS; implicit on WS).
-    async fn send_encoded(&mut self, bytes: Bytes) -> Result<(), Error> {
-        if self.config.version == Version::QMux01 {
-            // Until the peer's TRANSPORT_PARAMETERS arrive, fall back to the draft-01
-            // default so we don't accidentally send a record the peer must reject.
-            let limit = if self.params_received {
-                self.peer_params.max_record_size
-            } else {
-                crate::proto::DEFAULT_MAX_RECORD_SIZE
-            };
-            if bytes.len() as u64 > limit {
-                return Err(Error::FrameTooLarge);
-            }
-        }
-        self.transport.send(bytes).await?;
-        self.last_send_at = tokio::time::Instant::now();
-        Ok(())
-    }
-
-    async fn send_frame(&mut self, frame: Frame) -> Result<(), Error> {
-        // Update our state first.
-        match &frame {
-            Frame::ResetStream(reset) => {
-                self.send_streams.remove(&reset.id);
-            }
-            Frame::Stream(stream) if stream.fin => {
-                self.send_streams.remove(&stream.id);
-            }
-            Frame::StopSending(stop) => {
-                self.recv_streams.remove(&stop.id);
-            }
-            _ => {}
-        };
-
-        self.send_encoded(frame.encode(self.config.version)?).await
-    }
-
     /// Per-direction open/closed bookkeeping for peer-initiated recv streams.
     fn recv_open(&self, dir: StreamDir) -> &RecvOpen {
         match dir {
@@ -368,221 +489,220 @@ impl<T: Transport> SessionState<T> {
                     return Err(Error::InvalidStreamId);
                 }
 
-                // Ignore post-terminal frames on an already-closed peer-initiated
-                // stream. Once we deliver a FIN/RESET the entry is dropped, so
-                // without this a duplicate/late STREAM frame would fall through and
-                // be treated as a brand-new accepted stream (stream resurrection).
-                // `is_closed` distinguishes a retired id from one that was only
-                // implicitly opened (a higher index arrived first) and hasn't had
-                // its own first frame yet — the latter is still new. Locally-
-                // initiated ids are left to the `is_server` guard below; only QMux
-                // tracks this, where MAX_STREAMS bounds the hole set.
+                // Ignore a post-terminal frame on a retired peer-initiated stream
+                // before consuming connection credit — otherwise a flood of
+                // duplicate/late frames would drain conn flow-control that's never
+                // replenished (they're not delivered). `is_closed` distinguishes a
+                // retired id from one merely implicitly opened (a higher index
+                // arrived first); a live stream is delivered by the fast path below,
+                // so exclude it. Only QMux tracks this (MAX_STREAMS bounds the holes).
+                let live = self.streams.lock().unwrap().recv.contains_key(&stream.id);
                 if self.config.version.is_qmux()
                     && stream.id.server_initiated() != self.is_server
-                    && !self.recv_streams.contains_key(&stream.id)
+                    && !live
                     && self.recv_open(stream.id.dir()).is_closed(stream.id.index())
                 {
                     return Ok(());
                 }
 
-                // Validate receive-side flow control
+                // Connection-level flow control.
                 let data_len = stream.data.len() as u64;
-                if data_len > 0 {
-                    // Connection-level check
-                    if !self.conn_recv_credit.receive(data_len) {
-                        return Err(Error::FlowControlError);
-                    }
-
-                    // Stream-level check (for existing streams)
-                    if let Some(recv) = self.recv_streams.get(&stream.id) {
-                        if !recv.recv_credit.receive(data_len) {
-                            return Err(Error::FlowControlError);
-                        }
-                    }
-                    // For new streams, we check after creation below
+                if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
+                    return Err(Error::FlowControlError);
                 }
 
-                match self.recv_streams.entry(stream.id) {
-                    hash_map::Entry::Vacant(e) => {
-                        if self.is_server == stream.id.server_initiated() {
-                            // Already closed, ignore it.
-                            return Ok(());
-                        }
-
-                        // Validate stream count limits (QMux only)
-                        // Per QUIC RFC 9000 §4.6, the limit applies to the stream index,
-                        // not the count of seen streams. A peer opening stream index N
-                        // implicitly opens all streams 0..N.
-                        if self.config.version.is_qmux() {
-                            let credit = match stream.id.dir() {
-                                StreamDir::Bi => &self.recv_bi_credit,
-                                StreamDir::Uni => &self.recv_uni_credit,
-                            };
-                            if !credit.receive_up_to(stream.id.index() + 1) {
-                                return Err(Error::StreamLimitExceeded);
-                            }
-
-                            // Record that we're instantiating a frontend for this
-                            // id, so a later frame on it (after it's retired) is
-                            // recognized as closed rather than resurrected. Runs
-                            // after the credit gate, which bounds the hole set to at
-                            // most MAX_STREAMS. Reached only for peer-initiated ids
-                            // (the `is_server` guard above returned otherwise).
-                            // Access the field directly (not via `recv_open_mut`)
-                            // so the borrow stays disjoint from the `recv_streams`
-                            // entry held open by this match.
-                            match stream.id.dir() {
-                                StreamDir::Bi => &mut self.recv_open_bi,
-                                StreamDir::Uni => &mut self.recv_open_uni,
-                            }
-                            .record(stream.id.index());
-                        }
-
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        let (tx2, rx2) = mpsc::unbounded_channel();
-
-                        // Determine initial stream recv window
-                        let recv_window = if self.config.version.is_qmux() {
-                            match stream.id.dir() {
-                                StreamDir::Bi => {
-                                    self.our_params.initial_max_stream_data_bidi_remote
-                                }
-                                StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
-                            }
-                        } else {
-                            u64::MAX
-                        };
-
-                        let recv_credit = Credit::new(recv_window);
-
-                        // Validate stream-level for the first frame on new stream
-                        if data_len > 0 && !recv_credit.receive(data_len) {
+                // Fast path: an existing stream. Check its window and deliver under
+                // a brief lock (never held across an await).
+                {
+                    let mut streams = self.streams.lock().unwrap();
+                    if let Some(recv) = streams.recv.get(&stream.id) {
+                        if data_len > 0 && !recv.recv_credit.receive(data_len) {
                             return Err(Error::FlowControlError);
                         }
+                        let id = stream.id;
+                        let fin = stream.fin;
+                        recv.inbound_data.send(stream).ok();
+                        if fin {
+                            streams.recv.remove(&id);
+                        }
+                        return Ok(());
+                    }
+                }
 
-                        let recv_backend = RecvState {
-                            inbound_data: tx,
-                            inbound_reset: tx2,
-                            recv_credit: recv_credit.clone(),
+                // A frame on one of our own (already-retired) streams: ignore it.
+                if self.is_server == stream.id.server_initiated() {
+                    return Ok(());
+                }
+
+                // New peer-initiated stream. Enforce the stream-count limit — per
+                // RFC 9000 §4.6 opening index N implicitly opens all of 0..N.
+                if self.config.version.is_qmux() {
+                    let credit = match stream.id.dir() {
+                        StreamDir::Bi => &self.recv_bi_credit,
+                        StreamDir::Uni => &self.recv_uni_credit,
+                    };
+                    if !credit.receive_up_to(stream.id.index() + 1) {
+                        return Err(Error::StreamLimitExceeded);
+                    }
+
+                    // Record that we've instantiated a frontend for this id, so a
+                    // later frame on it (once retired) reads as closed rather than
+                    // resurrecting a new stream. After the credit gate, which bounds
+                    // the hole set to MAX_STREAMS.
+                    match stream.id.dir() {
+                        StreamDir::Bi => &mut self.recv_open_bi,
+                        StreamDir::Uni => &mut self.recv_open_uni,
+                    }
+                    .record(stream.id.index());
+                }
+
+                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx2, rx2) = mpsc::unbounded_channel();
+
+                // Determine initial stream recv window
+                let recv_window = if self.config.version.is_qmux() {
+                    match stream.id.dir() {
+                        StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
+                        StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
+                    }
+                } else {
+                    u64::MAX
+                };
+
+                let recv_credit = Credit::new(recv_window);
+
+                // Stream-level flow control for the first frame on the new stream.
+                if data_len > 0 && !recv_credit.receive(data_len) {
+                    return Err(Error::FlowControlError);
+                }
+
+                let recv_backend = RecvState {
+                    inbound_data: tx,
+                    inbound_reset: tx2,
+                    recv_credit: recv_credit.clone(),
+                };
+
+                let recv_streams_credit = if self.config.version.is_qmux() {
+                    Some(match stream.id.dir() {
+                        StreamDir::Bi => self.recv_bi_credit.clone(),
+                        StreamDir::Uni => self.recv_uni_credit.clone(),
+                    })
+                } else {
+                    None
+                };
+
+                let recv_frontend = RecvStream {
+                    id: stream.id,
+                    inbound_data: rx,
+                    inbound_reset: rx2,
+                    outbound_priority: self.control.clone(),
+                    buffer: Bytes::new(),
+                    closed: None,
+                    fin: false,
+                    recv_credit,
+                    conn_recv_credit: self.conn_recv_credit.clone(),
+                    version: self.config.version,
+                    recv_streams_credit,
+                };
+
+                match stream.id.dir() {
+                    StreamDir::Uni => {
+                        self.accept_uni
+                            .send(recv_frontend)
+                            .await
+                            .map_err(|_| Error::Closed)?;
+                    }
+                    StreamDir::Bi => {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        let send_backend = SendState {
+                            inbound_stopped: tx,
+                            stream_credit: if self.config.version.is_qmux() {
+                                // Peer opened this bidi stream, so our send limit
+                                // is their bidi_local (they are local to this stream)
+                                Some(Credit::new(
+                                    self.peer_params.initial_max_stream_data_bidi_local,
+                                ))
+                            } else {
+                                None
+                            },
                         };
 
-                        let recv_streams_credit = if self.config.version.is_qmux() {
-                            Some(match stream.id.dir() {
-                                StreamDir::Bi => self.recv_bi_credit.clone(),
-                                StreamDir::Uni => self.recv_uni_credit.clone(),
-                            })
-                        } else {
-                            None
-                        };
-
-                        let recv_frontend = RecvStream {
+                        let send_frontend = SendStream {
                             id: stream.id,
-                            inbound_data: rx,
-                            inbound_reset: rx2,
-                            outbound_priority: self.outbound_priority.0.clone(),
-                            buffer: Bytes::new(),
+                            outbound: self.outbound.clone(),
+                            outbound_priority: self.control.clone(),
+                            inbound_stopped: rx,
+                            offset: 0,
+                            priority: 0,
                             closed: None,
                             fin: false,
-                            recv_credit,
-                            conn_recv_credit: self.conn_recv_credit.clone(),
-                            version: self.config.version,
-                            recv_streams_credit,
+                            stream_credit: send_backend.stream_credit.clone(),
+                            conn_credit: if self.config.version.is_qmux() {
+                                Some(self.conn_send_credit.clone())
+                            } else {
+                                None
+                            },
                         };
 
-                        match stream.id.dir() {
-                            StreamDir::Uni => {
-                                self.accept_uni
-                                    .send(recv_frontend)
-                                    .await
-                                    .map_err(|_| Error::Closed)?;
-                            }
-                            StreamDir::Bi => {
-                                let (tx, rx) = mpsc::unbounded_channel();
-                                let send_backend = SendState {
-                                    inbound_stopped: tx,
-                                    stream_credit: if self.config.version.is_qmux() {
-                                        // Peer opened this bidi stream, so our send limit
-                                        // is their bidi_local (they are local to this stream)
-                                        Some(Credit::new(
-                                            self.peer_params.initial_max_stream_data_bidi_local,
-                                        ))
-                                    } else {
-                                        None
-                                    },
-                                };
-
-                                let send_frontend = SendStream {
-                                    id: stream.id,
-                                    outbound: self.outbound.clone(),
-                                    outbound_priority: self.outbound_priority.0.clone(),
-                                    inbound_stopped: rx,
-                                    offset: 0,
-                                    priority: 0,
-                                    closed: None,
-                                    fin: false,
-                                    stream_credit: send_backend.stream_credit.clone(),
-                                    conn_credit: if self.config.version.is_qmux() {
-                                        Some(self.conn_send_credit.clone())
-                                    } else {
-                                        None
-                                    },
-                                };
-
-                                self.send_streams.insert(stream.id, send_backend);
-                                self.accept_bi
-                                    .send((send_frontend, recv_frontend))
-                                    .await
-                                    .map_err(|_| Error::Closed)?;
-                            }
-                        };
-
-                        let fin = stream.fin;
-                        recv_backend.inbound_data.send(stream).ok();
-
-                        if !fin {
-                            e.insert(recv_backend);
-                        }
-                    }
-                    hash_map::Entry::Occupied(mut e) => {
-                        let fin = stream.fin;
-                        e.get_mut().inbound_data.send(stream).ok();
-                        if fin {
-                            e.remove();
-                        }
+                        self.streams
+                            .lock()
+                            .unwrap()
+                            .send
+                            .insert(stream.id, send_backend);
+                        self.accept_bi
+                            .send((send_frontend, recv_frontend))
+                            .await
+                            .map_err(|_| Error::Closed)?;
                     }
                 };
+
+                let id = stream.id;
+                let fin = stream.fin;
+                recv_backend.inbound_data.send(stream).ok();
+
+                if !fin {
+                    self.streams.lock().unwrap().recv.insert(id, recv_backend);
+                }
             }
             Frame::ResetStream(reset) => {
                 if !reset.id.can_recv(self.is_server) {
                     return Err(Error::InvalidStreamId);
                 }
 
-                if let Some(recv) = self.recv_streams.remove(&reset.id) {
-                    // Live stream: deliver the reset and drop it. It was recorded
-                    // in `recv_open` at creation, so it now reads as closed.
-                    recv.inbound_reset.send(reset).ok();
-                } else if self.config.version.is_qmux()
-                    && reset.id.server_initiated() != self.is_server
+                // Live stream: deliver the reset and drop it (it was recorded in
+                // `recv_open` at creation, so it now reads as closed).
+                let reset_id = reset.id;
+                let delivered = {
+                    let mut streams = self.streams.lock().unwrap();
+                    if let Some(recv) = streams.recv.remove(&reset_id) {
+                        recv.inbound_reset.send(reset).ok();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !delivered
+                    && self.config.version.is_qmux()
+                    && reset_id.server_initiated() != self.is_server
                 {
                     // RESET_STREAM can be the *first* frame for a peer-initiated
                     // stream (it implicitly opens the id). Record it as closed so a
-                    // later STREAM on the same id is recognized as retired rather
-                    // than resurrected into a new accepted stream. Gate on the
-                    // stream limit first, mirroring the STREAM path, so the hole set
-                    // stays bounded by MAX_STREAMS. Locally-initiated ids are left
-                    // to the `is_server` guard on the STREAM path.
-                    let credit = match reset.id.dir() {
+                    // later STREAM on the same id is recognized as retired rather than
+                    // resurrected into a new accepted stream. Gate on the stream limit
+                    // first (mirroring the STREAM path) so the hole set stays bounded
+                    // by MAX_STREAMS.
+                    let credit = match reset_id.dir() {
                         StreamDir::Bi => &self.recv_bi_credit,
                         StreamDir::Uni => &self.recv_uni_credit,
                     };
-                    if !credit.receive_up_to(reset.id.index() + 1) {
+                    if !credit.receive_up_to(reset_id.index() + 1) {
                         return Err(Error::StreamLimitExceeded);
                     }
-                    match reset.id.dir() {
+                    match reset_id.dir() {
                         StreamDir::Bi => &mut self.recv_open_bi,
                         StreamDir::Uni => &mut self.recv_open_uni,
                     }
-                    .record(reset.id.index());
+                    .record(reset_id.index());
                 }
             }
             Frame::StopSending(stop) => {
@@ -590,8 +710,8 @@ impl<T: Transport> SessionState<T> {
                     return Err(Error::InvalidStreamId);
                 }
 
-                if let Some(stream) = self.send_streams.get_mut(&stop.id) {
-                    stream.inbound_stopped.send(stop).ok();
+                if let Some(send) = self.streams.lock().unwrap().send.get(&stop.id) {
+                    send.inbound_stopped.send(stop).ok();
                 }
             }
             Frame::ConnectionClose(close) => {
@@ -607,7 +727,7 @@ impl<T: Transport> SessionState<T> {
                 self.conn_send_credit.increase_max(max)?;
             }
             Frame::MaxStreamData { id, max } => {
-                if let Some(send) = self.send_streams.get(&id) {
+                if let Some(send) = self.streams.lock().unwrap().send.get(&id) {
                     if let Some(credit) = &send.stream_credit {
                         credit.increase_max(max)?;
                     }
@@ -634,7 +754,7 @@ impl<T: Transport> SessionState<T> {
                         sequence: ping.sequence,
                         response: true,
                     });
-                    self.outbound_priority.0.send(response).ok();
+                    self.control.send(response).ok();
                 }
             }
             // DATAGRAM: fan out to the receive channel. `max_datagram_frame_size`
@@ -701,7 +821,7 @@ impl<T: Transport> SessionState<T> {
             .ok();
 
         // Update per-stream send credits for already-opened streams
-        for (id, send) in &self.send_streams {
+        for (id, send) in &self.streams.lock().unwrap().send {
             if let Some(credit) = &send.stream_credit {
                 let initial = match id.dir() {
                     StreamDir::Bi => {
@@ -718,6 +838,24 @@ impl<T: Transport> SessionState<T> {
                 credit.increase_max(initial).ok();
             }
         }
+
+        // Publish the two scalars the writer task needs, now that they're known:
+        // the outbound record-size limit (QMux01 only) and the effective idle
+        // timeout for its keep-alive ping. `record_limit` was seeded with the
+        // draft-01 default; raise it to the peer's advertised size.
+        let idle_ms = if self.config.version == Version::QMux01 {
+            self.record_limit
+                .store(params.max_record_size, Ordering::Release);
+            // Same rule as `effective_idle_timeout_ms`: min of the non-zero values.
+            match (self.our_params.max_idle_timeout, params.max_idle_timeout) {
+                (0, 0) => 0,
+                (a, 0) | (0, a) => a,
+                (a, b) => a.min(b),
+            }
+        } else {
+            0
+        };
+        self.idle_timeout_ms.store(idle_ms, Ordering::Release);
 
         // Resolve the datagram send limit. Datagrams are a QMux01-only feature
         // (they rely on the record layer for framing), so they stay disabled on
@@ -835,15 +973,56 @@ impl Session {
         let (create_bi_tx, create_bi_rx) = mpsc::channel(8);
 
         let outbound = PriorityQueue::new(8);
-        let (outbound_priority_tx, outbound_priority_rx) = mpsc::unbounded_channel();
+        // Control lane (lossless): RESET/STOP/CLOSE, window updates, pings, and the
+        // initial TRANSPORT_PARAMETERS. The reader and stream frontends produce;
+        // the writer consumes.
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
 
-        // Bounded, lossy inbound-datagram channel: the backend drops on a full
-        // buffer rather than stalling, matching QUIC's unreliable semantics.
+        // Bounded, lossy datagram channels — drop on a full buffer rather than
+        // stalling, matching QUIC's unreliable semantics. When the writer stalls on
+        // backpressure it stops draining `outbound_datagram`, which fills and makes
+        // `send_datagram` shed.
         let (recv_datagram_tx, recv_datagram_rx) = mpsc::channel(DATAGRAM_RECV_BUFFER);
         let (outbound_datagram_tx, outbound_datagram_rx) = mpsc::channel(DATAGRAM_SEND_BUFFER);
         let datagram_max_size = Arc::new(AtomicUsize::new(0));
 
+        // Shared with the writer task: per-stream backend state, plus the two
+        // scalars the writer needs — the outbound record-size limit (QMux01 seeds
+        // it with the draft-01 default) and the effective idle timeout for its
+        // keep-alive ping (0 until the peer's params arrive).
+        let streams: Arc<Mutex<Streams>> = Arc::new(Mutex::new(Streams::default()));
+        let record_limit = Arc::new(AtomicU64::new(crate::proto::DEFAULT_MAX_RECORD_SIZE));
+        let idle_timeout_ms = Arc::new(AtomicU64::new(0));
+
         let closed = watch::Sender::new(None);
+
+        // The QMux handshake requires TRANSPORT_PARAMETERS as the first frame. It
+        // leads the FIFO control lane, so the writer emits it before anything else.
+        if version.is_qmux() {
+            control_tx
+                .send(Frame::TransportParameters(our_params.clone()))
+                .ok();
+        }
+
+        // Split the transport into halves driven by two tasks: a write blocked on
+        // backpressure must never stall reads. The writer is the sole producer on
+        // the wire, pulling the outbound queues in priority order and sharing the
+        // stream maps + scalars above with the reader (no message-passing handoff).
+        let (writer_half, reader_half) = transport.split();
+        let mut writer = WriterState {
+            writer: writer_half,
+            version,
+            control: control_rx,
+            datagrams: outbound_datagram_rx,
+            outbound: outbound.clone(),
+            streams: streams.clone(),
+            record_limit: record_limit.clone(),
+            idle_timeout_ms: idle_timeout_ms.clone(),
+            closed: closed.clone(),
+            last_send_at: tokio::time::Instant::now(),
+            next_ping_seq: 0,
+        };
+        tokio::spawn(async move { writer.run().await });
 
         // Protocol negotiation. Only `Negotiate` resolves in-band (once the
         // peer's params arrive); the out-of-band cases resolve immediately.
@@ -887,17 +1066,16 @@ impl Session {
         });
 
         let mut backend = SessionState {
-            transport,
+            reader: reader_half,
             config: config.clone(),
+            is_server,
             outbound: outbound.clone(),
-            outbound_priority: (outbound_priority_tx.clone(), outbound_priority_rx),
+            control: control_tx.clone(),
             accept_bi: accept_bi_tx,
             accept_uni: accept_uni_tx,
             create_uni: create_uni_rx,
             create_bi: create_bi_rx,
-            is_server,
-            send_streams: HashMap::new(),
-            recv_streams: HashMap::new(),
+            streams: streams.clone(),
             closed: closed.clone(),
             negotiated: negotiated.clone(),
             established: established_tx,
@@ -913,11 +1091,10 @@ impl Session {
             recv_open_bi: RecvOpen::default(),
             recv_open_uni: RecvOpen::default(),
             last_recv_at: tokio::time::Instant::now(),
-            last_send_at: tokio::time::Instant::now(),
-            next_ping_seq: 0,
             recv_datagram: recv_datagram_tx,
             datagram_max_size: datagram_max_size.clone(),
-            outbound_datagram: outbound_datagram_rx,
+            record_limit: record_limit.clone(),
+            idle_timeout_ms: idle_timeout_ms.clone(),
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
@@ -931,7 +1108,7 @@ impl Session {
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
             backend.outbound.close();
-            for send in backend.send_streams.values() {
+            for send in backend.streams.lock().unwrap().send.values() {
                 if let Some(credit) = &send.stream_credit {
                     credit.close();
                 }
@@ -944,11 +1121,16 @@ impl Session {
             backend.closed.send_replace(Some(err));
         });
 
+        // Closes the connection once every `Session` clone has dropped.
+        let guard = Arc::new(SessionGuard {
+            closed: closed.clone(),
+        });
+
         Session {
             is_server,
             config,
             outbound,
-            outbound_priority: outbound_priority_tx,
+            outbound_priority: control_tx,
             accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
             accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
             create_uni: create_uni_tx,
@@ -963,6 +1145,7 @@ impl Session {
             recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
             datagram_max_size,
             outbound_datagram: outbound_datagram_tx,
+            _guard: guard,
         }
     }
 }
@@ -1137,10 +1320,11 @@ impl generic::Session for Session {
             return Err(Error::FrameTooLarge);
         }
         // Best-effort and synchronous, matching the trait's fire-and-forget
-        // contract. A full buffer means the transport is backpressured: drop the
-        // datagram (returning `Ok`) rather than block or grow without bound — an
-        // unreliable datagram is meant to be droppable. A closed session (the
-        // receiver is gone) surfaces as `Closed`.
+        // contract. When the writer stalls on transport backpressure it stops
+        // draining this lane, so a full lane *is* the backpressure signal: shed the
+        // datagram (returning `Ok` — an unreliable datagram is meant to be
+        // droppable) rather than block or grow without bound. A closed lane means
+        // the session is gone.
         match self.outbound_datagram.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -1636,7 +1820,7 @@ mod recv_open_tests {
 
     use web_transport_proto::VarInt;
 
-    use super::{Session, Transport};
+    use super::{Session, Transport, TransportReader, TransportWriter};
     use crate::proto::{Frame, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
@@ -1648,20 +1832,42 @@ mod recv_open_tests {
         incoming: mpsc::UnboundedReceiver<Bytes>,
     }
 
+    struct ScriptedWriter;
+
+    struct ScriptedReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+    }
+
     impl Transport for ScriptedTransport {
+        type Writer = ScriptedWriter;
+        type Reader = ScriptedReader;
+
+        fn split(self) -> (ScriptedWriter, ScriptedReader) {
+            (
+                ScriptedWriter,
+                ScriptedReader {
+                    incoming: self.incoming,
+                },
+            )
+        }
+    }
+
+    impl TransportWriter for ScriptedWriter {
         async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
             Ok(())
         }
 
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl TransportReader for ScriptedReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             match self.incoming.recv().await {
                 Some(bytes) => Ok(bytes),
                 None => std::future::pending().await,
             }
-        }
-
-        async fn close(&mut self) -> Result<(), Error> {
-            Ok(())
         }
     }
 

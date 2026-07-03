@@ -50,7 +50,7 @@ pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
-pub use transport::Transport;
+pub use transport::{Transport, TransportReader, TransportWriter};
 // The concrete byte-stream transport lives at `transport::Stream` rather than the
 // crate root, so the name doesn't collide with the STREAM-frame `Stream` type.
 

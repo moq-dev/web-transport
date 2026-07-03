@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(qmux)* datagram support (RFC 9221) on QMux01: `send_datagram`/`recv_datagram`/`max_datagram_size` on `Session`, negotiated via the `max_datagram_frame_size` transport parameter and configured with `Config::max_datagram_frame_size` (enabled by default). Datagrams are unavailable on QMux00 and the legacy `webtransport` format.
 
+### Changed
+
+- *(qmux)* the `Session` now drives the transport's send and receive halves on separate tasks so a write stalled on transport backpressure no longer blocks reads (or control-frame processing). The writer task pulls the outbound queues in priority order — control ahead of datagrams ahead of bulk stream data (still scheduled by `sendOrder`) — sharing per-stream state with the reader through a lock rather than a bytes channel. `Session::send_datagram` sheds datagrams the moment the transport backs up (the writer stops draining the datagram lane), rather than buffering them behind a stalled socket where they'd arrive stale.
+- *(qmux)* dropping the last `Session` clone now closes the connection promptly, tearing down the backend tasks and failing any in-flight stream `write`/`read` with `Error::Closed` (previously teardown waited for the transport to notice). Hold a `Session` clone for as long as you use its streams.
+
+### Breaking
+
+- *(qmux)* the `Transport` trait now splits into `TransportWriter` + `TransportReader` halves via `Transport::split`; `send`/`recv`/`close` moved onto those halves and `TransportWriter::maintain` was added for timer-driven work (e.g. WebSocket keep-alive). Custom `Transport` implementations must adopt the new shape; the built-in TCP/TLS/Unix/WebSocket transports and `Session::connect`/`accept` are unaffected.
+
 ## [0.3.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.1) - 2026-06-25
 
 ### Added

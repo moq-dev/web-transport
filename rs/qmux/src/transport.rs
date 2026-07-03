@@ -7,15 +7,44 @@ use crate::Error;
 /// Each `send`/`recv` operates on a single complete message (frame).
 /// For WebSocket, this maps to individual WS binary messages.
 /// For TCP/TLS byte streams, the transport handles frame delimiting.
+///
+/// A transport splits into independently-owned send and receive halves so the
+/// session can drive them on separate tasks: a write blocked on transport
+/// backpressure must never stall reads (and vice versa). This decoupling is what
+/// lets the session observe backpressure and shed unreliable datagrams instead
+/// of buffering them behind a stalled socket.
 pub trait Transport: Send + 'static {
-    /// Send a message.
-    fn send(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send;
+    /// The independently-owned send half.
+    type Writer: TransportWriter;
+    /// The independently-owned receive half.
+    type Reader: TransportReader;
 
-    /// Receive the next complete message.
-    fn recv(&mut self) -> impl std::future::Future<Output = Result<Bytes, Error>> + Send;
+    /// Split into send and receive halves.
+    fn split(self) -> (Self::Writer, Self::Reader);
+}
+
+/// The send half of a [`Transport`].
+pub trait TransportWriter: Send + 'static {
+    /// Send a single complete message.
+    fn send(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Gracefully close the transport.
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
+
+    /// Perform any timer-driven background work and resolve once it's done. The
+    /// session's writer loop selects on this alongside outbound frames, so a
+    /// transport can piggy-back periodic maintenance (e.g. a WebSocket keep-alive
+    /// Ping) on the same task that owns the send half. The default never
+    /// resolves — transports with nothing to do (TCP, Unix sockets) use it as-is.
+    fn maintain(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::pending()
+    }
+}
+
+/// The receive half of a [`Transport`].
+pub trait TransportReader: Send + 'static {
+    /// Receive the next complete message.
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Bytes, Error>> + Send;
 }
 
 // Stream: message I/O over a byte stream (TCP/TLS/Unix).
@@ -35,7 +64,7 @@ mod stream_transport {
     use tokio::task::JoinHandle;
     use web_transport_proto::VarInt;
 
-    use super::Transport;
+    use super::{Transport, TransportReader, TransportWriter};
     use crate::{Error, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
 
     /// Bound on queued frames waiting for the session to drain them. Bytes the
@@ -64,9 +93,20 @@ mod stream_transport {
     /// # }
     /// ```
     pub struct Stream<T> {
-        rx: mpsc::Receiver<Result<Bytes, Error>>,
+        writer: StreamWriter<T>,
+        reader: StreamReader,
+    }
+
+    /// The send half of a byte-stream [`Stream`].
+    pub struct StreamWriter<T> {
         writer: BufWriter<tokio::io::WriteHalf<T>>,
         version: Version,
+    }
+
+    /// The receive half of a byte-stream [`Stream`]. Owns the reader task's
+    /// abort handle so the task can't outlive the receive half.
+    pub struct StreamReader {
+        rx: mpsc::Receiver<Result<Bytes, Error>>,
         /// Aborted on drop so the reader task can't outlive the transport.
         reader_task: JoinHandle<()>,
     }
@@ -87,15 +127,25 @@ mod stream_transport {
                 tx,
             ));
             Self {
-                rx,
-                writer: BufWriter::new(write),
-                version,
-                reader_task,
+                writer: StreamWriter {
+                    writer: BufWriter::new(write),
+                    version,
+                },
+                reader: StreamReader { rx, reader_task },
             }
         }
     }
 
-    impl<T> Drop for Stream<T> {
+    impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for Stream<T> {
+        type Writer = StreamWriter<T>;
+        type Reader = StreamReader;
+
+        fn split(self) -> (StreamWriter<T>, StreamReader) {
+            (self.writer, self.reader)
+        }
+    }
+
+    impl Drop for StreamReader {
         fn drop(&mut self) {
             // Make sure the reader task doesn't outlive the transport; otherwise
             // it would hold the read half open until the connection drops.
@@ -103,7 +153,7 @@ mod stream_transport {
         }
     }
 
-    impl<T: AsyncRead + AsyncWrite + Send + 'static> Transport for Stream<T> {
+    impl<T: AsyncWrite + Send + 'static> TransportWriter for StreamWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             // QMux01 frames travel inside size-prefixed records on byte streams.
             // (Records are implicit on WebSocket, where the message boundary delimits them.)
@@ -117,16 +167,18 @@ mod stream_transport {
             Ok(())
         }
 
+        async fn close(&mut self) -> Result<(), Error> {
+            self.writer.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    impl TransportReader for StreamReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             // mpsc::Receiver::recv is cancel safe, so dropping this future never
             // loses a buffered frame. `None` means the reader task exited without
             // sending — treat as a clean close.
             self.rx.recv().await.unwrap_or(Err(Error::Closed))
-        }
-
-        async fn close(&mut self) -> Result<(), Error> {
-            self.writer.shutdown().await?;
-            Ok(())
         }
     }
 
@@ -349,6 +401,7 @@ mod stream_transport {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::transport::{Transport, TransportReader};
         use tokio::io::AsyncWriteExt;
 
         // Drip a frame in one byte at a time, racing each `recv` against an
@@ -358,7 +411,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_is_cancel_safe_across_partial_writes() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux00, 16 * 1024).split();
 
             // STREAM frame, type 0x0a (len bit set), id=4, length=5, payload="hello".
             let mut frame = Vec::new();
@@ -386,7 +439,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_qmux01_record_is_cancel_safe() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = Stream::new(client, Version::QMux01, 16 * 1024);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux01, 16 * 1024).split();
 
             // 1-byte varint length (0x08) followed by 8 bytes of payload.
             let mut record = vec![0x08];
@@ -414,7 +467,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_returns_consecutive_frames_in_order() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux00, 16 * 1024).split();
 
             // Two STREAM frames (type 0x0a) for stream ids 4 and 8.
             let frame_a: Vec<u8> = [0x0a, 0x04, 0x05].into_iter().chain(*b"hello").collect();
@@ -436,7 +489,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_propagates_parse_error_then_closes() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = Stream::new(client, Version::QMux00, 16 * 1024);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux00, 16 * 1024).split();
 
             // Frame type 0x02 isn't a recognized QMux00 frame type.
             server.write_all(&[0x02]).await.unwrap();
@@ -456,7 +509,7 @@ mod stream_transport {
         #[tokio::test]
         async fn recv_record_exceeding_max_returns_frame_too_large() {
             let (client, mut server) = tokio::io::duplex(64 * 1024);
-            let mut transport = Stream::new(client, Version::QMux01, 4);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux01, 4).split();
 
             // 1-byte varint length = 5, which exceeds the configured max of 4.
             server.write_all(&[0x05]).await.unwrap();
@@ -469,7 +522,7 @@ mod stream_transport {
 }
 
 #[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
-pub use stream_transport::Stream;
+pub use stream_transport::{Stream, StreamReader, StreamWriter};
 
 // Shared plumbing for the byte-stream transports (TCP, Unix sockets).
 #[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
@@ -511,44 +564,86 @@ mod ws_transport {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use futures::stream::{SplitSink, SplitStream};
     use tokio::time::{Instant, Interval, MissedTickBehavior, Sleep};
     use tokio_tungstenite::tungstenite;
 
-    use super::Transport;
+    use super::{Transport, TransportReader, TransportWriter};
     use crate::ws::KeepAlive;
     use crate::Error;
 
+    type Message = tungstenite::Message;
+
+    /// The combined `Stream + Sink` bound every WebSocket half requires.
+    pub(crate) trait WsStream:
+        futures::Stream<Item = Result<Message, tungstenite::Error>>
+        + futures::Sink<Message, Error = tungstenite::Error>
+        + Unpin
+        + Send
+        + 'static
+    {
+    }
+    impl<T> WsStream for T where
+        T: futures::Stream<Item = Result<Message, tungstenite::Error>>
+            + futures::Sink<Message, Error = tungstenite::Error>
+            + Unpin
+            + Send
+            + 'static
+    {
+    }
+
     pub(crate) struct WsTransport<T> {
         ws: T,
-        keep_alive: Option<KeepAliveState>,
+        keep_alive: Option<KeepAlive>,
     }
 
-    struct KeepAliveState {
-        // Fires on each interval; we send a Ping when it does.
+    impl<T> WsTransport<T> {
+        pub fn new(ws: T) -> Self {
+            Self {
+                ws,
+                keep_alive: None,
+            }
+        }
+
+        pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
+            self.keep_alive = Some(keep_alive);
+            self
+        }
+    }
+
+    /// Writer-side keep-alive: emit a Ping every `interval`.
+    struct PingState {
+        // Fires on each interval; the writer sends a Ping when it does.
         interval: Interval,
-
-        // Resets every time we receive a frame. If it elapses, the peer is gone.
-        deadline: Pin<Box<Sleep>>,
-
-        timeout: Duration,
     }
 
-    impl KeepAliveState {
+    impl PingState {
         fn new(config: KeepAlive) -> Self {
-            // tokio::time::interval panics on a zero Duration, and a deadline shorter than the
-            // interval would fire before the first ping. Floor both to 1ms so a misconfigured
-            // KeepAlive degrades into "very chatty" instead of crashing.
+            // tokio::time::interval panics on a zero Duration; floor to 1ms so a
+            // misconfigured KeepAlive degrades into "very chatty" instead of crashing.
             let interval_dur = config.interval.max(Duration::from_millis(1));
-            let timeout = config.timeout.max(interval_dur);
-
             // Skip catch-up bursts after a long pause; we just want one Ping per tick.
             let mut interval = tokio::time::interval(interval_dur);
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             // First tick fires immediately by default; consume it so we don't ping on connect.
             interval.reset();
+            Self { interval }
+        }
+    }
 
+    /// Reader-side keep-alive: close the session if no frame arrives within `timeout`.
+    struct DeadlineState {
+        // Resets every time we receive a frame. If it elapses, the peer is gone.
+        deadline: Pin<Box<Sleep>>,
+        timeout: Duration,
+    }
+
+    impl DeadlineState {
+        fn new(config: KeepAlive) -> Self {
+            let interval_dur = config.interval.max(Duration::from_millis(1));
+            // A deadline shorter than the interval would fire before the first ping.
+            let timeout = config.timeout.max(interval_dur);
             Self {
-                interval,
                 deadline: Box::pin(tokio::time::sleep(timeout)),
                 timeout,
             }
@@ -559,108 +654,117 @@ mod ws_transport {
         }
     }
 
-    impl<T> WsTransport<T>
-    where
-        T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
-            + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
-        pub fn new(ws: T) -> Self {
-            Self {
-                ws,
-                keep_alive: None,
-            }
-        }
+    /// The send half of a [`WsTransport`]: owns the sink and drives keep-alive Pings.
+    pub(crate) struct WsWriter<T: WsStream> {
+        sink: SplitSink<T, Message>,
+        ping: Option<PingState>,
+    }
 
-        pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
-            self.keep_alive = Some(KeepAliveState::new(keep_alive));
-            self
+    /// The receive half of a [`WsTransport`]: owns the stream and the idle deadline.
+    pub(crate) struct WsReader<T: WsStream> {
+        stream: SplitStream<T>,
+        deadline: Option<DeadlineState>,
+    }
+
+    impl<T: WsStream> Transport for WsTransport<T> {
+        type Writer = WsWriter<T>;
+        type Reader = WsReader<T>;
+
+        fn split(self) -> (WsWriter<T>, WsReader<T>) {
+            use futures::StreamExt;
+            // BiLock-backed halves: the sink and stream can be polled concurrently
+            // on separate tasks, briefly serializing on the shared socket.
+            let (sink, stream) = self.ws.split();
+            let (ping, deadline) = match self.keep_alive {
+                Some(ka) => (Some(PingState::new(ka)), Some(DeadlineState::new(ka))),
+                None => (None, None),
+            };
+            (WsWriter { sink, ping }, WsReader { stream, deadline })
         }
     }
 
-    impl<T> Transport for WsTransport<T>
-    where
-        T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
-            + futures::Sink<tungstenite::Message, Error = tungstenite::Error>
-            + Unpin
-            + Send
-            + 'static,
-    {
+    impl<T: WsStream> TransportWriter for WsWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             use futures::SinkExt;
-
-            self.ws
-                .send(tungstenite::Message::Binary(data))
+            self.sink
+                .send(Message::Binary(data))
                 .await
                 .map_err(|_| Error::Closed)?;
             Ok(())
         }
 
-        async fn recv(&mut self) -> Result<Bytes, Error> {
-            use futures::{SinkExt, StreamExt};
+        async fn close(&mut self) -> Result<(), Error> {
+            use futures::SinkExt;
+            self.sink.close().await.map_err(|_| Error::Closed)?;
+            Ok(())
+        }
 
-            // Destructure so we can take separate &mut borrows of `ws` and `keep_alive`.
-            let Self { ws, keep_alive } = self;
+        async fn maintain(&mut self) -> Result<(), Error> {
+            use futures::SinkExt;
+            match &mut self.ping {
+                Some(ping) => {
+                    // Wait for the next interval, then send one keep-alive Ping. The
+                    // session's writer loop re-invokes this each time it resolves, so
+                    // pings keep flowing without a dedicated task. tungstenite's
+                    // auto-queued Pong replies (from the reader) also flush here.
+                    ping.interval.tick().await;
+                    self.sink
+                        .send(Message::Ping(Bytes::new()))
+                        .await
+                        .map_err(|_| Error::Closed)?;
+                    Ok(())
+                }
+                // No keep-alive configured: never resolves, so the writer loop's
+                // select simply ignores this branch.
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    impl<T: WsStream> TransportReader for WsReader<T> {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            use futures::StreamExt;
+
+            // Destructure so we can take separate &mut borrows of `stream` and `deadline`.
+            let Self { stream, deadline } = self;
 
             loop {
                 enum Event<M> {
                     Message(M),
-                    SendPing,
                     Timeout,
                 }
 
-                let event = match keep_alive {
-                    Some(ka) => tokio::select! {
-                        msg = ws.next() => Event::Message(msg),
-                        _ = ka.interval.tick() => Event::SendPing,
-                        _ = ka.deadline.as_mut() => Event::Timeout,
+                let event = match deadline {
+                    Some(d) => tokio::select! {
+                        msg = stream.next() => Event::Message(msg),
+                        _ = d.deadline.as_mut() => Event::Timeout,
                     },
-                    None => Event::Message(ws.next().await),
+                    None => Event::Message(stream.next().await),
                 };
 
                 let message = match event {
                     Event::Message(msg) => msg.ok_or(Error::Closed)??,
-                    Event::SendPing => {
-                        ws.send(tungstenite::Message::Ping(Bytes::new()))
-                            .await
-                            .map_err(|_| Error::Closed)?;
-                        continue;
-                    }
                     Event::Timeout => {
                         tracing::debug!("websocket keep_alive timeout");
                         return Err(Error::Closed);
                     }
                 };
 
-                if let Some(ka) = keep_alive.as_mut() {
-                    ka.observe_recv();
+                if let Some(d) = deadline.as_mut() {
+                    d.observe_recv();
                 }
 
                 match message {
-                    tungstenite::Message::Binary(data) => {
-                        return Ok(data);
-                    }
-                    tungstenite::Message::Close(_) => {
-                        return Err(Error::Closed);
-                    }
-                    tungstenite::Message::Ping(_)
-                    | tungstenite::Message::Pong(_)
-                    | tungstenite::Message::Text(_)
-                    | tungstenite::Message::Frame(_) => {
+                    Message::Binary(data) => return Ok(data),
+                    Message::Close(_) => return Err(Error::Closed),
+                    Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
                         // tungstenite auto-queues a Pong reply when it reads a Ping;
-                        // it gets flushed on our next send/read. No manual reply needed.
+                        // the writer half flushes it on its next send/ping. The reader
+                        // owns no sink, so there's nothing to reply with here.
                         continue;
                     }
                 }
             }
-        }
-
-        async fn close(&mut self) -> Result<(), Error> {
-            use futures::SinkExt;
-            self.ws.close().await.map_err(|_| Error::Closed)?;
-            Ok(())
         }
     }
 }

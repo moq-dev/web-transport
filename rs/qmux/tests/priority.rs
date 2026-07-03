@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use qmux::{Config, Error, Session, Transport, Version};
+use qmux::{Config, Error, Session, Transport, TransportReader, TransportWriter, Version};
 use tokio::sync::mpsc;
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
@@ -20,21 +20,49 @@ struct ThrottledTransport {
     delay: Duration,
 }
 
+/// The throttled send half.
+struct ThrottledWriter {
+    tx: mpsc::Sender<Bytes>,
+    delay: Duration,
+}
+
+/// The receive half.
+struct ThrottledReader {
+    rx: mpsc::Receiver<Bytes>,
+}
+
 impl Transport for ThrottledTransport {
+    type Writer = ThrottledWriter;
+    type Reader = ThrottledReader;
+
+    fn split(self) -> (ThrottledWriter, ThrottledReader) {
+        (
+            ThrottledWriter {
+                tx: self.tx,
+                delay: self.delay,
+            },
+            ThrottledReader { rx: self.rx },
+        )
+    }
+}
+
+impl TransportWriter for ThrottledWriter {
     async fn send(&mut self, data: Bytes) -> Result<(), Error> {
         // The delay is what fills the session's outbound priority queue: while
-        // we're sleeping here, the writer loop can't pull the next frame, so
+        // we're sleeping here, the writer task can't pull the next frame, so
         // producers back up behind the capacity bound.
         tokio::time::sleep(self.delay).await;
         self.tx.send(data).await.map_err(|_| Error::Closed)
     }
 
-    async fn recv(&mut self) -> Result<Bytes, Error> {
-        self.rx.recv().await.ok_or(Error::Closed)
-    }
-
     async fn close(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+impl TransportReader for ThrottledReader {
+    async fn recv(&mut self) -> Result<Bytes, Error> {
+        self.rx.recv().await.ok_or(Error::Closed)
     }
 }
 
