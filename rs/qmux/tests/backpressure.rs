@@ -183,10 +183,88 @@ async fn datagrams_are_shed_under_backpressure() {
         received += 1;
     }
 
+    // The outbound datagram lane is 64 deep (DATAGRAM_SEND_BUFFER), so at most
+    // ~64 of the 200 can sit buffered while the writer is wedged; the rest are
+    // shed. Bound the count well under N so a regression that grows the lane or
+    // stops shedding is caught — `received < N` alone would still pass with, say,
+    // a 128-deep buffer.
     assert!(
-        received < N,
-        "backpressured datagrams must be shed, but {received}/{N} arrived"
+        received <= 96,
+        "backpressured datagrams must be shed down to ~the 64-deep lane, but {received}/{N} arrived"
     );
 
     filler.abort();
+}
+
+/// A connection whose writer is wedged on transport backpressure DEFERS its idle
+/// timeout — the wedge proves the peer's receive window is full, so it's alive and
+/// we simply can't get a keep-alive out. But the deferral is *bounded*: a peer that
+/// dies with our send buffer full is still reclaimed within roughly one extra idle
+/// window, instead of hanging until the transport's own (much longer) timeout.
+#[tokio::test]
+async fn idle_timeout_deferred_but_bounded_under_backpressure() {
+    let (c2s_tx, c2s_rx) = mpsc::channel(256);
+    let (s2c_tx, s2c_rx) = mpsc::channel(256);
+    // Keep the client's receive channel open even after the server task goes
+    // away, so the client sees a *silent but open* peer rather than a transport
+    // close. This isolates the client's own idle logic: the server (writer not
+    // gated) will itself idle-close once the wedged client goes quiet.
+    let _s2c_keepalive = s2c_tx.clone();
+
+    let (gate_tx, gate_rx) = watch::channel(true); // open: handshake flows
+    let client_transport = GatedTransport {
+        tx: c2s_tx,
+        rx: s2c_rx,
+        gate: Some(gate_rx),
+    };
+    let server_transport = GatedTransport {
+        tx: s2c_tx,
+        rx: c2s_rx,
+        gate: None,
+    };
+
+    // Short idle timeout so the test is quick; the deferral grace is one more
+    // window, so a stuck-backpressured peer is reclaimed at roughly 2× (~300ms).
+    let mut config = Config::new(Version::QMux01);
+    config.max_idle_timeout = 150;
+    let (client, server) = tokio::join!(
+        Session::connect(client_transport, config.clone()),
+        Session::accept(server_transport, config),
+    );
+    let client = client.unwrap();
+    let _server = server.unwrap();
+
+    // Wedge the client writer: close the gate, then push a write it can't drain.
+    gate_tx.send(false).unwrap();
+    let client_writer = client.clone();
+    let writer = tokio::spawn(async move {
+        let mut s = client_writer.open_uni().await.unwrap();
+        let _ = s.write(&vec![b'X'; 256 * 1024]).await;
+        client_writer
+    });
+
+    // Observe the client's close reason (resolves only once it actually closes).
+    let client_closed = client.clone();
+    let closed = tokio::spawn(async move { client_closed.closed().await });
+
+    // Past the raw 150ms idle window but within the bounded grace: still open.
+    // With no deferral the client would already have idle-closed by now.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !closed.is_finished(),
+        "idle-close must be deferred while the writer is backpressured (within grace)"
+    );
+
+    // Past the grace: the connection is reclaimed even though still backpressured,
+    // so a peer that died under backpressure can't hang here indefinitely.
+    let reason = tokio::time::timeout(Duration::from_millis(600), closed)
+        .await
+        .expect("bounded deferral must eventually idle-close a stuck-backpressured peer")
+        .unwrap();
+    assert!(
+        matches!(reason, Error::IdleTimeout),
+        "expected IdleTimeout once the grace elapses, got {reason:?}"
+    );
+
+    writer.abort();
 }

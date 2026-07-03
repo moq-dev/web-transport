@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(qmux)* the `Session` now drives the transport's send and receive halves on separate tasks so a write stalled on transport backpressure no longer blocks reads (or control-frame processing). The writer task pulls the outbound queues in priority order — control ahead of datagrams ahead of bulk stream data (still scheduled by `sendOrder`) — sharing per-stream state with the reader through a lock rather than a bytes channel. `Session::send_datagram` sheds datagrams the moment the transport backs up (the writer stops draining the datagram lane), rather than buffering them behind a stalled socket where they'd arrive stale.
 - *(qmux)* dropping the last `Session` clone now closes the connection promptly, tearing down the backend tasks and failing any in-flight stream `write`/`read` with `Error::Closed` (previously teardown waited for the transport to notice). Hold a `Session` clone for as long as you use its streams.
+- *(qmux)* the session idle timeout is *deferred* while a write is wedged on transport backpressure: a stalled `send` proves the peer is still there (its receive window is full) but also blocks the keep-alive, so a healthy backpressured connection isn't mistaken for a dead one. The deferral is bounded to one extra idle window, so a peer that dies under backpressure is still reclaimed (rather than hanging until the transport's own, much longer, timeout).
 
 ### Breaking
 

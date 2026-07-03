@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
@@ -251,6 +251,19 @@ struct SessionState<R: TransportReader> {
     // writer. Both are written once, when the peer's transport parameters arrive.
     record_limit: Arc<AtomicU64>,
     idle_timeout_ms: Arc<AtomicU64>,
+
+    // Set by the writer while a `send` is in flight (see `WriterState`). The reader
+    // consults it before firing the idle timeout, so transport backpressure isn't
+    // mistaken for a dead peer.
+    writer_backpressured: Arc<AtomicBool>,
+
+    // When the reader started deferring the idle timeout because the writer was
+    // backpressured, or `None` if it isn't currently deferring. Bounds the deferral:
+    // backpressure buys the connection at most one extra idle window before it's
+    // reclaimed anyway, so a peer that dies with our send buffer full is still
+    // idle-closed (just later) rather than hanging until the transport times out.
+    // Reset on any receive.
+    backpressure_suppressed_since: Option<tokio::time::Instant>,
 }
 
 /// Pick the next outbound frame in strict priority order: control (lossless,
@@ -275,6 +288,18 @@ async fn next_outbound(
     }
 }
 
+/// RFC 9000 §10.1 effective idle timeout in ms: the smaller of the two advertised
+/// values, ignoring a zero (disabled) side. Returns 0 when both are disabled.
+/// Shared by the reader's idle deadline and the writer's keep-alive cadence so the
+/// two never drift.
+fn negotiated_idle_timeout_ms(ours: u64, peer: u64) -> u64 {
+    match (ours, peer) {
+        (0, 0) => 0,
+        (a, 0) | (0, a) => a,
+        (a, b) => a.min(b),
+    }
+}
+
 /// Writer-side task state: owns the transport send half and is the sole producer
 /// on the wire. It pulls the outbound queues in strict priority order via
 /// [`next_outbound`], retires the stream a terminal frame closes and encodes it
@@ -293,6 +318,11 @@ struct WriterState<W: TransportWriter> {
     streams: Arc<Mutex<Streams>>,
     record_limit: Arc<AtomicU64>,
     idle_timeout_ms: Arc<AtomicU64>,
+
+    // Set while a `send` is in flight so the reader can tell a wedged-on-
+    // backpressure connection (peer alive, its recv window full) apart from a
+    // genuinely dead one, and not idle-close the former. See `transmit`.
+    writer_backpressured: Arc<AtomicBool>,
 
     closed: watch::Sender<Option<Error>>,
 
@@ -399,7 +429,15 @@ impl<W: TransportWriter> WriterState<W> {
                 return Err(Error::FrameTooLarge);
             }
         }
-        self.writer.send(bytes).await?;
+        // Flag the in-flight write so the reader won't idle-close a connection
+        // that's merely backpressured: a `send` stuck here proves the peer is
+        // still there (its receive window is just full). Cleared as soon as the
+        // write lands. Only the session idle timeout consults this — a WebSocket
+        // transport's own keep-alive deadline is independent.
+        self.writer_backpressured.store(true, Ordering::Release);
+        let result = self.writer.send(bytes).await;
+        self.writer_backpressured.store(false, Ordering::Release);
+        result?;
         self.last_send_at = tokio::time::Instant::now();
         Ok(())
     }
@@ -422,6 +460,8 @@ impl<R: TransportReader> SessionState<R> {
                 result = self.reader.recv() => {
                     let data = result?;
                     self.last_recv_at = tokio::time::Instant::now();
+                    // Real progress ends any backpressure deferral window.
+                    self.backpressure_suppressed_since = None;
                     if self.config.version == Version::QMux01 {
                         // QMux01: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
@@ -432,6 +472,33 @@ impl<R: TransportReader> SessionState<R> {
                     }
                 }
                 _ = async { tokio::time::sleep_until(idle_deadline.unwrap()).await }, if idle_deadline.is_some() => {
+                    let now = tokio::time::Instant::now();
+                    // One idle window of grace (the deadline is armed, so this is Some).
+                    let grace = std::time::Duration::from_millis(
+                        self.effective_idle_timeout_ms().unwrap_or(0),
+                    );
+                    match self.backpressure_suppressed_since {
+                        // Already deferring: keep the connection alive until the grace
+                        // window elapses, then reclaim it even if still backpressured —
+                        // a peer that died with our send buffer full must not hang here.
+                        Some(since) if now.duration_since(since) < grace => {
+                            self.last_recv_at = now; // re-arm the deadline; avoid a busy spin
+                            continue;
+                        }
+                        // Grace exhausted — fall through and idle-close.
+                        Some(_) => {}
+                        None => {
+                            if self.writer_backpressured.load(Ordering::Acquire) {
+                                // Writer wedged on transport backpressure: the peer's
+                                // receive window is full, which is evidence it's alive
+                                // and that we simply can't get a keep-alive out. Defer
+                                // the close, but only for the bounded grace above.
+                                self.backpressure_suppressed_since = Some(now);
+                                self.last_recv_at = now;
+                                continue;
+                            }
+                        }
+                    }
                     tracing::debug!("idle timeout fired");
                     return Err(Error::IdleTimeout);
                 }
@@ -451,13 +518,12 @@ impl<R: TransportReader> SessionState<R> {
         if self.config.version != Version::QMux01 || !self.params_received {
             return None;
         }
-        match (
+        match negotiated_idle_timeout_ms(
             self.our_params.max_idle_timeout,
             self.peer_params.max_idle_timeout,
         ) {
-            (0, 0) => None,
-            (a, 0) | (0, a) => Some(a),
-            (a, b) => Some(a.min(b)),
+            0 => None,
+            ms => Some(ms),
         }
     }
 
@@ -850,12 +916,7 @@ impl<R: TransportReader> SessionState<R> {
         let idle_ms = if self.config.version == Version::QMux01 {
             self.record_limit
                 .store(params.max_record_size, Ordering::Release);
-            // Same rule as `effective_idle_timeout_ms`: min of the non-zero values.
-            match (self.our_params.max_idle_timeout, params.max_idle_timeout) {
-                (0, 0) => 0,
-                (a, 0) | (0, a) => a,
-                (a, b) => a.min(b),
-            }
+            negotiated_idle_timeout_ms(self.our_params.max_idle_timeout, params.max_idle_timeout)
         } else {
             0
         };
@@ -994,6 +1055,9 @@ impl Session {
         let streams: Arc<Mutex<Streams>> = Arc::new(Mutex::new(Streams::default()));
         let record_limit = Arc::new(AtomicU64::new(crate::proto::DEFAULT_MAX_RECORD_SIZE));
         let idle_timeout_ms = Arc::new(AtomicU64::new(0));
+        // True while the writer is blocked in a `send`; lets the reader distinguish
+        // transport backpressure from a dead peer when the idle timeout fires.
+        let writer_backpressured = Arc::new(AtomicBool::new(false));
 
         let closed = watch::Sender::new(None);
 
@@ -1019,6 +1083,7 @@ impl Session {
             streams: streams.clone(),
             record_limit: record_limit.clone(),
             idle_timeout_ms: idle_timeout_ms.clone(),
+            writer_backpressured: writer_backpressured.clone(),
             closed: closed.clone(),
             last_send_at: tokio::time::Instant::now(),
             next_ping_seq: 0,
@@ -1094,6 +1159,8 @@ impl Session {
             datagram_max_size: datagram_max_size.clone(),
             record_limit: record_limit.clone(),
             idle_timeout_ms: idle_timeout_ms.clone(),
+            writer_backpressured,
+            backpressure_suppressed_since: None,
         };
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
