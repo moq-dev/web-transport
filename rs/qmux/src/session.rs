@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -87,6 +87,54 @@ pub struct Session {
     datagram_max_size: Arc<AtomicUsize>,
 }
 
+/// Tracks which peer-initiated recv-stream indices (in one direction) are open,
+/// closed, or merely implicitly opened, so a frame on an id can be classified.
+///
+/// A peer opening stream index N implicitly opens all lower indices too (QUIC
+/// RFC 9000 §3.2), and frames for different streams can arrive in any order. So a
+/// vacant id below the high-water mark is ambiguous: it may have been created and
+/// then retired (a duplicate/late frame to ignore) or implicitly opened and not
+/// yet delivered (a genuinely new stream). We disambiguate by recording the
+/// highest index we've instantiated a frontend for plus the still-unopened
+/// "holes" beneath it.
+#[derive(Default)]
+struct RecvOpen {
+    /// Highest index we've instantiated a frontend for (`None` = none yet).
+    created_max: Option<u64>,
+    /// Indices `<= created_max` that were implicitly opened (a higher index
+    /// arrived first) but haven't had their own first frame, so no frontend
+    /// exists yet. Bounded by MAX_STREAMS: a hole never replenishes stream-count
+    /// credit until it's created, so the peer can't outrun its stream limit.
+    holes: HashSet<u64>,
+}
+
+impl RecvOpen {
+    /// Whether a frame for `index` targets an already-closed stream: one we
+    /// created before (`index <= created_max` and not a still-open hole) but that
+    /// is no longer live. Callers check the active map for liveness separately.
+    fn is_closed(&self, index: u64) -> bool {
+        matches!(self.created_max, Some(max) if index <= max) && !self.holes.contains(&index)
+    }
+
+    /// Record that we've instantiated a frontend for `index`, advancing the
+    /// high-water mark and filling in the holes it implicitly opened.
+    fn record(&mut self, index: u64) {
+        match self.created_max {
+            // Filling a previously-implicit hole below the high-water mark.
+            Some(max) if index <= max => {
+                self.holes.remove(&index);
+            }
+            // New high-water mark: everything between the old mark and this index
+            // is now implicitly opened but not yet delivered.
+            prev => {
+                let start = prev.map_or(0, |max| max + 1);
+                self.holes.extend(start..index);
+                self.created_max = Some(index);
+            }
+        }
+    }
+}
+
 struct SessionState<T: Transport> {
     transport: T,
     config: Config,
@@ -124,15 +172,12 @@ struct SessionState<T: Transport> {
     recv_bi_credit: Credit,
     recv_uni_credit: Credit,
 
-    // Highest peer-initiated recv-stream index we've retired (delivered a FIN or
-    // RESET for and dropped from `recv_streams`), per direction. Post-terminal
-    // frames on a retired id must be ignored rather than resurrecting a brand-new
-    // accepted stream — see `retire_recv` / `is_recv_retired`. Stream indices are
-    // monotonic and delivery is ordered, so a single high-water mark per direction
-    // stands in for the whole set of retired ids and stays O(1) on a long-lived
-    // connection. `None` means nothing retired yet (index 0 is a valid id).
-    retired_recv_bi: Option<u64>,
-    retired_recv_uni: Option<u64>,
+    // Open/closed bookkeeping for peer-initiated recv streams, per direction, so a
+    // post-terminal frame on a retired id is ignored rather than resurrecting a
+    // brand-new accepted stream. See `RecvOpen`. QMux only: MAX_STREAMS flow
+    // control bounds the hole set to at most the peer's stream limit.
+    recv_open_bi: RecvOpen,
+    recv_open_uni: RecvOpen,
 
     // QMux01 idle-timeout state (engaged once we've received the peer's params)
     last_recv_at: tokio::time::Instant,
@@ -300,33 +345,12 @@ impl<T: Transport> SessionState<T> {
         self.send_encoded(frame.encode(self.config.version)?).await
     }
 
-    /// Record that a peer-initiated recv stream has reached a terminal state
-    /// (FIN or RESET delivered, entry removed). Advances the per-direction
-    /// high-water mark so later frames on this id are recognized as
-    /// post-terminal. Locally-initiated ids are a no-op: the `is_server` guard
-    /// in `recv_frame` already ignores stray frames on those.
-    fn retire_recv(&mut self, id: StreamId) {
-        if self.is_server == id.server_initiated() {
-            return;
+    /// Per-direction open/closed bookkeeping for peer-initiated recv streams.
+    fn recv_open(&self, dir: StreamDir) -> &RecvOpen {
+        match dir {
+            StreamDir::Bi => &self.recv_open_bi,
+            StreamDir::Uni => &self.recv_open_uni,
         }
-        let index = id.index();
-        let slot = match id.dir() {
-            StreamDir::Bi => &mut self.retired_recv_bi,
-            StreamDir::Uni => &mut self.retired_recv_uni,
-        };
-        *slot = Some(slot.map_or(index, |cur| cur.max(index)));
-    }
-
-    /// Whether `id` names a peer-initiated recv stream we've already retired.
-    /// Because indices are monotonic and delivery is ordered, any id at or below
-    /// the high-water mark that isn't currently open has already been closed, so
-    /// a frame for it is a duplicate/late one to discard.
-    fn is_recv_retired(&self, id: StreamId) -> bool {
-        let mark = match id.dir() {
-            StreamDir::Bi => self.retired_recv_bi,
-            StreamDir::Uni => self.retired_recv_uni,
-        };
-        matches!(mark, Some(high) if id.index() <= high)
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
@@ -343,13 +367,20 @@ impl<T: Transport> SessionState<T> {
                     return Err(Error::InvalidStreamId);
                 }
 
-                // Ignore post-terminal frames on a retired peer-initiated stream.
-                // Once we deliver a FIN/RESET the entry is dropped, so without this
-                // a duplicate/late STREAM frame would fall through and be treated as
-                // a brand-new accepted stream (stream resurrection). The high-water
-                // mark also covers still-open lower-index ids, so only bail when the
-                // id isn't currently live.
-                if self.is_recv_retired(stream.id) && !self.recv_streams.contains_key(&stream.id) {
+                // Ignore post-terminal frames on an already-closed peer-initiated
+                // stream. Once we deliver a FIN/RESET the entry is dropped, so
+                // without this a duplicate/late STREAM frame would fall through and
+                // be treated as a brand-new accepted stream (stream resurrection).
+                // `is_closed` distinguishes a retired id from one that was only
+                // implicitly opened (a higher index arrived first) and hasn't had
+                // its own first frame yet — the latter is still new. Locally-
+                // initiated ids are left to the `is_server` guard below; only QMux
+                // tracks this, where MAX_STREAMS bounds the hole set.
+                if self.config.version.is_qmux()
+                    && stream.id.server_initiated() != self.is_server
+                    && !self.recv_streams.contains_key(&stream.id)
+                    && self.recv_open(stream.id.dir()).is_closed(stream.id.index())
+                {
                     return Ok(());
                 }
 
@@ -389,6 +420,21 @@ impl<T: Transport> SessionState<T> {
                             if !credit.receive_up_to(stream.id.index() + 1) {
                                 return Err(Error::StreamLimitExceeded);
                             }
+
+                            // Record that we're instantiating a frontend for this
+                            // id, so a later frame on it (after it's retired) is
+                            // recognized as closed rather than resurrected. Runs
+                            // after the credit gate, which bounds the hole set to at
+                            // most MAX_STREAMS. Reached only for peer-initiated ids
+                            // (the `is_server` guard above returned otherwise).
+                            // Access the field directly (not via `recv_open_mut`)
+                            // so the borrow stays disjoint from the `recv_streams`
+                            // entry held open by this match.
+                            match stream.id.dir() {
+                                StreamDir::Bi => &mut self.recv_open_bi,
+                                StreamDir::Uni => &mut self.recv_open_uni,
+                            }
+                            .record(stream.id.index());
                         }
 
                         let (tx, rx) = mpsc::unbounded_channel();
@@ -490,24 +536,17 @@ impl<T: Transport> SessionState<T> {
                         };
 
                         let fin = stream.fin;
-                        let id = stream.id;
                         recv_backend.inbound_data.send(stream).ok();
 
-                        if fin {
-                            // Opened and finished in a single frame — tombstone it
-                            // so a later frame on this id can't re-accept it.
-                            self.retire_recv(id);
-                        } else {
+                        if !fin {
                             e.insert(recv_backend);
                         }
                     }
                     hash_map::Entry::Occupied(mut e) => {
                         let fin = stream.fin;
-                        let id = stream.id;
                         e.get_mut().inbound_data.send(stream).ok();
                         if fin {
                             e.remove();
-                            self.retire_recv(id);
                         }
                     }
                 };
@@ -518,11 +557,8 @@ impl<T: Transport> SessionState<T> {
                 }
 
                 if let hash_map::Entry::Occupied(mut e) = self.recv_streams.entry(reset.id) {
-                    let id = reset.id;
                     e.get_mut().inbound_reset.send(reset).ok();
                     e.remove();
-                    // Tombstone the id so a late STREAM/RESET can't re-accept it.
-                    self.retire_recv(id);
                 }
             }
             Frame::StopSending(stop) => {
@@ -844,8 +880,8 @@ impl Session {
             open_uni_credit: open_uni_credit.clone(),
             recv_bi_credit: recv_bi_credit.clone(),
             recv_uni_credit: recv_uni_credit.clone(),
-            retired_recv_bi: None,
-            retired_recv_uni: None,
+            recv_open_bi: RecvOpen::default(),
+            recv_open_uni: RecvOpen::default(),
             last_recv_at: tokio::time::Instant::now(),
             last_send_at: tokio::time::Instant::now(),
             next_ping_seq: 0,
@@ -1561,7 +1597,7 @@ mod negotiate_tests {
 }
 
 #[cfg(test)]
-mod recv_retire_tests {
+mod recv_open_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -1597,46 +1633,49 @@ mod recv_retire_tests {
         }
     }
 
+    /// A client session fed by a scripted transport, plus the sender for inbound
+    /// frames. QMux01, where the closed-stream tracking is active.
+    fn scripted_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let session = Session::new(
+            ScriptedTransport { incoming: rx },
+            false,
+            Config::new(Version::QMux01),
+        );
+        (session, tx)
+    }
+
+    /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and
+    /// receivable, since we're the client).
+    fn uni_stream(index: u64, data: &'static [u8], fin: bool) -> Bytes {
+        Frame::Stream(Stream {
+            id: StreamId::new(index, StreamDir::Uni, true),
+            data: Bytes::from_static(data),
+            fin,
+        })
+        .encode(Version::QMux01)
+        .unwrap()
+    }
+
     /// Regression test for the #274 stream-resurrection bug: after a
     /// peer-initiated recv stream is retired by a FIN, a duplicate/late STREAM
     /// frame on the same id must be ignored, not turned into a brand-new accepted
     /// stream.
     #[tokio::test]
     async fn retired_recv_stream_is_not_resurrected() {
-        let version = Version::WebTransport;
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        // We're the client, so a server-initiated uni stream is peer-initiated
-        // and receivable.
-        let session = Session::new(
-            ScriptedTransport { incoming: rx },
-            false,
-            Config::new(version),
-        );
-        let id = StreamId::new(0, StreamDir::Uni, true);
-
-        let stream_frame = |data: &'static [u8], fin: bool| {
-            Frame::Stream(Stream {
-                id,
-                data: Bytes::from_static(data),
-                fin,
-            })
-            .encode(version)
-            .unwrap()
-        };
+        let (session, tx) = scripted_session();
 
         // Open with data, FIN (retires the stream), then a late frame on the same id.
-        tx.send(stream_frame(b"hello", false)).unwrap();
-        tx.send(stream_frame(b"", true)).unwrap();
-        tx.send(stream_frame(b"late", false)).unwrap();
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        tx.send(uni_stream(0, b"", true)).unwrap();
+        tx.send(uni_stream(0, b"late", false)).unwrap();
 
         // The peer's stream is accepted exactly once; drain it to EOF.
         let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
             .await
             .expect("accept_uni timed out")
             .expect("accept_uni failed");
-        let payload = recv.read_all().await.unwrap();
-        assert_eq!(payload.as_ref(), b"hello");
+        assert_eq!(recv.read_all().await.unwrap().as_ref(), b"hello");
 
         // The late frame must be dropped: no second stream shows up on the queue.
         let second = tokio::time::timeout(Duration::from_millis(200), session.accept_uni()).await;
@@ -1644,5 +1683,33 @@ mod recv_retire_tests {
             second.is_err(),
             "a late frame on a retired stream resurrected a new accepted stream"
         );
+    }
+
+    /// A FIN for a higher stream index arriving before the first frame of a lower
+    /// one must NOT retire the lower stream. Opening index 10 only *implicitly*
+    /// opens 0..10 — it doesn't close them — so a later first frame on index 6 is a
+    /// real, new stream, not a post-terminal one. (Guards against a naive
+    /// highest-retired-index tombstone wrongly dropping it.)
+    #[tokio::test]
+    async fn implicitly_opened_lower_stream_is_still_accepted() {
+        let (session, tx) = scripted_session();
+
+        // Retire stream 10 first, then deliver the first frame of stream 6.
+        tx.send(uni_stream(10, b"", true)).unwrap();
+        tx.send(uni_stream(6, b"hello", true)).unwrap();
+
+        // Stream 10 arrived first, so it's accepted first, and it's empty.
+        let mut first = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+        assert_eq!(first.read_all().await.unwrap().as_ref(), b"");
+
+        // Stream 6 must still be delivered, not dropped as "already closed".
+        let mut second = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("stream 6 was wrongly dropped as already-closed")
+            .expect("accept_uni failed");
+        assert_eq!(second.read_all().await.unwrap().as_ref(), b"hello");
     }
 }
