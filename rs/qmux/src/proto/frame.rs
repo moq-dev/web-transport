@@ -140,7 +140,9 @@ impl Frame {
         // can't accidentally emit draft-01 wire bytes on a draft-00 session.
         if version != Version::QMux01 {
             match self {
-                Frame::Padding | Frame::Ping(_) => return Err(Error::InvalidFrameType(0)),
+                Frame::Padding | Frame::Ping(_) | Frame::Datagram(_) => {
+                    return Err(Error::InvalidFrameType(0))
+                }
                 _ => {}
             }
         }

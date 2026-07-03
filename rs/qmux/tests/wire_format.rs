@@ -21,7 +21,7 @@
 
 use bytes::Bytes;
 use qmux::proto::{ConnectionClose, Frame, ResetStream, StopSending, Stream};
-use qmux::{StreamId, Version};
+use qmux::{Error, StreamId, Version};
 use web_transport_proto::VarInt;
 
 /// Round-trip helper: hard-coded bytes ↔ expected frame, both directions.
@@ -248,6 +248,19 @@ fn qmux01_datagram() {
     let bytes = [0x31, 0x02, b'h', b'i'];
     let frame = Frame::Datagram(Bytes::from_static(b"hi"));
     assert_round_trip(Version::QMux01, &bytes, &frame);
+}
+
+#[test]
+fn datagram_rejected_on_non_qmux01() {
+    // Datagrams are a QMux01-only frame; encoding one for an older wire version
+    // must fail rather than emit draft-01 bytes onto a draft-00 / WebTransport
+    // session that can't interpret them.
+    for version in [Version::WebTransport, Version::QMux00] {
+        let err = Frame::Datagram(Bytes::from_static(b"hi"))
+            .encode(version)
+            .expect_err("datagram must not encode on non-QMux01");
+        assert!(matches!(err, Error::InvalidFrameType(_)), "got {err:?}");
+    }
 }
 
 #[test]

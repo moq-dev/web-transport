@@ -188,6 +188,34 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("datagrams: a DATAGRAM whose frame exactly fits our advertised size is delivered", async () => {
+		// ourParams.maxDatagramFrameSize = 10; an 8-byte payload encodes to a
+		// 1 (type) + 1 (length varint) + 8 = 10-byte frame — exactly the limit.
+		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+		session.close();
+	});
+
+	test("datagrams: a DATAGRAM whose frame overflows our advertised size is dropped", async () => {
+		// ourParams.maxDatagramFrameSize = 10. A 10-byte payload passes the old
+		// payload-only check but its encoded frame is 1 + 1 + 10 = 12 > 10, so it
+		// must be dropped. The following in-limit datagram is what the reader sees.
+		const { session, peer } = connect({ maxDatagramFrameSize: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "datagram", data: new Uint8Array(10) });
+		peer.send({ type: "datagram", data: new Uint8Array([9, 9]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([9, 9]);
+		session.close();
+	});
+
 	test("datagrams: maxDatagramSize reflects the peer's advertised frame size", async () => {
 		const { session, peer } = connect();
 		await session.ready;

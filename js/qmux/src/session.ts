@@ -596,12 +596,12 @@ export default class Session implements WebTransport {
 			this.#uniStreamCredit.increaseMax(frame.max);
 		} else if (frame.type === "datagram") {
 			// Only accept datagrams if we advertised support (a conforming peer
-			// won't send otherwise) and the payload fits the frame size we
+			// won't send otherwise) and the encoded frame fits the size we
 			// advertised — drop oversized ones rather than delivering them.
-			if (
-				this.#ourParams.maxDatagramFrameSize > 0n &&
-				BigInt(frame.data.byteLength) <= this.#ourParams.maxDatagramFrameSize
-			) {
+			// `maxDatagramFrameSize` limits the whole frame (type byte + length
+			// varint + payload), so reconstruct that size before comparing.
+			const frameSize = BigInt(1 + VarInt.from(frame.data.byteLength).size() + frame.data.byteLength);
+			if (this.#ourParams.maxDatagramFrameSize > 0n && frameSize <= this.#ourParams.maxDatagramFrameSize) {
 				this.datagrams.push(frame.data);
 			}
 		} else if (frame.type === "ping_request") {
