@@ -100,6 +100,47 @@ pub struct Ping {
     pub response: bool,
 }
 
+/// An unreliable datagram (RFC 9221).
+#[derive(Debug, Clone)]
+pub struct Datagram {
+    /// The payload bytes.
+    pub data: Bytes,
+    /// Whether the frame carried an explicit length varint on the wire (the
+    /// `0x31` form) rather than the no-length `0x30` form, whose payload is
+    /// delimited by the enclosing record. We always *emit* `0x31`; this is
+    /// preserved on decode so [`frame_size`](Datagram::frame_size) can report
+    /// the exact encoded size for `max_datagram_frame_size` validation.
+    pub length_prefixed: bool,
+}
+
+impl Datagram {
+    /// The encoded on-wire frame size in bytes: type byte + optional length
+    /// varint + payload. This is what `max_datagram_frame_size` (RFC 9221)
+    /// bounds, so the receive path compares against it.
+    pub(crate) fn frame_size(&self) -> u64 {
+        let len = self.data.len() as u64;
+        // The type is a 1-byte varint (0x30/0x31); the length varint is only
+        // present in the 0x31 form.
+        let header = if self.length_prefixed {
+            1 + super::varint_size(len)
+        } else {
+            1
+        };
+        header + len
+    }
+}
+
+/// Build the length-prefixed (`0x31`) datagram we always emit. Decoders that
+/// observe the no-length `0x30` form construct [`Datagram`] directly instead.
+impl From<Bytes> for Datagram {
+    fn from(data: Bytes) -> Self {
+        Self {
+            data,
+            length_prefixed: true,
+        }
+    }
+}
+
 /// A QUIC-compatible frame for multiplexed transport.
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -124,9 +165,8 @@ pub enum Frame {
     StreamsBlockedUni(u64),
     TransportParameters(TransportParams),
     Ping(Ping),
-    /// An unreliable datagram (RFC 9221). The payload carries no length prefix
-    /// on the wire; it is delimited by the enclosing record boundary.
-    Datagram(Bytes),
+    /// An unreliable datagram (RFC 9221).
+    Datagram(Datagram),
 }
 
 impl Frame {
@@ -293,7 +333,10 @@ impl Frame {
             // DATAGRAM without length — rest of record is payload
             0x30 => {
                 let payload = data.split_to(data.remaining());
-                Ok(Some(Frame::Datagram(payload)))
+                Ok(Some(Frame::Datagram(Datagram {
+                    data: payload,
+                    length_prefixed: false,
+                })))
             }
             // DATAGRAM with length
             0x31 => {
@@ -302,7 +345,10 @@ impl Frame {
                     return Err(Error::Short);
                 }
                 let payload = data.split_to(len as usize);
-                Ok(Some(Frame::Datagram(payload)))
+                Ok(Some(Frame::Datagram(Datagram {
+                    data: payload,
+                    length_prefixed: true,
+                })))
             }
             // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {
@@ -444,12 +490,12 @@ impl Frame {
                 }
                 VarInt::try_from(ping.sequence)?.encode(buf);
             }
-            Frame::Datagram(payload) => {
+            Frame::Datagram(datagram) => {
                 // Length-prefixed form (0x31): self-delimiting regardless of
                 // framing. See DATAGRAM_LEN for why we emit it uniformly.
                 DATAGRAM_LEN.encode(buf);
-                VarInt::try_from(payload.len())?.encode(buf);
-                buf.put_slice(payload);
+                VarInt::try_from(datagram.data.len())?.encode(buf);
+                buf.put_slice(&datagram.data);
             }
         }
 
@@ -626,7 +672,10 @@ impl Frame {
             // DATAGRAM without length — rest of message is payload
             0x30 => {
                 let payload = data.split_to(data.remaining());
-                Ok(Some(Frame::Datagram(payload)))
+                Ok(Some(Frame::Datagram(Datagram {
+                    data: payload,
+                    length_prefixed: false,
+                })))
             }
             // DATAGRAM with length
             0x31 => {
@@ -635,7 +684,10 @@ impl Frame {
                     return Err(Error::Short);
                 }
                 let payload = data.split_to(len as usize);
-                Ok(Some(Frame::Datagram(payload)))
+                Ok(Some(Frame::Datagram(Datagram {
+                    data: payload,
+                    length_prefixed: true,
+                })))
             }
             // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {

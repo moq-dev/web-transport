@@ -201,7 +201,7 @@ impl<T: Transport> SessionState<T> {
                 }
                 Some(payload) = self.outbound_datagram.recv() => {
                     // Ahead of bulk stream data for low latency, behind control.
-                    self.send_frame(Frame::Datagram(payload)).await?;
+                    self.send_frame(Frame::Datagram(payload.into())).await?;
                 }
                 frame = self.outbound.pop() => {
                     match frame {
@@ -520,21 +520,22 @@ impl<T: Transport> SessionState<T> {
             }
             // DATAGRAM: fan out to the receive channel. `max_datagram_frame_size`
             // caps the whole *frame* (type byte + length varint + payload), not
-            // just the payload, so reconstruct the encoded size and compare against
-            // the limit we advertised. A peer that sends a datagram we never
-            // advertised support for, or one that overflows the negotiated limit,
-            // is a protocol violation — surface it rather than silently dropping.
-            // Delivery past that is best-effort, so drop the datagram if the
-            // channel is full rather than blocking the session loop.
-            Frame::Datagram(payload) => {
+            // just the payload, so compare against the frame's exact encoded size
+            // — which depends on the wire form (`Datagram::frame_size` accounts
+            // for the 0x30 no-length form having no length varint). A peer that
+            // sends a datagram we never advertised support for, or one that
+            // overflows the negotiated limit, is a protocol violation — surface it
+            // rather than silently dropping. Delivery past that is best-effort, so
+            // drop the datagram if the channel is full rather than blocking the
+            // session loop.
+            Frame::Datagram(datagram) => {
                 if self.our_params.max_datagram_frame_size == 0 {
                     return Err(Error::DatagramsUnsupported);
                 }
-                let frame_size = 1 + varint_size(payload.len() as u64) + payload.len() as u64;
-                if frame_size > self.our_params.max_datagram_frame_size {
+                if datagram.frame_size() > self.our_params.max_datagram_frame_size {
                     return Err(Error::FrameTooLarge);
                 }
-                let _ = self.recv_datagram.try_send(payload);
+                let _ = self.recv_datagram.try_send(datagram.data);
             }
         }
 
@@ -1554,7 +1555,7 @@ mod datagram_recv_tests {
 
         // Usable payload is 97 (100 - 1 type byte - 2 length-varint bytes); a
         // 98-byte payload tips the encoded frame to 101 > 100.
-        let datagram = Frame::Datagram(Bytes::from(vec![0u8; 98]))
+        let datagram = Frame::Datagram(Bytes::from(vec![0u8; 98]).into())
             .encode(Version::QMux01)
             .unwrap();
         raw.write_all(&record(datagram)).await.unwrap();
@@ -1571,7 +1572,7 @@ mod datagram_recv_tests {
         cfg.max_datagram_frame_size = 0;
         let (server, mut raw) = raw_peer(cfg).await;
 
-        let datagram = Frame::Datagram(Bytes::from_static(b"hi"))
+        let datagram = Frame::Datagram(Bytes::from_static(b"hi").into())
             .encode(Version::QMux01)
             .unwrap();
         raw.write_all(&record(datagram)).await.unwrap();
@@ -1590,10 +1591,34 @@ mod datagram_recv_tests {
 
         // 97-byte payload → 1 + 2 + 97 == 100 == the limit.
         let payload = vec![7u8; 97];
-        let datagram = Frame::Datagram(Bytes::from(payload.clone()))
+        let datagram = Frame::Datagram(Bytes::from(payload.clone()).into())
             .encode(Version::QMux01)
             .unwrap();
         raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);
+    }
+
+    /// The no-length (0x30) form carries no length varint, so its frame is only
+    /// `1 + payload`. The size check must use that exact size, not the larger
+    /// length-prefixed reconstruction — otherwise a conforming 0x30 datagram at
+    /// the boundary is wrongly rejected.
+    #[tokio::test]
+    async fn no_length_datagram_uses_exact_frame_size() {
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 100;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        // A 99-byte 0x30 payload is a 1 + 99 = 100-byte frame — exactly the limit
+        // — even though the length-prefixed reconstruction (1 + 2 + 99 = 102)
+        // would overshoot it. We never emit 0x30, so hand-build the frame: a
+        // single 0x30 type byte (a 1-byte varint) followed by the payload.
+        let payload = vec![3u8; 99];
+        let mut frame = bytes::BytesMut::new();
+        frame.put_u8(0x30);
+        frame.extend_from_slice(&payload);
+        raw.write_all(&record(frame.freeze())).await.unwrap();
         raw.flush().await.unwrap();
 
         assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);

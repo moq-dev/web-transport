@@ -598,9 +598,13 @@ export default class Session implements WebTransport {
 			// Only accept datagrams if we advertised support (a conforming peer
 			// won't send otherwise) and the encoded frame fits the size we
 			// advertised — drop oversized ones rather than delivering them.
-			// `maxDatagramFrameSize` limits the whole frame (type byte + length
-			// varint + payload), so reconstruct that size before comparing.
-			const frameSize = BigInt(1 + VarInt.from(frame.data.byteLength).size() + frame.data.byteLength);
+			// `maxDatagramFrameSize` limits the whole frame, whose size depends on
+			// the wire form: the no-length `0x30` form is just a type byte plus
+			// payload, while `0x31` adds a length varint. The decoder records which
+			// arrived so we can size it exactly.
+			const len = frame.data.byteLength;
+			const header = frame.lengthPrefixed === false ? 1 : 1 + VarInt.from(len).size();
+			const frameSize = BigInt(header + len);
 			if (this.#ourParams.maxDatagramFrameSize > 0n && frameSize <= this.#ourParams.maxDatagramFrameSize) {
 				this.datagrams.push(frame.data);
 			}

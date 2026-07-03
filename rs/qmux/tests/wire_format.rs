@@ -114,7 +114,7 @@ fn assert_frames_eq(got: &Frame, want: &Frame, version: Version) {
             assert_eq!(a, b, "streams_blocked_uni")
         }
         (Frame::Datagram(a), Frame::Datagram(b)) => {
-            assert_eq!(a.as_ref(), b.as_ref(), "datagram payload")
+            assert_eq!(a.data.as_ref(), b.data.as_ref(), "datagram payload")
         }
         (a, b) => panic!("frame variants don't match: got {a:?}, want {b:?}"),
     }
@@ -246,7 +246,7 @@ fn qmux01_datagram() {
     // 0x31 = DATAGRAM | LEN; len=2, payload "hi". Datagrams are a QMux01 feature;
     // we always emit the length-prefixed form.
     let bytes = [0x31, 0x02, b'h', b'i'];
-    let frame = Frame::Datagram(Bytes::from_static(b"hi"));
+    let frame = Frame::Datagram(Bytes::from_static(b"hi").into());
     assert_round_trip(Version::QMux01, &bytes, &frame);
 }
 
@@ -256,7 +256,7 @@ fn datagram_rejected_on_non_qmux01() {
     // must fail rather than emit draft-01 bytes onto a draft-00 / WebTransport
     // session that can't interpret them.
     for version in [Version::WebTransport, Version::QMux00] {
-        let err = Frame::Datagram(Bytes::from_static(b"hi"))
+        let err = Frame::Datagram(Bytes::from_static(b"hi").into())
             .encode(version)
             .expect_err("datagram must not encode on non-QMux01");
         assert!(matches!(err, Error::InvalidFrameType(_)), "got {err:?}");
@@ -272,7 +272,12 @@ fn qmux_datagram_no_length_decodes() {
         .expect("decode succeeds")
         .expect("datagram is not an ignored frame");
     match decoded {
-        Frame::Datagram(payload) => assert_eq!(payload.as_ref(), b"hi"),
+        Frame::Datagram(dg) => {
+            assert_eq!(dg.data.as_ref(), b"hi");
+            // The no-length form is preserved so the size check can use its
+            // true (length-varint-free) frame size.
+            assert!(!dg.length_prefixed, "0x30 form must decode as no-length");
+        }
         other => panic!("expected datagram, got {other:?}"),
     }
 }
@@ -282,7 +287,7 @@ fn record_datagram_then_stream_decodes_both() {
     // The length-prefixed datagram (0x31) must stop consumption at its payload
     // boundary so a following frame in the same record still decodes — the exact
     // reason we always emit 0x31 rather than the no-length 0x30 form.
-    let datagram = Frame::Datagram(Bytes::from_static(b"hi"))
+    let datagram = Frame::Datagram(Bytes::from_static(b"hi").into())
         .encode(Version::QMux01)
         .unwrap();
     let stream = Frame::Stream(Stream {
@@ -300,7 +305,7 @@ fn record_datagram_then_stream_decodes_both() {
     let frames = Frame::decode_record(Bytes::from(record)).expect("record decodes");
     assert_eq!(frames.len(), 2, "both frames decode");
     match &frames[0] {
-        Frame::Datagram(p) => assert_eq!(p.as_ref(), b"hi"),
+        Frame::Datagram(dg) => assert_eq!(dg.data.as_ref(), b"hi"),
         other => panic!("expected datagram, got {other:?}"),
     }
     match &frames[1] {
