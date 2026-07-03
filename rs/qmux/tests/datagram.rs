@@ -41,16 +41,18 @@ async fn round_trip() {
     assert_eq!(client.recv_datagram().await.unwrap().as_ref(), b"pong");
 }
 
-/// QMux00 has no record layer, so datagrams still round-trip via the
-/// length-prefixed frame form.
+/// Datagrams are a QMux01 feature; on QMux00 they're unsupported in both
+/// directions (the parameter isn't advertised, so nothing negotiates them).
 #[tokio::test]
-async fn round_trip_qmux00() {
+async fn disabled_on_qmux00() {
     let (client, server) = pair(Config::new(Version::QMux00), Config::new(Version::QMux00)).await;
 
-    assert!(client.max_datagram_size() > 0);
-
-    client.send_datagram(Bytes::from_static(b"hello")).unwrap();
-    assert_eq!(server.recv_datagram().await.unwrap().as_ref(), b"hello");
+    assert_eq!(client.max_datagram_size(), 0);
+    assert_eq!(server.max_datagram_size(), 0);
+    assert!(matches!(
+        client.send_datagram(Bytes::from_static(b"hello")),
+        Err(Error::DatagramsUnsupported)
+    ));
 }
 
 /// A peer that advertises `max_datagram_frame_size = 0` disables datagrams in

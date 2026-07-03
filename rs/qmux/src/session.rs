@@ -594,25 +594,25 @@ impl<T: Transport> SessionState<T> {
             }
         }
 
-        // Resolve the datagram send limit from the peer's params. Whether we may
-        // *send* depends solely on the peer's willingness to receive (RFC 9221):
-        // 0 means the peer omitted (or zeroed) max_datagram_frame_size.
-        let datagram_max = if params.max_datagram_frame_size == 0 {
-            0
-        } else {
-            let mut cap = params.max_datagram_frame_size;
-            // A datagram must fit in one record, but only QMux01 has a real
-            // record layer; QMux00 frames each ride their own message.
-            if self.config.version == Version::QMux01 {
-                cap = cap.min(params.max_record_size);
-            }
-            // We encode the length-prefixed form (0x31): one type byte plus a
-            // length varint. `varint_size(cap)` bounds the varint for any payload
-            // that fits in `cap`, so subtracting it keeps the encoded frame within
-            // the peer's limit regardless of the exact payload length.
-            let overhead = 1 + varint_size(cap);
-            usize::try_from(cap.saturating_sub(overhead)).unwrap_or(usize::MAX)
-        };
+        // Resolve the datagram send limit. Datagrams are a QMux01-only feature
+        // (they rely on the record layer for framing), so they stay disabled on
+        // any other wire format. Otherwise whether we may *send* depends solely on
+        // the peer's willingness to receive (RFC 9221): 0 means the peer omitted
+        // (or zeroed) max_datagram_frame_size.
+        let datagram_max =
+            if self.config.version != Version::QMux01 || params.max_datagram_frame_size == 0 {
+                0
+            } else {
+                // A datagram must fit in one record, so the frame is capped by the
+                // smaller of the peer's datagram-frame limit and its record size.
+                let cap = params.max_datagram_frame_size.min(params.max_record_size);
+                // We encode the length-prefixed form (0x31): one type byte plus a
+                // length varint. `varint_size(cap)` bounds the varint for any payload
+                // that fits in `cap`, so subtracting it keeps the encoded frame within
+                // the peer's limit regardless of the exact payload length.
+                let overhead = 1 + varint_size(cap);
+                usize::try_from(cap.saturating_sub(overhead)).unwrap_or(usize::MAX)
+            };
         // Store before signalling establishment so `connect`/`accept` callers
         // observe the resolved value via `max_datagram_size()`.
         self.datagram_max_size

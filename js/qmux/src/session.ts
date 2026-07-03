@@ -38,7 +38,8 @@ export interface Config {
 	 *  willingness to receive; 0 disables datagrams. This is a frame size, not a
 	 *  payload size — {@link Datagrams.maxDatagramSize} reports the usable payload
 	 *  (this value less framing overhead). Keep it at or below `maxRecordSize`.
-	 *  Defaults to a full record. */
+	 *  Datagrams are a QMux01 feature; this is ignored on qmux-00. Defaults to a
+	 *  full record. */
 	maxDatagramFrameSize?: bigint;
 }
 
@@ -518,6 +519,13 @@ export default class Session implements WebTransport {
 		this.#version = version;
 		this.#protocol = parseProtocol(rawProtocol, version);
 
+		// Datagrams are a QMux01 feature (they rely on the record layer for
+		// framing): don't advertise the parameter — or accept datagrams — on any
+		// other wire format. The recv path gates on #ourParams.maxDatagramFrameSize.
+		if (version !== "qmux-01") {
+			this.#ourParams = { ...this.#ourParams, maxDatagramFrameSize: 0n };
+		}
+
 		this.#scheduler = new SendScheduler(sink, {
 			onActivity: () => {
 				this.#lastSendAt = Date.now();
@@ -613,15 +621,15 @@ export default class Session implements WebTransport {
 		this.#bidiStreamCredit.increaseMax(params.initialMaxStreamsBidi);
 		this.#uniStreamCredit.increaseMax(params.initialMaxStreamsUni);
 
-		// Resolve the datagram send limit. Whether we may *send* depends solely on
-		// the peer's willingness to receive (RFC 9221): 0 means unsupported.
-		if (params.maxDatagramFrameSize > 0n) {
-			let cap = params.maxDatagramFrameSize;
-			// A datagram must fit in one record, but only QMux01 has a real record
-			// layer; QMux00 frames each ride their own message.
-			if (this.#version === "qmux-01" && params.maxRecordSize < cap) {
-				cap = params.maxRecordSize;
-			}
+		// Resolve the datagram send limit. Datagrams are a QMux01-only feature, so
+		// they stay disabled on any other wire format. Otherwise whether we may
+		// *send* depends solely on the peer's willingness to receive (RFC 9221):
+		// 0 means unsupported.
+		if (this.#version === "qmux-01" && params.maxDatagramFrameSize > 0n) {
+			// A datagram must fit in one record, so the frame is capped by the
+			// smaller of the peer's datagram-frame limit and its record size.
+			const cap =
+				params.maxRecordSize < params.maxDatagramFrameSize ? params.maxRecordSize : params.maxDatagramFrameSize;
 			// We encode the length-prefixed form (0x31): one type byte plus a length
 			// varint sized for `cap`. Subtracting it keeps the frame within the limit.
 			const overhead = BigInt(1 + VarInt.from(cap).size());

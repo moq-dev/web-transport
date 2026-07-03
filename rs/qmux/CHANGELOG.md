@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(qmux)* datagram support (RFC 9221): `send_datagram`/`recv_datagram`/`max_datagram_size` on `Session`, negotiated via the `max_datagram_frame_size` transport parameter and configured with `Config::max_datagram_frame_size` (enabled by default).
+- *(qmux)* datagram support (RFC 9221) on QMux01: `send_datagram`/`recv_datagram`/`max_datagram_size` on `Session`, negotiated via the `max_datagram_frame_size` transport parameter and configured with `Config::max_datagram_frame_size` (enabled by default). Datagrams are unavailable on QMux00 and the legacy `webtransport` format.
 
 ## [0.3.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.1) - 2026-06-25
 

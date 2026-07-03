@@ -17,13 +17,11 @@ const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 // DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
-// the record); 0x31 prefixes a length varint. We always emit 0x31 because it is
-// self-delimiting regardless of framing: it is *required* on the QMux00 byte
-// stream (no record layer to bound a trailing no-length datagram), and inside a
-// QMux01 record whenever another frame follows it. On WebSocket / a lone QMux01
-// record the length is redundant — the record boundary already delimits it, so
-// 0x30 would do — but we emit one form everywhere to keep a single code path and
-// stay correct if frames are ever batched into a record. Both forms decode.
+// the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
+// QMux01, where each rides its own record, so the record boundary would already
+// delimit a lone 0x30 datagram. We still emit 0x31 so the frame stays
+// self-delimiting even if a record ever carries a frame after it — the length
+// varint costs 1-2 bytes. Both forms decode.
 const DATAGRAM_LEN: VarInt = VarInt::from_u32(0x31);
 
 const PADDING: VarInt = VarInt::from_u32(0x00);

@@ -242,12 +242,12 @@ fn qmux00_stop_sending() {
 }
 
 #[test]
-fn qmux00_datagram() {
-    // 0x31 = DATAGRAM | LEN; len=2, payload "hi". We always emit the
-    // length-prefixed form so the frame is self-delimiting on a byte stream.
+fn qmux01_datagram() {
+    // 0x31 = DATAGRAM | LEN; len=2, payload "hi". Datagrams are a QMux01 feature;
+    // we always emit the length-prefixed form.
     let bytes = [0x31, 0x02, b'h', b'i'];
     let frame = Frame::Datagram(Bytes::from_static(b"hi"));
-    assert_round_trip(Version::QMux00, &bytes, &frame);
+    assert_round_trip(Version::QMux01, &bytes, &frame);
 }
 
 #[test]
@@ -255,7 +255,7 @@ fn qmux_datagram_no_length_decodes() {
     // A peer may use the no-length form (0x30 + payload), where the payload runs
     // to the end of the record. We never emit it, but must decode it.
     let bytes = [0x30, b'h', b'i'];
-    let decoded = Frame::decode(Bytes::copy_from_slice(&bytes), Version::QMux00)
+    let decoded = Frame::decode(Bytes::copy_from_slice(&bytes), Version::QMux01)
         .expect("decode succeeds")
         .expect("datagram is not an ignored frame");
     match decoded {
