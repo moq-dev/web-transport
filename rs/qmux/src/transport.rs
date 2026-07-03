@@ -797,8 +797,16 @@ mod ws_transport {
 
             let message = match message {
                 Some(Ok(message)) => message,
-                // Stream ended or errored: a clean/dirty close either way.
-                Some(Err(_)) | None => {
+                // The socket errored mid-stream: forward the specific WebSocket
+                // error (matching `StreamReader`, and preserving what the old inline
+                // `recv()` surfaced via `?`) rather than flattening it to a generic
+                // close, so callers can still distinguish e.g. a protocol fault.
+                Some(Err(err)) => {
+                    let _ = tx.send(Err(err.into())).await;
+                    return;
+                }
+                // Clean end of stream.
+                None => {
                     let _ = tx.send(Err(Error::Closed)).await;
                     return;
                 }
