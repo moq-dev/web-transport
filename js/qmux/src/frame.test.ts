@@ -140,6 +140,7 @@ describe("QMux01 record framing", () => {
 				maxDatagramFrameSize: 0n,
 				// Deliberately set to 0 — exercises the encoder's "skip-if-zero" + decoder's default seeding.
 				maxRecordSize: 0n,
+				resetStreamAt: false,
 			},
 		};
 		const bytes = Frame.encode(params, "qmux-01");
@@ -166,7 +167,7 @@ describe("QMux02 (draft-02)", () => {
 		}
 	});
 
-	test("RESET_STREAM_AT (0x24) decodes as a plain reset", () => {
+	test("RESET_STREAM_AT (0x24) decodes as a reset carrying reliableSize", () => {
 		// 0x24, id=4, code=42, final_size=128 (0x40 0x80), reliable_size=64 (0x40 0x40).
 		const wire = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40]);
 		const decoded = Frame.decode(wire, "qmux-02");
@@ -174,6 +175,32 @@ describe("QMux02 (draft-02)", () => {
 		if (decoded?.type === "reset_stream") {
 			expect(decoded.id.value.value).toBe(4n);
 			expect(decoded.code.value).toBe(42n);
+			// reliableSize present marks it as RESET_STREAM_AT (vs a plain 0x04 reset,
+			// which leaves it undefined); the session uses this to gate on negotiation.
+			expect(decoded.reliableSize).toBe(64n);
+		}
+	});
+
+	test("reset_stream_at transport parameter round-trips (empty flag)", () => {
+		const on: Frame.Any = {
+			type: "transport_parameters",
+			params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, initialMaxData: 1024n, resetStreamAt: true },
+		};
+		const decoded = Frame.decodeRecord(Frame.encode(on, "qmux-02"));
+		expect(decoded.length).toBe(1);
+		if (decoded[0].type === "transport_parameters") {
+			expect(decoded[0].params.resetStreamAt).toBe(true);
+			expect(decoded[0].params.initialMaxData).toBe(1024n);
+		}
+
+		// Omitted from the wire (and decodes false) when unset.
+		const off: Frame.Any = {
+			type: "transport_parameters",
+			params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, initialMaxData: 1n },
+		};
+		const d2 = Frame.decodeRecord(Frame.encode(off, "qmux-02"));
+		if (d2[0].type === "transport_parameters") {
+			expect(d2[0].params.resetStreamAt).toBe(false);
 		}
 	});
 

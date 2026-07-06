@@ -23,6 +23,13 @@ pub struct TransportParams {
     pub max_datagram_frame_size: u64,             // ID 0x20 (RFC 9221; 0 = datagrams unsupported)
     pub max_record_size: u64,                     // ID 0x0571c59429cd0845 (default 16382)
 
+    /// Whether we advertise support for *receiving* RESET_STREAM_AT frames, via
+    /// the empty-valued `reset_stream_at` transport parameter (ID 0x1d, from
+    /// draft-ietf-quic-reliable-stream-reset). Only meaningful on QMux draft-02,
+    /// which permits the extension. A peer may send us RESET_STREAM_AT only once
+    /// we've advertised this.
+    pub reset_stream_at: bool,
+
     /// Application protocols advertised for negotiation (preference order).
     ///
     /// QMux-specific (ID 0x3d4f9c2a8b1e6075). This is the non-TLS substitute
@@ -66,6 +73,8 @@ impl TransportParams {
     const INITIAL_MAX_STREAMS_BIDI: VarInt = VarInt::from_u32(0x08);
     const INITIAL_MAX_STREAMS_UNI: VarInt = VarInt::from_u32(0x09);
     const MAX_DATAGRAM_FRAME_SIZE: VarInt = VarInt::from_u32(0x20);
+    // reset_stream_at (draft-ietf-quic-reliable-stream-reset): empty value.
+    const RESET_STREAM_AT: VarInt = VarInt::from_u32(0x1d);
 
     /// Encode transport parameters as a series of ID-length-value tuples.
     pub fn encode(&self) -> Result<Bytes, Error> {
@@ -118,6 +127,13 @@ impl TransportParams {
         )?;
         write_param(&mut buf, MAX_RECORD_SIZE_ID_VI, self.max_record_size)?;
 
+        // reset_stream_at: an empty-valued flag. Presence advertises that we
+        // accept RESET_STREAM_AT frames; absence means we don't.
+        if self.reset_stream_at {
+            Self::RESET_STREAM_AT.encode(&mut buf);
+            VarInt::from_u32(0).encode(&mut buf);
+        }
+
         // application_protocols: a list of length-prefixed UTF-8 names. Omitted
         // entirely when empty so peers that don't negotiate stay byte-identical.
         if !self.protocols.is_empty() {
@@ -160,6 +176,17 @@ impl TransportParams {
                         return Err(Error::DuplicateParam(id));
                     }
                     params.protocols = decode_protocols(&mut param_data)?;
+                }
+                0x1d => {
+                    // reset_stream_at: presence-only. A non-empty value is a
+                    // TRANSPORT_PARAMETER_ERROR per the extension spec.
+                    if !seen.insert(id) {
+                        return Err(Error::DuplicateParam(id));
+                    }
+                    if param_data.has_remaining() {
+                        return Err(Error::TransportParameter);
+                    }
+                    params.reset_stream_at = true;
                 }
                 0x01 | 0x04..=0x09 | 0x20 | MAX_RECORD_SIZE_ID => {
                     if !seen.insert(id) {
@@ -286,6 +313,38 @@ mod tests {
                 .max_datagram_frame_size,
             0
         );
+    }
+
+    #[test]
+    fn reset_stream_at_round_trips() {
+        let params = TransportParams {
+            reset_stream_at: true,
+            ..TransportParams::default()
+        };
+        assert!(
+            TransportParams::decode(params.encode().unwrap())
+                .unwrap()
+                .reset_stream_at
+        );
+        // Omitted from the wire when unset, so a peer that doesn't support the
+        // extension stays byte-identical.
+        let bytes = TransportParams::default().encode().unwrap();
+        assert!(!bytes.contains(&0x1d));
+        assert!(!TransportParams::decode(bytes).unwrap().reset_stream_at);
+    }
+
+    #[test]
+    fn reset_stream_at_non_empty_rejected() {
+        // id=0x1d, len=1, one value byte — a non-empty value is a
+        // TRANSPORT_PARAMETER_ERROR per the extension spec.
+        let mut buf = BytesMut::new();
+        VarInt::from_u32(0x1d).encode(&mut buf);
+        VarInt::from_u32(1).encode(&mut buf);
+        buf.put_u8(0x00);
+        assert!(matches!(
+            TransportParams::decode(buf.freeze()),
+            Err(Error::TransportParameter)
+        ));
     }
 
     #[test]

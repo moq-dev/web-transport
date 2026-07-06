@@ -76,6 +76,12 @@ pub struct ResetStream {
     pub code: VarInt,
     /// Total bytes sent on the stream before the reset (for flow control accounting).
     pub final_size: u64,
+    /// `Some(reliable_size)` when this was decoded from a RESET_STREAM_AT frame
+    /// (`0x24`, draft-02); `None` for a plain RESET_STREAM (`0x04`). The session
+    /// uses this to enforce that RESET_STREAM_AT is only accepted when we
+    /// advertised the `reset_stream_at` transport parameter. We never emit
+    /// RESET_STREAM_AT, so the encoder ignores this field.
+    pub reliable_size: Option<u64>,
 }
 
 /// Requests that the peer stop sending on a stream.
@@ -273,13 +279,15 @@ impl Frame {
                     id,
                     code,
                     final_size,
+                    reliable_size: None,
                 })))
             }
             // RESET_STREAM_AT (draft-02). QMux runs on a reliable, ordered
             // transport, so every STREAM frame up to `final_size` has already
             // been delivered by the time this frame arrives — the Reliable Size
             // guarantee is automatically satisfied and we treat it as a plain
-            // reset. `reliable_size > final_size` is a FRAME_ENCODING_ERROR.
+            // reset. `reliable_size > final_size` is a FRAME_ENCODING_ERROR; the
+            // session additionally rejects it unless we advertised reset_stream_at.
             RESET_STREAM_AT => {
                 let id = StreamId(VarInt::decode(data)?);
                 let code = VarInt::decode(data)?;
@@ -292,6 +300,7 @@ impl Frame {
                     id,
                     code,
                     final_size,
+                    reliable_size: Some(reliable_size),
                 })))
             }
             // STOP_SENDING
@@ -555,6 +564,7 @@ impl Frame {
                     id,
                     code,
                     final_size: 0,
+                    reliable_size: None,
                 }))
             }
             0x05 => {
@@ -631,6 +641,7 @@ impl Frame {
                     id,
                     code,
                     final_size,
+                    reliable_size: None,
                 })))
             }
             // RESET_STREAM_AT (draft-02); see the record-decoder arm for why we
@@ -647,6 +658,7 @@ impl Frame {
                     id,
                     code,
                     final_size,
+                    reliable_size: Some(reliable_size),
                 })))
             }
             // STOP_SENDING

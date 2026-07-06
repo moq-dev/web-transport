@@ -148,6 +148,10 @@ impl Config {
                 0
             },
             max_record_size: self.max_record_size,
+            // Advertise willingness to receive RESET_STREAM_AT only on draft-02,
+            // the version that permits the extension. A peer may then send it, and
+            // our receive path (gated on this same flag) accepts it.
+            reset_stream_at: self.version == Version::QMux02,
             // Only advertise protocols when negotiating in-band; TLS/WS already
             // chose one via ALPN and must not send this parameter.
             protocols: match &self.protocol {

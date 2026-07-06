@@ -70,6 +70,8 @@ function configToTransportParams(config: Required<Config>): TransportParams {
 		maxDatagramFrameSize:
 			config.maxDatagramFrameSize < config.maxRecordSize ? config.maxDatagramFrameSize : config.maxRecordSize,
 		maxRecordSize: config.maxRecordSize,
+		// Version-gated in #startSession (only advertised on qmux-02).
+		resetStreamAt: false,
 	};
 }
 
@@ -532,10 +534,14 @@ export default class Session implements WebTransport {
 
 		// Datagrams rely on the record layer for framing, so don't advertise the
 		// parameter — or accept datagrams — on any non-record wire format. The recv
-		// path gates on #ourParams.maxDatagramFrameSize.
-		if (!usesRecords(version)) {
-			this.#ourParams = { ...this.#ourParams, maxDatagramFrameSize: 0n };
-		}
+		// path gates on #ourParams.maxDatagramFrameSize. RESET_STREAM_AT is only
+		// permitted on draft-02, so advertise `reset_stream_at` there and nowhere
+		// else; the recv path gates on #ourParams.resetStreamAt.
+		this.#ourParams = {
+			...this.#ourParams,
+			maxDatagramFrameSize: usesRecords(version) ? this.#ourParams.maxDatagramFrameSize : 0n,
+			resetStreamAt: version === "qmux-02",
+		};
 
 		this.#scheduler = new SendScheduler(sink, {
 			onActivity: () => {
@@ -1031,6 +1037,14 @@ export default class Session implements WebTransport {
 	}
 
 	#handleResetStream(frame: Frame.ResetStream) {
+		// A RESET_STREAM_AT frame (reliableSize present, draft-02) is only legal if
+		// we advertised the `reset_stream_at` transport parameter. Receiving it
+		// otherwise — or on an earlier draft, which never advertises it — is a
+		// PROTOCOL_VIOLATION. Plain RESET_STREAM is always allowed.
+		if (frame.reliableSize !== undefined && !this.#ourParams.resetStreamAt) {
+			throw new Error("RESET_STREAM_AT received without advertising reset_stream_at");
+		}
+
 		const streamId = frame.id.value.value;
 		const recv = this.#recvStreams.get(streamId);
 		if (!recv) return;

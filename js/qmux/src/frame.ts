@@ -26,6 +26,11 @@ export interface ResetStream {
 	type: "reset_stream";
 	id: Stream.Id;
 	code: VarInt;
+	/** Set (to the frame's Reliable Size) when this was decoded from a
+	 * RESET_STREAM_AT frame (0x24, draft-02); absent for a plain RESET_STREAM.
+	 * The session uses its presence to enforce that RESET_STREAM_AT is only
+	 * accepted when we advertised the `reset_stream_at` transport parameter. */
+	reliableSize?: bigint;
 }
 
 export interface StopSending {
@@ -110,6 +115,10 @@ export interface TransportParams {
 	/** RFC 9221 max_datagram_frame_size (ID 0x20); 0 = datagrams unsupported. */
 	maxDatagramFrameSize: bigint;
 	maxRecordSize: bigint;
+	/** Whether we advertise support for *receiving* RESET_STREAM_AT frames, via
+	 * the empty-valued `reset_stream_at` transport parameter (ID 0x1d). Only set
+	 * on QMux draft-02. */
+	resetStreamAt: boolean;
 }
 
 /** Default max_record_size per draft-01. */
@@ -125,6 +134,7 @@ export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamsUni: 0n,
 	maxDatagramFrameSize: 0n,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+	resetStreamAt: false,
 };
 
 export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
@@ -137,6 +147,7 @@ export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamsUni: 100n,
 	maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+	resetStreamAt: false,
 };
 
 export interface Padding {
@@ -203,6 +214,9 @@ const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 // This implementation only runs over WebSocket, which negotiates the protocol
 // via its subprotocol (ALPN), so receiving this parameter is a protocol error.
 const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
+// reset_stream_at transport parameter ID (draft-ietf-quic-reliable-stream-reset):
+// empty value, presence advertises support for receiving RESET_STREAM_AT.
+const RESET_STREAM_AT_PARAM_ID = 0x1dn;
 
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
@@ -418,8 +432,8 @@ function encodeQMux(frame: Any): Uint8Array {
 
 function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
 	// Each param: id(varint) + length(varint) + value(varint)
-	// Max 9 params * 24 bytes each
-	let buffer = new Uint8Array(new ArrayBuffer(216), 0, 0);
+	// Max 9 varint params * 24 bytes each + the 2-byte reset_stream_at flag.
+	let buffer = new Uint8Array(new ArrayBuffer(256), 0, 0);
 
 	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number | bigint, value: bigint): Uint8Array<ArrayBuffer> {
 		if (value === 0n) return buf;
@@ -439,6 +453,13 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 	buffer = writeParam(buffer, 0x09, params.initialMaxStreamsUni);
 	buffer = writeParam(buffer, 0x20, params.maxDatagramFrameSize);
 	buffer = writeParam(buffer, MAX_RECORD_SIZE_ID, params.maxRecordSize);
+
+	// reset_stream_at: an empty-valued flag. Presence advertises that we accept
+	// RESET_STREAM_AT frames; absence means we don't.
+	if (params.resetStreamAt) {
+		buffer = VarInt.from(RESET_STREAM_AT_PARAM_ID).encode(buffer);
+		buffer = VarInt.from(0).encode(buffer);
+	}
 
 	return buffer;
 }
@@ -466,6 +487,16 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		// negotiates via its subprotocol, so the parameter must never appear.
 		if (id === APPLICATION_PROTOCOLS_ID) {
 			throw new Error("unexpected application_protocols parameter over WebSocket");
+		}
+
+		// reset_stream_at: presence-only. A non-empty value is a
+		// TRANSPORT_PARAMETER_ERROR per the extension spec.
+		if (id === RESET_STREAM_AT_PARAM_ID) {
+			if (paramData.byteLength !== 0) {
+				throw new Error("reset_stream_at transport parameter must be empty");
+			}
+			params.resetStreamAt = true;
+			continue;
 		}
 
 		if (paramData.byteLength < 1) {
@@ -663,7 +694,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		if (reliableSize > finalSize) {
 			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
 		}
-		return { type: "reset_stream", id, code };
+		return { type: "reset_stream", id, code, reliableSize };
 	}
 
 	// STOP_SENDING
@@ -851,7 +882,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		if (reliableSize > finalSize) {
 			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
 		}
-		return [{ type: "reset_stream", id, code }, buffer];
+		return [{ type: "reset_stream", id, code, reliableSize }, buffer];
 	}
 
 	// STOP_SENDING

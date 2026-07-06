@@ -164,6 +164,7 @@ fn webtransport_reset_stream() {
         id: sid(4),
         code: code(42),
         final_size: 0,
+        reliable_size: None,
     });
     assert_round_trip(Version::WebTransport, &bytes, &frame);
 }
@@ -226,6 +227,7 @@ fn qmux00_reset_stream() {
         id: sid(4),
         code: code(42),
         final_size: 128,
+        reliable_size: None,
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
 }

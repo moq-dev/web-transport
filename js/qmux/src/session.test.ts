@@ -99,6 +99,7 @@ function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
 		initialMaxStreamsUni: 100n,
 		maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 		maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+		resetStreamAt: false,
 		...overrides,
 	};
 }

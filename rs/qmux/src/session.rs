@@ -911,6 +911,16 @@ impl<R: Reader> SessionState<R> {
                 }
             }
             Frame::ResetStream(reset) => {
+                // A RESET_STREAM_AT frame (draft-02) is only legal if we
+                // advertised the `reset_stream_at` transport parameter — i.e. told
+                // the peer we accept the extension. Receiving it otherwise (or on
+                // an earlier draft, which never advertises it) is a
+                // PROTOCOL_VIOLATION. Plain RESET_STREAM (`reliable_size == None`)
+                // is always allowed.
+                if reset.reliable_size.is_some() && !self.our_params.reset_stream_at {
+                    return Err(Error::ProtocolViolation);
+                }
+
                 if !reset.id.can_recv(self.is_server) {
                     return Err(Error::InvalidStreamId);
                 }
@@ -1738,6 +1748,7 @@ impl SendStream {
                 id: self.id,
                 code,
                 final_size: self.offset,
+                reliable_size: None,
             };
             // Flush queued STREAM data so none trails the RESET_STREAM on the wire.
             self.outbound.remove(self.id);
@@ -1893,6 +1904,7 @@ impl generic::SendStream for SendStream {
             id: self.id,
             code,
             final_size: self.offset,
+            reliable_size: None,
         };
 
         // Flush any STREAM data still queued for this stream: it must not go out
@@ -2358,6 +2370,7 @@ mod recv_open_tests {
             id: StreamId::new(index, StreamDir::Uni, true),
             code: VarInt::from_u32(0),
             final_size: 0,
+            reliable_size: None,
         })
         .encode(Version::QMux01)
         .unwrap()
@@ -2724,6 +2737,38 @@ mod qmux02_recv_tests {
                 }
             }
         }
+    }
+
+    /// RESET_STREAM_AT is only legal once we've advertised `reset_stream_at`. A
+    /// draft-01 peer never advertises it, so a RESET_STREAM_AT on a draft-01
+    /// session is a PROTOCOL_VIOLATION. (The positive path is covered by
+    /// `reset_stream_at_resets_accepted_stream`, whose draft-02 server advertises it.)
+    #[tokio::test]
+    async fn reset_stream_at_without_negotiation_rejected() {
+        let server_cfg = Config::new(Version::QMux01);
+        let (server_io, mut raw) = tokio::io::duplex(1024 * 1024);
+        let transport = ByteStream::new(server_io, Version::QMux01, server_cfg.max_record_size);
+        let accept = tokio::spawn(Session::accept(transport, server_cfg));
+
+        let params = Frame::TransportParameters(Config::new(Version::QMux01).to_transport_params())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(&params)).await.unwrap();
+        raw.flush().await.unwrap();
+        let server = accept.await.unwrap().unwrap();
+
+        // Hand-built RESET_STREAM_AT (0x24) on a client uni stream.
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let mut reset_at = bytes::BytesMut::new();
+        reset_at.put_u8(0x24);
+        id.0.encode(&mut reset_at);
+        VarInt::from_u32(0).encode(&mut reset_at); // code
+        VarInt::from_u32(0).encode(&mut reset_at); // final_size
+        VarInt::from_u32(0).encode(&mut reset_at); // reliable_size
+        raw.write_all(&record(&reset_at)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::ProtocolViolation));
     }
 }
 
