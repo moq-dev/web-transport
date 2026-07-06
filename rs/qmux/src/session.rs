@@ -2640,6 +2640,18 @@ mod qmux02_recv_tests {
         ));
     }
 
+    /// A second QX_TRANSPORT_PARAMETERS frame after establishment is a
+    /// PROTOCOL_VIOLATION (the "exactly once" half of the first-frame rule).
+    #[tokio::test]
+    async fn duplicate_transport_parameters_rejected() {
+        let (server, mut raw) = established_peer().await;
+
+        raw.write_all(&record(&qmux02_params())).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::ProtocolViolation));
+    }
+
     /// A `max_record_size` below the default minimum is a TRANSPORT_PARAMETER_ERROR.
     #[tokio::test]
     async fn max_record_size_below_default_rejected() {

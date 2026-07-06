@@ -181,6 +181,29 @@ describe("QMux02 (draft-02)", () => {
 		}
 	});
 
+	test("a duplicate transport parameter is rejected", () => {
+		// QX_TRANSPORT_PARAMETERS carrying initial_max_data (0x04) twice — a
+		// protocol error, matching the Rust decoder's DuplicateParam.
+		const bytes = new Uint8Array([
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a, // frame type
+			0x06, // payload length
+			0x04,
+			0x01,
+			0x01, // id=0x04, len=1, value=1
+			0x04,
+			0x01,
+			0x01, // duplicate
+		]);
+		expect(() => Frame.decode(bytes, "qmux-02")).toThrow();
+	});
+
 	test("reset_stream_at transport parameter round-trips (empty flag)", () => {
 		const on: Frame.Any = {
 			type: "transport_parameters",

@@ -754,7 +754,10 @@ export default class Session implements WebTransport {
 		// of the timeout. Any frame counts as activity, so this only fires when truly idle.
 		if (now - this.#lastSendAt > timeoutMs / 3) {
 			const seq = this.#nextPingSeq;
-			this.#nextPingSeq = (this.#nextPingSeq + 1) >>> 0;
+			// Monotonic (never wraps within a session's life): the draft-02
+			// strictly-increasing rule requires it, and it must not wrap earlier
+			// than the Rust peer's u64 counter or a valid ping would be rejected.
+			this.#nextPingSeq += 1;
 			try {
 				this.#sendPriorityFrame({ type: "ping_request", sequence: BigInt(seq) });
 			} catch (e) {

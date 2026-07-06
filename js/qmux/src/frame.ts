@@ -218,6 +218,23 @@ const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
 // empty value, presence advertises support for receiving RESET_STREAM_AT.
 const RESET_STREAM_AT_PARAM_ID = 0x1dn;
 
+// The transport-parameter IDs we recognize. A repeat of any of these is a
+// protocol error (matching the Rust decoder's DuplicateParam); unknown IDs are
+// skipped and may repeat, per RFC 9000.
+const RECOGNIZED_PARAM_IDS = new Set<bigint>([
+	0x01n,
+	0x04n,
+	0x05n,
+	0x06n,
+	0x07n,
+	0x08n,
+	0x09n,
+	0x20n,
+	MAX_RECORD_SIZE_ID,
+	APPLICATION_PROTOCOLS_ID,
+	RESET_STREAM_AT_PARAM_ID,
+]);
+
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
 		case "stream": {
@@ -466,6 +483,7 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 
 function decodeTransportParams(buffer: Uint8Array): TransportParams {
 	const params = { ...DEFAULT_TRANSPORT_PARAMS };
+	const seen = new Set<bigint>();
 	let v: VarInt;
 
 	while (buffer.byteLength > 0) {
@@ -481,6 +499,15 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 
 		const paramData = buffer.slice(0, len);
 		buffer = buffer.slice(len);
+
+		// A repeated recognized parameter is a protocol error (mirrors Rust's
+		// DuplicateParam). Unknown IDs fall through and may repeat.
+		if (RECOGNIZED_PARAM_IDS.has(id)) {
+			if (seen.has(id)) {
+				throw new Error(`duplicate transport parameter 0x${id.toString(16)}`);
+			}
+			seen.add(id);
+		}
 
 		// In-band ALPN negotiation is only valid on transports without their own
 		// (TCP, Unix sockets). This implementation only runs over WebSocket, which
