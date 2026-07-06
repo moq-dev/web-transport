@@ -5,6 +5,11 @@ use crate::{Error, StreamId, TransportParams, Version};
 
 // QMux frame type IDs (QUIC v1 compatible)
 const RESET_STREAM: VarInt = VarInt::from_u32(0x04);
+// RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset), permitted by QMux
+// draft-02. Decode-only: we accept and validate it, then treat it as a plain
+// reset (see the decode arms for why the reliable-delivery guarantee is
+// automatically satisfied on a reliable, ordered transport).
+const RESET_STREAM_AT: u64 = 0x24;
 const STOP_SENDING: VarInt = VarInt::from_u32(0x05);
 const STREAM_BASE: u32 = 0x08;
 const MAX_DATA: VarInt = VarInt::from_u32(0x10);
@@ -178,9 +183,10 @@ impl Frame {
     /// the transport layer is responsible for delimiting records (size
     /// varint on TCP/TLS; implicit on WebSocket message boundaries).
     pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
-        // Reject QMux01-only frames for older versions so a misrouted call
-        // can't accidentally emit draft-01 wire bytes on a draft-00 session.
-        if version != Version::QMux01 {
+        // Reject record-layer frames (PADDING, QX_PING, DATAGRAM) for versions
+        // that don't use records, so a misrouted call can't accidentally emit
+        // draft-01+ wire bytes on a draft-00 / webtransport session.
+        if !version.uses_records() {
             match self {
                 Frame::Padding | Frame::Ping(_) | Frame::Datagram(_) => {
                     return Err(Error::InvalidFrameType(0))
@@ -193,7 +199,7 @@ impl Frame {
 
         match version {
             Version::WebTransport => self.encode_wt(&mut buf)?,
-            Version::QMux00 | Version::QMux01 => self.encode_qmux(&mut buf)?,
+            Version::QMux00 | Version::QMux01 | Version::QMux02 => self.encode_qmux(&mut buf)?,
         }
 
         Ok(buf.freeze())
@@ -263,6 +269,25 @@ impl Frame {
                 let id = StreamId(VarInt::decode(data)?);
                 let code = VarInt::decode(data)?;
                 let final_size = VarInt::decode(data)?.into_inner();
+                Ok(Some(Frame::ResetStream(ResetStream {
+                    id,
+                    code,
+                    final_size,
+                })))
+            }
+            // RESET_STREAM_AT (draft-02). QMux runs on a reliable, ordered
+            // transport, so every STREAM frame up to `final_size` has already
+            // been delivered by the time this frame arrives — the Reliable Size
+            // guarantee is automatically satisfied and we treat it as a plain
+            // reset. `reliable_size > final_size` is a FRAME_ENCODING_ERROR.
+            RESET_STREAM_AT => {
+                let id = StreamId(VarInt::decode(data)?);
+                let code = VarInt::decode(data)?;
+                let final_size = VarInt::decode(data)?.into_inner();
+                let reliable_size = VarInt::decode(data)?.into_inner();
+                if reliable_size > final_size {
+                    return Err(Error::FrameEncoding);
+                }
                 Ok(Some(Frame::ResetStream(ResetStream {
                     id,
                     code,
@@ -514,7 +539,7 @@ impl Frame {
 
         match version {
             Version::WebTransport => Self::decode_wt(data).map(Some),
-            Version::QMux00 | Version::QMux01 => Self::decode_qmux(data),
+            Version::QMux00 | Version::QMux01 | Version::QMux02 => Self::decode_qmux(data),
         }
     }
 
@@ -602,6 +627,22 @@ impl Frame {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 let code = VarInt::decode(&mut data)?;
                 let final_size = VarInt::decode(&mut data)?.into_inner();
+                Ok(Some(Frame::ResetStream(ResetStream {
+                    id,
+                    code,
+                    final_size,
+                })))
+            }
+            // RESET_STREAM_AT (draft-02); see the record-decoder arm for why we
+            // treat it as a plain reset.
+            RESET_STREAM_AT => {
+                let id = StreamId(VarInt::decode(&mut data)?);
+                let code = VarInt::decode(&mut data)?;
+                let final_size = VarInt::decode(&mut data)?.into_inner();
+                let reliable_size = VarInt::decode(&mut data)?.into_inner();
+                if reliable_size > final_size {
+                    return Err(Error::FrameEncoding);
+                }
                 Ok(Some(Frame::ResetStream(ResetStream {
                     id,
                     code,

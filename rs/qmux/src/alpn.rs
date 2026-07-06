@@ -5,10 +5,10 @@
 //! is emitted once per version, in order. An empty `versions` slice means
 //! "every QMux draft this crate knows about" (see [`QMUX_VERSIONS`]).
 //!
-//! Bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`, no app protocol
-//! attached) are advertised/accepted by default, so a peer that only knows a
-//! wire-format version can still connect. Set the `require_protocol` flag to
-//! suppress them and advertise/accept only the configured prefixed pairs.
+//! Bare version ALPNs (`qmux-02`, `qmux-01`, `qmux-00`, `webtransport`, no app
+//! protocol attached) are advertised/accepted by default, so a peer that only
+//! knows a wire-format version can still connect. Set the `require_protocol`
+//! flag to suppress them and advertise/accept only the configured prefixed pairs.
 //!
 //! [`parse`] recovers `(Version, Option<String>)` from a negotiated wire-format
 //! ALPN. Only the QMux drafts appear in `{prefix}{alpn}` form; the legacy
@@ -18,12 +18,16 @@
 use crate::Version;
 
 /// QMux versions that can ride under a `{prefix}{alpn}` pair, newest first.
-pub(crate) const QMUX_VERSIONS: &[Version] = &[Version::QMux01, Version::QMux00];
+pub(crate) const QMUX_VERSIONS: &[Version] = &[Version::QMux02, Version::QMux01, Version::QMux00];
 
 /// Bare version ALPNs added (offered by clients, accepted by servers) unless
 /// the caller opts out via `require_protocol`. Newest first.
-pub(crate) const BARE_ALPNS: &[Version] =
-    &[Version::QMux01, Version::QMux00, Version::WebTransport];
+pub(crate) const BARE_ALPNS: &[Version] = &[
+    Version::QMux02,
+    Version::QMux01,
+    Version::QMux00,
+    Version::WebTransport,
+];
 
 /// Resolve an entry's `versions` slice: empty falls back to every supported
 /// QMux draft, mirroring JS's `null` value.
@@ -38,9 +42,9 @@ pub(crate) fn expand_versions(versions: &[Version]) -> &[Version] {
 /// Build the ALPN list from `(alpn, versions)` entries.
 ///
 /// Each entry emits `{v.prefix()}{alpn}` per version in `expand_versions(versions)`.
-/// Unless `require_protocol` is set, the bare version ALPNs (`qmux-01`,
-/// `qmux-00`, `webtransport`) are appended after the prefixed pairs as a
-/// fallback for peers that don't want to commit to an app protocol.
+/// Unless `require_protocol` is set, the bare version ALPNs (`qmux-02`,
+/// `qmux-01`, `qmux-00`, `webtransport`) are appended after the prefixed pairs
+/// as a fallback for peers that don't want to commit to an app protocol.
 ///
 /// Suitable for TLS ALPN or WebSocket `Sec-WebSocket-Protocol`.
 ///
@@ -107,7 +111,13 @@ mod tests {
         let out = build([("moq-lite-04", &[Version::QMux01][..])], false);
         assert_eq!(
             out,
-            vec!["qmux-01.moq-lite-04", "qmux-01", "qmux-00", "webtransport"]
+            vec![
+                "qmux-01.moq-lite-04",
+                "qmux-02",
+                "qmux-01",
+                "qmux-00",
+                "webtransport"
+            ]
         );
     }
 
@@ -126,7 +136,14 @@ mod tests {
     #[test]
     fn build_expands_empty_versions_to_all_qmux_drafts() {
         let out = build([("moq-lite-04", &[][..])], true);
-        assert_eq!(out, vec!["qmux-01.moq-lite-04", "qmux-00.moq-lite-04"]);
+        assert_eq!(
+            out,
+            vec![
+                "qmux-02.moq-lite-04",
+                "qmux-01.moq-lite-04",
+                "qmux-00.moq-lite-04"
+            ]
+        );
     }
 
     #[test]
@@ -142,7 +159,7 @@ mod tests {
     fn build_empty_by_default_emits_only_bare_alpns() {
         let entries: [(&str, &[Version]); 0] = [];
         let out = build(entries, false);
-        assert_eq!(out, vec!["qmux-01", "qmux-00", "webtransport"]);
+        assert_eq!(out, vec!["qmux-02", "qmux-01", "qmux-00", "webtransport"]);
     }
 
     #[test]
@@ -155,6 +172,10 @@ mod tests {
     #[test]
     fn parse_recognises_prefixed_pairs() {
         assert_eq!(
+            parse(Some("qmux-02.moq-lite-04")),
+            (Version::QMux02, Some("moq-lite-04".to_string()))
+        );
+        assert_eq!(
             parse(Some("qmux-01.moq-lite-04")),
             (Version::QMux01, Some("moq-lite-04".to_string()))
         );
@@ -166,6 +187,7 @@ mod tests {
 
     #[test]
     fn parse_recognises_bare_versions() {
+        assert_eq!(parse(Some("qmux-02")), (Version::QMux02, None));
         assert_eq!(parse(Some("qmux-01")), (Version::QMux01, None));
         assert_eq!(parse(Some("qmux-00")), (Version::QMux00, None));
         assert_eq!(parse(Some("webtransport")), (Version::WebTransport, None));

@@ -155,9 +155,10 @@ mod stream_transport {
 
     impl<T: AsyncWrite + Send + 'static> Writer for StreamWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
-            // QMux01 frames travel inside size-prefixed records on byte streams.
-            // (Records are implicit on WebSocket, where the message boundary delimits them.)
-            if self.version == Version::QMux01 {
+            // Record-framed drafts (QMux01+) travel inside size-prefixed records
+            // on byte streams. (Records are implicit on WebSocket, where the
+            // message boundary delimits them.)
+            if self.version.uses_records() {
                 let mut size_buf = BytesMut::with_capacity(8);
                 VarInt::try_from(data.len())?.encode(&mut size_buf);
                 self.writer.write_all(&size_buf).await?;
@@ -193,7 +194,9 @@ mod stream_transport {
     ) {
         loop {
             let result = match version {
-                Version::QMux01 => recv_record(&mut reader, our_max_record_size).await,
+                Version::QMux01 | Version::QMux02 => {
+                    recv_record(&mut reader, our_max_record_size).await
+                }
                 Version::QMux00 | Version::WebTransport => recv_qmux00_frame(&mut reader).await,
             };
             let stop = result.is_err();

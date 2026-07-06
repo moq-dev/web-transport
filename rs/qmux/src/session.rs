@@ -258,6 +258,13 @@ struct SessionState<R: Reader> {
     // parameters arrive.
     record_limit: Arc<AtomicU64>,
     idle_timeout_ms: Arc<AtomicU64>,
+
+    // Draft-02 QX_PING sequence validation. `last_ping_recv` is the highest
+    // sequence seen in a received QX_PING *request*, so we can enforce that they
+    // strictly increase. `pings_sent` (shared with the timer) is how many
+    // requests we've sent, bounding the sequence a received *response* may echo.
+    last_ping_recv: Option<u64>,
+    pings_sent: Arc<AtomicU64>,
 }
 
 /// Pick the next outbound frame in strict priority order: control (lossless,
@@ -478,7 +485,7 @@ impl<W: Writer> WriterState<W> {
         }
 
         let bytes = frame.encode(self.version)?;
-        if self.version == Version::QMux01 {
+        if self.version.uses_records() {
             // `record_limit` holds the draft-01 default until the peer's params
             // arrive, then the peer's `max_record_size`.
             let limit = self.record_limit.load(Ordering::Acquire);
@@ -504,7 +511,8 @@ impl<W: Writer> WriterState<W> {
     }
 }
 
-/// Timer task: the sole owner of the QMux01 idle timeout and keep-alive ping.
+/// Timer task: the sole owner of the record-framed-draft idle timeout and
+/// keep-alive ping (QMux01+).
 ///
 /// Runs on its own task, decoupled from where the reader and writer are parked, so
 /// neither transport backpressure (writer wedged in `send`) nor application
@@ -519,8 +527,8 @@ impl<W: Writer> WriterState<W> {
 ///    backpressured — that's evidence the peer is alive and we simply can't get a
 ///    keep-alive through (or aren't reading its replies).
 ///
-/// Only meaningful for QMux01 — the sole version that negotiates an idle timeout —
-/// so it isn't spawned otherwise.
+/// Only meaningful for the record-framed drafts (QMux01+) — the versions that
+/// negotiate an idle timeout — so it isn't spawned otherwise.
 struct TimerState {
     // Origin shared with the reader/writer for interpreting the millis timestamps.
     base: tokio::time::Instant,
@@ -535,6 +543,11 @@ struct TimerState {
     closed: watch::Sender<Option<Error>>,
     // Gates arming: the idle timeout only applies once params are exchanged.
     established: watch::Receiver<bool>,
+
+    // Count of QX_PING requests we've enqueued (i.e. sequences 0..pings_sent).
+    // Published for the reader task, which rejects (draft-02) a QX_PING response
+    // echoing a sequence we never sent.
+    pings_sent: Arc<AtomicU64>,
 }
 
 impl TimerState {
@@ -607,6 +620,9 @@ impl TimerState {
                         response: false,
                     });
                     next_ping_seq = next_ping_seq.wrapping_add(1);
+                    // Publish before the enqueue is observable so the reader never
+                    // sees a response to a ping it hasn't been told about.
+                    self.pings_sent.store(next_ping_seq, Ordering::Release);
                     if self.control.send(ping).is_err() {
                         return; // writer gone
                     }
@@ -665,8 +681,8 @@ impl<R: Reader> SessionState<R> {
                         millis_since(self.base, tokio::time::Instant::now()),
                         Ordering::Release,
                     );
-                    if self.config.version == Version::QMux01 {
-                        // QMux01: data is a record containing one or more frames
+                    if self.config.version.uses_records() {
+                        // Record-framed drafts: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
                             self.recv_frame(frame).await?;
                         }
@@ -690,6 +706,17 @@ impl<R: Reader> SessionState<R> {
     }
 
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
+        // Draft-02: QX_TRANSPORT_PARAMETERS MUST be the first frame, and only the
+        // first. A non-params frame before params, or a second params frame, is a
+        // PROTOCOL_VIOLATION. (`decode_record` drops leading PADDING before we get
+        // here, so it never trips this.)
+        if self.config.version == Version::QMux02 {
+            let is_params = matches!(frame, Frame::TransportParameters(_));
+            if is_params == self.params_received {
+                return Err(Error::ProtocolViolation);
+            }
+        }
+
         match frame {
             Frame::TransportParameters(params) => {
                 self.recv_transport_parameters(params)?;
@@ -966,8 +993,27 @@ impl<R: Reader> SessionState<R> {
             | Frame::StreamsBlockedUni(_) => {}
             // PADDING is a no-op
             Frame::Padding => {}
-            // QX_PING: respond to requests, ignore responses
+            // QX_PING: respond to requests, ignore responses.
             Frame::Ping(ping) => {
+                // Draft-02 tightens the sequence-number rules.
+                if self.config.version == Version::QMux02 {
+                    if ping.response {
+                        // A response must echo a sequence we actually sent — i.e.
+                        // one of 0..pings_sent. Anything else is a violation.
+                        if ping.sequence >= self.pings_sent.load(Ordering::Acquire) {
+                            return Err(Error::ProtocolViolation);
+                        }
+                    } else {
+                        // Request sequence numbers must strictly increase.
+                        if self
+                            .last_ping_recv
+                            .is_some_and(|prev| ping.sequence <= prev)
+                        {
+                            return Err(Error::ProtocolViolation);
+                        }
+                        self.last_ping_recv = Some(ping.sequence);
+                    }
+                }
                 if !ping.response {
                     let response = Frame::Ping(crate::Ping {
                         sequence: ping.sequence,
@@ -1002,10 +1048,20 @@ impl<R: Reader> SessionState<R> {
 
     fn recv_transport_parameters(&mut self, params: TransportParams) -> Result<(), Error> {
         if self.params_received {
-            // Duplicate transport parameters
+            // Duplicate transport parameters. (Draft-02 additionally forbids this
+            // as a PROTOCOL_VIOLATION before we get here — see `recv_frame`.)
             return Err(Error::FlowControlError);
         }
         self.params_received = true;
+
+        // Draft-02: a peer that advertises `max_record_size` MUST NOT go below the
+        // default minimum. Values omit to the default (decode seeds it), so only an
+        // explicit smaller value trips this. Earlier drafts didn't enforce it.
+        if self.config.version == Version::QMux02
+            && params.max_record_size < crate::proto::DEFAULT_MAX_RECORD_SIZE
+        {
+            return Err(Error::TransportParameter);
+        }
 
         // Resolve / validate the application protocol now the peer's offer is known.
         match &self.config.protocol {
@@ -1072,7 +1128,7 @@ impl<R: Reader> SessionState<R> {
         // the outbound record-size limit (QMux01 only) and the effective idle
         // timeout for its keep-alive ping. `record_limit` was seeded with the
         // draft-01 default; raise it to the peer's advertised size.
-        let idle_ms = if self.config.version == Version::QMux01 {
+        let idle_ms = if self.config.version.uses_records() {
             self.record_limit
                 .store(params.max_record_size, Ordering::Release);
             negotiated_idle_timeout_ms(self.our_params.max_idle_timeout, params.max_idle_timeout)
@@ -1081,13 +1137,13 @@ impl<R: Reader> SessionState<R> {
         };
         self.idle_timeout_ms.store(idle_ms, Ordering::Release);
 
-        // Resolve the datagram send limit. Datagrams are a QMux01-only feature
-        // (they rely on the record layer for framing), so they stay disabled on
-        // any other wire format. Otherwise whether we may *send* depends solely on
-        // the peer's willingness to receive (RFC 9221): 0 means the peer omitted
-        // (or zeroed) max_datagram_frame_size.
+        // Resolve the datagram send limit. Datagrams are a record-framed-draft
+        // feature (they rely on the record layer for framing), so they stay
+        // disabled on any other wire format. Otherwise whether we may *send*
+        // depends solely on the peer's willingness to receive (RFC 9221): 0 means
+        // the peer omitted (or zeroed) max_datagram_frame_size.
         let datagram_max =
-            if self.config.version != Version::QMux01 || params.max_datagram_frame_size == 0 {
+            if !self.config.version.uses_records() || params.max_datagram_frame_size == 0 {
                 0
             } else {
                 // A datagram must fit in one record, so the frame is capped by the
@@ -1214,6 +1270,9 @@ impl Session {
         let streams: Arc<Mutex<Streams>> = Arc::new(Mutex::new(Streams::default()));
         let record_limit = Arc::new(AtomicU64::new(crate::proto::DEFAULT_MAX_RECORD_SIZE));
         let idle_timeout_ms = Arc::new(AtomicU64::new(0));
+        // Count of keep-alive pings the timer has sent; the reader consults it to
+        // validate draft-02 QX_PING responses. Shared between the two tasks.
+        let pings_sent = Arc::new(AtomicU64::new(0));
 
         // Last-activity clocks for the timer task. `base` is the shared origin; the
         // reader/writer publish their progress as millis since it (see
@@ -1327,12 +1386,15 @@ impl Session {
             datagram_max_size: datagram_max_size.clone(),
             record_limit: record_limit.clone(),
             idle_timeout_ms: idle_timeout_ms.clone(),
+            last_ping_recv: None,
+            pings_sent: pings_sent.clone(),
         };
 
-        // Timer task: owns the QMux01 idle timeout + keep-alive ping, reading the
-        // last-activity clocks the reader/writer publish. Only QMux01 negotiates an
-        // idle timeout, so there's nothing for it to do on other wire formats.
-        if version == Version::QMux01 {
+        // Timer task: owns the record-framed-draft idle timeout + keep-alive ping,
+        // reading the last-activity clocks the reader/writer publish. Only the
+        // record-framed drafts (QMux01+) negotiate an idle timeout, so there's
+        // nothing for it to do on other wire formats.
+        if version.uses_records() {
             let timer = TimerState {
                 base,
                 last_recv_at: last_recv_at.clone(),
@@ -1343,6 +1405,7 @@ impl Session {
                 control: control_tx.clone(),
                 closed: closed.clone(),
                 established: established_rx.clone(),
+                pings_sent: pings_sent.clone(),
             };
             tokio::spawn(timer.run());
         }
@@ -2098,6 +2161,7 @@ mod timer_tests {
             control,
             closed: closed.clone(),
             established,
+            pings_sent: Arc::new(AtomicU64::new(0)),
         };
         tokio::spawn(timer.run());
 
@@ -2491,6 +2555,175 @@ mod datagram_recv_tests {
         raw.flush().await.unwrap();
 
         assert_eq!(server.recv_datagram().await.unwrap().as_ref(), &payload[..]);
+    }
+}
+
+// Draft-02 receive-side validation. Like `datagram_recv_tests`, these drive a
+// real server `Session` from a hand-crafted raw peer that injects records a
+// conforming client never would.
+#[cfg(all(test, feature = "tcp"))]
+mod qmux02_recv_tests {
+    use super::*;
+    use crate::transport::Stream as ByteStream;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use web_transport_trait::Session as _;
+
+    /// Wrap a QMux02 frame (or hand-built frame bytes) in its size-prefixed record.
+    fn record(frame: &[u8]) -> Bytes {
+        let mut buf = bytes::BytesMut::new();
+        VarInt::try_from(frame.len()).unwrap().encode(&mut buf);
+        buf.extend_from_slice(frame);
+        buf.freeze()
+    }
+
+    fn qmux02_params() -> Bytes {
+        Frame::TransportParameters(Config::new(Version::QMux02).to_transport_params())
+            .encode(Version::QMux02)
+            .unwrap()
+    }
+
+    /// Spawn a server `Session::accept` opposite a raw duplex write half, without
+    /// sending anything — the caller drives the (possibly malformed) handshake.
+    fn raw_accept(
+        server_cfg: Config,
+    ) -> (
+        tokio::task::JoinHandle<Result<Session, Error>>,
+        DuplexStream,
+    ) {
+        let (server_io, raw) = tokio::io::duplex(1024 * 1024);
+        let transport = ByteStream::new(server_io, Version::QMux02, server_cfg.max_record_size);
+        (tokio::spawn(Session::accept(transport, server_cfg)), raw)
+    }
+
+    /// Establish a real QMux02 server opposite a raw peer that sent valid params
+    /// first, returning the server plus the raw write half.
+    async fn established_peer() -> (Session, DuplexStream) {
+        let (accept, mut raw) = raw_accept(Config::new(Version::QMux02));
+        raw.write_all(&record(&qmux02_params())).await.unwrap();
+        raw.flush().await.unwrap();
+        (accept.await.unwrap().unwrap(), raw)
+    }
+
+    /// A first frame that isn't QX_TRANSPORT_PARAMETERS is a PROTOCOL_VIOLATION,
+    /// so the handshake never establishes.
+    #[tokio::test]
+    async fn transport_parameters_must_be_first() {
+        let (accept, mut raw) = raw_accept(Config::new(Version::QMux02));
+
+        // A STREAM frame ahead of any params.
+        let stream = Frame::Stream(Stream {
+            id: StreamId::new(0, StreamDir::Uni, false),
+            data: Bytes::from_static(b"hi"),
+            fin: false,
+        })
+        .encode(Version::QMux02)
+        .unwrap();
+        raw.write_all(&record(&stream)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(
+            accept.await.unwrap(),
+            Err(Error::ProtocolViolation)
+        ));
+    }
+
+    /// A `max_record_size` below the default minimum is a TRANSPORT_PARAMETER_ERROR.
+    #[tokio::test]
+    async fn max_record_size_below_default_rejected() {
+        let (accept, mut raw) = raw_accept(Config::new(Version::QMux02));
+
+        let mut params = Config::new(Version::QMux02).to_transport_params();
+        params.max_record_size = 100; // below DEFAULT_MAX_RECORD_SIZE (16382)
+        let frame = Frame::TransportParameters(params)
+            .encode(Version::QMux02)
+            .unwrap();
+        raw.write_all(&record(&frame)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(
+            accept.await.unwrap(),
+            Err(Error::TransportParameter)
+        ));
+    }
+
+    /// A QX_PING response echoing a sequence we never sent is a PROTOCOL_VIOLATION.
+    #[tokio::test]
+    async fn ping_response_for_unsent_sequence_closes() {
+        let (server, mut raw) = established_peer().await;
+
+        let ping = Frame::Ping(crate::Ping {
+            sequence: 5,
+            response: true,
+        })
+        .encode(Version::QMux02)
+        .unwrap();
+        raw.write_all(&record(&ping)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::ProtocolViolation));
+    }
+
+    /// QX_PING request sequence numbers must strictly increase.
+    #[tokio::test]
+    async fn ping_request_not_increasing_closes() {
+        let (server, mut raw) = established_peer().await;
+
+        for _ in 0..2 {
+            let ping = Frame::Ping(crate::Ping {
+                sequence: 5, // same value twice → not strictly increasing
+                response: false,
+            })
+            .encode(Version::QMux02)
+            .unwrap();
+            raw.write_all(&record(&ping)).await.unwrap();
+        }
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::ProtocolViolation));
+    }
+
+    /// A RESET_STREAM_AT frame (draft-02, hand-built — we never emit it) is
+    /// delivered to the accepted stream as a reset, after its data.
+    #[tokio::test]
+    async fn reset_stream_at_resets_accepted_stream() {
+        use web_transport_trait::RecvStream as _;
+
+        let (server, mut raw) = established_peer().await;
+
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let stream = Frame::Stream(Stream {
+            id,
+            data: Bytes::from_static(b"hi"),
+            fin: false,
+        })
+        .encode(Version::QMux02)
+        .unwrap();
+        raw.write_all(&record(&stream)).await.unwrap();
+
+        // Hand-build RESET_STREAM_AT (0x24): id, code=0, final_size=2, reliable_size=0.
+        let mut reset_at = bytes::BytesMut::new();
+        reset_at.put_u8(0x24);
+        id.0.encode(&mut reset_at);
+        VarInt::from_u32(0).encode(&mut reset_at); // code
+        VarInt::from_u32(2).encode(&mut reset_at); // final_size = len("hi")
+        VarInt::from_u32(0).encode(&mut reset_at); // reliable_size
+        raw.write_all(&record(&reset_at)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        // The reset is delivered like a plain RESET_STREAM. Data and reset race on
+        // the two inbound channels, so read until the stream ends: any bytes must
+        // be "hi" and it must terminate with a reset, never a clean FIN.
+        let mut recv = server.accept_uni().await.unwrap();
+        loop {
+            match recv.read_chunk(64).await {
+                Ok(Some(data)) => assert_eq!(data.as_ref(), b"hi"),
+                Ok(None) => panic!("stream finished cleanly instead of resetting"),
+                Err(err) => {
+                    assert!(matches!(err, Error::StreamReset(_)), "got {err:?}");
+                    break;
+                }
+            }
+        }
     }
 }
 

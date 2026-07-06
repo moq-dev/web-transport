@@ -317,6 +317,92 @@ fn record_datagram_then_stream_decodes_both() {
     }
 }
 
+// --------------------------------------------------------------------------
+// QMux draft-02: RESET_STREAM_AT + wire compatibility with draft-01
+// --------------------------------------------------------------------------
+
+#[test]
+fn qmux02_reset_stream_at_decodes_as_reset() {
+    // 0x24 RESET_STREAM_AT: id=4, code=42, final_size=128 (0x40 0x80),
+    // reliable_size=64 (0x40 0x40). QMux runs on a reliable, ordered transport, so
+    // this decodes to a plain reset carrying final_size; reliable_size is validated
+    // (<= final_size) and dropped.
+    let bytes = [0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40];
+    let decoded = Frame::decode(Bytes::copy_from_slice(&bytes), Version::QMux02)
+        .expect("decode succeeds")
+        .expect("reset_stream_at is not an ignored frame");
+    match decoded {
+        Frame::ResetStream(r) => {
+            assert_eq!(r.id.0.into_inner(), 4, "reset id");
+            assert_eq!(r.code.into_inner(), 42, "reset code");
+            assert_eq!(r.final_size, 128, "reset final_size");
+        }
+        other => panic!("expected reset_stream, got {other:?}"),
+    }
+}
+
+#[test]
+fn qmux02_reset_stream_at_reliable_over_final_rejected() {
+    // reliable_size (200 = 0x40 0xc8) > final_size (128 = 0x40 0x80) is a
+    // FRAME_ENCODING_ERROR per draft-ietf-quic-reliable-stream-reset.
+    let bytes = [0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0xc8];
+    let err = Frame::decode(Bytes::copy_from_slice(&bytes), Version::QMux02)
+        .expect_err("reliable_size > final_size must be rejected");
+    assert!(matches!(err, Error::FrameEncoding), "got {err:?}");
+}
+
+#[test]
+fn qmux02_reset_stream_at_in_record() {
+    // The same frame decodes through the record path (draft-01+ framing), stopping
+    // at its own boundary so a following frame in the record still decodes.
+    let reset_at = [0x24u8, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40];
+    let stream = Frame::Stream(Stream {
+        id: sid(8),
+        data: Bytes::from_static(b"bye"),
+        fin: false,
+    })
+    .encode(Version::QMux02)
+    .unwrap();
+
+    let mut record = reset_at.to_vec();
+    record.extend_from_slice(&stream);
+
+    let frames = Frame::decode_record(Bytes::from(record)).expect("record decodes");
+    assert_eq!(frames.len(), 2, "both frames decode");
+    match &frames[0] {
+        Frame::ResetStream(r) => assert_eq!(r.final_size, 128),
+        other => panic!("expected reset_stream, got {other:?}"),
+    }
+    match &frames[1] {
+        Frame::Stream(s) => assert_eq!(s.data.as_ref(), b"bye"),
+        other => panic!("expected stream, got {other:?}"),
+    }
+}
+
+#[test]
+fn qmux02_wire_matches_qmux01() {
+    // Draft-02 shares the draft-01 record wire format: the same frames must encode
+    // byte-for-byte identically under both versions.
+    let frames: Vec<Frame> = vec![
+        Frame::Stream(Stream {
+            id: sid(4),
+            data: Bytes::from_static(b"hi"),
+            fin: true,
+        }),
+        Frame::MaxData(1024),
+        Frame::Datagram(Bytes::from_static(b"hi").into()),
+    ];
+    for frame in &frames {
+        let a = frame.encode(Version::QMux01).unwrap();
+        let b = frame.encode(Version::QMux02).unwrap();
+        assert_eq!(
+            a.as_ref(),
+            b.as_ref(),
+            "qmux-02 must match qmux-01 for {frame:?}"
+        );
+    }
+}
+
 #[test]
 fn qmux00_application_close() {
     // 0x1d (APPLICATION_CLOSE) + code(=42) + frame_type(=0) + reason_len(=3) + "bye".

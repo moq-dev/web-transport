@@ -7,7 +7,7 @@ import { VarInt } from "./varint.ts";
  * `index.ts`) only includes the QMux drafts; `"webtransport"` is the
  * legacy fallback wire format and isn't a valid value for any public option.
  */
-export type WireFormat = "webtransport" | "qmux-00" | "qmux-01";
+export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
 
 /** Maximum size of a single QMux frame on the wire. */
 export const MAX_FRAME_SIZE = 16384;
@@ -181,12 +181,22 @@ export function encode(frame: Any, version: WireFormat = "webtransport"): Uint8A
 
 /** Returns true if the version uses QMux framing (draft-00 or later). */
 export function isQmux(version: WireFormat): boolean {
-	return version === "qmux-00" || version === "qmux-01";
+	return version === "qmux-00" || version === "qmux-01" || version === "qmux-02";
+}
+
+/** Returns true if the version uses the QMux Record framing layer and the
+ * features introduced alongside it (QX_PING keep-alive, PADDING, datagrams,
+ * max_record_size) — draft-01 and later. */
+export function usesRecords(version: WireFormat): boolean {
+	return version === "qmux-01" || version === "qmux-02";
 }
 
 // QX_PING frame type constants (draft-01)
 const QX_PING_REQUEST = 0x348c67529ef8c7bdn;
 const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
+// RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset), permitted by QMux
+// draft-02. Decode-only: accepted, validated, and treated as a plain reset.
+const RESET_STREAM_AT = 0x24n;
 // max_record_size transport parameter ID
 const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 // application_protocols transport parameter ID (QMux-specific, non-TLS ALPN).
@@ -638,6 +648,24 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "reset_stream", id, code };
 	}
 
+	// RESET_STREAM_AT (draft-02). On a reliable, ordered transport all stream data
+	// up to final_size has already arrived, so we treat it as a plain reset;
+	// reliable_size > final_size is a FRAME_ENCODING_ERROR.
+	if (frameType === RESET_STREAM_AT) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
+		[v, buffer] = VarInt.decode(buffer);
+		const reliableSize = v.value;
+		if (reliableSize > finalSize) {
+			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
+		}
+		return { type: "reset_stream", id, code };
+	}
+
 	// STOP_SENDING
 	if (frameType === 0x05n) {
 		[v, buffer] = VarInt.decode(buffer);
@@ -807,6 +835,22 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 		[v, buffer] = VarInt.decode(buffer); // final_size
+		return [{ type: "reset_stream", id, code }, buffer];
+	}
+
+	// RESET_STREAM_AT (draft-02); see the single-frame decoder for the semantics.
+	if (frameType === RESET_STREAM_AT) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
+		[v, buffer] = VarInt.decode(buffer);
+		const reliableSize = v.value;
+		if (reliableSize > finalSize) {
+			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
+		}
 		return [{ type: "reset_stream", id, code }, buffer];
 	}
 

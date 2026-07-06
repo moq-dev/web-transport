@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolveSubprotocols } from "./session.ts";
 
 // The bare version ALPNs the polyfill appends when `requireProtocol` is false.
-const BARE = ["qmux-01", "qmux-00", "webtransport"];
+const BARE = ["qmux-02", "qmux-01", "qmux-00", "webtransport"];
 
 describe("resolveSubprotocols", () => {
 	test("no protocols still offers the bare version ALPNs by default", () => {
@@ -31,6 +31,7 @@ describe("resolveSubprotocols", () => {
 
 	test("null version expands to every qmux draft, newest first", () => {
 		expect(resolveSubprotocols(["moq-lite-04"], { "moq-lite-04": null }, true)).toEqual([
+			"qmux-02.moq-lite-04",
 			"qmux-01.moq-lite-04",
 			"qmux-00.moq-lite-04",
 		]);

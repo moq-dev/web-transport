@@ -152,3 +152,50 @@ describe("QMux01 record framing", () => {
 		}
 	});
 });
+
+describe("QMux02 (draft-02)", () => {
+	test("qmux-02 shares the qmux-01 record wire format", () => {
+		const id = new Stream.Id(VarInt.from(4n));
+		const frames: Frame.Any[] = [
+			{ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: true },
+			{ type: "max_data", max: 1024n },
+			{ type: "datagram", data: new Uint8Array([9, 9]) },
+		];
+		for (const frame of frames) {
+			expect(Array.from(Frame.encode(frame, "qmux-02"))).toEqual(Array.from(Frame.encode(frame, "qmux-01")));
+		}
+	});
+
+	test("RESET_STREAM_AT (0x24) decodes as a plain reset", () => {
+		// 0x24, id=4, code=42, final_size=128 (0x40 0x80), reliable_size=64 (0x40 0x40).
+		const wire = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40]);
+		const decoded = Frame.decode(wire, "qmux-02");
+		expect(decoded?.type).toBe("reset_stream");
+		if (decoded?.type === "reset_stream") {
+			expect(decoded.id.value.value).toBe(4n);
+			expect(decoded.code.value).toBe(42n);
+		}
+	});
+
+	test("RESET_STREAM_AT with reliable_size > final_size is rejected", () => {
+		// reliable_size=200 (0x40 0xc8) > final_size=128 (0x40 0x80).
+		const wire = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0xc8]);
+		expect(() => Frame.decode(wire, "qmux-02")).toThrow();
+	});
+
+	test("RESET_STREAM_AT stops at its boundary inside a record", () => {
+		const resetAt = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40]);
+		const stream = Frame.encode(
+			{ type: "stream", id: new Stream.Id(VarInt.from(8n)), data: new Uint8Array([1, 2]), fin: false },
+			"qmux-02",
+		);
+		const record = new Uint8Array(resetAt.byteLength + stream.byteLength);
+		record.set(resetAt, 0);
+		record.set(stream, resetAt.byteLength);
+
+		const decoded = Frame.decodeRecord(record);
+		expect(decoded.length).toBe(2);
+		expect(decoded[0].type).toBe("reset_stream");
+		expect(decoded[1].type).toBe("stream");
+	});
+});

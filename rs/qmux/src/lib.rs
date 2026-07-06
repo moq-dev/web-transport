@@ -1,7 +1,8 @@
-//! QMux protocol (draft-ietf-quic-qmux-01) over reliable transports.
+//! QMux protocol (draft-ietf-quic-qmux-02) over reliable transports.
 //!
-//! Provides QUIC-style multiplexed streams over TCP, TLS, and WebSocket,
-//! with backwards compatibility for the legacy `webtransport` wire format.
+//! Provides QUIC-style multiplexed streams over TCP, TLS, and WebSocket.
+//! Speaks draft-02 by default, negotiating down to draft-01 or draft-00, with
+//! backwards compatibility for the legacy `webtransport` wire format.
 
 // ALPN/subprotocol negotiation is only used by the TLS and WebSocket transports.
 #[cfg(any(feature = "tls", feature = "ws"))]
@@ -60,4 +61,4 @@ pub use transport::Transport;
 ///
 /// Use this when configuring TLS to advertise QMux support.
 /// For version-specific ALPNs, use [`Version::alpn()`].
-pub const ALPNS: &[&str] = &["qmux-01", "qmux-00", "webtransport"];
+pub const ALPNS: &[&str] = &["qmux-02", "qmux-01", "qmux-00", "webtransport"];
