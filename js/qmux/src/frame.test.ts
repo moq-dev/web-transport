@@ -140,6 +140,7 @@ describe("QMux01 record framing", () => {
 				maxDatagramFrameSize: 0n,
 				// Deliberately set to 0 — exercises the encoder's "skip-if-zero" + decoder's default seeding.
 				maxRecordSize: 0n,
+				resetStreamAt: false,
 			},
 		};
 		const bytes = Frame.encode(params, "qmux-01");
@@ -150,5 +151,101 @@ describe("QMux01 record framing", () => {
 		if (got.type === "transport_parameters") {
 			expect(got.params.maxRecordSize).toBe(Frame.DEFAULT_MAX_RECORD_SIZE);
 		}
+	});
+});
+
+describe("QMux02 (draft-02)", () => {
+	test("qmux-02 shares the qmux-01 record wire format", () => {
+		const id = new Stream.Id(VarInt.from(4n));
+		const frames: Frame.Any[] = [
+			{ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: true },
+			{ type: "max_data", max: 1024n },
+			{ type: "datagram", data: new Uint8Array([9, 9]) },
+		];
+		for (const frame of frames) {
+			expect(Array.from(Frame.encode(frame, "qmux-02"))).toEqual(Array.from(Frame.encode(frame, "qmux-01")));
+		}
+	});
+
+	test("RESET_STREAM_AT (0x24) decodes as a reset carrying reliableSize", () => {
+		// 0x24, id=4, code=42, final_size=128 (0x40 0x80), reliable_size=64 (0x40 0x40).
+		const wire = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40]);
+		const decoded = Frame.decode(wire, "qmux-02");
+		expect(decoded?.type).toBe("reset_stream");
+		if (decoded?.type === "reset_stream") {
+			expect(decoded.id.value.value).toBe(4n);
+			expect(decoded.code.value).toBe(42n);
+			// reliableSize present marks it as RESET_STREAM_AT (vs a plain 0x04 reset,
+			// which leaves it undefined); the session uses this to gate on negotiation.
+			expect(decoded.reliableSize).toBe(64n);
+		}
+	});
+
+	test("a duplicate transport parameter is rejected", () => {
+		// QX_TRANSPORT_PARAMETERS carrying initial_max_data (0x04) twice — a
+		// protocol error, matching the Rust decoder's DuplicateParam.
+		const bytes = new Uint8Array([
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a, // frame type
+			0x06, // payload length
+			0x04,
+			0x01,
+			0x01, // id=0x04, len=1, value=1
+			0x04,
+			0x01,
+			0x01, // duplicate
+		]);
+		expect(() => Frame.decode(bytes, "qmux-02")).toThrow();
+	});
+
+	test("reset_stream_at transport parameter round-trips (empty flag)", () => {
+		const on: Frame.Any = {
+			type: "transport_parameters",
+			params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, initialMaxData: 1024n, resetStreamAt: true },
+		};
+		const decoded = Frame.decodeRecord(Frame.encode(on, "qmux-02"));
+		expect(decoded.length).toBe(1);
+		if (decoded[0].type === "transport_parameters") {
+			expect(decoded[0].params.resetStreamAt).toBe(true);
+			expect(decoded[0].params.initialMaxData).toBe(1024n);
+		}
+
+		// Omitted from the wire (and decodes false) when unset.
+		const off: Frame.Any = {
+			type: "transport_parameters",
+			params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, initialMaxData: 1n },
+		};
+		const d2 = Frame.decodeRecord(Frame.encode(off, "qmux-02"));
+		if (d2[0].type === "transport_parameters") {
+			expect(d2[0].params.resetStreamAt).toBe(false);
+		}
+	});
+
+	test("RESET_STREAM_AT with reliable_size > final_size is rejected", () => {
+		// reliable_size=200 (0x40 0xc8) > final_size=128 (0x40 0x80).
+		const wire = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0xc8]);
+		expect(() => Frame.decode(wire, "qmux-02")).toThrow();
+	});
+
+	test("RESET_STREAM_AT stops at its boundary inside a record", () => {
+		const resetAt = new Uint8Array([0x24, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40]);
+		const stream = Frame.encode(
+			{ type: "stream", id: new Stream.Id(VarInt.from(8n)), data: new Uint8Array([1, 2]), fin: false },
+			"qmux-02",
+		);
+		const record = new Uint8Array(resetAt.byteLength + stream.byteLength);
+		record.set(resetAt, 0);
+		record.set(stream, resetAt.byteLength);
+
+		const decoded = Frame.decodeRecord(record);
+		expect(decoded.length).toBe(2);
+		expect(decoded[0].type).toBe("reset_stream");
+		expect(decoded[1].type).toBe("stream");
 	});
 });

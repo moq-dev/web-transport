@@ -30,6 +30,24 @@ pub enum Error {
     #[error("flow control error")]
     FlowControlError,
 
+    /// A frame was malformed on the wire — QMux's FRAME_ENCODING_ERROR. Draft-02
+    /// raises this e.g. when a RESET_STREAM_AT frame's Reliable Size exceeds its
+    /// Final Size.
+    #[error("frame encoding error")]
+    FrameEncoding,
+
+    /// The peer broke a protocol rule — QMux's PROTOCOL_VIOLATION. Draft-02
+    /// raises this for QX_TRANSPORT_PARAMETERS sent out of order (or twice) and
+    /// for invalid QX_PING sequence numbers.
+    #[error("protocol violation")]
+    ProtocolViolation,
+
+    /// A transport parameter carried an illegal value — QMux's
+    /// TRANSPORT_PARAMETER_ERROR. Draft-02 raises this when a peer advertises a
+    /// `max_record_size` below the default minimum.
+    #[error("transport parameter error")]
+    TransportParameter,
+
     #[error("stream limit exceeded")]
     StreamLimitExceeded,
 

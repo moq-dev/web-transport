@@ -99,6 +99,7 @@ function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
 		initialMaxStreamsUni: 100n,
 		maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 		maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+		resetStreamAt: false,
 		...overrides,
 	};
 }
@@ -166,6 +167,17 @@ describe("Session integration (scripted peer)", () => {
 		peer.sendText("not binary");
 		const info = await session.closed;
 		expect(info.closeCode).toBe(1003);
+	});
+
+	test("an unnegotiated RESET_STREAM_AT closes the session", async () => {
+		// The peer negotiates qmux-01, which never advertises `reset_stream_at`, so
+		// a RESET_STREAM_AT (0x24) frame is a protocol violation. Hand-built bytes:
+		// type=0x24, id=3, code=0, final_size=0, reliable_size=0.
+		const { session, peer } = connect();
+		await session.ready;
+		peer.sendRaw(new Uint8Array([0x24, 0x03, 0x00, 0x00, 0x00]));
+		const info = await session.closed;
+		expect(info.closeCode).toBe(1002);
 	});
 
 	test("datagrams: an app write produces a DATAGRAM frame on the wire", async () => {

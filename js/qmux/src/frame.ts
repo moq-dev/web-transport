@@ -7,7 +7,7 @@ import { VarInt } from "./varint.ts";
  * `index.ts`) only includes the QMux drafts; `"webtransport"` is the
  * legacy fallback wire format and isn't a valid value for any public option.
  */
-export type WireFormat = "webtransport" | "qmux-00" | "qmux-01";
+export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
 
 /** Maximum size of a single QMux frame on the wire. */
 export const MAX_FRAME_SIZE = 16384;
@@ -26,6 +26,11 @@ export interface ResetStream {
 	type: "reset_stream";
 	id: Stream.Id;
 	code: VarInt;
+	/** Set (to the frame's Reliable Size) when this was decoded from a
+	 * RESET_STREAM_AT frame (0x24, draft-02); absent for a plain RESET_STREAM.
+	 * The session uses its presence to enforce that RESET_STREAM_AT is only
+	 * accepted when we advertised the `reset_stream_at` transport parameter. */
+	reliableSize?: bigint;
 }
 
 export interface StopSending {
@@ -110,6 +115,10 @@ export interface TransportParams {
 	/** RFC 9221 max_datagram_frame_size (ID 0x20); 0 = datagrams unsupported. */
 	maxDatagramFrameSize: bigint;
 	maxRecordSize: bigint;
+	/** Whether we advertise support for *receiving* RESET_STREAM_AT frames, via
+	 * the empty-valued `reset_stream_at` transport parameter (ID 0x1d). Only set
+	 * on QMux draft-02. */
+	resetStreamAt: boolean;
 }
 
 /** Default max_record_size per draft-01. */
@@ -125,6 +134,7 @@ export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamsUni: 0n,
 	maxDatagramFrameSize: 0n,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+	resetStreamAt: false,
 };
 
 export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
@@ -137,6 +147,7 @@ export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
 	initialMaxStreamsUni: 100n,
 	maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
 	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
+	resetStreamAt: false,
 };
 
 export interface Padding {
@@ -181,18 +192,48 @@ export function encode(frame: Any, version: WireFormat = "webtransport"): Uint8A
 
 /** Returns true if the version uses QMux framing (draft-00 or later). */
 export function isQmux(version: WireFormat): boolean {
-	return version === "qmux-00" || version === "qmux-01";
+	return version === "qmux-00" || version === "qmux-01" || version === "qmux-02";
+}
+
+/** Returns true if the version uses the QMux Record framing layer and the
+ * features introduced alongside it (QX_PING keep-alive, PADDING, datagrams,
+ * max_record_size) — draft-01 and later. */
+export function usesRecords(version: WireFormat): boolean {
+	return version === "qmux-01" || version === "qmux-02";
 }
 
 // QX_PING frame type constants (draft-01)
 const QX_PING_REQUEST = 0x348c67529ef8c7bdn;
 const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
+// RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset), permitted by QMux
+// draft-02. Decode-only: accepted, validated, and treated as a plain reset.
+const RESET_STREAM_AT = 0x24n;
 // max_record_size transport parameter ID
 const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 // application_protocols transport parameter ID (QMux-specific, non-TLS ALPN).
 // This implementation only runs over WebSocket, which negotiates the protocol
 // via its subprotocol (ALPN), so receiving this parameter is a protocol error.
 const APPLICATION_PROTOCOLS_ID = 0x3d4f9c2a8b1e6075n;
+// reset_stream_at transport parameter ID (draft-ietf-quic-reliable-stream-reset):
+// empty value, presence advertises support for receiving RESET_STREAM_AT.
+const RESET_STREAM_AT_PARAM_ID = 0x1dn;
+
+// The transport-parameter IDs we recognize. A repeat of any of these is a
+// protocol error (matching the Rust decoder's DuplicateParam); unknown IDs are
+// skipped and may repeat, per RFC 9000.
+const RECOGNIZED_PARAM_IDS = new Set<bigint>([
+	0x01n,
+	0x04n,
+	0x05n,
+	0x06n,
+	0x07n,
+	0x08n,
+	0x09n,
+	0x20n,
+	MAX_RECORD_SIZE_ID,
+	APPLICATION_PROTOCOLS_ID,
+	RESET_STREAM_AT_PARAM_ID,
+]);
 
 function encodeWebTransport(frame: Any): Uint8Array {
 	switch (frame.type) {
@@ -408,8 +449,8 @@ function encodeQMux(frame: Any): Uint8Array {
 
 function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer> {
 	// Each param: id(varint) + length(varint) + value(varint)
-	// Max 9 params * 24 bytes each
-	let buffer = new Uint8Array(new ArrayBuffer(216), 0, 0);
+	// Max 9 varint params * 24 bytes each + the 2-byte reset_stream_at flag.
+	let buffer = new Uint8Array(new ArrayBuffer(256), 0, 0);
 
 	function writeParam(buf: Uint8Array<ArrayBuffer>, id: number | bigint, value: bigint): Uint8Array<ArrayBuffer> {
 		if (value === 0n) return buf;
@@ -430,11 +471,19 @@ function encodeTransportParams(params: TransportParams): Uint8Array<ArrayBuffer>
 	buffer = writeParam(buffer, 0x20, params.maxDatagramFrameSize);
 	buffer = writeParam(buffer, MAX_RECORD_SIZE_ID, params.maxRecordSize);
 
+	// reset_stream_at: an empty-valued flag. Presence advertises that we accept
+	// RESET_STREAM_AT frames; absence means we don't.
+	if (params.resetStreamAt) {
+		buffer = VarInt.from(RESET_STREAM_AT_PARAM_ID).encode(buffer);
+		buffer = VarInt.from(0).encode(buffer);
+	}
+
 	return buffer;
 }
 
 function decodeTransportParams(buffer: Uint8Array): TransportParams {
 	const params = { ...DEFAULT_TRANSPORT_PARAMS };
+	const seen = new Set<bigint>();
 	let v: VarInt;
 
 	while (buffer.byteLength > 0) {
@@ -451,11 +500,30 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 		const paramData = buffer.slice(0, len);
 		buffer = buffer.slice(len);
 
+		// A repeated recognized parameter is a protocol error (mirrors Rust's
+		// DuplicateParam). Unknown IDs fall through and may repeat.
+		if (RECOGNIZED_PARAM_IDS.has(id)) {
+			if (seen.has(id)) {
+				throw new Error(`duplicate transport parameter 0x${id.toString(16)}`);
+			}
+			seen.add(id);
+		}
+
 		// In-band ALPN negotiation is only valid on transports without their own
 		// (TCP, Unix sockets). This implementation only runs over WebSocket, which
 		// negotiates via its subprotocol, so the parameter must never appear.
 		if (id === APPLICATION_PROTOCOLS_ID) {
 			throw new Error("unexpected application_protocols parameter over WebSocket");
+		}
+
+		// reset_stream_at: presence-only. A non-empty value is a
+		// TRANSPORT_PARAMETER_ERROR per the extension spec.
+		if (id === RESET_STREAM_AT_PARAM_ID) {
+			if (paramData.byteLength !== 0) {
+				throw new Error("reset_stream_at transport parameter must be empty");
+			}
+			params.resetStreamAt = true;
+			continue;
 		}
 
 		if (paramData.byteLength < 1) {
@@ -638,6 +706,24 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "reset_stream", id, code };
 	}
 
+	// RESET_STREAM_AT (draft-02). On a reliable, ordered transport all stream data
+	// up to final_size has already arrived, so we treat it as a plain reset;
+	// reliable_size > final_size is a FRAME_ENCODING_ERROR.
+	if (frameType === RESET_STREAM_AT) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
+		[v, buffer] = VarInt.decode(buffer);
+		const reliableSize = v.value;
+		if (reliableSize > finalSize) {
+			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
+		}
+		return { type: "reset_stream", id, code, reliableSize };
+	}
+
 	// STOP_SENDING
 	if (frameType === 0x05n) {
 		[v, buffer] = VarInt.decode(buffer);
@@ -808,6 +894,22 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		const code = v;
 		[v, buffer] = VarInt.decode(buffer); // final_size
 		return [{ type: "reset_stream", id, code }, buffer];
+	}
+
+	// RESET_STREAM_AT (draft-02); see the single-frame decoder for the semantics.
+	if (frameType === RESET_STREAM_AT) {
+		[v, buffer] = VarInt.decode(buffer);
+		const id = new Stream.Id(v);
+		[v, buffer] = VarInt.decode(buffer);
+		const code = v;
+		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
+		[v, buffer] = VarInt.decode(buffer);
+		const reliableSize = v.value;
+		if (reliableSize > finalSize) {
+			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
+		}
+		return [{ type: "reset_stream", id, code, reliableSize }, buffer];
 	}
 
 	// STOP_SENDING

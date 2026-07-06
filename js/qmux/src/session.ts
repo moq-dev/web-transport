@@ -2,7 +2,7 @@ import { openWebSocketStream, type WebSocketStreamLike } from "@moq/web-socket-s
 import { Credit, replenishWindow } from "./credit.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
-import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD } from "./frame.ts";
+import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD, usesRecords } from "./frame.ts";
 import { RecvStream } from "./recv.ts";
 import { DEFAULT_SEND_ORDER, SendScheduler, type SendSink, WritableStreamSink } from "./scheduler.ts";
 import * as Stream from "./stream.ts";
@@ -38,8 +38,8 @@ export interface Config {
 	 *  willingness to receive; 0 disables datagrams. This is a frame size, not a
 	 *  payload size — {@link Datagrams.maxDatagramSize} reports the usable payload
 	 *  (this value less framing overhead). Keep it at or below `maxRecordSize`.
-	 *  Datagrams are a QMux01 feature; this is ignored on qmux-00. Defaults to a
-	 *  full record. */
+	 *  Datagrams are a record-framed-draft feature (qmux-01+); this is ignored on
+	 *  qmux-00. Defaults to a full record. */
 	maxDatagramFrameSize?: bigint;
 }
 
@@ -70,6 +70,8 @@ function configToTransportParams(config: Required<Config>): TransportParams {
 		maxDatagramFrameSize:
 			config.maxDatagramFrameSize < config.maxRecordSize ? config.maxDatagramFrameSize : config.maxRecordSize,
 		maxRecordSize: config.maxRecordSize,
+		// Version-gated in #startSession (only advertised on qmux-02).
+		resetStreamAt: false,
 	};
 }
 
@@ -172,8 +174,8 @@ export interface SessionOptions extends WebTransportOptions {
 	 *  - `Version[]`: advertise one `{v}.{alpn}` per array entry in order.
 	 *    Lets the server pick across multiple QMux drafts.
 	 *  - `null`: advertise the ALPN under every QMux version this polyfill
-	 *    knows about (currently qmux-01, then qmux-00). Useful when the app
-	 *    doesn't care which draft and wants forward compatibility.
+	 *    knows about (currently qmux-02, qmux-01, then qmux-00). Useful when the
+	 *    app doesn't care which draft and wants forward compatibility.
 	 *
 	 * The legacy `webtransport.{alpn}` pair form was used briefly during the
 	 * web-transport-ws -> qmux transition; no production client depended on
@@ -214,6 +216,8 @@ const DEFAULT_SEND_BUFFER_SIZE = 64 * 1024;
 /** Get the subprotocol prefix for a QMux wire-format version. */
 function versionPrefix(version: Version): string {
 	switch (version) {
+		case "qmux-02":
+			return "qmux-02.";
 		case "qmux-01":
 			return "qmux-01.";
 		case "qmux-00":
@@ -222,7 +226,7 @@ function versionPrefix(version: Version): string {
 }
 
 /** QMux versions recognized as prefixed ALPNs, newest first. */
-const QMUX_VERSIONS = ["qmux-01", "qmux-00"] as const satisfies readonly Version[];
+const QMUX_VERSIONS = ["qmux-02", "qmux-01", "qmux-00"] as const satisfies readonly Version[];
 
 /** Convert `http(s)://` to `ws(s)://`. Pass-through for `ws(s)://` URLs. */
 function toWebSocketUrl(url: string | URL): string {
@@ -244,7 +248,7 @@ function toWebSocketUrl(url: string | URL): string {
 }
 
 /** Bare version ALPNs appended unless `requireProtocol` is set. Newest first. */
-const BARE_ALPNS = ["qmux-01", "qmux-00", "webtransport"] as const;
+const BARE_ALPNS = ["qmux-02", "qmux-01", "qmux-00", "webtransport"] as const;
 
 /** Resolve a `protocols` + `versions` pair to the wire subprotocol list.
  *
@@ -397,6 +401,9 @@ export default class Session implements WebTransport {
 	#lastRecvAt = Date.now();
 	#lastSendAt = Date.now();
 	#nextPingSeq = 0;
+	// Highest sequence seen in a received QX_PING request (draft-02 requires them
+	// to strictly increase). Undefined until the first request arrives.
+	#lastPingRecv?: bigint;
 	#idleTimer?: ReturnType<typeof setInterval>;
 
 	/** Open a QMux session over WebSocket against `url`.
@@ -525,12 +532,16 @@ export default class Session implements WebTransport {
 		this.#version = version;
 		this.#protocol = parseProtocol(rawProtocol, version);
 
-		// Datagrams are a QMux01 feature (they rely on the record layer for
-		// framing): don't advertise the parameter — or accept datagrams — on any
-		// other wire format. The recv path gates on #ourParams.maxDatagramFrameSize.
-		if (version !== "qmux-01") {
-			this.#ourParams = { ...this.#ourParams, maxDatagramFrameSize: 0n };
-		}
+		// Datagrams rely on the record layer for framing, so don't advertise the
+		// parameter — or accept datagrams — on any non-record wire format. The recv
+		// path gates on #ourParams.maxDatagramFrameSize. RESET_STREAM_AT is only
+		// permitted on draft-02, so advertise `reset_stream_at` there and nowhere
+		// else; the recv path gates on #ourParams.resetStreamAt.
+		this.#ourParams = {
+			...this.#ourParams,
+			maxDatagramFrameSize: usesRecords(version) ? this.#ourParams.maxDatagramFrameSize : 0n,
+			resetStreamAt: version === "qmux-02",
+		};
 
 		this.#scheduler = new SendScheduler(sink, {
 			onActivity: () => {
@@ -557,8 +568,8 @@ export default class Session implements WebTransport {
 	#onData(data: Uint8Array) {
 		this.#lastRecvAt = Date.now();
 		try {
-			if (this.#version === "qmux-01") {
-				// QMux01: each WS message is a record containing one or more frames
+			if (usesRecords(this.#version)) {
+				// Record-framed drafts: each WS message is a record with one or more frames
 				const frames = Frame.decodeRecord(data);
 				for (const frame of frames) {
 					this.#recvFrame(frame);
@@ -577,6 +588,16 @@ export default class Session implements WebTransport {
 	}
 
 	#recvFrame(frame: Frame.Any) {
+		// Draft-02: QX_TRANSPORT_PARAMETERS MUST be the first frame, and only the
+		// first. A non-params frame before params, or a second params frame, is a
+		// PROTOCOL_VIOLATION. (decodeRecord drops leading PADDING before we get here.)
+		if (this.#version === "qmux-02") {
+			const isParams = frame.type === "transport_parameters";
+			if (isParams === this.#paramsReceived) {
+				throw new Error("QX_TRANSPORT_PARAMETERS must be the first frame");
+			}
+		}
+
 		if (frame.type === "stream") {
 			this.#handleStreamFrame(frame);
 		} else if (frame.type === "reset_stream") {
@@ -621,10 +642,20 @@ export default class Session implements WebTransport {
 			}
 			this.datagrams.push(frame.data);
 		} else if (frame.type === "ping_request") {
+			// Draft-02: request sequence numbers must strictly increase.
+			if (this.#version === "qmux-02") {
+				if (this.#lastPingRecv !== undefined && frame.sequence <= this.#lastPingRecv) {
+					throw new Error("QX_PING request sequence must strictly increase");
+				}
+				this.#lastPingRecv = frame.sequence;
+			}
 			// Respond to ping requests
 			this.#sendPriorityFrame({ type: "ping_response", sequence: frame.sequence });
 		} else if (frame.type === "ping_response") {
-			// Ping response received, no action needed
+			// Draft-02: a response must echo a sequence we actually sent (0..nextPingSeq).
+			if (this.#version === "qmux-02" && frame.sequence >= BigInt(this.#nextPingSeq)) {
+				throw new Error("QX_PING response echoed a sequence we never sent");
+			}
 		} else if (
 			frame.type === "data_blocked" ||
 			frame.type === "stream_data_blocked" ||
@@ -637,6 +668,12 @@ export default class Session implements WebTransport {
 
 	#handleTransportParameters(params: TransportParams) {
 		if (this.#paramsReceived) return;
+		// Draft-02: an advertised max_record_size MUST NOT go below the default
+		// minimum. Omitted values decode to the default, so only an explicit
+		// smaller value trips this (TRANSPORT_PARAMETER_ERROR).
+		if (this.#version === "qmux-02" && params.maxRecordSize < Frame.DEFAULT_MAX_RECORD_SIZE) {
+			throw new Error("max_record_size below the default minimum");
+		}
 		this.#paramsReceived = true;
 		this.#peerParams = params;
 
@@ -648,7 +685,7 @@ export default class Session implements WebTransport {
 		// they stay disabled on any other wire format. Otherwise whether we may
 		// *send* depends solely on the peer's willingness to receive (RFC 9221):
 		// 0 means unsupported.
-		if (this.#version === "qmux-01" && params.maxDatagramFrameSize > 0n) {
+		if (usesRecords(this.#version) && params.maxDatagramFrameSize > 0n) {
 			// A datagram must fit in one record, so the frame is capped by the
 			// smaller of the peer's datagram-frame limit and its record size.
 			const cap =
@@ -682,7 +719,7 @@ export default class Session implements WebTransport {
 	 * (or the single non-zero one). If both are zero, idle timeouts are disabled.
 	 */
 	#effectiveIdleTimeoutMs(): bigint {
-		if (this.#version !== "qmux-01") return 0n;
+		if (!usesRecords(this.#version)) return 0n;
 		const a = this.#ourParams.maxIdleTimeout;
 		const b = this.#peerParams.maxIdleTimeout;
 		if (a === 0n && b === 0n) return 0n;
@@ -717,7 +754,10 @@ export default class Session implements WebTransport {
 		// of the timeout. Any frame counts as activity, so this only fires when truly idle.
 		if (now - this.#lastSendAt > timeoutMs / 3) {
 			const seq = this.#nextPingSeq;
-			this.#nextPingSeq = (this.#nextPingSeq + 1) >>> 0;
+			// Monotonic (never wraps within a session's life): the draft-02
+			// strictly-increasing rule requires it, and it must not wrap earlier
+			// than the Rust peer's u64 counter or a valid ping would be rejected.
+			this.#nextPingSeq += 1;
 			try {
 				this.#sendPriorityFrame({ type: "ping_request", sequence: BigInt(seq) });
 			} catch (e) {
@@ -1000,6 +1040,14 @@ export default class Session implements WebTransport {
 	}
 
 	#handleResetStream(frame: Frame.ResetStream) {
+		// A RESET_STREAM_AT frame (reliableSize present, draft-02) is only legal if
+		// we advertised the `reset_stream_at` transport parameter. Receiving it
+		// otherwise — or on an earlier draft, which never advertises it — is a
+		// PROTOCOL_VIOLATION. Plain RESET_STREAM is always allowed.
+		if (frame.reliableSize !== undefined && !this.#ourParams.resetStreamAt) {
+			throw new Error("RESET_STREAM_AT received without advertising reset_stream_at");
+		}
+
 		const streamId = frame.id.value.value;
 		const recv = this.#recvStreams.get(streamId);
 		if (!recv) return;
@@ -1037,9 +1085,9 @@ export default class Session implements WebTransport {
 		this.#sendPriorityFrame({ type: "transport_parameters", params: this.#ourParams });
 	}
 
-	/** Validate an encoded record against the peer's max_record_size (QMux01). */
+	/** Validate an encoded record against the peer's max_record_size (QMux01+). */
 	#validateRecordSize(bytes: Uint8Array) {
-		if (this.#version === "qmux-01") {
+		if (usesRecords(this.#version)) {
 			// Before the peer's TRANSPORT_PARAMETERS arrive, use the draft-01 default
 			// (16382) so we don't accidentally send something the peer will reject.
 			const limit = this.#paramsReceived ? this.#peerParams.maxRecordSize : Frame.DEFAULT_MAX_RECORD_SIZE;
@@ -1065,7 +1113,7 @@ export default class Session implements WebTransport {
 			// (qmux-01 only — once params are received). Leave 32 bytes of headroom for
 			// the STREAM frame header (frame type + stream id + length varints).
 			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
-			if (this.#version === "qmux-01" && this.#paramsReceived) {
+			if (usesRecords(this.#version) && this.#paramsReceived) {
 				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
 				if (peerLimit > 0) {
 					chunkMax = Math.min(chunkMax, peerLimit);
