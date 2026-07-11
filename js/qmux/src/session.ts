@@ -776,7 +776,7 @@ export default class Session implements WebTransport {
 			// 1. Try stream credit
 			const streamClaimed = flow.sendCredit.tryClaim(desired);
 			if (streamClaimed === 0n) {
-				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				if (this.#closed) throw this.#closed;
 				// Wait for stream credit, then release and retry to coordinate with conn credit
 				const claimed = await flow.sendCredit.claim(desired);
 				flow.sendCredit.release(claimed);
@@ -787,7 +787,7 @@ export default class Session implements WebTransport {
 			const connClaimed = this.#connCredit.tryClaim(streamClaimed);
 			if (connClaimed === 0n) {
 				flow.sendCredit.release(streamClaimed);
-				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				if (this.#closed) throw this.#closed;
 				const claimed = await this.#connCredit.claim(1n);
 				this.#connCredit.release(claimed);
 				continue;
@@ -1203,7 +1203,7 @@ export default class Session implements WebTransport {
 		await this.ready;
 
 		if (this.#closed) {
-			throw this.#closeReason || new Error("Connection closed");
+			throw this.#closed;
 		}
 
 		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;

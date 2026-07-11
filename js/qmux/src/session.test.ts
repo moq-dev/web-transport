@@ -430,4 +430,18 @@ describe("Session integration (scripted peer)", () => {
 			expect((err as Error).message).toBe("Connection closed: 1001 going away");
 		});
 	});
+
+	test("createBidirectionalStream on an already-closed session rejects with the descriptive reason", async () => {
+		const { session } = connect();
+		await session.ready;
+
+		// Graceful app-initiated close leaves #closeReason unset, so the synchronous
+		// already-closed throw must fall back to #closed's "Connection closed: <code> <reason>",
+		// not a generic "Connection closed".
+		session.close({ closeCode: 5, reason: "done" });
+
+		const err = await settle(session.createBidirectionalStream());
+		expect(err).toBeInstanceOf(Error);
+		expect((err as Error).message).toBe("Connection closed: 5 done");
+	});
 });
