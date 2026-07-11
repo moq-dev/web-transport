@@ -904,7 +904,12 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	async #handleStreamFrame(frame: Frame.Data) {
+	#handleStreamFrame(frame: Frame.Data) {
+		// The read loop can still deliver frames after #close() has torn down the
+		// incoming-stream controllers and #recvStreams; drop them, matching the
+		// #sendDatagram/#sendPriorityFrame post-close guards.
+		if (this.#closed) return;
+
 		if (frame.data.byteLength > MAX_FRAME_PAYLOAD) {
 			this.close({ closeCode: 1002, reason: "frame too large" });
 			return;
@@ -1010,9 +1015,28 @@ export default class Session implements WebTransport {
 				});
 				this.#attachSendOrder(writer, streamId, DEFAULT_SEND_ORDER);
 
-				this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
+				try {
+					this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
+				} catch {
+					// The app cancelled the incoming-bidi acceptor while the session is
+					// still open (a closed session already returned at the #closed guard
+					// above). Keep the stream registered in #recvStreams — as in <=0.2.0 —
+					// so later in-flight frames for this id take the existing-stream path
+					// below instead of re-opening it (which would re-credit stream-count
+					// and re-emit STOP_SENDING per frame). Error the orphaned recv buffer
+					// so we don't retain bytes no reader can drain, then fall through so
+					// connection flow control is still accounted for this frame.
+					recv.error(new Error("incoming stream acceptor cancelled"));
+				}
 			} else {
-				this.#incomingUnidirectionalStreams.enqueue(reader);
+				try {
+					this.#incomingUnidirectionalStreams.enqueue(reader);
+				} catch {
+					// Acceptor cancelled mid-session; see the bidi branch. Keep the stream
+					// registered, drop its orphaned buffer, and fall through to account
+					// connection flow control below.
+					recv.error(new Error("incoming stream acceptor cancelled"));
+				}
 			}
 		} else {
 			// Existing stream — validate recv flow control

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as Frame from "./frame.ts";
 import { DEFAULT_MAX_RECORD_SIZE, type TransportParams } from "./frame.ts";
 import Session, { type Config } from "./session.ts";
@@ -84,6 +84,14 @@ async function waitFor(check: () => boolean, timeoutMs = 1000): Promise<void> {
 	const start = Date.now();
 	while (!check()) {
 		if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+}
+
+/** Yield a few macrotask turns so queued reads and any pending promise rejections
+ * settle (an unhandled rejection surfaces at the end of the current turn). */
+async function settle(turns = 5): Promise<void> {
+	for (let i = 0; i < turns; i++) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
 }
@@ -337,5 +345,174 @@ describe("Session integration (scripted peer)", () => {
 		// Delivering the buffered bytes replenishes the window.
 		await waitFor(() => peer.count("max_stream_data") > 0);
 		session.close();
+	});
+
+	// Regression: a STREAM frame delivered by the read loop after the session has
+	// closed used to hit the already-closed incoming-stream controllers, and the
+	// throw escaped as an unhandled rejection because #handleStreamFrame was an
+	// unawaited async call. These tests capture process-level unhandled rejections
+	// so the failure mode is asserted, not just observed in logs.
+	describe("STREAM frame vs session teardown", () => {
+		const rejections: unknown[] = [];
+		const onRejection = (err: unknown) => {
+			rejections.push(err);
+		};
+
+		beforeEach(async () => {
+			process.on("unhandledRejection", onRejection);
+			// Drain any late async work from earlier tests before arming the capture,
+			// so a stray rejection from another test's teardown can't be misattributed
+			// to the test about to run.
+			await settle();
+			rejections.length = 0;
+		});
+		afterEach(() => {
+			process.off("unhandledRejection", onRejection);
+		});
+
+		test("a STREAM frame arriving after close() is dropped without an unhandled rejection", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			session.close({ closeCode: 42, reason: "bye" });
+
+			// Peer-initiated streams still in flight when the session closed: one uni,
+			// one bidi — both would hit the now-closed incoming-stream controllers.
+			// The third targets a stream id that could only exist pre-close (#recvStreams
+			// was cleared by close), so it also takes the new-stream branch.
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+				data: new Uint8Array(3),
+				fin: false,
+			});
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Bi, true),
+				data: new Uint8Array(3),
+				fin: false,
+			});
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+				data: new Uint8Array(3),
+				fin: true,
+			});
+
+			await settle();
+			expect(rejections).toEqual([]);
+			expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
+		});
+
+		test("a STREAM frame on a send-only stream ID closes the session with 1002", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			// A client-initiated uni stream is send-only from our (client) perspective;
+			// the peer writing to it is a protocol violation. Now that #handleStreamFrame
+			// is synchronous, the throw propagates to #onData and closes with 1002 —
+			// previously it leaked as a rejection while the session limped on.
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Uni, false),
+				data: new Uint8Array([1]),
+				fin: false,
+			});
+
+			expect(await session.closed).toEqual({ closeCode: 1002, reason: "Protocol violation" });
+			await settle();
+			expect(rejections).toEqual([]);
+		});
+
+		test("a stream arriving after the app cancelled the acceptor is refused, not fatal", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			// App stops accepting incoming uni streams while the session stays open.
+			await session.incomingUnidirectionalStreams.cancel();
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+				data: new Uint8Array(3),
+				fin: false,
+			});
+
+			// Ping barrier: once the pong is seen the STREAM frame above has been fully
+			// processed. The session must still be alive — an app-local cancel is not a
+			// peer protocol violation.
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"), 5000);
+
+			await settle();
+			expect(rejections).toEqual([]);
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+
+		test("repeated frames on a refused stream id do not amplify STOP_SENDING or re-credit stream count", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			await session.incomingUnidirectionalStreams.cancel();
+
+			// One peer-initiated uni stream, its payload split across several in-flight
+			// STREAM frames (all before the peer could honor any STOP_SENDING). Deleting
+			// the stream on refusal would make each later frame re-open it, re-crediting
+			// MAX_STREAMS and emitting a STOP_SENDING per frame; keeping it registered
+			// means exactly one refusal.
+			const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+			for (let i = 0; i < 8; i++) {
+				peer.send({ type: "stream", id, data: new Uint8Array(3), fin: false });
+			}
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"), 5000);
+
+			await settle();
+			expect(rejections).toEqual([]);
+			// No per-frame amplification: the refused stream never sends STOP_SENDING and
+			// never re-credits the peer's stream-count limit.
+			expect(peer.count("stop_sending")).toBe(0);
+			expect(peer.has("max_streams_uni")).toBe(false);
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+
+		test("refused streams do not leak connection flow-control credit", async () => {
+			// Tight connection window (300B). Each refused stream's bytes advance the
+			// connection recv offset; if they aren't also counted as consumed, the
+			// advertised window never replenishes and the peer is wrongly starved /
+			// eventually tripped into a 1002 flow-control close.
+			const { session, peer } = connect({ maxData: 300n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			await session.incomingUnidirectionalStreams.cancel();
+
+			// Five distinct refused uni streams carrying 500B total — well past the 300B
+			// window. With correct accounting the window keeps pace (MAX_DATA is emitted)
+			// and the session stays healthy; the buggy refuse path froze `consumed` and
+			// closed with a spurious flow-control error by the 4th stream.
+			for (let i = 0n; i < 5n; i++) {
+				peer.send({
+					type: "stream",
+					id: Stream.Id.create(i, Stream.Dir.Uni, true),
+					data: new Uint8Array(100),
+					fin: false,
+				});
+			}
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"), 5000);
+
+			await settle();
+			expect(rejections).toEqual([]);
+			expect(peer.has("connection_close")).toBe(false);
+			// The connection window advanced, proving refused bytes were credited back.
+			expect(peer.has("max_data")).toBe(true);
+			session.close();
+		});
 	});
 });
