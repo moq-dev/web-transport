@@ -3,6 +3,7 @@ import * as Frame from "./frame.ts";
 import { DEFAULT_MAX_RECORD_SIZE, type TransportParams } from "./frame.ts";
 import Session, { type Config } from "./session.ts";
 import * as Stream from "./stream.ts";
+import { VarInt } from "./varint.ts";
 
 // A scripted peer standing in for the `WebSocketStream` transport. The test
 // plays the remote end: it injects frames into the Session's readable and
@@ -94,6 +95,21 @@ async function settle(turns = 5): Promise<void> {
 	for (let i = 0; i < turns; i++) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
+}
+
+/** Drain queued microtasks so a just-issued claim() reaches its parked state.
+ *  Parking is pure-microtask work (no I/O), so a bounded drain is deterministic. */
+async function flushMicrotasks(turns = 10): Promise<void> {
+	for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
+/** Settle a promise to its value or its rejection error, without leaking an
+ *  unhandled rejection while the test arranges the teardown that resolves it. */
+function settleTo<T>(p: Promise<T>): Promise<T | Error> {
+	return p.then(
+		(v) => v,
+		(e) => e,
+	);
 }
 
 function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
@@ -514,5 +530,95 @@ describe("Session integration (scripted peer)", () => {
 			expect(peer.has("max_data")).toBe(true);
 			session.close();
 		});
+	});
+
+	describe("close threads its reason into blocked Credit.claim() waiters", () => {
+		test("a uni stream blocked on stream-count credit rejects with the graceful close reason", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			// Peer grants zero uni stream-count credit, so createUnidirectionalStream parks on claim().
+			peer.send({ type: "transport_parameters", params: peerParams({ initialMaxStreamsUni: 0n }) });
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"));
+
+			const created = settleTo(session.createUnidirectionalStream());
+			await flushMicrotasks(); // let the call reach its parked claim()
+
+			session.close({ closeCode: 42, reason: "bye" });
+
+			const err = await created;
+			expect(err).toBeInstanceOf(Error);
+			expect((err as Error).message).toBe("Connection closed: 42 bye");
+		});
+
+		test("a bidi stream blocked on stream-count credit rejects with a CONNECTION_CLOSE frame's reason", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams({ initialMaxStreamsBidi: 0n }) });
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"));
+
+			const created = settleTo(session.createBidirectionalStream());
+			await flushMicrotasks();
+
+			// The peer aborts the connection; the frame's code/reason must reach the waiter.
+			peer.send({ type: "connection_close", code: VarInt.from(7n), reason: "peer gone" });
+
+			const err = await created;
+			expect(err).toBeInstanceOf(Error);
+			expect((err as Error).message).toBe("Connection closed: 7 peer gone");
+		});
+
+		test("a stream write blocked on send credit rejects with the close reason", async () => {
+			// Tiny per-stream send window: the first chunk drains it, the next write parks.
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams({ initialMaxStreamDataUni: 5n }) });
+
+			const writable = await session.createUnidirectionalStream();
+			const writer = writable.getWriter();
+			const wrote = settleTo(writer.write(new Uint8Array(8)));
+
+			// The first 5 bytes flush to the wire, so the write is now parked on the remaining 3.
+			await waitFor(() => peer.has("stream"));
+
+			session.close({ closeCode: 9, reason: "credit gone" });
+
+			const err = await wrote;
+			expect(err).toBeInstanceOf(Error);
+			expect((err as Error).message).toBe("Connection closed: 9 credit gone");
+		});
+
+		test("a blocked claim rejects with the reason from a WebSocket-level close", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams({ initialMaxStreamsUni: 0n }) });
+			peer.send({ type: "ping_request", sequence: 1n });
+			await waitFor(() => peer.has("ping_response"));
+
+			const created = settleTo(session.createUnidirectionalStream());
+			await flushMicrotasks();
+
+			// The transport closes underneath the session (no CONNECTION_CLOSE frame).
+			peer.close({ closeCode: 1001, reason: "going away" });
+
+			const err = await created;
+			expect(err).toBeInstanceOf(Error);
+			expect((err as Error).message).toBe("Connection closed: 1001 going away");
+		});
+	});
+
+	test("createBidirectionalStream on an already-closed session rejects with the descriptive reason", async () => {
+		const { session } = connect();
+		await session.ready;
+
+		// Graceful app-initiated close leaves #closeReason unset, so the synchronous
+		// already-closed throw must fall back to #closed's "Connection closed: <code> <reason>",
+		// not a generic "Connection closed".
+		session.close({ closeCode: 5, reason: "done" });
+
+		const err = await settleTo(session.createBidirectionalStream());
+		expect(err).toBeInstanceOf(Error);
+		expect((err as Error).message).toBe("Connection closed: 5 done");
 	});
 });

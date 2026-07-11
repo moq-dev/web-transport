@@ -26,6 +26,7 @@ export class Credit {
 	#max: bigint;
 	#released = 0n;
 	#closed = false;
+	#closeReason?: Error;
 	#waiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
 
 	constructor(max: bigint) {
@@ -49,7 +50,7 @@ export class Credit {
 		if (limit === 0n) return 0n;
 
 		while (true) {
-			if (this.#closed) throw new Error("closed");
+			if (this.#closed) throw this.#closeReason ?? new Error("closed");
 
 			const claimed = this.tryClaim(limit);
 			if (claimed > 0n) return claimed;
@@ -75,13 +76,14 @@ export class Credit {
 		return true;
 	}
 
-	/** Close the credit, rejecting all pending and future `claim()` calls. */
-	close(): void {
+	/** Close the credit, rejecting all pending and future `claim()` calls.
+	 *  `reason` (if provided) becomes the rejection error; the first reason wins. */
+	close(reason?: Error): void {
 		this.#closed = true;
+		this.#closeReason ??= reason ?? new Error("closed");
 		const waiters = this.#waiters;
 		this.#waiters = [];
-		const err = new Error("closed");
-		for (const { reject } of waiters) reject(err);
+		for (const { reject } of waiters) reject(this.#closeReason);
 	}
 
 	/** Set used to max(used, value). Returns false if value > max (flow control violation). */
