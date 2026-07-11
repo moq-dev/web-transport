@@ -605,7 +605,7 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "stop_sending") {
 			this.#handleStopSending(frame);
 		} else if (frame.type === "connection_close") {
-			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
+			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value} ${frame.reason}`);
 			this.#close(Number(frame.code.value), frame.reason);
 			this.#transportClose();
 		} else if (frame.type === "transport_parameters") {
@@ -1376,18 +1376,20 @@ export default class Session implements WebTransport {
 		this.#sendStreams.clear();
 		this.#recvStreams.clear();
 
-		// Close per-stream credits before clearing the map
+		// Close per-stream credits before clearing the map. Pass the rich close
+		// reason so writes parked in Credit.claim() reject with the same
+		// "Connection closed: <code> <reason>" error as every other teardown path.
 		for (const flow of this.#streamFlow.values()) {
-			flow.sendCredit.close();
+			flow.sendCredit.close(closeErr);
 		}
 		this.#streamFlow.clear();
 
 		// Close global credits so blocked claim() calls reject.
-		this.#connCredit.close();
-		this.#bidiStreamCredit.close();
-		this.#uniStreamCredit.close();
-		this.#recvBiCredit.close();
-		this.#recvUniCredit.close();
+		this.#connCredit.close(closeErr);
+		this.#bidiStreamCredit.close(closeErr);
+		this.#uniStreamCredit.close(closeErr);
+		this.#recvBiCredit.close(closeErr);
+		this.#recvUniCredit.close(closeErr);
 
 		// Reject pending stream writes; already-queued control (e.g. CONNECTION_CLOSE)
 		// still flushes before the socket is torn down.
