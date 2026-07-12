@@ -232,6 +232,18 @@ describe("Session integration (scripted peer)", () => {
 			expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
 		});
 
+		test("a peer CONNECTION_CLOSE fulfills even when it carries a violation code", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+
+			// The peer caught *us* violating the protocol and closed with 1002. It still
+			// said goodbye, so this is graceful and the app gets its code and reason —
+			// only a violation *we* detect (#abort) rejects. Same line rs/qmux draws:
+			// ConnectionClosed{code,reason} for a peer close, ProtocolViolation for ours.
+			peer.send({ type: "connection_close", code: VarInt.from(1002), reason: "Protocol violation" });
+			expect(await session.closed).toEqual({ closeCode: 1002, reason: "Protocol violation" });
+		});
+
 		test("a socket drop with no CONNECTION_CLOSE rejects closed", async () => {
 			const { session, peer } = connect();
 			await session.ready;
@@ -244,12 +256,17 @@ describe("Session integration (scripted peer)", () => {
 			expect(err.message).toContain("Connection closed");
 		});
 
-		test("a socket error rejects closed", async () => {
+		test("a socket error rejects closed, preserving the underlying failure", async () => {
 			const { session, peer } = connect();
 			await session.ready;
 
 			peer.error(new Error("connection reset"));
-			await expectSessionFailure(session);
+
+			// Why the transport died is the whole value of the rejection, so the socket's
+			// own error has to survive rather than be flattened into a fixed string.
+			const err = await expectSessionFailure(session);
+			expect(err.message).toBe("connection reset");
+			expect((err.cause as Error).message).toBe("connection reset");
 		});
 
 		test("an idle timeout rejects closed, rather than mimicking a graceful close", async () => {

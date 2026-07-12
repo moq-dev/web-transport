@@ -25,9 +25,13 @@ const stream = await transport.createBidirectionalStream()
 
 ### Detecting a dropped session
 
-`closed` follows the WebTransport contract: it **fulfills** with `{ closeCode, reason }` when the
-session ends gracefully — either side calling `close()` — and **rejects** when it ends abnormally:
-the socket dropped, the peer went idle, or either end detected a protocol violation.
+`closed` follows the WebTransport contract:
+
+- **Fulfills** with `{ closeCode, reason }` when the session ends gracefully — a `CONNECTION_CLOSE`
+  arrived, from either side calling `close()`. That includes a peer that closes because *it* caught
+  a protocol violation: it told us why, so you get its close code and reason.
+- **Rejects** when the session ends abnormally, with no `CONNECTION_CLOSE`: the socket dropped, the
+  peer went idle, or *this* endpoint caught the peer violating the protocol.
 
 ```ts
 try {

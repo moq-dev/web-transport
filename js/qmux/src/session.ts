@@ -510,8 +510,10 @@ export default class Session implements WebTransport {
 				this.#closeReason ??= new Error(`Connection closed: ${info.closeCode ?? 0} ${info.reason ?? ""}`);
 				this.#close(info.closeCode ?? 1006, info.reason ?? "", false);
 			},
-			() => {
-				this.#closeReason ??= new Error("WebSocketStream closed");
+			(err: unknown) => {
+				// Keep the socket failure itself — it becomes the SessionError's cause, and
+				// it's the only description of *why* the transport died.
+				this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream closed");
 				this.#close(1006, "WebSocketStream error", false);
 			},
 		);
