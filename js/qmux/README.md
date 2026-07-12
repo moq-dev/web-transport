@@ -23,6 +23,25 @@ await transport.ready
 const stream = await transport.createBidirectionalStream()
 ```
 
+### Detecting a dropped session
+
+`closed` follows the WebTransport contract: it **fulfills** with `{ closeCode, reason }` when the
+session ends gracefully — either side calling `close()` — and **rejects** when it ends abnormally:
+the socket dropped, the peer went idle, or either end detected a protocol violation.
+
+```ts
+try {
+	const info = await transport.closed
+	console.log("closed gracefully", info.closeCode, info.reason)
+} catch (err) {
+	// err is a WebTransportError-shaped SessionError: err.source === "session"
+	console.warn("session dropped, reconnecting", err)
+}
+```
+
+Don't reach for `closeCode` to tell the two apart — close codes are application-defined, so an app
+closing with `1006` is indistinguishable from a dropped socket. The settled state is the signal.
+
 ### Polyfill
 
 Install as a global `WebTransport` polyfill:
