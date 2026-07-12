@@ -605,7 +605,7 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "stop_sending") {
 			this.#handleStopSending(frame);
 		} else if (frame.type === "connection_close") {
-			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value}: ${frame.reason}`);
+			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value} ${frame.reason}`);
 			this.#close(Number(frame.code.value), frame.reason);
 			this.#transportClose();
 		} else if (frame.type === "transport_parameters") {
@@ -776,7 +776,7 @@ export default class Session implements WebTransport {
 			// 1. Try stream credit
 			const streamClaimed = flow.sendCredit.tryClaim(desired);
 			if (streamClaimed === 0n) {
-				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				if (this.#closed) throw this.#closed;
 				// Wait for stream credit, then release and retry to coordinate with conn credit
 				const claimed = await flow.sendCredit.claim(desired);
 				flow.sendCredit.release(claimed);
@@ -787,7 +787,7 @@ export default class Session implements WebTransport {
 			const connClaimed = this.#connCredit.tryClaim(streamClaimed);
 			if (connClaimed === 0n) {
 				flow.sendCredit.release(streamClaimed);
-				if (this.#closed) throw this.#closeReason || new Error("Connection closed");
+				if (this.#closed) throw this.#closed;
 				const claimed = await this.#connCredit.claim(1n);
 				this.#connCredit.release(claimed);
 				continue;
@@ -904,7 +904,12 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	async #handleStreamFrame(frame: Frame.Data) {
+	#handleStreamFrame(frame: Frame.Data) {
+		// The read loop can still deliver frames after #close() has torn down the
+		// incoming-stream controllers and #recvStreams; drop them, matching the
+		// #sendDatagram/#sendPriorityFrame post-close guards.
+		if (this.#closed) return;
+
 		if (frame.data.byteLength > MAX_FRAME_PAYLOAD) {
 			this.close({ closeCode: 1002, reason: "frame too large" });
 			return;
@@ -1010,9 +1015,28 @@ export default class Session implements WebTransport {
 				});
 				this.#attachSendOrder(writer, streamId, DEFAULT_SEND_ORDER);
 
-				this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
+				try {
+					this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
+				} catch {
+					// The app cancelled the incoming-bidi acceptor while the session is
+					// still open (a closed session already returned at the #closed guard
+					// above). Keep the stream registered in #recvStreams — as in <=0.2.0 —
+					// so later in-flight frames for this id take the existing-stream path
+					// below instead of re-opening it (which would re-credit stream-count
+					// and re-emit STOP_SENDING per frame). Error the orphaned recv buffer
+					// so we don't retain bytes no reader can drain, then fall through so
+					// connection flow control is still accounted for this frame.
+					recv.error(new Error("incoming stream acceptor cancelled"));
+				}
 			} else {
-				this.#incomingUnidirectionalStreams.enqueue(reader);
+				try {
+					this.#incomingUnidirectionalStreams.enqueue(reader);
+				} catch {
+					// Acceptor cancelled mid-session; see the bidi branch. Keep the stream
+					// registered, drop its orphaned buffer, and fall through to account
+					// connection flow control below.
+					recv.error(new Error("incoming stream acceptor cancelled"));
+				}
 			}
 		} else {
 			// Existing stream — validate recv flow control
@@ -1203,7 +1227,7 @@ export default class Session implements WebTransport {
 		await this.ready;
 
 		if (this.#closed) {
-			throw this.#closeReason || new Error("Connection closed");
+			throw this.#closed;
 		}
 
 		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;
@@ -1376,18 +1400,20 @@ export default class Session implements WebTransport {
 		this.#sendStreams.clear();
 		this.#recvStreams.clear();
 
-		// Close per-stream credits before clearing the map
+		// Close per-stream credits before clearing the map. Pass the rich close
+		// reason so writes parked in Credit.claim() reject with the same
+		// "Connection closed: <code> <reason>" error as every other teardown path.
 		for (const flow of this.#streamFlow.values()) {
-			flow.sendCredit.close();
+			flow.sendCredit.close(closeErr);
 		}
 		this.#streamFlow.clear();
 
 		// Close global credits so blocked claim() calls reject.
-		this.#connCredit.close();
-		this.#bidiStreamCredit.close();
-		this.#uniStreamCredit.close();
-		this.#recvBiCredit.close();
-		this.#recvUniCredit.close();
+		this.#connCredit.close(closeErr);
+		this.#bidiStreamCredit.close(closeErr);
+		this.#uniStreamCredit.close(closeErr);
+		this.#recvBiCredit.close(closeErr);
+		this.#recvUniCredit.close(closeErr);
 
 		// Reject pending stream writes; already-queued control (e.g. CONNECTION_CLOSE)
 		// still flushes before the socket is torn down.
