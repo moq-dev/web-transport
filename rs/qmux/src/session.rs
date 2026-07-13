@@ -971,12 +971,22 @@ impl<R: Reader> SessionState<R> {
                 }
             }
             Frame::ConnectionClose(close) => {
-                self.closed
-                    .send(Some(Error::ConnectionClosed {
+                // APPLICATION_CLOSE (0x1d) is a graceful, deliberate peer close;
+                // CONNECTION_CLOSE (0x1c) means the peer hit a protocol/transport
+                // error. The subtype, not the code, decides which — so the former
+                // surfaces as a clean session close and the latter as abnormal.
+                let err = if close.application {
+                    Error::ConnectionClosed {
                         code: close.code,
                         reason: close.reason,
-                    }))
-                    .ok();
+                    }
+                } else {
+                    Error::ConnectionReset {
+                        code: close.code,
+                        reason: close.reason,
+                    }
+                };
+                self.closed.send(Some(err)).ok();
             }
             // Flow control frames
             Frame::MaxData(max) => {
@@ -1234,10 +1244,13 @@ impl Session {
             // Timed out waiting for the peer's parameters: abort the half-open
             // handshake, notifying the peer, and fail rather than hang.
             None => {
+                // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
+                // rather than seeing a graceful close.
                 let _ = self.outbound_priority.send(
                     ConnectionClose {
                         code: VarInt::from(0u32),
                         reason: "handshake timeout".to_string(),
+                        application: false,
                     }
                     .into(),
                 );
@@ -1422,6 +1435,23 @@ impl Session {
 
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
+            // If we tore down because of a protocol/transport violation *we*
+            // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
+            // session rejects too, rather than seeing a bare drop. Enqueue on the
+            // control lane *before* flipping `closed`, so the writer's teardown
+            // flush picks it up. `transport_close` returns `None` for a graceful
+            // close, a close the peer already sent us, an idle timeout, or a dead
+            // transport — none of which should (or can) emit a frame here.
+            if let Some(code) = err.transport_close() {
+                let _ = backend.control.send(
+                    ConnectionClose {
+                        code: VarInt::from(code),
+                        reason: err.to_string(),
+                        application: false,
+                    }
+                    .into(),
+                );
+            }
             // Dropping `backend` drops the `established` sender; an `established()`
             // waiter that was still pending then observes the channel close and
             // reports this terminal error. The OnceLock stays unset, so the
@@ -1628,9 +1658,12 @@ impl generic::Session for Session {
     }
 
     fn close(&self, code: u32, reason: &str) {
+        // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
+        // session close carrying our code/reason.
         let frame = ConnectionClose {
             code: VarInt::from(code),
             reason: reason.to_string(),
+            application: true,
         };
         let _ = self.outbound_priority.send(frame.into());
 
@@ -2525,6 +2558,112 @@ mod datagram_recv_tests {
         raw.flush().await.unwrap();
 
         assert!(matches!(server.closed().await, Error::DatagramsUnsupported));
+    }
+
+    /// Scan the size-prefixed records the server wrote and return the first
+    /// CONNECTION_CLOSE / APPLICATION_CLOSE frame among them.
+    fn find_connection_close(buf: &[u8]) -> Option<ConnectionClose> {
+        let mut data = Bytes::copy_from_slice(buf);
+        while !data.is_empty() {
+            let len = VarInt::decode(&mut data).ok()?.into_inner() as usize;
+            if data.len() < len {
+                return None;
+            }
+            let record = data.split_to(len);
+            for frame in Frame::decode_record(record).ok()? {
+                if let Frame::ConnectionClose(c) = frame {
+                    return Some(c);
+                }
+            }
+        }
+        None
+    }
+
+    /// A protocol violation we detect is reported to the peer as a CONNECTION_CLOSE
+    /// (0x1c), not a graceful APPLICATION_CLOSE — so the peer's session rejects too,
+    /// matching the JS polyfill.
+    #[tokio::test]
+    async fn violation_emits_connection_close_to_peer() {
+        use tokio::io::AsyncReadExt;
+
+        let mut cfg = Config::new(Version::QMux01);
+        cfg.max_datagram_frame_size = 100;
+        let (server, mut raw) = raw_peer(cfg).await;
+
+        // Oversized DATAGRAM frame → the server tears down with FrameTooLarge.
+        let datagram = Frame::Datagram(Bytes::from(vec![0u8; 98]).into())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(server.closed().await, Error::FrameTooLarge));
+
+        // Drain everything the server wrote and find the close frame it emitted.
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(1), raw.read_to_end(&mut buf))
+            .await
+            .expect("reading the server's output timed out")
+            .unwrap();
+
+        let close = find_connection_close(&buf).expect("server must emit a CONNECTION_CLOSE");
+        assert!(
+            !close.application,
+            "a violation is a transport CONNECTION_CLOSE (0x1c), not APPLICATION_CLOSE"
+        );
+        assert_eq!(close.code.into_inner(), 1002, "protocol-violation code");
+    }
+
+    /// A peer APPLICATION_CLOSE (0x1d) is graceful: a clean session close carrying
+    /// the peer's code/reason.
+    #[tokio::test]
+    async fn peer_application_close_is_graceful() {
+        let (server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
+
+        let close = Frame::ConnectionClose(ConnectionClose {
+            code: VarInt::from_u32(42),
+            reason: "bye".to_string(),
+            application: true,
+        })
+        .encode(Version::QMux01)
+        .unwrap();
+        raw.write_all(&record(close)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        match server.closed().await {
+            Error::ConnectionClosed { code, reason } => {
+                assert_eq!(code.into_inner(), 42);
+                assert_eq!(reason, "bye");
+            }
+            other => panic!("expected a graceful ConnectionClosed, got {other:?}"),
+        }
+    }
+
+    /// A peer CONNECTION_CLOSE (0x1c) is abnormal: the peer hit a protocol/transport
+    /// error, so it surfaces as a reset — and must NOT masquerade as a clean
+    /// application close (`session_error()` returns `None`).
+    #[tokio::test]
+    async fn peer_connection_close_is_abnormal() {
+        use web_transport_trait::Error as _;
+
+        let (server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
+
+        let close = Frame::ConnectionClose(ConnectionClose {
+            code: VarInt::from_u32(1002),
+            reason: "protocol violation".to_string(),
+            application: false,
+        })
+        .encode(Version::QMux01)
+        .unwrap();
+        raw.write_all(&record(close)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        let err = server.closed().await;
+        assert!(
+            matches!(err, Error::ConnectionReset { .. }),
+            "a peer CONNECTION_CLOSE must be abnormal, got {err:?}"
+        );
+        assert!(err.session_error().is_none());
     }
 
     /// A DATAGRAM whose encoded frame exactly hits the advertised limit is

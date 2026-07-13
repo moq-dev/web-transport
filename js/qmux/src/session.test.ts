@@ -122,12 +122,18 @@ function settleTo<T>(p: Promise<T>): Promise<T | Error> {
 	);
 }
 
-/** The code on the CONNECTION_CLOSE the Session put on the wire, if any. A
- *  locally-detected violation still owes the peer an explanation, even though it
- *  settles `closed` as a failure on our side. */
-function sentCloseCode(peer: FakePeer): number | undefined {
+/** The session-close frame the Session put on the wire, if any. A locally-detected
+ *  violation still owes the peer an explanation, even though it settles `closed`
+ *  as a failure on our side. Its `application` flag distinguishes the graceful
+ *  APPLICATION_CLOSE a `close()` sends from the CONNECTION_CLOSE a violation sends. */
+function sentClose(peer: FakePeer): Frame.ConnectionClose | undefined {
 	const frame = peer.received().find((f) => f.type === "connection_close");
-	return frame?.type === "connection_close" ? Number(frame.code.value) : undefined;
+	return frame?.type === "connection_close" ? frame : undefined;
+}
+
+function sentCloseCode(peer: FakePeer): number | undefined {
+	const frame = sentClose(peer);
+	return frame ? Number(frame.code.value) : undefined;
 }
 
 /** Assert `closed` rejected the way the WebTransport contract requires of an
@@ -204,13 +210,15 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
-	test("close() sends CONNECTION_CLOSE, resolves closed, and is idempotent", async () => {
+	test("close() sends APPLICATION_CLOSE, resolves closed, and is idempotent", async () => {
 		const { session, peer } = connect();
 		await session.ready;
 
 		session.close({ closeCode: 42, reason: "bye" });
 		expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
 		await waitFor(() => peer.has("connection_close"));
+		// A graceful close is an APPLICATION_CLOSE (0x1d), so the peer fulfills.
+		expect(sentClose(peer)?.application).toBe(true);
 
 		// Second close is a no-op: the resolved info is unchanged.
 		session.close({ closeCode: 7, reason: "again" });
@@ -222,26 +230,42 @@ describe("Session integration (scripted peer)", () => {
 	// split a consumer cannot tell a dropped session from a clean shutdown — the close
 	// code can't carry it, since codes are application-defined.
 	describe("closed settles graceful vs abnormal", () => {
-		test("a peer CONNECTION_CLOSE resolves closed with its code and reason", async () => {
+		test("a peer APPLICATION_CLOSE resolves closed with its code and reason", async () => {
 			const { session, peer } = connect();
 			await session.ready;
 
-			// The peer closing the session deliberately is graceful, even though we
-			// didn't initiate it.
-			peer.send({ type: "connection_close", code: VarInt.from(42), reason: "bye" });
+			// The peer closing the session deliberately (APPLICATION_CLOSE / 0x1d) is
+			// graceful, even though we didn't initiate it.
+			peer.send({ type: "connection_close", application: true, code: VarInt.from(42), reason: "bye" });
 			expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
 		});
 
-		test("a peer CONNECTION_CLOSE fulfills even when it carries a violation code", async () => {
+		test("a peer APPLICATION_CLOSE fulfills even when its code looks like a transport error", async () => {
 			const { session, peer } = connect();
 			await session.ready;
 
-			// The peer caught *us* violating the protocol and closed with 1002. It still
-			// said goodbye, so this is graceful and the app gets its code and reason —
-			// only a violation *we* detect (#abort) rejects. Same line rs/qmux draws:
-			// ConnectionClosed{code,reason} for a peer close, ProtocolViolation for ours.
-			peer.send({ type: "connection_close", code: VarInt.from(1002), reason: "Protocol violation" });
-			expect(await session.closed).toEqual({ closeCode: 1002, reason: "Protocol violation" });
+			// 1002 is a transport-error code, but an APPLICATION_CLOSE is graceful by
+			// definition — the *subtype*, not the code, decides. Codes are
+			// application-defined, so the app still gets its code and reason.
+			peer.send({ type: "connection_close", application: true, code: VarInt.from(1002), reason: "bye" });
+			expect(await session.closed).toEqual({ closeCode: 1002, reason: "bye" });
+		});
+
+		test("a peer CONNECTION_CLOSE rejects closed", async () => {
+			const { session, peer } = connect();
+			await session.ready;
+
+			// The peer detected a protocol violation / transport error and sent a
+			// CONNECTION_CLOSE (0x1c) — abnormal, so `closed` rejects rather than
+			// fulfilling. Mirrors the frame we emit from #abort.
+			peer.send({
+				type: "connection_close",
+				application: false,
+				code: VarInt.from(1002),
+				reason: "Protocol violation",
+			});
+			const err = await expectSessionFailure(session);
+			expect(err.message).toContain("Protocol violation");
 		});
 
 		test("a socket drop with no CONNECTION_CLOSE rejects closed", async () => {
@@ -313,6 +337,8 @@ describe("Session integration (scripted peer)", () => {
 		const err = await expectSessionFailure(session);
 		expect(err.message).toContain("text frames are not valid for QMux");
 		await waitFor(() => sentCloseCode(peer) === 1003);
+		// A violation we detect is a CONNECTION_CLOSE (0x1c), so the peer rejects too.
+		expect(sentClose(peer)?.application).toBe(false);
 	});
 
 	test("an unnegotiated RESET_STREAM_AT rejects closed and tells the peer why (1002)", async () => {
@@ -327,6 +353,7 @@ describe("Session integration (scripted peer)", () => {
 		// The decode failure itself is carried as the cause, not flattened away.
 		expect(err.cause).toBeInstanceOf(Error);
 		await waitFor(() => sentCloseCode(peer) === 1002);
+		expect(sentClose(peer)?.application).toBe(false);
 	});
 
 	test("datagrams: an app write produces a DATAGRAM frame on the wire", async () => {
@@ -689,8 +716,9 @@ describe("Session integration (scripted peer)", () => {
 			const created = settleTo(session.createBidirectionalStream());
 			await flushMicrotasks();
 
-			// The peer aborts the connection; the frame's code/reason must reach the waiter.
-			peer.send({ type: "connection_close", code: VarInt.from(7n), reason: "peer gone" });
+			// The peer aborts the connection (CONNECTION_CLOSE / 0x1c); the frame's
+			// code/reason must reach the waiter.
+			peer.send({ type: "connection_close", application: false, code: VarInt.from(7n), reason: "peer gone" });
 
 			const err = await created;
 			expect(err).toBeInstanceOf(Error);

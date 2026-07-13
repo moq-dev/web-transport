@@ -102,11 +102,30 @@ describe("WebTransport wire format", () => {
 			type: "connection_close",
 			code: code(42n),
 			reason: "bye",
+			application: true,
 		};
 		const decoded = Frame.decode(wire, "webtransport") as Frame.ConnectionClose;
 		expect(decoded.type).toBe("connection_close");
 		expect(decoded.code.value).toBe(42n);
 		expect(decoded.reason).toBe("bye");
+		expect(decoded.application).toBe(true);
+
+		expect(arr(Frame.encode(frame, "webtransport"))).toEqual(arr(wire));
+	});
+
+	test("connection_close (transport, 0x1c)", () => {
+		// Same body as APPLICATION_CLOSE, but the leading byte flips to 0x1c and the
+		// decoded frame is flagged application:false so the receiver rejects.
+		const wire = bytes(0x1c, 0x2a, 0x62, 0x79, 0x65);
+		const frame: Frame.ConnectionClose = {
+			type: "connection_close",
+			code: code(42n),
+			reason: "bye",
+			application: false,
+		};
+		const decoded = Frame.decode(wire, "webtransport") as Frame.ConnectionClose;
+		expect(decoded.type).toBe("connection_close");
+		expect(decoded.application).toBe(false);
 
 		expect(arr(Frame.encode(frame, "webtransport"))).toEqual(arr(wire));
 	});
@@ -174,11 +193,34 @@ describe("QMux draft-00 wire format", () => {
 	test("application_close", () => {
 		// 0x1d + code(=42) + frame_type(=0) + reason_len(=3) + "bye"
 		const wire = bytes(0x1d, 0x2a, 0x00, 0x03, 0x62, 0x79, 0x65);
-		const frame: Frame.ConnectionClose = { type: "connection_close", code: code(42n), reason: "bye" };
+		const frame: Frame.ConnectionClose = {
+			type: "connection_close",
+			code: code(42n),
+			reason: "bye",
+			application: true,
+		};
 		const decoded = Frame.decode(wire, "qmux-00") as Frame.ConnectionClose;
 		expect(decoded.type).toBe("connection_close");
 		expect(decoded.code.value).toBe(42n);
 		expect(decoded.reason).toBe("bye");
+		expect(decoded.application).toBe(true);
+
+		expect(arr(Frame.encode(frame, "qmux-00"))).toEqual(arr(wire));
+	});
+
+	test("connection_close (transport, 0x1c)", () => {
+		// 0x1c + code(=42) + frame_type(=0) + reason_len(=3) + "bye" — a transport
+		// error / protocol violation. Only the leading type byte differs from 0x1d.
+		const wire = bytes(0x1c, 0x2a, 0x00, 0x03, 0x62, 0x79, 0x65);
+		const frame: Frame.ConnectionClose = {
+			type: "connection_close",
+			code: code(42n),
+			reason: "bye",
+			application: false,
+		};
+		const decoded = Frame.decode(wire, "qmux-00") as Frame.ConnectionClose;
+		expect(decoded.type).toBe("connection_close");
+		expect(decoded.application).toBe(false);
 
 		expect(arr(Frame.encode(frame, "qmux-00"))).toEqual(arr(wire));
 	});
@@ -213,7 +255,7 @@ describe("QMux draft-00 wire format", () => {
 		const cases: [Frame.Any, number][] = [
 			[{ type: "stream", id: sid(4n), data: bytes(0x68, 0x69), fin: false }, 0x0a],
 			[{ type: "max_data", max: 1024n }, 0x10],
-			[{ type: "connection_close", code: code(42n), reason: "bye" }, 0x1d],
+			[{ type: "connection_close", code: code(42n), reason: "bye", application: true }, 0x1d],
 		];
 		for (const [frame, expectedFirstByte] of cases) {
 			const encoded = Frame.encode(frame, "qmux-00");

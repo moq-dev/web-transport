@@ -21,6 +21,7 @@ const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
 const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
+const CONNECTION_CLOSE: VarInt = VarInt::from_u32(0x1c);
 // DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
 // the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
 // QMux01, where each rides its own record, so the record boundary would already
@@ -100,6 +101,15 @@ pub struct ConnectionClose {
     pub code: VarInt,
     /// Human-readable reason for closing.
     pub reason: String,
+    /// Which QUIC close subtype this is, and how the receiver settles the session:
+    /// - `true` → APPLICATION_CLOSE (0x1d): a graceful, app-initiated close; the
+    ///   receiver surfaces it as a clean session close carrying `code`/`reason`.
+    /// - `false` → CONNECTION_CLOSE (0x1c): a protocol violation or transport error
+    ///   the sender detected; the receiver surfaces it as an abnormal close.
+    ///
+    /// The subtype, not the code, carries this distinction — codes are
+    /// application-defined, so a graceful close may legitimately use any value.
+    pub application: bool,
 }
 
 /// A QX_PING frame for connection liveness probing (draft-01).
@@ -322,6 +332,7 @@ impl Frame {
                 Ok(Some(Frame::ConnectionClose(ConnectionClose {
                     code,
                     reason,
+                    application: frame_type == 0x1d,
                 })))
             }
             // MAX_DATA
@@ -434,7 +445,8 @@ impl Frame {
                 s.code.encode(buf);
             }
             Frame::ConnectionClose(c) => {
-                buf.put_u8(0x1d);
+                // APPLICATION_CLOSE (0x1d) vs CONNECTION_CLOSE (0x1c).
+                buf.put_u8(if c.application { 0x1d } else { 0x1c });
                 c.code.encode(buf);
                 buf.put_slice(c.reason.as_bytes());
             }
@@ -467,7 +479,13 @@ impl Frame {
                 s.code.encode(buf);
             }
             Frame::ConnectionClose(c) => {
-                APPLICATION_CLOSE.encode(buf);
+                // APPLICATION_CLOSE (0x1d) vs CONNECTION_CLOSE (0x1c). Both carry the
+                // causing-frame-type field in this draft, so only the type differs.
+                if c.application {
+                    APPLICATION_CLOSE.encode(buf);
+                } else {
+                    CONNECTION_CLOSE.encode(buf);
+                }
                 c.code.encode(buf);
                 // frame_type = 0 (application close)
                 VarInt::from(0u32).encode(buf);
@@ -588,10 +606,14 @@ impl Frame {
                     fin: true,
                 }))
             }
-            0x1d => {
+            0x1c | 0x1d => {
                 let code = VarInt::decode(&mut data)?;
                 let reason = String::from_utf8_lossy(&data).into_owned();
-                Ok(Frame::ConnectionClose(ConnectionClose { code, reason }))
+                Ok(Frame::ConnectionClose(ConnectionClose {
+                    code,
+                    reason,
+                    application: frame_type == 0x1d,
+                }))
             }
             _ => Err(Error::InvalidFrameType(frame_type as u64)),
         }
@@ -680,6 +702,7 @@ impl Frame {
                 Ok(Some(Frame::ConnectionClose(ConnectionClose {
                     code,
                     reason,
+                    application: frame_type == 0x1d,
                 })))
             }
             // MAX_DATA

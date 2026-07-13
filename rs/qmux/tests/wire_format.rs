@@ -66,6 +66,7 @@ fn assert_frames_eq(got: &Frame, want: &Frame, version: Version) {
         (Frame::ConnectionClose(a), Frame::ConnectionClose(b)) => {
             assert_eq!(a.code.into_inner(), b.code.into_inner(), "close code");
             assert_eq!(a.reason, b.reason, "close reason");
+            assert_eq!(a.application, b.application, "close application flag");
         }
         (Frame::MaxData(a), Frame::MaxData(b)) => assert_eq!(a, b, "max_data"),
         (
@@ -187,6 +188,19 @@ fn webtransport_connection_close() {
     let frame = Frame::ConnectionClose(ConnectionClose {
         code: code(42),
         reason: "bye".to_string(),
+        application: true,
+    });
+    assert_round_trip(Version::WebTransport, &bytes, &frame);
+}
+
+#[test]
+fn webtransport_connection_close_transport() {
+    // Same body as APPLICATION_CLOSE, but 0x1c flags it as a transport close.
+    let bytes = [0x1c, 0x2a, b'b', b'y', b'e'];
+    let frame = Frame::ConnectionClose(ConnectionClose {
+        code: code(42),
+        reason: "bye".to_string(),
+        application: false,
     });
     assert_round_trip(Version::WebTransport, &bytes, &frame);
 }
@@ -412,6 +426,19 @@ fn qmux00_application_close() {
     let frame = Frame::ConnectionClose(ConnectionClose {
         code: code(42),
         reason: "bye".to_string(),
+        application: true,
+    });
+    assert_round_trip(Version::QMux00, &bytes, &frame);
+}
+
+#[test]
+fn qmux00_connection_close_transport() {
+    // 0x1c (CONNECTION_CLOSE) + code(=42) + frame_type(=0) + reason_len(=3) + "bye".
+    let bytes = [0x1c, 0x2a, 0x00, 0x03, b'b', b'y', b'e'];
+    let frame = Frame::ConnectionClose(ConnectionClose {
+        code: code(42),
+        reason: "bye".to_string(),
+        application: false,
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
 }
@@ -543,6 +570,7 @@ fn qmux00_encoding_has_no_record_size_prefix() {
         Frame::ConnectionClose(ConnectionClose {
             code: code(42),
             reason: "bye".to_string(),
+            application: true,
         }),
     ];
     for frame in &cases {

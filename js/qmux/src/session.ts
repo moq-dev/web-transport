@@ -498,7 +498,7 @@ export default class Session implements WebTransport {
 			},
 			(err: unknown) => {
 				this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream failed to open");
-				this.#close(1006, "WebSocketStream error", false);
+				this.#abort(1006, "WebSocketStream error");
 			},
 		);
 		wss.closed.then(
@@ -508,13 +508,13 @@ export default class Session implements WebTransport {
 				// idempotent), so reaching here settled means the session dropped —
 				// even if the WebSocket itself closed with a "clean" status code.
 				this.#closeReason ??= new Error(`Connection closed: ${info.closeCode ?? 0} ${info.reason ?? ""}`);
-				this.#close(info.closeCode ?? 1006, info.reason ?? "", false);
+				this.#abort(info.closeCode ?? 1006, info.reason ?? "");
 			},
 			(err: unknown) => {
 				// Keep the socket failure itself — it becomes the SessionError's cause, and
 				// it's the only description of *why* the transport died.
 				this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream closed");
-				this.#close(1006, "WebSocketStream error", false);
+				this.#abort(1006, "WebSocketStream error");
 			},
 		);
 	}
@@ -527,6 +527,7 @@ export default class Session implements WebTransport {
 				// QMux is binary-only; a text frame is a protocol error, not something
 				// to silently drop (which would desync the session).
 				if (typeof value === "string") {
+					this.#sendConnectionClose(1003, "text frames are not valid for QMux");
 					this.#abort(1003, "text frames are not valid for QMux");
 					return;
 				}
@@ -534,7 +535,7 @@ export default class Session implements WebTransport {
 			}
 		} catch (err) {
 			this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream read error");
-			this.#close(1006, "WebSocketStream read error", false);
+			this.#abort(1006, "WebSocketStream read error");
 		}
 	}
 
@@ -596,6 +597,7 @@ export default class Session implements WebTransport {
 		} catch (error) {
 			// A decode failure or a frame that violates a negotiated limit is fatal.
 			console.error("Protocol violation:", error);
+			this.#sendConnectionClose(1002, "Protocol violation");
 			this.#abort(1002, "Protocol violation", error);
 		}
 	}
@@ -618,11 +620,17 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "stop_sending") {
 			this.#handleStopSending(frame);
 		} else if (frame.type === "connection_close") {
-			// The peer closed the session deliberately: graceful, so `closed`
-			// fulfills with its code/reason. Only a termination with *no*
-			// CONNECTION_CLOSE is a drop.
 			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value} ${frame.reason}`);
-			this.#close(Number(frame.code.value), frame.reason, true);
+			if (frame.application) {
+				// APPLICATION_CLOSE (0x1d): the peer closed the session deliberately —
+				// graceful, so `closed` fulfills with its code/reason.
+				this.#close(Number(frame.code.value), frame.reason);
+			} else {
+				// CONNECTION_CLOSE (0x1c): the peer hit a protocol violation or
+				// transport error, so `closed` rejects. A termination with *no* close
+				// frame at all is a drop, which #abort also handles.
+				this.#abort(Number(frame.code.value), frame.reason);
+			}
 			this.#transportClose();
 		} else if (frame.type === "transport_parameters") {
 			this.#handleTransportParameters(frame.params);
@@ -764,7 +772,7 @@ export default class Session implements WebTransport {
 			// rejection this is indistinguishable from a graceful close(), which also
 			// settles with closeCode 0.
 			this.#closeReason ??= new Error("idle timeout");
-			this.#close(0, "idle timeout", false);
+			this.#abort(0, "idle timeout");
 			this.#transportClose();
 			return;
 		}
@@ -929,6 +937,7 @@ export default class Session implements WebTransport {
 		if (this.#closed) return;
 
 		if (frame.data.byteLength > MAX_FRAME_PAYLOAD) {
+			this.#sendConnectionClose(1002, "frame too large");
 			this.#abort(1002, "frame too large");
 			return;
 		}
@@ -955,6 +964,7 @@ export default class Session implements WebTransport {
 			if (isQmux(this.#version)) {
 				const credit = frame.id.dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
 				if (!credit.receiveUpTo(frame.id.index + 1n)) {
+					this.#sendConnectionClose(1002, "stream limit exceeded");
 					this.#abort(1002, "stream limit exceeded");
 					return;
 				}
@@ -980,6 +990,7 @@ export default class Session implements WebTransport {
 
 			// Validate recv flow control before accepting
 			if (!this.#accountRecv(streamId, frame.data.byteLength)) {
+				this.#sendConnectionClose(1002, "flow control error");
 				this.#abort(1002, "flow control error");
 				return;
 			}
@@ -1059,6 +1070,7 @@ export default class Session implements WebTransport {
 		} else {
 			// Existing stream — validate recv flow control
 			if (!this.#accountRecv(streamId, frame.data.byteLength)) {
+				this.#sendConnectionClose(1002, "flow control error");
 				this.#abort(1002, "flow control error");
 				return;
 			}
@@ -1372,37 +1384,15 @@ export default class Session implements WebTransport {
 		return writer;
 	}
 
-	/** The single, idempotent close transition: marks the session closed, settles
-	 *  `ready`/`closed`, and tears down streams, credits, and the scheduler.
-	 *  Protocol-close paths route through here before/while closing the socket.
-	 *
-	 *  `graceful` decides how `closed` settles, and it is the only signal a
-	 *  consumer has to tell a dropped session from a clean shutdown. Per the
-	 *  WebTransport contract `closed` fulfills only when the session ends
-	 *  cleanly — a local `close()` or a peer CONNECTION_CLOSE — and rejects with
-	 *  a `WebTransportError` on everything else: socket failure, read error,
-	 *  locally-detected protocol violation, idle timeout. Close codes cannot carry
-	 *  that distinction, since they are application-defined (an app closing with
-	 *  1006 must not look like a dropped socket). */
-	#close(code: number, reason: string, graceful: boolean) {
-		if (this.#closed) return;
-		this.#closed = this.#closeReason ?? new Error(`Connection closed: ${code} ${reason}`);
-
+	/** Shared teardown for both terminal transitions: tears down streams,
+	 *  credits, and the scheduler. The caller has already marked the session
+	 *  closed and settled `ready`/`closed` — the only thing that differs between
+	 *  a clean shutdown and a dropped session is which way `closed` settled, and
+	 *  {@link #close} vs {@link #abort} own that choice. */
+	#teardown() {
 		if (this.#idleTimer) {
 			clearInterval(this.#idleTimer);
 			this.#idleTimer = undefined;
-		}
-
-		// Settle the WebTransport promises. Rejecting `ready` is a no-op once it
-		// has resolved (i.e. after a successful open).
-		this.#readyReject(this.#closed);
-		if (graceful) {
-			this.#closedResolve({
-				closeCode: code,
-				reason,
-			});
-		} else {
-			this.#closedReject(new SessionError(this.#closed.message, { cause: this.#closed }));
 		}
 
 		// Fail active streams so consumers unblock
@@ -1448,7 +1438,43 @@ export default class Session implements WebTransport {
 
 		// Reject pending stream writes; already-queued control (e.g. CONNECTION_CLOSE)
 		// still flushes before the socket is torn down.
-		this.#scheduler?.close(this.#closed ?? this.#closeReason ?? new Error("Connection closed"));
+		this.#scheduler?.close(closeErr);
+	}
+
+	/** Graceful terminal transition: `closed` **fulfills** with the close code
+	 *  and reason. Per the WebTransport contract this is the only clean outcome —
+	 *  reached by a local {@link close} (which first puts an APPLICATION_CLOSE on
+	 *  the wire) or by receiving a peer's CONNECTION_CLOSE. Idempotent. */
+	#close(code: number, reason: string) {
+		if (this.#closed) return;
+		this.#closed = this.#closeReason ?? new Error(`Connection closed: ${code} ${reason}`);
+
+		// Rejecting `ready` is a no-op once it has resolved (i.e. after a
+		// successful open).
+		this.#readyReject(this.#closed);
+		this.#closedResolve({ closeCode: code, reason });
+
+		this.#teardown();
+	}
+
+	/** Abnormal terminal transition: `closed` **rejects** with a
+	 *  `WebTransportError`. Reached on everything that is not a clean shutdown —
+	 *  socket failure, read error, idle timeout, or a protocol violation we
+	 *  detected locally. Close codes cannot carry this distinction, since they are
+	 *  application-defined (an app closing with 1006 must not look like a dropped
+	 *  socket). `cause`, when given, is preserved as the close reason so the
+	 *  original failure survives on `closed`. Idempotent. */
+	#abort(code: number, reason: string, cause?: unknown) {
+		if (this.#closed) return;
+		if (cause !== undefined) {
+			this.#closeReason ??= cause instanceof Error ? cause : new Error(String(cause));
+		}
+		this.#closed = this.#closeReason ?? new Error(`Connection closed: ${code} ${reason}`);
+
+		this.#readyReject(this.#closed);
+		this.#closedReject(new SessionError(this.#closed.message, { cause: this.#closed }));
+
+		this.#teardown();
 	}
 
 	/** Tear down the underlying transport. The meaningful close code/reason
@@ -1460,38 +1486,43 @@ export default class Session implements WebTransport {
 		} catch {}
 	}
 
-	/** Emit CONNECTION_CLOSE, transition, and give the queued frame a moment to
-	 *  flush before actually closing the socket. Shared by the app-initiated
-	 *  `close()` and the locally-detected failure path `#abort()`, which differ
-	 *  only in how they settle `closed`. */
-	#closeWithFrame(code: number, reason: string, graceful: boolean) {
-		if (this.#closed) return;
-
+	/** Put a session-close frame on the wire and give it a moment to flush before
+	 *  tearing down the socket. Used only by the paths that initiate a close on a
+	 *  live connection — the app-initiated {@link close} and the locally-detected
+	 *  violations — which the peer deserves to hear about. `application` selects
+	 *  the QUIC subtype the peer keys its resolve-vs-reject on. Must run *before*
+	 *  the terminal transition, which closes the scheduler to new control frames. */
+	#putClose(code: number, reason: string, application: boolean) {
 		this.#sendPriorityFrame({
 			type: "connection_close",
 			code: VarInt.from(code),
 			reason,
+			application,
 		});
-
-		this.#close(code, reason, graceful);
 		setTimeout(() => {
 			this.#transportClose();
 		}, 100);
 	}
 
-	/** A failure we detected ourselves (protocol violation, unsupported frame).
-	 *  It borrows the same wire path as `close()` — the peer still deserves a
-	 *  CONNECTION_CLOSE saying why — but it is not an app-initiated close, so
-	 *  `closed` rejects rather than fulfilling. */
-	#abort(code: number, reason: string, cause?: unknown) {
-		if (cause !== undefined) {
-			this.#closeReason ??= cause instanceof Error ? cause : new Error(String(cause));
-		}
-		this.#closeWithFrame(code, reason, false);
+	/** APPLICATION_CLOSE (0x1d): a graceful, app-initiated close the peer surfaces
+	 *  by *fulfilling* its `closed`. Pairs with the {@link #close} transition. */
+	#sendApplicationClose(code: number, reason: string) {
+		this.#putClose(code, reason, true);
+	}
+
+	/** CONNECTION_CLOSE (0x1c): a protocol violation or transport error we detected,
+	 *  which the peer surfaces by *rejecting* its `closed`. Pairs with the
+	 *  {@link #abort} transition. */
+	#sendConnectionClose(code: number, reason: string) {
+		this.#putClose(code, reason, false);
 	}
 
 	close(info?: { closeCode?: number; reason?: string }) {
-		this.#closeWithFrame(info?.closeCode ?? 0, info?.reason ?? "", true);
+		if (this.#closed) return;
+		const code = info?.closeCode ?? 0;
+		const reason = info?.reason ?? "";
+		this.#sendApplicationClose(code, reason);
+		this.#close(code, reason);
 	}
 
 	/** Resize the send-buffer high-water mark (bytes) used for write

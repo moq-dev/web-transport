@@ -43,6 +43,14 @@ export interface ConnectionClose {
 	type: "connection_close";
 	code: VarInt;
 	reason: string;
+	/** Which QUIC close subtype this is, and how the receiver settles `closed`:
+	 *  - `true` → APPLICATION_CLOSE (0x1d): a graceful, app-initiated close; the
+	 *    receiver *fulfills* `closed` with `code`/`reason`.
+	 *  - `false` → CONNECTION_CLOSE (0x1c): a protocol violation or transport error
+	 *    the sender detected; the receiver *rejects* `closed`.
+	 *  The subtype, not the code, carries this distinction — codes are
+	 *  application-defined, so a graceful close may legitimately use any value. */
+	application: boolean;
 }
 
 export interface MaxData {
@@ -271,7 +279,8 @@ function encodeWebTransport(frame: Any): Uint8Array {
 			const body = new TextEncoder().encode(frame.reason);
 			let buffer = new Uint8Array(new ArrayBuffer(1 + 8 + body.length), 0, 1);
 
-			buffer[0] = 0x1d;
+			// APPLICATION_CLOSE (0x1d) vs CONNECTION_CLOSE (0x1c).
+			buffer[0] = frame.application ? 0x1d : 0x1c;
 			buffer = frame.code.encode(buffer);
 
 			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + body.length);
@@ -330,8 +339,9 @@ function encodeQMux(frame: Any): Uint8Array {
 		}
 
 		case "connection_close": {
-			// APPLICATION_CLOSE (0x1d)
-			const frameType = VarInt.from(0x1d);
+			// APPLICATION_CLOSE (0x1d) vs CONNECTION_CLOSE (0x1c). Both carry the
+			// causing-frame-type field in this draft, so only the type byte differs.
+			const frameType = VarInt.from(frame.application ? 0x1d : 0x1c);
 			const causingFrameType = VarInt.from(0);
 			const body = new TextEncoder().encode(frame.reason);
 			const reasonLength = VarInt.from(body.length);
@@ -636,13 +646,13 @@ function decodeWebTransport(buffer: Uint8Array): Any {
 		return { type: "stop_sending", id, code };
 	}
 
-	if (frameType === 0x1d) {
+	if (frameType === 0x1d || frameType === 0x1c) {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 
 		const reason = new TextDecoder().decode(buffer);
 
-		return { type: "connection_close", code, reason };
+		return { type: "connection_close", code, reason, application: frameType === 0x1d };
 	}
 
 	if (frameType === 0x08 || frameType === 0x09) {
@@ -750,7 +760,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		[reasonBytes, buffer] = take(buffer, reasonLen);
 		const reason = new TextDecoder().decode(reasonBytes);
 
-		return { type: "connection_close", code, reason };
+		return { type: "connection_close", code, reason, application: frameType === 0x1dn };
 	}
 
 	// MAX_DATA
@@ -931,7 +941,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		let reasonBytes: Uint8Array;
 		[reasonBytes, buffer] = take(buffer, reasonLen);
 		const reason = new TextDecoder().decode(reasonBytes);
-		return [{ type: "connection_close", code, reason }, buffer];
+		return [{ type: "connection_close", code, reason, application: frameType === 0x1dn }, buffer];
 	}
 
 	// MAX_DATA
