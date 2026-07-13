@@ -486,6 +486,9 @@ impl Frame {
     fn encode_qmux(&self, buf: &mut BytesMut) -> Result<(), Error> {
         match self {
             Frame::Stream(s) => {
+                // TODO(#294): Keep draft-02's offset-less behavior for compatibility.
+                // Once draft-03 is published and supported, emit OFF with the
+                // per-stream send offset and validate received offsets/terminal state.
                 // Always LEN bit (0x02), never OFF bit. Type = 0x0a | fin_bit
                 let frame_type =
                     VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
