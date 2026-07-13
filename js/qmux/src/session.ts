@@ -1444,7 +1444,8 @@ export default class Session implements WebTransport {
 	/** Graceful terminal transition: `closed` **fulfills** with the close code
 	 *  and reason. Per the WebTransport contract this is the only clean outcome —
 	 *  reached by a local {@link close} (which first puts an APPLICATION_CLOSE on
-	 *  the wire) or by receiving a peer's CONNECTION_CLOSE. Idempotent. */
+	 *  the wire) or by receiving a peer's APPLICATION_CLOSE (0x1d). A peer's
+	 *  CONNECTION_CLOSE (0x1c) routes to {@link #abort} instead. Idempotent. */
 	#close(code: number, reason: string) {
 		if (this.#closed) return;
 		this.#closed = this.#closeReason ?? new Error(`Connection closed: ${code} ${reason}`);
@@ -1459,8 +1460,9 @@ export default class Session implements WebTransport {
 
 	/** Abnormal terminal transition: `closed` **rejects** with a
 	 *  `WebTransportError`. Reached on everything that is not a clean shutdown —
-	 *  socket failure, read error, idle timeout, or a protocol violation we
-	 *  detected locally. Close codes cannot carry this distinction, since they are
+	 *  socket failure, read error, idle timeout, a protocol violation we detected
+	 *  locally, or a peer's CONNECTION_CLOSE (0x1c). Close codes cannot carry this
+	 *  distinction, since they are
 	 *  application-defined (an app closing with 1006 must not look like a dropped
 	 *  socket). `cause`, when given, is preserved as the close reason so the
 	 *  original failure survives on `closed`. Idempotent. */
