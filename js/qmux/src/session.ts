@@ -1486,34 +1486,27 @@ export default class Session implements WebTransport {
 		} catch {}
 	}
 
-	/** Put a session-close frame on the wire and give it a moment to flush before
-	 *  tearing down the socket. Used only by the paths that initiate a close on a
-	 *  live connection — the app-initiated {@link close} and the locally-detected
-	 *  violations — which the peer deserves to hear about. `application` selects
-	 *  the QUIC subtype the peer keys its resolve-vs-reject on. Must run *before*
-	 *  the terminal transition, which closes the scheduler to new control frames. */
-	#putClose(code: number, reason: string, application: boolean) {
-		this.#sendPriorityFrame(
-			application
-				? { type: "application_close", code: VarInt.from(code), reason }
-				: { type: "connection_close", code: VarInt.from(code), reason },
-		);
-		setTimeout(() => {
-			this.#transportClose();
-		}, 100);
-	}
-
 	/** APPLICATION_CLOSE (0x1d): a graceful, app-initiated close the peer surfaces
 	 *  by *fulfilling* its `closed`. Pairs with the {@link #close} transition. */
 	#sendApplicationClose(code: number, reason: string) {
-		this.#putClose(code, reason, true);
+		this.#sendPriorityFrame({ type: "application_close", code: VarInt.from(code), reason });
+		// Give the queued frame a moment to flush before tearing down the socket.
+		// Must run *before* the terminal transition, which closes the scheduler to
+		// new control frames.
+		setTimeout(() => {
+			this.#transportClose();
+		}, 100);
 	}
 
 	/** CONNECTION_CLOSE (0x1c): a protocol violation or transport error we detected,
 	 *  which the peer surfaces by *rejecting* its `closed`. Pairs with the
 	 *  {@link #abort} transition. */
 	#sendConnectionClose(code: number, reason: string) {
-		this.#putClose(code, reason, false);
+		this.#sendPriorityFrame({ type: "connection_close", code: VarInt.from(code), reason });
+		// Flush the queued frame before tearing down the socket (see above).
+		setTimeout(() => {
+			this.#transportClose();
+		}, 100);
 	}
 
 	close(info?: { closeCode?: number; reason?: string }) {
