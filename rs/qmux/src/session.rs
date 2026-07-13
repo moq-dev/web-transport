@@ -760,6 +760,13 @@ impl<R: Reader> SessionState<R> {
                         if data_len > 0 && !recv.recv_credit.receive(data_len) {
                             return Err(Error::FlowControlError);
                         }
+                        // An empty STREAM without FIN carries no state beyond
+                        // opening the stream. Once the stream exists, queuing one
+                        // only allocates an unbounded-channel node without using
+                        // any flow-control credit.
+                        if data_len == 0 && !stream.fin {
+                            return Ok(());
+                        }
                         let id = stream.id;
                         let fin = stream.fin;
                         recv.inbound_data.send(stream).ok();
@@ -904,7 +911,11 @@ impl<R: Reader> SessionState<R> {
 
                 let id = stream.id;
                 let fin = stream.fin;
-                recv_backend.inbound_data.send(stream).ok();
+                // The first empty non-FIN frame still opens the stream, but does
+                // not need to reach the application-facing receive queue.
+                if data_len > 0 || fin {
+                    recv_backend.inbound_data.send(stream).ok();
+                }
 
                 if !fin {
                     self.streams.lock().unwrap().recv.insert(id, recv_backend);
@@ -2479,6 +2490,40 @@ mod recv_open_tests {
         assert!(
             accepted.is_err(),
             "a STREAM after a RESET-first stream resurrected a new accepted stream"
+        );
+    }
+
+    /// Empty non-FIN STREAM frames open a stream but must not consume unbounded
+    /// receive-queue memory while its application-facing reader is stalled.
+    #[tokio::test]
+    async fn empty_non_fin_stream_frames_are_not_queued() {
+        const FLOOD: usize = 10_000;
+
+        let (session, tx) = scripted_session();
+
+        // The first empty frame still opens the peer-initiated stream.
+        tx.send(uni_stream(0, b"", false)).unwrap();
+        let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+
+        // Stall `recv`, then flood its stream with frames that consume no byte
+        // credit. A second accepted stream is a FIFO marker proving the reader
+        // task processed the entire flood before we inspect the first queue.
+        for _ in 0..FLOOD {
+            tx.send(uni_stream(0, b"", false)).unwrap();
+        }
+        tx.send(uni_stream(1, b"", true)).unwrap();
+        let _marker = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("marker accept_uni timed out")
+            .expect("marker accept_uni failed");
+
+        assert_eq!(
+            recv.inbound_data.len(),
+            0,
+            "empty non-FIN STREAM frames accumulated behind a stalled reader"
         );
     }
 }
