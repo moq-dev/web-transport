@@ -263,7 +263,7 @@ impl RecvStream {
         let mut driver = self.driver.lock();
 
         // Check if the connection is closed.
-        if let Poll::Ready(res) = driver.closed(waker) {
+        if let Poll::Ready(res) = driver.error(waker) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -330,7 +330,7 @@ impl RecvStream {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().closed(waker) {
+        if let Poll::Ready(res) = self.driver.lock().error(waker) {
             return Poll::Ready(Err(res.into()));
         }
 

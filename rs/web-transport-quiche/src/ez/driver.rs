@@ -36,8 +36,8 @@ pub(super) struct DriverState {
     bi: DriverOpen<(Lock<SendState>, Lock<RecvState>)>,
     uni: DriverOpen<Lock<SendState>>,
 
-    local: ConnectionClosed,
-    remote: ConnectionClosed,
+    close_requested: ConnectionClosed,
+    closed: ConnectionClosed,
 
     /// The negotiated ALPN protocol, set after the handshake completes.
     alpn: Option<Vec<u8>>,
@@ -67,8 +67,8 @@ impl DriverState {
             send: HashSet::new(),
             recv: HashSet::new(),
             waker: None,
-            local: ConnectionClosed::default(),
-            remote: ConnectionClosed::default(),
+            close_requested: ConnectionClosed::default(),
+            closed: ConnectionClosed::default(),
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
             alpn: None,
@@ -84,15 +84,31 @@ impl DriverState {
     }
 
     pub fn close(&mut self, err: ConnectionError) -> Vec<Waker> {
-        self.local.abort(err)
+        self.close_requested.abort(err)
     }
 
     pub fn closed(&self, waker: &Waker) -> Poll<ConnectionError> {
-        self.local.poll(waker)
+        self.closed.poll(waker)
+    }
+
+    fn finish_close(&self, err: ConnectionError) -> Vec<Waker> {
+        self.closed.abort(err)
+    }
+
+    fn close_requested(&self, waker: &Waker) -> Poll<ConnectionError> {
+        self.close_requested.poll(waker)
+    }
+
+    pub fn error(&self, waker: &Waker) -> Poll<ConnectionError> {
+        if let Poll::Ready(err) = self.close_requested.poll(waker) {
+            return Poll::Ready(err);
+        }
+
+        self.closed.poll(waker)
     }
 
     pub fn is_closed(&self) -> bool {
-        self.local.is_closed() || self.remote.is_closed()
+        self.close_requested.is_closed() || self.closed.is_closed()
     }
 
     /// Returns the negotiated ALPN protocol, if the handshake has completed.
@@ -119,10 +135,7 @@ impl DriverState {
         }
 
         // Check if connection is closed
-        if let Poll::Ready(err) = self.local.poll(waker) {
-            return Poll::Ready(Err(err));
-        }
-        if let Poll::Ready(err) = self.remote.poll(waker) {
+        if let Poll::Ready(err) = self.error(waker) {
             return Poll::Ready(Err(err));
         }
 
@@ -166,7 +179,7 @@ impl DriverState {
 
     // Try to create the next bidirectional stream, although it may not be possible yet.
     pub fn open_bi(&mut self, waker: &Waker) -> OpenBiResult {
-        if let Poll::Ready(err) = self.local.poll(waker) {
+        if let Poll::Ready(err) = self.error(waker) {
             return Poll::Ready(Err(err));
         }
 
@@ -188,7 +201,7 @@ impl DriverState {
     }
 
     pub fn open_uni(&mut self, waker: &Waker) -> OpenUniResult {
-        if let Poll::Ready(err) = self.local.poll(waker) {
+        if let Poll::Ready(err) = self.error(waker) {
             return Poll::Ready(Err(err));
         }
 
@@ -411,7 +424,7 @@ impl Driver {
     ) -> Poll<Result<(), ConnectionError>> {
         if !qconn.is_draining() {
             // Check if the application wants to close the connection.
-            if let Poll::Ready(err) = self.state.lock().closed(waker) {
+            if let Poll::Ready(err) = self.state.lock().close_requested(waker) {
                 // Close the connection and return the error.
                 return Poll::Ready(
                     match err {
@@ -565,7 +578,7 @@ impl Driver {
     }
 
     fn abort(&mut self, err: ConnectionError) {
-        let wakers = self.state.lock().local.abort(err);
+        let wakers = self.state.lock().close_requested.abort(err);
         for waker in wakers {
             waker.wake();
         }
@@ -669,7 +682,7 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     ) {
         let state = self.state.lock();
 
-        let err = if let Poll::Ready(err) = state.local.poll(Waker::noop()) {
+        let err = if let Poll::Ready(err) = state.close_requested.poll(Waker::noop()) {
             err
         } else if let Some(local) = qconn.local_error() {
             let reason = String::from_utf8_lossy(&local.reason).to_string();
@@ -683,14 +696,16 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
             ConnectionError::Unknown("no error message".to_string())
         };
 
-        // Finally set the remote error once the connection is done.
-        let wakers = state.remote.abort(err.clone());
+        // Mark the connection closed only after the driver is done. In particular,
+        // a local close request must not make Connection::closed resolve before
+        // quiche has had an opportunity to emit CONNECTION_CLOSE.
+        let wakers = state.finish_close(err.clone());
         for waker in wakers {
             waker.wake();
         }
 
         // Also wake up any local wakers if the peer closed.
-        let wakers = state.local.abort(err);
+        let wakers = state.close_requested.abort(err);
         for waker in wakers {
             waker.wake();
         }
@@ -712,5 +727,28 @@ impl<T> DriverOpen<T> {
             create: Vec::new(),
             wakers: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_waits_for_driver_completion() {
+        let mut state = DriverState::new(false);
+        let waker = Waker::noop();
+        let err = ConnectionError::Local(42, "done".to_string());
+
+        assert!(state.closed(waker).is_pending());
+
+        state.close(err.clone());
+
+        assert!(state.close_requested(waker).is_ready());
+        assert!(state.closed(waker).is_pending());
+
+        state.finish_close(err);
+
+        assert!(state.closed(waker).is_ready());
     }
 }
