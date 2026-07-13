@@ -20,7 +20,7 @@
 //! encodes as `0x44 0x00`.
 
 use bytes::Bytes;
-use qmux::proto::{ConnectionClose, Frame, ResetStream, StopSending, Stream};
+use qmux::proto::{ApplicationClose, ConnectionClose, Frame, ResetStream, StopSending, Stream};
 use qmux::{Error, StreamId, Version};
 use web_transport_proto::VarInt;
 
@@ -66,7 +66,10 @@ fn assert_frames_eq(got: &Frame, want: &Frame, version: Version) {
         (Frame::ConnectionClose(a), Frame::ConnectionClose(b)) => {
             assert_eq!(a.code.into_inner(), b.code.into_inner(), "close code");
             assert_eq!(a.reason, b.reason, "close reason");
-            assert_eq!(a.application, b.application, "close application flag");
+        }
+        (Frame::ApplicationClose(a), Frame::ApplicationClose(b)) => {
+            assert_eq!(a.code.into_inner(), b.code.into_inner(), "app close code");
+            assert_eq!(a.reason, b.reason, "app close reason");
         }
         (Frame::MaxData(a), Frame::MaxData(b)) => assert_eq!(a, b, "max_data"),
         (
@@ -182,25 +185,23 @@ fn webtransport_stop_sending() {
 }
 
 #[test]
-fn webtransport_connection_close() {
+fn webtransport_application_close() {
     // 0x1d + code(=42) + reason("bye") as the rest of the buffer.
     let bytes = [0x1d, 0x2a, b'b', b'y', b'e'];
-    let frame = Frame::ConnectionClose(ConnectionClose {
+    let frame = Frame::ApplicationClose(ApplicationClose {
         code: code(42),
         reason: "bye".to_string(),
-        application: true,
     });
     assert_round_trip(Version::WebTransport, &bytes, &frame);
 }
 
 #[test]
-fn webtransport_connection_close_transport() {
-    // Same body as APPLICATION_CLOSE, but 0x1c flags it as a transport close.
+fn webtransport_connection_close() {
+    // Same legacy body, but 0x1c marks it a transport close.
     let bytes = [0x1c, 0x2a, b'b', b'y', b'e'];
     let frame = Frame::ConnectionClose(ConnectionClose {
         code: code(42),
         reason: "bye".to_string(),
-        application: false,
     });
     assert_round_trip(Version::WebTransport, &bytes, &frame);
 }
@@ -421,24 +422,24 @@ fn qmux02_wire_matches_qmux01() {
 
 #[test]
 fn qmux00_application_close() {
-    // 0x1d (APPLICATION_CLOSE) + code(=42) + frame_type(=0) + reason_len(=3) + "bye".
-    let bytes = [0x1d, 0x2a, 0x00, 0x03, b'b', b'y', b'e'];
-    let frame = Frame::ConnectionClose(ConnectionClose {
+    // 0x1d (APPLICATION_CLOSE) + code(=42) + reason_len(=3) + "bye".
+    // No Frame Type field — RFC 9000 §19.19 omits it for the application variant.
+    let bytes = [0x1d, 0x2a, 0x03, b'b', b'y', b'e'];
+    let frame = Frame::ApplicationClose(ApplicationClose {
         code: code(42),
         reason: "bye".to_string(),
-        application: true,
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
 }
 
 #[test]
-fn qmux00_connection_close_transport() {
+fn qmux00_connection_close() {
     // 0x1c (CONNECTION_CLOSE) + code(=42) + frame_type(=0) + reason_len(=3) + "bye".
+    // The transport variant *does* carry the Frame Type field.
     let bytes = [0x1c, 0x2a, 0x00, 0x03, b'b', b'y', b'e'];
     let frame = Frame::ConnectionClose(ConnectionClose {
         code: code(42),
         reason: "bye".to_string(),
-        application: false,
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
 }
@@ -567,10 +568,9 @@ fn qmux00_encoding_has_no_record_size_prefix() {
             fin: false,
         }),
         Frame::MaxData(1024),
-        Frame::ConnectionClose(ConnectionClose {
+        Frame::ApplicationClose(ApplicationClose {
             code: code(42),
             reason: "bye".to_string(),
-            application: true,
         }),
     ];
     for frame in &cases {
@@ -579,7 +579,7 @@ fn qmux00_encoding_has_no_record_size_prefix() {
         match frame {
             Frame::Stream(_) => assert_eq!(bytes[0], 0x0a, "stream without fin = type 0x0a"),
             Frame::MaxData(_) => assert_eq!(bytes[0], 0x10, "max_data = type 0x10"),
-            Frame::ConnectionClose(_) => {
+            Frame::ApplicationClose(_) => {
                 assert_eq!(bytes[0], 0x1d, "application_close = type 0x1d")
             }
             _ => unreachable!(),

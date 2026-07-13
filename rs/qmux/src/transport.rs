@@ -337,10 +337,13 @@ mod stream_transport {
                 read_varint_into(reader, &mut buf).await?; // id
                 read_varint_into(reader, &mut buf).await?; // code
             }
-            // CONNECTION_CLOSE / APPLICATION_CLOSE
+            // CONNECTION_CLOSE (0x1c) carries the Frame Type field; APPLICATION_CLOSE
+            // (0x1d) omits it (RFC 9000 §19.19).
             0x1c | 0x1d => {
                 read_varint_into(reader, &mut buf).await?; // code
-                read_varint_into(reader, &mut buf).await?; // frame_type
+                if frame_type == 0x1c {
+                    read_varint_into(reader, &mut buf).await?; // frame_type
+                }
                 let reason_len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
                 if reason_len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);

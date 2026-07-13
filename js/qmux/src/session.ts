@@ -619,9 +619,9 @@ export default class Session implements WebTransport {
 			this.#handleResetStream(frame);
 		} else if (frame.type === "stop_sending") {
 			this.#handleStopSending(frame);
-		} else if (frame.type === "connection_close") {
+		} else if (frame.type === "application_close" || frame.type === "connection_close") {
 			this.#closeReason ??= new Error(`Connection closed: ${frame.code.value} ${frame.reason}`);
-			if (frame.application) {
+			if (frame.type === "application_close") {
 				// APPLICATION_CLOSE (0x1d): the peer closed the session deliberately —
 				// graceful, so `closed` fulfills with its code/reason.
 				this.#close(Number(frame.code.value), frame.reason);
@@ -1493,12 +1493,11 @@ export default class Session implements WebTransport {
 	 *  the QUIC subtype the peer keys its resolve-vs-reject on. Must run *before*
 	 *  the terminal transition, which closes the scheduler to new control frames. */
 	#putClose(code: number, reason: string, application: boolean) {
-		this.#sendPriorityFrame({
-			type: "connection_close",
-			code: VarInt.from(code),
-			reason,
-			application,
-		});
+		this.#sendPriorityFrame(
+			application
+				? { type: "application_close", code: VarInt.from(code), reason }
+				: { type: "connection_close", code: VarInt.from(code), reason },
+		);
 		setTimeout(() => {
 			this.#transportClose();
 		}, 100);

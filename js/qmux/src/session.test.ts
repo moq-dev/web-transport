@@ -124,11 +124,13 @@ function settleTo<T>(p: Promise<T>): Promise<T | Error> {
 
 /** The session-close frame the Session put on the wire, if any. A locally-detected
  *  violation still owes the peer an explanation, even though it settles `closed`
- *  as a failure on our side. Its `application` flag distinguishes the graceful
+ *  as a failure on our side. The frame *type* distinguishes the graceful
  *  APPLICATION_CLOSE a `close()` sends from the CONNECTION_CLOSE a violation sends. */
-function sentClose(peer: FakePeer): Frame.ConnectionClose | undefined {
-	const frame = peer.received().find((f) => f.type === "connection_close");
-	return frame?.type === "connection_close" ? frame : undefined;
+function sentClose(peer: FakePeer): Frame.ApplicationClose | Frame.ConnectionClose | undefined {
+	return peer.received().find((f) => f.type === "application_close" || f.type === "connection_close") as
+		| Frame.ApplicationClose
+		| Frame.ConnectionClose
+		| undefined;
 }
 
 function sentCloseCode(peer: FakePeer): number | undefined {
@@ -216,9 +218,9 @@ describe("Session integration (scripted peer)", () => {
 
 		session.close({ closeCode: 42, reason: "bye" });
 		expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
-		await waitFor(() => peer.has("connection_close"));
+		await waitFor(() => peer.has("application_close"));
 		// A graceful close is an APPLICATION_CLOSE (0x1d), so the peer fulfills.
-		expect(sentClose(peer)?.application).toBe(true);
+		expect(sentClose(peer)?.type).toBe("application_close");
 
 		// Second close is a no-op: the resolved info is unchanged.
 		session.close({ closeCode: 7, reason: "again" });
@@ -236,7 +238,7 @@ describe("Session integration (scripted peer)", () => {
 
 			// The peer closing the session deliberately (APPLICATION_CLOSE / 0x1d) is
 			// graceful, even though we didn't initiate it.
-			peer.send({ type: "connection_close", application: true, code: VarInt.from(42), reason: "bye" });
+			peer.send({ type: "application_close", code: VarInt.from(42), reason: "bye" });
 			expect(await session.closed).toEqual({ closeCode: 42, reason: "bye" });
 		});
 
@@ -247,7 +249,7 @@ describe("Session integration (scripted peer)", () => {
 			// 1002 is a transport-error code, but an APPLICATION_CLOSE is graceful by
 			// definition — the *subtype*, not the code, decides. Codes are
 			// application-defined, so the app still gets its code and reason.
-			peer.send({ type: "connection_close", application: true, code: VarInt.from(1002), reason: "bye" });
+			peer.send({ type: "application_close", code: VarInt.from(1002), reason: "bye" });
 			expect(await session.closed).toEqual({ closeCode: 1002, reason: "bye" });
 		});
 
@@ -260,7 +262,6 @@ describe("Session integration (scripted peer)", () => {
 			// fulfilling. Mirrors the frame we emit from #abort.
 			peer.send({
 				type: "connection_close",
-				application: false,
 				code: VarInt.from(1002),
 				reason: "Protocol violation",
 			});
@@ -338,7 +339,7 @@ describe("Session integration (scripted peer)", () => {
 		expect(err.message).toContain("text frames are not valid for QMux");
 		await waitFor(() => sentCloseCode(peer) === 1003);
 		// A violation we detect is a CONNECTION_CLOSE (0x1c), so the peer rejects too.
-		expect(sentClose(peer)?.application).toBe(false);
+		expect(sentClose(peer)?.type).toBe("connection_close");
 	});
 
 	test("an unnegotiated RESET_STREAM_AT rejects closed and tells the peer why (1002)", async () => {
@@ -353,7 +354,7 @@ describe("Session integration (scripted peer)", () => {
 		// The decode failure itself is carried as the cause, not flattened away.
 		expect(err.cause).toBeInstanceOf(Error);
 		await waitFor(() => sentCloseCode(peer) === 1002);
-		expect(sentClose(peer)?.application).toBe(false);
+		expect(sentClose(peer)?.type).toBe("connection_close");
 	});
 
 	test("datagrams: an app write produces a DATAGRAM frame on the wire", async () => {
@@ -718,7 +719,7 @@ describe("Session integration (scripted peer)", () => {
 
 			// The peer aborts the connection (CONNECTION_CLOSE / 0x1c); the frame's
 			// code/reason must reach the waiter.
-			peer.send({ type: "connection_close", application: false, code: VarInt.from(7n), reason: "peer gone" });
+			peer.send({ type: "connection_close", code: VarInt.from(7n), reason: "peer gone" });
 
 			const err = await created;
 			expect(err).toBeInstanceOf(Error);

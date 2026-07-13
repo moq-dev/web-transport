@@ -11,8 +11,8 @@ use crate::credit::Credit;
 use crate::sched::PriorityQueue;
 use crate::transport::{Reader, Transport, Writer};
 use crate::{
-    proto::varint_size, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
-    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
+    proto::varint_size, ApplicationClose, ConnectionClose, Error, Frame, ResetStream, StopSending,
+    Stream, StreamDir, StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -970,23 +970,25 @@ impl<R: Reader> SessionState<R> {
                     send.inbound_stopped.send(stop).ok();
                 }
             }
+            // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
+            // as a clean session close carrying the peer's code/reason.
+            Frame::ApplicationClose(close) => {
+                self.closed
+                    .send(Some(Error::ConnectionClosed {
+                        code: close.code,
+                        reason: close.reason,
+                    }))
+                    .ok();
+            }
+            // CONNECTION_CLOSE (0x1c): the peer hit a protocol/transport error —
+            // surfaces as an abnormal close, not a clean one.
             Frame::ConnectionClose(close) => {
-                // APPLICATION_CLOSE (0x1d) is a graceful, deliberate peer close;
-                // CONNECTION_CLOSE (0x1c) means the peer hit a protocol/transport
-                // error. The subtype, not the code, decides which — so the former
-                // surfaces as a clean session close and the latter as abnormal.
-                let err = if close.application {
-                    Error::ConnectionClosed {
+                self.closed
+                    .send(Some(Error::ConnectionReset {
                         code: close.code,
                         reason: close.reason,
-                    }
-                } else {
-                    Error::ConnectionReset {
-                        code: close.code,
-                        reason: close.reason,
-                    }
-                };
-                self.closed.send(Some(err)).ok();
+                    }))
+                    .ok();
             }
             // Flow control frames
             Frame::MaxData(max) => {
@@ -1250,7 +1252,6 @@ impl Session {
                     ConnectionClose {
                         code: VarInt::from(0u32),
                         reason: "handshake timeout".to_string(),
-                        application: false,
                     }
                     .into(),
                 );
@@ -1447,7 +1448,6 @@ impl Session {
                     ConnectionClose {
                         code: VarInt::from(code),
                         reason: err.to_string(),
-                        application: false,
                     }
                     .into(),
                 );
@@ -1660,10 +1660,9 @@ impl generic::Session for Session {
     fn close(&self, code: u32, reason: &str) {
         // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
         // session close carrying our code/reason.
-        let frame = ConnectionClose {
+        let frame = ApplicationClose {
             code: VarInt::from(code),
             reason: reason.to_string(),
-            application: true,
         };
         let _ = self.outbound_priority.send(frame.into());
 
@@ -2561,7 +2560,8 @@ mod datagram_recv_tests {
     }
 
     /// Scan the size-prefixed records the server wrote and return the first
-    /// CONNECTION_CLOSE / APPLICATION_CLOSE frame among them.
+    /// transport CONNECTION_CLOSE (0x1c) frame among them — a graceful
+    /// APPLICATION_CLOSE (0x1d) is a different `Frame` variant and won't match.
     fn find_connection_close(buf: &[u8]) -> Option<ConnectionClose> {
         let mut data = Bytes::copy_from_slice(buf);
         while !data.is_empty() {
@@ -2606,11 +2606,10 @@ mod datagram_recv_tests {
             .expect("reading the server's output timed out")
             .unwrap();
 
-        let close = find_connection_close(&buf).expect("server must emit a CONNECTION_CLOSE");
-        assert!(
-            !close.application,
-            "a violation is a transport CONNECTION_CLOSE (0x1c), not APPLICATION_CLOSE"
-        );
+        // Finding a `ConnectionClose` (0x1c) at all is the assertion: a graceful
+        // APPLICATION_CLOSE (0x1d) would be a different variant and not match.
+        let close = find_connection_close(&buf)
+            .expect("a violation must emit a transport CONNECTION_CLOSE (0x1c)");
         assert_eq!(close.code.into_inner(), 1002, "protocol-violation code");
     }
 
@@ -2620,10 +2619,9 @@ mod datagram_recv_tests {
     async fn peer_application_close_is_graceful() {
         let (server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
 
-        let close = Frame::ConnectionClose(ConnectionClose {
+        let close = Frame::ApplicationClose(ApplicationClose {
             code: VarInt::from_u32(42),
             reason: "bye".to_string(),
-            application: true,
         })
         .encode(Version::QMux01)
         .unwrap();
@@ -2651,7 +2649,6 @@ mod datagram_recv_tests {
         let close = Frame::ConnectionClose(ConnectionClose {
             code: VarInt::from_u32(1002),
             reason: "protocol violation".to_string(),
-            application: false,
         })
         .encode(Version::QMux01)
         .unwrap();
