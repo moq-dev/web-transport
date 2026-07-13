@@ -518,6 +518,48 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("completed unaccepted streams do not recycle receive credit", async () => {
+		// A single-stream/single-payload budget makes any premature replenishment
+		// immediately observable. This is the reproduction from issue #299: the peer
+		// sends a full stream plus FIN while the application never reads the acceptor.
+		const { session, peer } = connect({
+			maxStreamsUni: 1n,
+			maxData: 100n,
+			maxStreamDataUni: 100n,
+		});
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({
+			type: "stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+			data: new Uint8Array(100),
+			fin: true,
+		});
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+
+		// FIN only completed the wire-level receive. The stream object and all 100
+		// bytes are still transport-owned, so neither budget may be recycled yet.
+		expect(peer.count("max_streams_uni")).toBe(0);
+		expect(peer.count("max_data")).toBe(0);
+		expect(peer.count("max_stream_data")).toBe(0);
+
+		const acceptor = session.incomingUnidirectionalStreams.getReader();
+		const accepted = await acceptor.read();
+		if (accepted.done || !accepted.value) throw new Error("expected an incoming stream");
+
+		// Accepting transfers ownership of the stream object, but the unread payload
+		// remains charged to MAX_DATA until the application asks for it.
+		await waitFor(() => peer.count("max_streams_uni") === 1);
+		expect(peer.count("max_data")).toBe(0);
+
+		const payload = await accepted.value.getReader().read();
+		expect(payload.value?.byteLength).toBe(100);
+		await waitFor(() => peer.count("max_data") === 1);
+		session.close();
+	});
+
 	// Regression: a STREAM frame delivered by the read loop after the session has
 	// closed used to hit the already-closed incoming-stream controllers, and the
 	// throw escaped as an unhandled rejection because #handleStreamFrame was an
