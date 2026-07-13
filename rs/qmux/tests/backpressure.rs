@@ -208,20 +208,21 @@ async fn idle_timeout_deferred_but_bounded_under_backpressure() {
     let (s2c_tx, s2c_rx) = mpsc::channel(256);
     // Keep the client's receive channel open even after the server task goes
     // away, so the client sees a *silent but open* peer rather than a transport
-    // close. This isolates the client's own idle logic: the server (writer not
-    // gated) will itself idle-close once the wedged client goes quiet.
+    // close. This isolates the client's own idle logic after both transport
+    // writers are gated: otherwise the server's successful QX_PING writes would
+    // count as activity and correctly keep the client alive.
     let _s2c_keepalive = s2c_tx.clone();
 
     let (gate_tx, gate_rx) = watch::channel(true); // open: handshake flows
     let client_transport = GatedTransport {
         tx: c2s_tx,
         rx: s2c_rx,
-        gate: Some(gate_rx),
+        gate: Some(gate_rx.clone()),
     };
     let server_transport = GatedTransport {
         tx: s2c_tx,
         rx: c2s_rx,
-        gate: None,
+        gate: Some(gate_rx),
     };
 
     // Short idle timeout so the test is quick; the deferral grace is one more
