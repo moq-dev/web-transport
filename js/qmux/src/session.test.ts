@@ -23,8 +23,8 @@ class FakePeer {
 		extensions: string;
 	}>;
 	readonly closed: Promise<{ closeCode?: number; reason?: string }>;
-	#closedResolve!: (info: { closeCode?: number; reason?: string }) => void;
-	#closedReject!: (err: Error) => void;
+	#closedResolve: (info: { closeCode?: number; reason?: string }) => void;
+	#closedReject: (err: Error) => void;
 	#recv!: ReadableStreamDefaultController<Uint8Array | string>;
 
 	/** Raw chunks the Session has written. */
@@ -45,10 +45,10 @@ class FakePeer {
 			},
 		});
 		this.opened = Promise.resolve({ readable, writable, protocol: "qmux-01", extensions: "" });
-		this.closed = new Promise((resolve, reject) => {
-			this.#closedResolve = resolve;
-			this.#closedReject = reject;
-		});
+		const closed = Promise.withResolvers<{ closeCode?: number; reason?: string }>();
+		this.closed = closed.promise;
+		this.#closedResolve = closed.resolve;
+		this.#closedReject = closed.reject;
 		// A real WebSocketStream's `closed` can reject; nothing may await it here
 		// until the test does, so keep that from surfacing as an unhandled rejection.
 		this.closed.catch(() => {});
