@@ -26,6 +26,9 @@ export interface ResetStream {
 	type: "reset_stream";
 	id: Stream.Id;
 	code: VarInt;
+	/** Final byte offset consumed by the send side. The legacy WebTransport wire
+	 * format omits this field and decodes it as zero. */
+	finalSize: bigint;
 	/** Set (to the frame's Reliable Size) when this was decoded from a
 	 * RESET_STREAM_AT frame (0x24, draft-02); absent for a plain RESET_STREAM.
 	 * The session uses its presence to enforce that RESET_STREAM_AT is only
@@ -329,7 +332,7 @@ function encodeQMux(frame: Any): Uint8Array {
 
 		case "reset_stream": {
 			const frameType = VarInt.from(0x04);
-			const finalSize = VarInt.from(0);
+			const finalSize = VarInt.from(frame.finalSize);
 
 			let buffer = new Uint8Array(new ArrayBuffer(8 + 8 + 8 + 8), 0, 0);
 
@@ -673,7 +676,7 @@ function decodeWebTransport(buffer: Uint8Array): Any {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 
-		return { type: "reset_stream", id, code };
+		return { type: "reset_stream", id, code, finalSize: 0n };
 	}
 
 	if (frameType === 0x05) {
@@ -758,10 +761,10 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 
-		// Skip final_size
 		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
 
-		return { type: "reset_stream", id, code };
+		return { type: "reset_stream", id, code, finalSize };
 	}
 
 	// RESET_STREAM_AT (draft-02). On a reliable, ordered transport all stream data
@@ -779,7 +782,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		if (reliableSize > finalSize) {
 			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
 		}
-		return { type: "reset_stream", id, code, reliableSize };
+		return { type: "reset_stream", id, code, finalSize, reliableSize };
 	}
 
 	// STOP_SENDING
@@ -954,8 +957,9 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		const id = new Stream.Id(v);
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
-		[v, buffer] = VarInt.decode(buffer); // final_size
-		return [{ type: "reset_stream", id, code }, buffer];
+		[v, buffer] = VarInt.decode(buffer);
+		const finalSize = v.value;
+		return [{ type: "reset_stream", id, code, finalSize }, buffer];
 	}
 
 	// RESET_STREAM_AT (draft-02); see the single-frame decoder for the semantics.
@@ -971,7 +975,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		if (reliableSize > finalSize) {
 			throw new Error("RESET_STREAM_AT reliable_size exceeds final_size");
 		}
-		return [{ type: "reset_stream", id, code, reliableSize }, buffer];
+		return [{ type: "reset_stream", id, code, finalSize, reliableSize }, buffer];
 	}
 
 	// STOP_SENDING

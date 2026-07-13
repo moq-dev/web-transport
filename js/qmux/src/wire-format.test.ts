@@ -71,6 +71,7 @@ describe("WebTransport wire format", () => {
 			type: "reset_stream",
 			id: sid(4n),
 			code: code(42n),
+			finalSize: 0n,
 		};
 		const decoded = Frame.decode(wire, "webtransport") as Frame.ResetStream;
 		expect(decoded.type).toBe("reset_stream");

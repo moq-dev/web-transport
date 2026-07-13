@@ -89,6 +89,18 @@ describe("QMux01 record framing", () => {
 		expect(respDecoded[0]).toEqual({ type: "ping_response", sequence: 0xdeadbeefn });
 	});
 
+	test("RESET_STREAM round-trip preserves final_size", () => {
+		const frame: Frame.ResetStream = {
+			type: "reset_stream",
+			id: new Stream.Id(VarInt.from(4n)),
+			code: VarInt.from(42n),
+			finalSize: 128n,
+		};
+		const decoded = Frame.decodeRecord(Frame.encode(frame, "qmux-01"));
+		expect(decoded).toHaveLength(1);
+		expect(decoded[0]).toEqual(frame);
+	});
+
 	test("datagram round-trips via the length-prefixed (0x31) form", () => {
 		const frame: Frame.Any = { type: "datagram", data: new Uint8Array([1, 2, 3, 4]) };
 		const bytes = Frame.encode(frame, "qmux-01");
@@ -175,6 +187,7 @@ describe("QMux02 (draft-02)", () => {
 		if (decoded?.type === "reset_stream") {
 			expect(decoded.id.value.value).toBe(4n);
 			expect(decoded.code.value).toBe(42n);
+			expect(decoded.finalSize).toBe(128n);
 			// reliableSize present marks it as RESET_STREAM_AT (vs a plain 0x04 reset,
 			// which leaves it undefined); the session uses this to gate on negotiation.
 			expect(decoded.reliableSize).toBe(64n);

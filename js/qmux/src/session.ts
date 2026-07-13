@@ -411,9 +411,37 @@ function parseProtocol(raw: string, version: WireFormat): string {
 /** Per-stream flow control state. */
 interface StreamFlowState {
 	sendCredit: Credit;
+	/** Bytes that have actually reached the transport for this send half. */
+	sendOffset: bigint;
 	recvMax: bigint;
 	recvOffset: bigint;
 	recvConsumed: bigint;
+}
+
+/** Compact open/terminal tracking for peer-initiated receive streams.
+ *
+ * Opening stream N implicitly opens every lower stream. `holes` distinguishes
+ * one of those not-yet-seen streams from an id whose receive half has already
+ * reached FIN or RESET_STREAM, so a late STREAM frame cannot resurrect it. */
+class RecvOpen {
+	#createdMax?: bigint;
+	#holes = new Set<bigint>();
+
+	isClosed(index: bigint): boolean {
+		return this.#createdMax !== undefined && index <= this.#createdMax && !this.#holes.has(index);
+	}
+
+	record(index: bigint) {
+		if (this.#createdMax !== undefined && index <= this.#createdMax) {
+			this.#holes.delete(index);
+			return;
+		}
+
+		for (let hole = (this.#createdMax ?? -1n) + 1n; hole < index; hole++) {
+			this.#holes.add(hole);
+		}
+		this.#createdMax = index;
+	}
 }
 
 export default class Session implements WebTransport {
@@ -480,6 +508,8 @@ export default class Session implements WebTransport {
 
 	// Per-stream flow control
 	#streamFlow = new Map<bigint, StreamFlowState>();
+	#recvOpenBi = new RecvOpen();
+	#recvOpenUni = new RecvOpen();
 
 	// Stream count tracking via Credit (for sending — peer's limits).
 	// Initialized to "unlimited" matching the default webtransport version;
@@ -1002,6 +1032,42 @@ export default class Session implements WebTransport {
 		}
 	}
 
+	#recvOpen(dir: Stream.DirType): RecvOpen {
+		return dir === Stream.Dir.Bi ? this.#recvOpenBi : this.#recvOpenUni;
+	}
+
+	/** Account the previously-unseen tail declared by RESET_STREAM.
+	 *
+	 * Drafts through -02 were emitted by implementations that used an incorrect
+	 * zero final size, so tolerate a value below the bytes already received. The
+	 * stricter FINAL_SIZE_ERROR check starts with draft-03; meanwhile the larger
+	 * of the two values still prevents a reset from undoing flow-control usage. */
+	#accountReset(frame: Frame.ResetStream): boolean {
+		if (!isQmux(this.#version)) return true;
+
+		const streamId = frame.id.value.value;
+		const flow = this.#streamFlow.get(streamId);
+		const received = flow?.recvOffset ?? 0n;
+		// TODO(qmux-03): Once draft-03 is implemented, reject finalSize < received
+		// (and conflicting terminal final sizes) with FINAL_SIZE_ERROR instead of
+		// applying this draft-00/-01/-02 compatibility fallback.
+		const finalSize = frame.finalSize > received ? frame.finalSize : received;
+		const gap = finalSize - received;
+
+		const recvMax =
+			flow?.recvMax ??
+			(frame.id.dir === Stream.Dir.Bi
+				? this.#ourParams.initialMaxStreamDataBidiRemote
+				: this.#ourParams.initialMaxStreamDataUni);
+		if (finalSize > recvMax || this.#recvDataOffset + gap > this.#recvDataMax) {
+			return false;
+		}
+
+		this.#recvDataOffset += gap;
+		if (flow) flow.recvOffset = finalSize;
+		return true;
+	}
+
 	/** Delete stream flow state only when both send and recv sides are gone. */
 	#maybeDeleteStreamFlow(streamId: bigint) {
 		if (!this.#sendStreams.has(streamId) && !this.#recvStreams.has(streamId)) {
@@ -1032,6 +1098,14 @@ export default class Session implements WebTransport {
 		}
 
 		let recv = this.#recvStreams.get(streamId);
+		if (
+			isQmux(this.#version) &&
+			frame.id.serverInitiated !== this.#isServer &&
+			!recv &&
+			this.#recvOpen(frame.id.dir).isClosed(frame.id.index)
+		) {
+			return;
+		}
 		if (!recv) {
 			// We created the stream, we can skip it.
 			if (frame.id.serverInitiated === this.#isServer) {
@@ -1051,6 +1125,7 @@ export default class Session implements WebTransport {
 					this.#abort(1002, "stream limit exceeded");
 					return;
 				}
+				this.#recvOpen(frame.id.dir).record(frame.id.index);
 			}
 
 			// Initialize flow control state for new stream
@@ -1065,6 +1140,7 @@ export default class Session implements WebTransport {
 
 				this.#streamFlow.set(streamId, {
 					sendCredit: new Credit(sendMax),
+					sendOffset: 0n,
 					recvMax,
 					recvOffset: 0n,
 					recvConsumed: 0n,
@@ -1137,6 +1213,7 @@ export default class Session implements WebTransport {
 							type: "reset_stream",
 							id: frame.id,
 							code: VarInt.from(0),
+							finalSize: this.#sendFinalSize(streamId),
 						});
 
 						this.#sendStreams.delete(streamId);
@@ -1194,10 +1271,44 @@ export default class Session implements WebTransport {
 		if (frame.reliableSize !== undefined && !this.#ourParams.resetStreamAt) {
 			throw new Error("RESET_STREAM_AT received without advertising reset_stream_at");
 		}
+		if (!frame.id.canRecv(this.#isServer)) {
+			throw new Error("Invalid stream ID direction");
+		}
 
 		const streamId = frame.id.value.value;
 		const recv = this.#recvStreams.get(streamId);
-		if (!recv) return;
+		const peerInitiated = frame.id.serverInitiated !== this.#isServer;
+
+		if (!recv) {
+			// A terminal peer-initiated stream stays terminal. In particular, a
+			// duplicate RESET must not consume its final size twice.
+			if (isQmux(this.#version) && peerInitiated && this.#recvOpen(frame.id.dir).isClosed(frame.id.index)) {
+				return;
+			}
+			// A locally-created receive half that is no longer live is already closed.
+			if (!peerInitiated) return;
+
+			if (isQmux(this.#version)) {
+				const credit = frame.id.dir === Stream.Dir.Bi ? this.#recvBiCredit : this.#recvUniCredit;
+				if (!credit.receiveUpTo(frame.id.index + 1n)) {
+					this.#sendConnectionClose(1002, "stream limit exceeded");
+					this.#abort(1002, "stream limit exceeded");
+					return;
+				}
+			}
+		}
+
+		if (!this.#accountReset(frame)) {
+			this.#sendConnectionClose(1002, "flow control error");
+			this.#abort(1002, "flow control error");
+			return;
+		}
+
+		if (!recv) {
+			if (isQmux(this.#version)) this.#recvOpen(frame.id.dir).record(frame.id.index);
+			this.#replenishStreamCredit(frame.id.dir);
+			return;
+		}
 
 		this.#accountConnConsumed(recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`)));
 		this.#recvStreams.delete(streamId);
@@ -1217,9 +1328,14 @@ export default class Session implements WebTransport {
 			type: "reset_stream",
 			id: frame.id,
 			code: frame.code,
+			finalSize: this.#sendFinalSize(streamId),
 		});
 
 		this.#maybeDeleteStreamFlow(streamId);
+	}
+
+	#sendFinalSize(streamId: bigint): bigint {
+		return this.#streamFlow.get(streamId)?.sendOffset ?? 0n;
 	}
 
 	#sendTransportParameters() {
@@ -1272,6 +1388,8 @@ export default class Session implements WebTransport {
 
 			try {
 				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
+				const flow = this.#streamFlow.get(streamId);
+				if (flow) flow.sendOffset += BigInt(sendable);
 			} catch (e) {
 				// Return claimed credits on send failure
 				if (sendable > 0) {
@@ -1362,6 +1480,7 @@ export default class Session implements WebTransport {
 		if (isQmux(this.#version)) {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataBidiRemote),
+				sendOffset: 0n,
 				recvMax: this.#ourParams.initialMaxStreamDataBidiLocal,
 				recvOffset: 0n,
 				recvConsumed: 0n,
@@ -1382,6 +1501,7 @@ export default class Session implements WebTransport {
 					type: "reset_stream",
 					id: streamId,
 					code: VarInt.from(0),
+					finalSize: this.#sendFinalSize(streamIdVal),
 				});
 
 				this.#sendStreams.delete(streamIdVal);
@@ -1438,6 +1558,7 @@ export default class Session implements WebTransport {
 		if (isQmux(this.#version)) {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataUni),
+				sendOffset: 0n,
 				recvMax: 0n,
 				recvOffset: 0n,
 				recvConsumed: 0n,
@@ -1460,6 +1581,7 @@ export default class Session implements WebTransport {
 					type: "reset_stream",
 					id: streamId,
 					code: VarInt.from(0),
+					finalSize: session.#sendFinalSize(streamIdVal),
 				});
 
 				session.#sendStreams.delete(streamIdVal);

@@ -225,6 +225,76 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("aborting after a write sends the transmitted byte count as final_size", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		const writer = writable.getWriter();
+		await writer.write(new Uint8Array([1, 2, 3]));
+		await writer.abort(new Error("cancel"));
+
+		await waitFor(() => peer.has("reset_stream"));
+		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
+		expect(reset.finalSize).toBe(3n);
+		session.close();
+	});
+
+	test("a RESET_STREAM received first keeps the stream terminal", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(5n, Stream.Dir.Uni, true);
+		peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 0n });
+		peer.send({ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: false });
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+
+		const reader = session.incomingUnidirectionalStreams.getReader();
+		const next = reader.read();
+		const resurrected = await Promise.race([
+			next.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+		]);
+		expect(resurrected).toBe(false);
+		session.close();
+		await next;
+		reader.releaseLock();
+	});
+
+	test("RESET_STREAM final_size consumes connection flow control", async () => {
+		const { session, peer } = connect({ maxData: 4n, maxStreamDataUni: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({
+			type: "reset_stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+			code: VarInt.from(0),
+			finalSize: 5n,
+		});
+
+		const err = await expectSessionFailure(session);
+		expect(err.message).toContain("flow control error");
+		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
+	test("draft-01 tolerates the legacy zero final_size after data", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		peer.send({ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: false });
+		peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 0n });
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+		expect(peer.has("connection_close")).toBe(false);
+		session.close();
+	});
+
 	test("close() sends APPLICATION_CLOSE, resolves closed, and is idempotent", async () => {
 		const { session, peer } = connect();
 		await session.ready;
