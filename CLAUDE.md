@@ -1,87 +1,69 @@
-# CLAUDE.md
+# Repository guidance
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file contains only cross-cutting instructions for coding agents. Keep detailed
+architecture, package usage, and release procedures next to the code they describe.
 
-## Common Commands
+## Read before changing code
+
+- Start with [`README.md`](README.md) for the project model and workspace map.
+- Read the nearest package `README.md`, `Cargo.toml`, `package.json`, or language
+  build file before editing that package. Package-local documentation is the source
+  of truth for package-specific behavior.
+- Read [`justfile`](justfile) before adding or changing development commands.
+- For language bindings, also read [`py/web-transport/README.md`](py/web-transport/README.md),
+  [`kt/README.md`](kt/README.md), or [`swift/README.md`](swift/README.md), as applicable.
+
+## Development commands
+
+Use the Nix development shell when available so local tooling matches CI:
 
 ```bash
-# Development environment (requires Nix)
-nix develop          # Enter dev shell with all tools
-
-# Rust
-just check           # Full CI: clippy, fmt, feature powerset, cargo-shear, cargo-sort, biome
-just test            # Run all tests including WASM targets
-just fix             # Auto-fix: clippy, fmt, cargo-shear, cargo-sort, biome
-cargo test -p <crate>                    # Test a single crate
-cargo check -p <crate>                   # Check a single crate
-cargo test -p <crate> -- <test_name>     # Run a single test
-
-# JavaScript/TypeScript — use bun, never pnpm/npm/yarn
-bun install          # Install JS dependencies
-bun run check        # Biome lint
-bun run fix          # Biome auto-fix
+nix develop --command just check  # lint, formatting, and compile checks
+nix develop --command just test   # test Rust and WASM targets
+nix develop --command just fix    # apply automatic fixes
 ```
 
-## Architecture
+For a focused iteration, use `cargo test -p <crate>`, `cargo check -p <crate>`, or
+the relevant `bun run` script. JavaScript and TypeScript use Bun, not npm, pnpm, or
+Yarn. Before finishing, run the narrowest relevant checks plus `just check`; run
+`just test` when behavior changes.
 
-Rust/TypeScript monorepo implementing WebTransport (bidirectional streams + datagrams over HTTP/3 + QUIC) with multiple backend adapters. Organized into `rs/` (Rust crates) and `js/` (TypeScript packages).
+## Workspace boundaries
 
-### Rust Crates (`rs/`)
+- `rs/` contains the Rust crates: the public router and trait, protocol layer,
+  native backends, WASM adapter, Node bridge, UniFFI bridge, and QMux.
+- `js/` contains the TypeScript packages and browser demo.
+- `py/`, `kt/`, and `swift/` are language bindings generated from
+  `rs/web-transport-ffi` and released from the same `web-transport-ffi-v*` tag.
+- `.github/workflows/` is the source of truth for CI and release behavior.
 
-```
-                        web-transport
-                  (platform-agnostic router)
-                    /                  \
-          [native targets]        [wasm32 target]
-                  |                     |
-    ┌─────────────┼──────────────┐      |
-    │             │              │      │
-web-transport  web-transport  web-transport  web-transport
-   -quinn        -noq         -quiche       -wasm
-    │             │              │      (browser WebTransport API)
-    └─────────────┼──────────────┘
-                  │
-          web-transport-proto     web-transport-trait
-        (HTTP/3 frame parsing)    (async trait interface)
-```
+When changing a shared protocol or public API, search every backend, wrapper,
+binding, example, and README for corresponding updates. In particular, changes to
+`rs/web-transport-ffi` may require coordinated Python, Kotlin, and Swift changes.
 
-- **`rs/web-transport`** — Platform router: compiles to quinn on native, wasm bindings in browser. Start here for consumers.
-- **`rs/web-transport-trait`** — Shared async trait that all backends implement.
-- **`rs/web-transport-proto`** — Low-level HTTP/3 protocol (frame encoding/decoding). Used by all native backends.
-- **`rs/web-transport-quinn`** / **`rs/web-transport-noq`** / **`rs/web-transport-quiche`** — Backend adapters for different QUIC libraries.
-- **`rs/web-transport-wasm`** — WASM bindings to the browser's native WebTransport API via `wasm-bindgen`.
-- **`rs/web-transport-node`** — NAPI-RS bridge: compiles Rust to `.node` binary for Node.js.
-- **`rs/web-transport-ffi`** — UniFFI crate exporting WebTransport client/server to Python, Kotlin, and Swift. Default TLS provider is aws-lc-rs; opt in to ring with `--no-default-features --features ring`.
-- **`rs/qmux`** — QMux protocol (draft-ietf-quic-qmux) over TCP/TLS/WebSocket (Rust implementation).
+## Engineering rules
 
-### TypeScript Packages (`js/`)
+- Reproduce bugs and identify the mechanism before fixing them. Fix the lowest
+  responsible layer and add a regression test that fails without the fix.
+- Treat public API design as a compatibility commitment. Prefer a small,
+  composable, strongly typed surface over one-off helpers or primitive parameters.
+- Document exported Rust and TypeScript APIs. Keep implementation comments brief
+  and reserve them for non-obvious constraints or invariants.
+- Keep documentation and examples accurate in the same change that alters
+  behavior. Describe the current design, not its history.
+- Prefer maintained libraries for non-core functionality. Keep custom code for
+  WebTransport, HTTP/3, QUIC, QMux, or integration behavior that needs local
+  control.
+- WASM builds require `--cfg=web_sys_unstable_apis`; the repository config and CI
+  already provide it. Preserve native and `wasm32` conditional behavior when
+  editing the platform router.
+- Run `just fix` before committing, then verify the affected scope. Do not hide
+  failures with ignored exit codes, empty catches, retries, or widened timeouts
+  without explaining why failure is safe or why timing is the root cause.
 
-- **`js/qmux`** (`@moq/qmux`) — QMux protocol over WebSocket (TypeScript implementation).
-- **`js/web-transport`** (`@moq/web-transport`) — Node.js WebTransport via NAPI-RS (TS wrapper around `rs/web-transport-node`).
-- **`js/web-demo`** — Browser demo app.
+## Maintaining these instructions
 
-### Language Bindings (UniFFI)
-
-All built from `rs/web-transport-ffi`. A single `web-transport-ffi-v*` tag (pushed by release-plz) drives all three downstream release workflows.
-
-- **`py/web-transport`** — Python wheel, published to PyPI as `web-transport-rs`. Import name remains `web_transport`. Pure-Python wrapper at `python/web_transport/__init__.py` re-creates the legacy exception hierarchy on top of the flat `_uniffi.WebTransportError` enum.
-- **`kt/`** — Kotlin Multiplatform module (JVM + Android), published to Maven Central as `dev.moq:web-transport`. The `:web-transport` gradle module ships JNA-loaded desktop libs (`src/jvmMain/resources/<os>-<arch>/`) and Android `jniLibs/<abi>/`.
-- **`swift/`** — Swift Package Manager package. `WebTransportFFI.xcframework.zip` is attached to the GitHub Release (no SPM mirror yet — re-enable later via `vars.PUBLISH_SPM`).
-
-### WASM Considerations
-
-WASM targets require `RUSTFLAGS=--cfg=web_sys_unstable_apis` (set in `.cargo/config.toml`). The `web-transport` crate uses conditional compilation (`target_arch = "wasm32"`) to route between native and WASM implementations.
-
-## Workflow
-
-- Always run `just fix` before committing to auto-fix formatting, linting, and sorting issues.
-
-## Formatting & Style
-
-- **Rust**: `cargo fmt`, standard rustfmt
-- **TypeScript**: Biome — tabs, 120 line width, double quotes, LF line endings
-- Both are enforced in `just check`
-
-## Release
-
-Automated via `release-plz` on push to main. Publishes Rust crates to crates.io. NPM packages use `bun run release` scripts in each package directory.
+Keep this file short and cross-cutting. Put package-specific guidance in the
+nearest package README (or a nested `AGENTS.md` only when agents need instructions
+that do not belong in user documentation), then link to it here if it affects
+repository-wide work.
