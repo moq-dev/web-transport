@@ -110,6 +110,20 @@ impl SendState {
         Poll::Pending
     }
 
+    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+        if let Some(reset) = self.reset {
+            return Poll::Ready(Err(StreamError::Reset(reset)));
+        } else if let Some(stop) = self.stop {
+            return Poll::Ready(Err(StreamError::Stop(stop)));
+        } else if self.queued.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        self.blocked = Some(waker.clone());
+
+        Poll::Pending
+    }
+
     #[must_use = "wake the driver"]
     pub fn flush(&mut self, qconn: &mut QuicheConnection) -> quiche::Result<Option<Waker>> {
         if let Some(code) = self.reset {
@@ -187,7 +201,9 @@ impl SendState {
             Err(e) => return Err(e),
         };
 
-        if self.capacity > 0 {
+        // A flush waiter can make progress as soon as the internal queue has
+        // drained, even if there is no capacity available for another write.
+        if self.queued.is_empty() || self.capacity > 0 {
             return Ok(self.blocked.take());
         }
 
@@ -348,6 +364,18 @@ impl SendStream {
         Poll::Pending
     }
 
+    fn poll_flushed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+        if let Poll::Ready(res) = self.state.lock().poll_flushed(waker) {
+            return Poll::Ready(res);
+        }
+
+        if let Poll::Ready(res) = self.driver.lock().closed(waker) {
+            return Poll::Ready(Err(res.into()));
+        }
+
+        Poll::Pending
+    }
+
     /// Wait until the stream is closed by either side.
     ///
     /// This includes:
@@ -403,21 +431,26 @@ impl AsyncWrite for SendStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        // Flushing happens automatically via the driver
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        self.poll_flushed(cx.waker())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        match self.finish() {
-            Ok(()) => match self.poll_closed(cx.waker()) {
-                Poll::Ready(res) => Poll::Ready(res.map_err(|e| io::Error::other(e.to_string()))),
-                Poll::Pending => Poll::Pending,
-            },
-            Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
+        match self.is_finished() {
+            Ok(false) => {
+                if let Err(e) = self.finish() {
+                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+                }
+            }
+            Ok(true) => {}
+            Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
         }
+
+        self.poll_closed(cx.waker())
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 }
