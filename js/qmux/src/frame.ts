@@ -39,8 +39,23 @@ export interface StopSending {
 	code: VarInt;
 }
 
+/** Transport CONNECTION_CLOSE (0x1c): a protocol violation or transport error the
+ *  sender detected. The receiver *rejects* `closed`. Per RFC 9000 §19.19 the
+ *  transport variant carries the Frame Type field (we always send 0). */
 export interface ConnectionClose {
 	type: "connection_close";
+	code: VarInt;
+	reason: string;
+}
+
+/** APPLICATION_CLOSE (0x1d): a graceful, app-initiated close carrying an
+ *  application code/reason. The receiver *fulfills* `closed`. Per RFC 9000 §19.19
+ *  the application variant omits the Frame Type field.
+ *
+ *  The close subtype, not the code, carries the fulfill/reject distinction —
+ *  codes are application-defined, so a graceful close may use any value. */
+export interface ApplicationClose {
+	type: "application_close";
 	code: VarInt;
 	reason: string;
 }
@@ -170,6 +185,7 @@ export type Any =
 	| ResetStream
 	| StopSending
 	| ConnectionClose
+	| ApplicationClose
 	| MaxData
 	| MaxStreamData
 	| MaxStreamsBidi
@@ -267,11 +283,14 @@ function encodeWebTransport(frame: Any): Uint8Array {
 			return buffer;
 		}
 
-		case "connection_close": {
+		// The legacy WebTransport format keeps the reason as the rest of the buffer
+		// (no Frame Type / length fields); only the type byte differs.
+		case "connection_close":
+		case "application_close": {
 			const body = new TextEncoder().encode(frame.reason);
 			let buffer = new Uint8Array(new ArrayBuffer(1 + 8 + body.length), 0, 1);
 
-			buffer[0] = 0x1d;
+			buffer[0] = frame.type === "application_close" ? 0x1d : 0x1c;
 			buffer = frame.code.encode(buffer);
 
 			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + body.length);
@@ -330,8 +349,9 @@ function encodeQMux(frame: Any): Uint8Array {
 		}
 
 		case "connection_close": {
-			// APPLICATION_CLOSE (0x1d)
-			const frameType = VarInt.from(0x1d);
+			// CONNECTION_CLOSE (0x1c) carries the Frame Type field (RFC 9000 §19.19).
+			// We don't track which frame tripped the error, so it's always 0 (PADDING).
+			const frameType = VarInt.from(0x1c);
 			const causingFrameType = VarInt.from(0);
 			const body = new TextEncoder().encode(frame.reason);
 			const reasonLength = VarInt.from(body.length);
@@ -341,6 +361,24 @@ function encodeQMux(frame: Any): Uint8Array {
 			buffer = frameType.encode(buffer);
 			buffer = frame.code.encode(buffer);
 			buffer = causingFrameType.encode(buffer);
+			buffer = reasonLength.encode(buffer);
+
+			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + body.length);
+			buffer.set(body, buffer.byteLength - body.length);
+
+			return buffer;
+		}
+
+		case "application_close": {
+			// APPLICATION_CLOSE (0x1d): no Frame Type field (RFC 9000 §19.19).
+			const frameType = VarInt.from(0x1d);
+			const body = new TextEncoder().encode(frame.reason);
+			const reasonLength = VarInt.from(body.length);
+
+			let buffer = new Uint8Array(new ArrayBuffer(8 + 8 + 8 + body.length), 0, 0);
+
+			buffer = frameType.encode(buffer);
+			buffer = frame.code.encode(buffer);
 			buffer = reasonLength.encode(buffer);
 
 			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + body.length);
@@ -636,13 +674,16 @@ function decodeWebTransport(buffer: Uint8Array): Any {
 		return { type: "stop_sending", id, code };
 	}
 
-	if (frameType === 0x1d) {
+	if (frameType === 0x1d || frameType === 0x1c) {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 
+		// Legacy format: the reason is the rest of the buffer (no Frame Type field).
 		const reason = new TextDecoder().decode(buffer);
 
-		return { type: "connection_close", code, reason };
+		return frameType === 0x1d
+			? { type: "application_close", code, reason }
+			: { type: "connection_close", code, reason };
 	}
 
 	if (frameType === 0x08 || frameType === 0x09) {
@@ -740,8 +781,11 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
 
-		// Skip frame_type field
-		[v, buffer] = VarInt.decode(buffer);
+		// The Frame Type field is present only for CONNECTION_CLOSE (0x1c);
+		// APPLICATION_CLOSE (0x1d) omits it (RFC 9000 §19.19).
+		if (frameType === 0x1cn) {
+			[v, buffer] = VarInt.decode(buffer);
+		}
 
 		// reason_length + reason
 		[v, buffer] = VarInt.decode(buffer);
@@ -750,7 +794,9 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		[reasonBytes, buffer] = take(buffer, reasonLen);
 		const reason = new TextDecoder().decode(reasonBytes);
 
-		return { type: "connection_close", code, reason };
+		return frameType === 0x1dn
+			? { type: "application_close", code, reason }
+			: { type: "connection_close", code, reason };
 	}
 
 	// MAX_DATA
@@ -925,13 +971,20 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 	if (frameType === 0x1cn || frameType === 0x1dn) {
 		[v, buffer] = VarInt.decode(buffer);
 		const code = v;
-		[v, buffer] = VarInt.decode(buffer); // frame_type
+		// Frame Type field present only for 0x1c; 0x1d omits it (RFC 9000 §19.19).
+		if (frameType === 0x1cn) {
+			[v, buffer] = VarInt.decode(buffer); // frame_type
+		}
 		[v, buffer] = VarInt.decode(buffer);
 		const reasonLen = Number(v.value);
 		let reasonBytes: Uint8Array;
 		[reasonBytes, buffer] = take(buffer, reasonLen);
 		const reason = new TextDecoder().decode(reasonBytes);
-		return [{ type: "connection_close", code, reason }, buffer];
+		const close: Any =
+			frameType === 0x1dn
+				? { type: "application_close", code, reason }
+				: { type: "connection_close", code, reason };
+		return [close, buffer];
 	}
 
 	// MAX_DATA

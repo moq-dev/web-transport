@@ -21,6 +21,7 @@ const STREAM_DATA_BLOCKED: VarInt = VarInt::from_u32(0x15);
 const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
+const CONNECTION_CLOSE: VarInt = VarInt::from_u32(0x1c);
 // DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
 // the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
 // QMux01, where each rides its own record, so the record boundary would already
@@ -93,9 +94,25 @@ pub struct StopSending {
     pub code: VarInt,
 }
 
-/// Closes the entire connection with an error code and reason.
+/// Transport CONNECTION_CLOSE (0x1c): a protocol violation or transport error the
+/// sender detected. The receiver surfaces it as an *abnormal* close. Per RFC 9000
+/// §19.19 the transport variant carries the Frame Type field (we always send 0).
 #[derive(Debug, Clone)]
 pub struct ConnectionClose {
+    /// Error code (RFC 9000 transport error-code space).
+    pub code: VarInt,
+    /// Human-readable reason for closing.
+    pub reason: String,
+}
+
+/// APPLICATION_CLOSE (0x1d): a graceful, app-initiated close carrying an
+/// application code/reason. The receiver surfaces it as a *clean* session close.
+/// Per RFC 9000 §19.19 the application variant omits the Frame Type field.
+///
+/// The close subtype, not the code, carries the graceful/abnormal distinction —
+/// codes are application-defined, so a graceful close may use any value.
+#[derive(Debug, Clone)]
+pub struct ApplicationClose {
     /// Application-defined error code.
     pub code: VarInt,
     /// Human-readable reason for closing.
@@ -161,6 +178,7 @@ pub enum Frame {
     ResetStream(ResetStream),
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
+    ApplicationClose(ApplicationClose),
     Stream(Stream),
     MaxData(u64),
     MaxStreamData {
@@ -309,8 +327,8 @@ impl Frame {
                 let code = VarInt::decode(data)?;
                 Ok(Some(Frame::StopSending(StopSending { id, code })))
             }
-            // CONNECTION_CLOSE / APPLICATION_CLOSE
-            0x1c | 0x1d => {
+            // CONNECTION_CLOSE (0x1c): carries the Frame Type field (RFC 9000 §19.19).
+            0x1c => {
                 let code = VarInt::decode(data)?;
                 let _frame_type = VarInt::decode(data)?;
                 let reason_len = VarInt::decode(data)?.into_inner();
@@ -320,6 +338,20 @@ impl Frame {
                 let reason =
                     String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
                 Ok(Some(Frame::ConnectionClose(ConnectionClose {
+                    code,
+                    reason,
+                })))
+            }
+            // APPLICATION_CLOSE (0x1d): no Frame Type field (RFC 9000 §19.19).
+            0x1d => {
+                let code = VarInt::decode(data)?;
+                let reason_len = VarInt::decode(data)?.into_inner();
+                if (data.remaining() as u64) < reason_len {
+                    return Err(Error::Short);
+                }
+                let reason =
+                    String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
+                Ok(Some(Frame::ApplicationClose(ApplicationClose {
                     code,
                     reason,
                 })))
@@ -433,7 +465,14 @@ impl Frame {
                 s.id.0.encode(buf);
                 s.code.encode(buf);
             }
+            // The legacy WebTransport format keeps the reason as the rest of the
+            // buffer (no Frame Type / length fields); only the type byte differs.
             Frame::ConnectionClose(c) => {
+                buf.put_u8(0x1c);
+                c.code.encode(buf);
+                buf.put_slice(c.reason.as_bytes());
+            }
+            Frame::ApplicationClose(c) => {
                 buf.put_u8(0x1d);
                 c.code.encode(buf);
                 buf.put_slice(c.reason.as_bytes());
@@ -467,10 +506,19 @@ impl Frame {
                 s.code.encode(buf);
             }
             Frame::ConnectionClose(c) => {
+                CONNECTION_CLOSE.encode(buf);
+                c.code.encode(buf);
+                // Frame Type field — present for 0x1c (RFC 9000 §19.19). We don't
+                // track which frame tripped the error, so it's always 0 (PADDING).
+                VarInt::from(0u32).encode(buf);
+                let reason_bytes = c.reason.as_bytes();
+                VarInt::try_from(reason_bytes.len())?.encode(buf);
+                buf.put_slice(reason_bytes);
+            }
+            Frame::ApplicationClose(c) => {
                 APPLICATION_CLOSE.encode(buf);
                 c.code.encode(buf);
-                // frame_type = 0 (application close)
-                VarInt::from(0u32).encode(buf);
+                // No Frame Type field for 0x1d (RFC 9000 §19.19).
                 let reason_bytes = c.reason.as_bytes();
                 VarInt::try_from(reason_bytes.len())?.encode(buf);
                 buf.put_slice(reason_bytes);
@@ -588,10 +636,15 @@ impl Frame {
                     fin: true,
                 }))
             }
-            0x1d => {
+            0x1c => {
                 let code = VarInt::decode(&mut data)?;
                 let reason = String::from_utf8_lossy(&data).into_owned();
                 Ok(Frame::ConnectionClose(ConnectionClose { code, reason }))
+            }
+            0x1d => {
+                let code = VarInt::decode(&mut data)?;
+                let reason = String::from_utf8_lossy(&data).into_owned();
+                Ok(Frame::ApplicationClose(ApplicationClose { code, reason }))
             }
             _ => Err(Error::InvalidFrameType(frame_type as u64)),
         }
@@ -667,8 +720,8 @@ impl Frame {
                 let code = VarInt::decode(&mut data)?;
                 Ok(Some(Frame::StopSending(StopSending { id, code })))
             }
-            // CONNECTION_CLOSE / APPLICATION_CLOSE
-            0x1c | 0x1d => {
+            // CONNECTION_CLOSE (0x1c): carries the Frame Type field (RFC 9000 §19.19).
+            0x1c => {
                 let code = VarInt::decode(&mut data)?;
                 let _frame_type = VarInt::decode(&mut data)?;
                 let reason_len = VarInt::decode(&mut data)?.into_inner();
@@ -678,6 +731,20 @@ impl Frame {
                 let reason =
                     String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
                 Ok(Some(Frame::ConnectionClose(ConnectionClose {
+                    code,
+                    reason,
+                })))
+            }
+            // APPLICATION_CLOSE (0x1d): no Frame Type field (RFC 9000 §19.19).
+            0x1d => {
+                let code = VarInt::decode(&mut data)?;
+                let reason_len = VarInt::decode(&mut data)?.into_inner();
+                if (data.remaining() as u64) < reason_len {
+                    return Err(Error::Short);
+                }
+                let reason =
+                    String::from_utf8_lossy(&data.split_to(reason_len as usize)).into_owned();
+                Ok(Some(Frame::ApplicationClose(ApplicationClose {
                     code,
                     reason,
                 })))
@@ -796,5 +863,11 @@ impl From<StopSending> for Frame {
 impl From<ConnectionClose> for Frame {
     fn from(close: ConnectionClose) -> Self {
         Frame::ConnectionClose(close)
+    }
+}
+
+impl From<ApplicationClose> for Frame {
+    fn from(close: ApplicationClose) -> Self {
+        Frame::ApplicationClose(close)
     }
 }

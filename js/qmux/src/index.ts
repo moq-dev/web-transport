@@ -1,6 +1,7 @@
 import type { Version } from "./session.ts";
 import Session from "./session.ts";
 
+export { SessionError } from "./error.ts";
 export type { Config, SessionOptions, Version } from "./session.ts";
 
 /** Options forwarded to every `Session` constructed by [[install]]. */

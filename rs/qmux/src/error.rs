@@ -15,8 +15,18 @@ pub enum Error {
     #[error("stream closed")]
     StreamClosed,
 
+    /// The peer sent an APPLICATION_CLOSE (0x1d): a graceful, deliberate session
+    /// close carrying an application code and reason. Surfaced as a clean session
+    /// error (see [`session_error`](web_transport_trait::Error::session_error)).
     #[error("connection closed: {code}: {reason}")]
     ConnectionClosed { code: VarInt, reason: String },
+
+    /// The peer sent a CONNECTION_CLOSE (0x1c): it detected a protocol violation
+    /// or transport error. Abnormal — unlike [`ConnectionClosed`](Self::ConnectionClosed)
+    /// it does *not* surface as a clean application close, mirroring how a QUIC
+    /// transport CONNECTION_CLOSE rejects rather than gracefully ending a session.
+    #[error("connection reset: {code}: {reason}")]
+    ConnectionReset { code: VarInt, reason: String },
 
     #[error("stream reset: {0}")]
     StreamReset(VarInt),
@@ -98,6 +108,30 @@ pub enum Error {
 
     #[error("datagrams not supported")]
     DatagramsUnsupported,
+}
+
+impl Error {
+    /// The wire error code to send on a CONNECTION_CLOSE (0x1c) when *we* tear the
+    /// session down because of this error, or `None` when the peer should not (or
+    /// cannot) be told: a graceful close, a close the peer already sent us, an idle
+    /// timeout (silent, like QUIC), or a dead transport. Every protocol/transport
+    /// violation we detect maps to 1002, matching the JS QMux polyfill.
+    pub(crate) fn transport_close(&self) -> Option<u32> {
+        match self {
+            Error::ProtocolViolation
+            | Error::FrameEncoding
+            | Error::TransportParameter
+            | Error::DuplicateParam(_)
+            | Error::InvalidFrameType(_)
+            | Error::InvalidStreamId
+            | Error::FlowControlError
+            | Error::StreamLimitExceeded
+            | Error::FrameTooLarge
+            | Error::DatagramsUnsupported
+            | Error::Short => Some(1002),
+            _ => None,
+        }
+    }
 }
 
 impl From<VarIntUnexpectedEnd> for Error {
