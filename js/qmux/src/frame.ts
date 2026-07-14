@@ -307,6 +307,9 @@ function encodeWebTransport(frame: Any): Uint8Array {
 function encodeQMux(frame: Any): Uint8Array {
 	switch (frame.type) {
 		case "stream": {
+			// TODO(#294): Keep draft-02's offset-less behavior for compatibility.
+			// Once draft-03 is published and supported, emit OFF with the
+			// per-stream send offset and validate received offsets/terminal state.
 			// Always set LEN bit (0x02), type = 0x0a | fin_bit
 			const frameType = VarInt.from(0x0a | (frame.fin ? 0x01 : 0x00));
 			const lengthVi = VarInt.from(frame.data.length);
