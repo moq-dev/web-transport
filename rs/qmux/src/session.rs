@@ -470,10 +470,20 @@ impl<W: Writer> WriterState<W> {
     /// Retire the stream a terminal frame closes, encode the frame (validating its
     /// size for QMux01), and write it. The `streams` lock is only held for the
     /// synchronous retirement, never across the `send` await.
-    async fn transmit(&mut self, frame: Frame) -> Result<(), Error> {
-        match &frame {
+    async fn transmit(&mut self, mut frame: Frame) -> Result<(), Error> {
+        let transmitted_stream = match &frame {
+            Frame::Stream(stream) if !stream.fin => Some((stream.id, stream.data.len() as u64)),
+            _ => None,
+        };
+
+        match &mut frame {
             Frame::ResetStream(reset) => {
-                self.streams.lock().unwrap().send.remove(&reset.id);
+                // The frontend offset includes frames that may still be queued.
+                // RESET_STREAM is a priority frame and drops that backlog, so its
+                // final size must come from bytes this writer actually emitted.
+                if let Some(send) = self.streams.lock().unwrap().send.remove(&reset.id) {
+                    reset.final_size = send.sent_offset;
+                }
             }
             Frame::Stream(stream) if stream.fin => {
                 self.streams.lock().unwrap().send.remove(&stream.id);
@@ -502,12 +512,134 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
+        if let Some((id, len)) = transmitted_stream {
+            if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
+                send.sent_offset += len;
+            }
+        }
         // Publish send progress for the timer's keep-alive and idle scheduling.
         self.last_send_at.store(
             millis_since(self.base, tokio::time::Instant::now()),
             Ordering::Release,
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod writer_final_size_tests {
+    use super::*;
+
+    struct CaptureWriter(Arc<Mutex<Vec<Bytes>>>);
+
+    impl Writer for CaptureWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.0.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_uses_bytes_transmitted_not_frontend_offset() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let streams = Arc::new(Mutex::new(Streams::default()));
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let (stopped, _stopped_rx) = mpsc::unbounded_channel();
+        streams.lock().unwrap().send.insert(
+            id,
+            SendState {
+                inbound_stopped: stopped,
+                sent_offset: 0,
+                stream_credit: None,
+            },
+        );
+
+        let (_control_tx, control) = mpsc::unbounded_channel();
+        let (_datagram_tx, datagrams) = mpsc::channel(1);
+        let mut writer = WriterState {
+            writer: CaptureWriter(sent.clone()),
+            version: Version::QMux01,
+            control,
+            datagrams,
+            outbound: PriorityQueue::new(1),
+            streams,
+            record_limit: Arc::new(AtomicU64::new(u64::MAX)),
+            writer_backpressured: Arc::new(AtomicBool::new(false)),
+            closed: watch::Sender::new(None),
+            base: tokio::time::Instant::now(),
+            last_send_at: Arc::new(AtomicU64::new(0)),
+        };
+
+        writer
+            .transmit(
+                Stream {
+                    id,
+                    data: Bytes::from_static(b"abc"),
+                    fin: false,
+                }
+                .into(),
+            )
+            .await
+            .unwrap();
+        writer
+            .transmit(
+                ResetStream {
+                    id,
+                    code: VarInt::from_u32(0),
+                    // Simulate a frontend offset that also included queued data.
+                    final_size: 99,
+                    reliable_size: None,
+                }
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let wire = sent.lock().unwrap()[1].clone();
+        let decoded = Frame::decode(wire, Version::QMux01).unwrap().unwrap();
+        let Frame::ResetStream(reset) = decoded else {
+            panic!("expected RESET_STREAM");
+        };
+        assert_eq!(reset.final_size, 3);
+    }
+
+    #[tokio::test]
+    async fn reset_returns_credit_reserved_for_dropped_frames() {
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let outbound = PriorityQueue::new(4);
+        let (priority, _priority_rx) = mpsc::unbounded_channel();
+        let (_stopped, stopped_rx) = mpsc::unbounded_channel();
+        let stream_credit = Credit::new(3);
+        let conn_credit = Credit::new(3);
+        let mut send = SendStream {
+            id,
+            outbound,
+            outbound_priority: priority,
+            inbound_stopped: stopped_rx,
+            offset: 0,
+            priority: 0,
+            closed: None,
+            fin: false,
+            stream_credit: Some(stream_credit.clone()),
+            conn_credit: Some(conn_credit.clone()),
+        };
+
+        assert_eq!(
+            generic::SendStream::write(&mut send, b"abc").await.unwrap(),
+            3
+        );
+        assert_eq!(stream_credit.try_claim(1), 0);
+        assert_eq!(conn_credit.try_claim(1), 0);
+
+        // All three bytes are still queued, so reset drops them. They are not
+        // part of the transmitted final size and must not consume flow control.
+        generic::SendStream::reset(&mut send, 0);
+        assert_eq!(stream_credit.try_claim(3), 3);
+        assert_eq!(conn_credit.try_claim(3), 3);
     }
 }
 
@@ -767,10 +899,11 @@ impl<R: Reader> SessionState<R> {
                 // a brief lock (never held across an await).
                 {
                     let mut streams = self.streams.lock().unwrap();
-                    if let Some(recv) = streams.recv.get(&stream.id) {
+                    if let Some(recv) = streams.recv.get_mut(&stream.id) {
                         if data_len > 0 && !recv.recv_credit.receive(data_len) {
                             return Err(Error::FlowControlError);
                         }
+                        recv.recv_offset += data_len;
                         // An empty STREAM without FIN carries no state beyond
                         // opening the stream. Once the stream exists, queuing one
                         // only allocates an unbounded-channel node without using
@@ -839,6 +972,7 @@ impl<R: Reader> SessionState<R> {
                     inbound_data: tx,
                     inbound_reset: tx2,
                     recv_credit: recv_credit.clone(),
+                    recv_offset: data_len,
                 };
 
                 let recv_streams_credit = if self.config.version.is_qmux() {
@@ -878,6 +1012,7 @@ impl<R: Reader> SessionState<R> {
                         let (tx, rx) = mpsc::unbounded_channel();
                         let send_backend = SendState {
                             inbound_stopped: tx,
+                            sent_offset: 0,
                             stream_credit: if self.config.version.is_qmux() {
                                 // Peer opened this bidi stream, so our send limit
                                 // is their bidi_local (they are local to this stream)
@@ -947,9 +1082,84 @@ impl<R: Reader> SessionState<R> {
                     return Err(Error::InvalidStreamId);
                 }
 
+                let reset_id = reset.id;
+                let peer_initiated = reset_id.server_initiated() != self.is_server;
+                let live = self.streams.lock().unwrap().recv.contains_key(&reset_id);
+
+                if !live {
+                    // A terminal peer-initiated stream stays terminal. In
+                    // particular, a duplicate RESET must not consume its final
+                    // size twice. A locally-created receive half that is absent is
+                    // likewise already closed.
+                    if !peer_initiated {
+                        return Ok(());
+                    }
+                    if self.config.version.is_qmux()
+                        && self.recv_open(reset_id.dir()).is_closed(reset_id.index())
+                    {
+                        return Ok(());
+                    }
+
+                    // RESET_STREAM can be the first frame for a peer-initiated
+                    // stream and therefore implicitly opens its index.
+                    if self.config.version.is_qmux() {
+                        let credit = match reset_id.dir() {
+                            StreamDir::Bi => &self.recv_bi_credit,
+                            StreamDir::Uni => &self.recv_uni_credit,
+                        };
+                        if !credit.receive_up_to(reset_id.index() + 1) {
+                            return Err(Error::StreamLimitExceeded);
+                        }
+                    }
+                }
+
+                if self.config.version.is_qmux() {
+                    let received = self
+                        .streams
+                        .lock()
+                        .unwrap()
+                        .recv
+                        .get(&reset_id)
+                        .map_or(0, |recv| recv.recv_offset);
+
+                    // Drafts through -02 were emitted by implementations that
+                    // incorrectly used zero here. Preserve compatibility by never
+                    // letting that value reduce bytes already received; strict
+                    // FINAL_SIZE_ERROR validation begins with draft-03.
+                    // TODO(qmux-03): Once draft-03 is implemented, reject
+                    // reset.final_size < received (and conflicting terminal final
+                    // sizes) with FINAL_SIZE_ERROR instead of taking the maximum.
+                    let final_size = reset.final_size.max(received);
+                    let gap = final_size - received;
+
+                    let stream_ok = if live {
+                        let mut streams = self.streams.lock().unwrap();
+                        let recv = streams.recv.get_mut(&reset_id).expect("live recv stream");
+                        let ok = recv.recv_credit.receive(gap);
+                        if ok {
+                            recv.recv_offset = final_size;
+                        }
+                        ok
+                    } else {
+                        let recv_max = match reset_id.dir() {
+                            StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
+                            StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
+                        };
+                        final_size <= recv_max
+                    };
+                    if !stream_ok || !self.conn_recv_credit.receive(gap) {
+                        return Err(Error::FlowControlError);
+                    }
+                    // The gap consumes connection flow control, but no bytes in
+                    // it can ever occupy receive memory. Make it immediately
+                    // eligible to replenish the connection window.
+                    if let Some(new_max) = self.conn_recv_credit.consume(gap) {
+                        self.control.send(Frame::MaxData(new_max)).ok();
+                    }
+                }
+
                 // Live stream: deliver the reset and drop it (it was recorded in
                 // `recv_open` at creation, so it now reads as closed).
-                let reset_id = reset.id;
                 let delivered = {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.remove(&reset_id) {
@@ -959,28 +1169,25 @@ impl<R: Reader> SessionState<R> {
                         false
                     }
                 };
-                if !delivered
-                    && self.config.version.is_qmux()
-                    && reset_id.server_initiated() != self.is_server
-                {
-                    // RESET_STREAM can be the *first* frame for a peer-initiated
-                    // stream (it implicitly opens the id). Record it as closed so a
-                    // later STREAM on the same id is recognized as retired rather than
-                    // resurrected into a new accepted stream. Gate on the stream limit
-                    // first (mirroring the STREAM path) so the hole set stays bounded
-                    // by MAX_STREAMS.
-                    let credit = match reset_id.dir() {
-                        StreamDir::Bi => &self.recv_bi_credit,
-                        StreamDir::Uni => &self.recv_uni_credit,
-                    };
-                    if !credit.receive_up_to(reset_id.index() + 1) {
-                        return Err(Error::StreamLimitExceeded);
-                    }
+                if !delivered && self.config.version.is_qmux() && peer_initiated {
                     match reset_id.dir() {
                         StreamDir::Bi => &mut self.recv_open_bi,
                         StreamDir::Uni => &mut self.recv_open_uni,
                     }
                     .record(reset_id.index());
+
+                    // No frontend exists to replenish MAX_STREAMS on Drop.
+                    let credit = match reset_id.dir() {
+                        StreamDir::Bi => &self.recv_bi_credit,
+                        StreamDir::Uni => &self.recv_uni_credit,
+                    };
+                    if let Some(new_max) = credit.consume(1) {
+                        let frame = match reset_id.dir() {
+                            StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
+                            StreamDir::Uni => Frame::MaxStreamsUni(new_max),
+                        };
+                        self.control.send(frame).ok();
+                    }
                 }
             }
             Frame::StopSending(stop) => {
@@ -1564,6 +1771,7 @@ impl generic::Session for Session {
 
         let send_backend = SendState {
             inbound_stopped: tx,
+            sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
         let send_frontend = SendStream {
@@ -1618,6 +1826,7 @@ impl generic::Session for Session {
 
         let send_backend = SendState {
             inbound_stopped: tx,
+            sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
         let send_frontend = SendStream {
@@ -1648,6 +1857,7 @@ impl generic::Session for Session {
             inbound_data: tx,
             inbound_reset: tx2,
             recv_credit: recv_credit.clone(),
+            recv_offset: 0,
         };
         let recv_frontend = RecvStream {
             id,
@@ -1764,6 +1974,8 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
 
 struct SendState {
     inbound_stopped: mpsc::UnboundedSender<StopSending>,
+    /// Bytes that the writer has successfully put on the transport.
+    sent_offset: u64,
     stream_credit: Option<Credit>,
 }
 
@@ -1804,8 +2016,11 @@ impl SendStream {
                 final_size: self.offset,
                 reliable_size: None,
             };
-            // Flush queued STREAM data so none trails the RESET_STREAM on the wire.
-            self.outbound.remove(self.id);
+            // Flush queued STREAM data so none trails RESET_STREAM, and return
+            // the connection/stream credit reserved for bytes that never reached
+            // the wire. The reset final size only consumes transmitted bytes.
+            let dropped = self.outbound.remove(self.id);
+            self.release_credit(dropped);
             self.outbound_priority.send(frame.into()).ok();
         }
         self.closed = Some(error.clone());
@@ -1964,7 +2179,8 @@ impl generic::SendStream for SendStream {
         // Flush any STREAM data still queued for this stream: it must not go out
         // after the RESET_STREAM, where it would be post-terminal data burning
         // congestion window on a stream the peer has abandoned.
-        self.outbound.remove(self.id);
+        let dropped = self.outbound.remove(self.id);
+        self.release_credit(dropped);
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
@@ -2007,6 +2223,7 @@ pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
     recv_credit: Credit,
+    recv_offset: u64,
 }
 
 /// The receive half of a multiplexed stream.
@@ -2417,14 +2634,14 @@ mod recv_open_tests {
 
     /// A client session fed by a scripted transport, plus the sender for inbound
     /// frames. QMux01, where the closed-stream tracking is active.
-    fn scripted_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
+    fn scripted_session_with_config(config: Config) -> (Session, mpsc::UnboundedSender<Bytes>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let session = Session::new(
-            ScriptedTransport { incoming: rx },
-            false,
-            Config::new(Version::QMux01),
-        );
+        let session = Session::new(ScriptedTransport { incoming: rx }, false, config);
         (session, tx)
+    }
+
+    fn scripted_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
+        scripted_session_with_config(Config::new(Version::QMux01))
     }
 
     /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and
@@ -2440,11 +2657,11 @@ mod recv_open_tests {
     }
 
     /// Encode a RESET_STREAM frame on a server-initiated uni stream.
-    fn uni_reset(index: u64) -> Bytes {
+    fn uni_reset(index: u64, final_size: u64) -> Bytes {
         Frame::ResetStream(ResetStream {
             id: StreamId::new(index, StreamDir::Uni, true),
             code: VarInt::from_u32(0),
-            final_size: 0,
+            final_size,
             reliable_size: None,
         })
         .encode(Version::QMux01)
@@ -2515,7 +2732,7 @@ mod recv_open_tests {
         let (session, tx) = scripted_session();
 
         // RESET arrives before any STREAM frame for this id, then a STREAM does.
-        tx.send(uni_reset(5)).unwrap();
+        tx.send(uni_reset(5, 0)).unwrap();
         tx.send(uni_stream(5, b"late", false)).unwrap();
 
         let accepted = tokio::time::timeout(Duration::from_millis(200), session.accept_uni()).await;
@@ -2557,6 +2774,88 @@ mod recv_open_tests {
             0,
             "empty non-FIN STREAM frames accumulated behind a stalled reader"
         );
+    }
+
+    /// A reset's final size consumes connection-level credit even when no STREAM
+    /// frame preceded it; otherwise reset-only streams bypass MAX_DATA entirely.
+    #[tokio::test]
+    async fn reset_final_size_consumes_connection_credit() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 4;
+        config.max_stream_data_uni = 10;
+        let (session, tx) = scripted_session_with_config(config);
+
+        tx.send(uni_reset(0, 5)).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("session did not close on RESET_STREAM flow-control violation");
+        assert!(matches!(err, Error::FlowControlError), "got {err:?}");
+    }
+
+    /// Reset-only final sizes and ordinary STREAM payloads share the same
+    /// cumulative MAX_DATA budget across streams.
+    #[tokio::test]
+    async fn reset_final_size_is_cumulative_with_later_stream_data() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 10;
+        config.max_stream_data_uni = 10;
+        let (session, tx) = scripted_session_with_config(config);
+
+        tx.send(uni_reset(0, 3)).unwrap();
+        tx.send(uni_stream(1, b"12345678", false)).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("session did not close after cumulative MAX_DATA exhaustion");
+        assert!(matches!(err, Error::FlowControlError), "got {err:?}");
+    }
+
+    /// A reset gap cannot occupy receive memory, so once it has been charged to
+    /// MAX_DATA it is immediately eligible to replenish the connection window.
+    #[tokio::test]
+    async fn reset_final_size_replenishes_connection_credit() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 10;
+        config.max_stream_data_uni = 10;
+        let (session, tx) = scripted_session_with_config(config);
+
+        tx.send(uni_reset(0, 6)).unwrap();
+        tx.send(uni_stream(1, b"12345", true)).unwrap();
+
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("connection credit was not replenished after reset")
+            .expect("accept_uni failed");
+        assert_eq!(recv.read_all().await.unwrap().as_ref(), b"12345");
+    }
+
+    /// Older QMux drafts were emitted by implementations that always wrote a
+    /// zero final size. Keep accepting those resets until draft-03 while still
+    /// retaining the stream's terminal state.
+    #[tokio::test]
+    async fn legacy_zero_final_size_after_data_is_tolerated() {
+        let (session, tx) = scripted_session();
+
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+        tx.send(uni_reset(0, 0)).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(1), recv.closed())
+            .await
+            .expect("reset was not delivered")
+            .expect_err("reset should close the receive stream");
+        assert!(matches!(err, Error::StreamReset(_)), "got {err:?}");
+
+        // The connection remains usable after tolerating the legacy value.
+        tx.send(uni_stream(1, b"ok", true)).unwrap();
+        let mut next = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("connection closed after legacy reset")
+            .expect("accept_uni failed");
+        assert_eq!(next.read_all().await.unwrap().as_ref(), b"ok");
     }
 }
 
