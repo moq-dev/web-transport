@@ -144,6 +144,10 @@ impl ConnectionClose {
         poll_fn(|cx| self.driver.lock().closed(cx.waker())).await
     }
 
+    pub async fn error(&self) -> ConnectionError {
+        poll_fn(|cx| self.driver.lock().error(cx.waker())).await
+    }
+
     pub fn is_closed(&self) -> bool {
         self.driver.lock().is_closed()
     }
@@ -208,7 +212,7 @@ impl Connection {
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
         tokio::select! {
             Ok(res) = self.accept_bi.recv_async() => Ok(res),
-            res = self.closed() => Err(res),
+            err = self.close.error() => Err(err),
         }
     }
 
@@ -216,7 +220,7 @@ impl Connection {
     pub async fn accept_uni(&self) -> Result<RecvStream, ConnectionError> {
         tokio::select! {
             Ok(res) = self.accept_uni.recv_async() => Ok(res),
-            res = self.closed() => Err(res),
+            err = self.close.error() => Err(err),
         }
     }
 
@@ -256,9 +260,9 @@ impl Connection {
             res = self.dgram_in.recv_async() => match res {
                 Ok(bytes) => Ok(bytes),
                 // Sender dropped — the driver closed; surface the close reason.
-                Err(_) => Err(self.closed().await),
+                Err(_) => Err(self.close.error().await),
             },
-            err = self.closed() => Err(err),
+            err = self.close.error() => Err(err),
         }
     }
 
@@ -343,5 +347,25 @@ impl Deref for Connection {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+
+    use super::*;
+
+    #[test]
+    fn local_close_is_an_error_before_driver_is_closed() {
+        let close = ConnectionClose::new(Lock::new(DriverState::new(false)));
+
+        close.close(ConnectionError::Local(42, "done".to_string()));
+
+        assert!(matches!(
+            close.error().now_or_never(),
+            Some(ConnectionError::Local(42, reason)) if reason == "done"
+        ));
+        assert!(close.wait().now_or_never().is_none());
     }
 }

@@ -267,7 +267,7 @@ impl SendStream {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().closed(cx.waker()) {
+        if let Poll::Ready(res) = self.driver.lock().error(cx.waker()) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -357,7 +357,7 @@ impl SendStream {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().closed(waker) {
+        if let Poll::Ready(res) = self.driver.lock().error(waker) {
             return Poll::Ready(Err(res.into()));
         }
 
