@@ -567,13 +567,21 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 			continue;
 		}
 
-		if (paramData.byteLength < 1) {
-			continue; // Empty param, skip
+		// QMux permits only a subset of the transport parameters defined by
+		// QUIC v1. Unassigned IDs are extensions and remain ignorable.
+		if (id === 0x00n || id === 0x02n || id === 0x03n || (id >= 0x0an && id <= 0x10n)) {
+			throw new Error(`forbidden QUIC v1 transport parameter 0x${id.toString(16)}`);
 		}
 
-		let paramValue: bigint;
-		[v] = VarInt.decode(paramData);
-		paramValue = v.value;
+		if (!RECOGNIZED_PARAM_IDS.has(id)) {
+			continue;
+		}
+
+		const [paramValueVarInt, remaining] = VarInt.decode(paramData);
+		if (remaining.byteLength !== 0) {
+			throw new Error(`transport parameter 0x${id.toString(16)} has trailing bytes`);
+		}
+		const paramValue = paramValueVarInt.value;
 
 		switch (id) {
 			case 0x01n:
@@ -603,7 +611,8 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 			case MAX_RECORD_SIZE_ID:
 				params.maxRecordSize = paramValue;
 				break;
-			// Unknown params: skip
+			default:
+				throw new Error(`unhandled recognized transport parameter 0x${id.toString(16)}`);
 		}
 	}
 
@@ -709,6 +718,11 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 
 	[v, buffer] = VarInt.decode(buffer);
 	const frameType = v.value;
+
+	// PADDING
+	if (frameType === 0x00n) {
+		return null;
+	}
 
 	// STREAM frames: 0x08-0x0f
 	if (frameType >= 0x08n && frameType <= 0x0fn) {
@@ -890,8 +904,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		return { type: "datagram", data, lengthPrefixed: true };
 	}
 
-	// Unknown frame type
-	return null;
+	throw new Error(`Invalid QMux frame type: 0x${frameType.toString(16)}`);
 }
 
 /** Decode a single QMux frame, returning the frame and remaining buffer.
@@ -1079,6 +1092,5 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		return [{ type: "datagram", data, lengthPrefixed: true }, buffer];
 	}
 
-	// Unknown: skip remaining (can't delimit)
-	return [null, buffer.slice(buffer.byteLength)];
+	throw new Error(`Invalid QMux frame type: 0x${frameType.toString(16)}`);
 }

@@ -76,6 +76,14 @@ impl TransportParams {
     // reset_stream_at (draft-ietf-quic-reliable-stream-reset): empty value.
     const RESET_STREAM_AT: VarInt = VarInt::from_u32(0x1d);
 
+    /// Whether `id` is defined by QUIC v1 but prohibited by QMux.
+    ///
+    /// IDs not listed here are extensions and remain ignorable unless QMux (or
+    /// another compatible extension) assigns them semantics.
+    fn is_forbidden_quic_v1(id: u64) -> bool {
+        matches!(id, 0x00 | 0x02 | 0x03 | 0x0a..=0x10)
+    }
+
     /// Encode transport parameters as a series of ID-length-value tuples.
     pub fn encode(&self) -> Result<Bytes, Error> {
         let mut buf = BytesMut::new();
@@ -222,6 +230,9 @@ impl TransportParams {
                         }
                         _ => unreachable!(),
                     }
+                }
+                id if Self::is_forbidden_quic_v1(id) => {
+                    return Err(Error::TransportParameter);
                 }
                 _ => {
                     // Unknown parameter, skip (already split off)
@@ -398,5 +409,27 @@ mod tests {
             TransportParams::decode(buf.freeze()),
             Err(Error::InvalidProtocol(_))
         ));
+    }
+
+    #[test]
+    fn forbidden_quic_v1_params_rejected() {
+        for id in [0x00, 0x02, 0x03, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10] {
+            let mut buf = BytesMut::new();
+            VarInt::from_u32(id).encode(&mut buf);
+            VarInt::from_u32(0).encode(&mut buf);
+            assert!(matches!(
+                TransportParams::decode(buf.freeze()),
+                Err(Error::TransportParameter)
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_extension_param_ignored() {
+        let mut buf = BytesMut::new();
+        VarInt::from_u32(0x11).encode(&mut buf);
+        VarInt::from_u32(1).encode(&mut buf);
+        buf.put_u8(0xff);
+        TransportParams::decode(buf.freeze()).unwrap();
     }
 }

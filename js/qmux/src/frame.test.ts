@@ -204,6 +204,83 @@ describe("QMux02 (draft-02)", () => {
 		expect(() => Frame.decode(bytes, "qmux-02")).toThrow();
 	});
 
+	test("forbidden QUIC v1 transport parameters are rejected", () => {
+		for (const id of [0x00, 0x02, 0x03, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10]) {
+			const bytes = new Uint8Array([
+				0xff,
+				0x51,
+				0x53,
+				0x30,
+				0x0d,
+				0x0a,
+				0x0d,
+				0x0a, // frame type
+				0x02, // payload length
+				id,
+				0x00, // empty parameter value
+			]);
+			expect(() => Frame.decode(bytes, "qmux-02")).toThrow("forbidden QUIC v1 transport parameter");
+		}
+	});
+
+	test("unknown extension transport parameters are ignored", () => {
+		const bytes = new Uint8Array([
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a, // frame type
+			0x03, // payload length
+			0x11,
+			0x01,
+			0xff, // unknown extension id=0x11, len=1
+		]);
+		expect(Frame.decode(bytes, "qmux-02")?.type).toBe("transport_parameters");
+	});
+
+	test("recognized integer transport parameters require exactly one varint", () => {
+		const empty = new Uint8Array([
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a,
+			0x02,
+			0x04,
+			0x00, // initial_max_data with an empty value
+		]);
+		expect(() => Frame.decode(empty, "qmux-02")).toThrow();
+
+		const trailing = new Uint8Array([
+			0xff,
+			0x51,
+			0x53,
+			0x30,
+			0x0d,
+			0x0a,
+			0x0d,
+			0x0a,
+			0x04,
+			0x04,
+			0x02,
+			0x01,
+			0x00, // initial_max_data=1 followed by a trailing byte
+		]);
+		expect(() => Frame.decode(trailing, "qmux-02")).toThrow("trailing bytes");
+	});
+
+	test("an unknown frame type is rejected without suppressing trailing frames", () => {
+		const record = new Uint8Array([0x02, 0x10, 0x01]);
+		expect(() => Frame.decodeRecord(record)).toThrow("Invalid QMux frame type");
+		expect(() => Frame.decode(new Uint8Array([0x02]), "qmux-02")).toThrow("Invalid QMux frame type");
+	});
+
 	test("reset_stream_at transport parameter round-trips (empty flag)", () => {
 		const on: Frame.Any = {
 			type: "transport_parameters",
