@@ -281,6 +281,32 @@ describe("Session integration (scripted peer)", () => {
 		await waitFor(() => sentCloseCode(peer) === 1002);
 	});
 
+	test("RESET_STREAM final_size is cumulative with later stream data for MAX_DATA", async () => {
+		const { session, peer } = connect({ maxData: 10n, maxStreamDataUni: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		// The reset-only stream consumes six bytes of connection credit even though
+		// no STREAM frame carried them. Five bytes on a second stream then exceed
+		// MAX_DATA (6 + 5 > 10).
+		peer.send({
+			type: "reset_stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+			code: VarInt.from(0),
+			finalSize: 6n,
+		});
+		peer.send({
+			type: "stream",
+			id: Stream.Id.create(1n, Stream.Dir.Uni, true),
+			data: new Uint8Array(5),
+			fin: false,
+		});
+
+		const err = await expectSessionFailure(session);
+		expect(err.message).toContain("flow control error");
+		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
 	test("draft-01 tolerates the legacy zero final_size after data", async () => {
 		const { session, peer } = connect();
 		await session.ready;

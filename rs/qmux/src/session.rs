@@ -606,6 +606,41 @@ mod writer_final_size_tests {
         };
         assert_eq!(reset.final_size, 3);
     }
+
+    #[tokio::test]
+    async fn reset_returns_credit_reserved_for_dropped_frames() {
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let outbound = PriorityQueue::new(4);
+        let (priority, _priority_rx) = mpsc::unbounded_channel();
+        let (_stopped, stopped_rx) = mpsc::unbounded_channel();
+        let stream_credit = Credit::new(3);
+        let conn_credit = Credit::new(3);
+        let mut send = SendStream {
+            id,
+            outbound,
+            outbound_priority: priority,
+            inbound_stopped: stopped_rx,
+            offset: 0,
+            priority: 0,
+            closed: None,
+            fin: false,
+            stream_credit: Some(stream_credit.clone()),
+            conn_credit: Some(conn_credit.clone()),
+        };
+
+        assert_eq!(
+            generic::SendStream::write(&mut send, b"abc").await.unwrap(),
+            3
+        );
+        assert_eq!(stream_credit.try_claim(1), 0);
+        assert_eq!(conn_credit.try_claim(1), 0);
+
+        // All three bytes are still queued, so reset drops them. They are not
+        // part of the transmitted final size and must not consume flow control.
+        generic::SendStream::reset(&mut send, 0);
+        assert_eq!(stream_credit.try_claim(3), 3);
+        assert_eq!(conn_credit.try_claim(3), 3);
+    }
 }
 
 /// Timer task: the sole owner of the record-framed-draft idle timeout and
@@ -1975,8 +2010,11 @@ impl SendStream {
                 final_size: self.offset,
                 reliable_size: None,
             };
-            // Flush queued STREAM data so none trails the RESET_STREAM on the wire.
-            self.outbound.remove(self.id);
+            // Flush queued STREAM data so none trails RESET_STREAM, and return
+            // the connection/stream credit reserved for bytes that never reached
+            // the wire. The reset final size only consumes transmitted bytes.
+            let dropped = self.outbound.remove(self.id);
+            self.release_credit(dropped);
             self.outbound_priority.send(frame.into()).ok();
         }
         self.closed = Some(error.clone());
@@ -2135,7 +2173,8 @@ impl generic::SendStream for SendStream {
         // Flush any STREAM data still queued for this stream: it must not go out
         // after the RESET_STREAM, where it would be post-terminal data burning
         // congestion window on a stream the peer has abandoned.
-        self.outbound.remove(self.id);
+        let dropped = self.outbound.remove(self.id);
+        self.release_credit(dropped);
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
@@ -2745,6 +2784,24 @@ mod recv_open_tests {
         let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
             .await
             .expect("session did not close on RESET_STREAM flow-control violation");
+        assert!(matches!(err, Error::FlowControlError), "got {err:?}");
+    }
+
+    /// Reset-only final sizes and ordinary STREAM payloads share the same
+    /// cumulative MAX_DATA budget across streams.
+    #[tokio::test]
+    async fn reset_final_size_is_cumulative_with_later_stream_data() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 10;
+        config.max_stream_data_uni = 10;
+        let (session, tx) = scripted_session_with_config(config);
+
+        tx.send(uni_reset(0, 6)).unwrap();
+        tx.send(uni_stream(1, b"12345", false)).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("session did not close after cumulative MAX_DATA exhaustion");
         assert!(matches!(err, Error::FlowControlError), "got {err:?}");
     }
 

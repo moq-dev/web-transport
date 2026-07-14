@@ -225,16 +225,24 @@ impl PriorityQueue {
     }
 
     /// Drop every queued frame for `id`, unscheduling it and freeing the
-    /// capacity they held. Used when a stream is reset: any STREAM data still
-    /// buffered here must not reach the wire *after* the RESET_STREAM, or it's
-    /// post-terminal data that wastes congestion window on a stream the peer has
-    /// already abandoned. No-op if the stream has nothing queued.
-    pub fn remove(&self, id: StreamId) {
+    /// capacity they held. Returns the number of queued STREAM payload bytes
+    /// removed so the caller can return flow-control credit that never reached
+    /// the wire. Used when a stream is reset: buffered STREAM data must not trail
+    /// RESET_STREAM. Returns zero if the stream has nothing queued.
+    pub fn remove(&self, id: StreamId) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let Some(slot) = inner.streams.remove(&id) else {
-            return;
+            return 0;
         };
         let removed = slot.frames.len();
+        let removed_bytes = slot
+            .frames
+            .iter()
+            .map(|frame| match frame {
+                Frame::Stream(stream) => stream.data.len() as u64,
+                _ => 0,
+            })
+            .sum();
 
         // Unschedule it from its band (it's scheduled iff it had frames, which it
         // did). `slot.priority` is the single source of truth for which band.
@@ -254,6 +262,7 @@ impl PriorityQueue {
         for _ in 0..removed {
             self.has_space.notify_one();
         }
+        removed_bytes
     }
 
     /// Close the queue, unblocking any blocked producers and the consumer.
@@ -422,7 +431,7 @@ mod tests {
         q.push(5, b, frame(b, 9)).await.unwrap();
 
         // Reset `a`: its queued frames vanish, `b`'s survive.
-        q.remove(a);
+        assert_eq!(q.remove(a), 2);
 
         assert_eq!(id_of(&q.pop().await.unwrap()), b);
         // Nothing left: the next pop blocks, so a closed-drain returns None.
@@ -445,7 +454,7 @@ mod tests {
         assert!(!pushing.is_finished(), "push should block while full");
 
         // Removing `a` frees both slots and wakes the blocked producer.
-        q.remove(a);
+        assert_eq!(q.remove(a), 2);
         pushing.await.unwrap().unwrap();
         assert_eq!(id_of(&q.pop().await.unwrap()), b);
     }
@@ -453,6 +462,6 @@ mod tests {
     #[tokio::test]
     async fn remove_unknown_stream_is_noop() {
         let q = PriorityQueue::new(8);
-        q.remove(sid(99)); // must not panic or underflow
+        assert_eq!(q.remove(sid(99)), 0); // must not panic or underflow
     }
 }
