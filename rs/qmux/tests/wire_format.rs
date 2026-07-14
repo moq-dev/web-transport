@@ -47,6 +47,7 @@ fn assert_frames_eq(got: &Frame, want: &Frame, version: Version) {
     match (got, want) {
         (Frame::Stream(a), Frame::Stream(b)) => {
             assert_eq!(a.id.0.into_inner(), b.id.0.into_inner(), "stream id");
+            assert_eq!(a.offset, b.offset, "stream offset");
             assert_eq!(a.data.as_ref(), b.data.as_ref(), "stream data");
             assert_eq!(a.fin, b.fin, "stream fin");
         }
@@ -142,6 +143,7 @@ fn webtransport_stream_no_fin() {
     let bytes = [0x08, 0x04, b'h', b'i'];
     let frame = Frame::Stream(Stream {
         id: sid(4),
+        offset: 0,
         data: Bytes::from_static(b"hi"),
         fin: false,
     });
@@ -154,6 +156,7 @@ fn webtransport_stream_fin() {
     let bytes = [0x09, 0x08, b'b', b'y', b'e'];
     let frame = Frame::Stream(Stream {
         id: sid(8),
+        offset: 0,
         data: Bytes::from_static(b"bye"),
         fin: true,
     });
@@ -212,10 +215,11 @@ fn webtransport_connection_close() {
 
 #[test]
 fn qmux00_stream_with_len_no_fin() {
-    // 0x0a = STREAM | LEN (no OFF, no FIN), id=4, len=2, "hi".
-    let bytes = [0x0a, 0x04, 0x02, b'h', b'i'];
+    // 0x0e = STREAM | OFF | LEN (no FIN), id=4, offset=5, len=2, "hi".
+    let bytes = [0x0e, 0x04, 0x05, 0x02, b'h', b'i'];
     let frame = Frame::Stream(Stream {
         id: sid(4),
+        offset: 5,
         data: Bytes::from_static(b"hi"),
         fin: false,
     });
@@ -224,14 +228,35 @@ fn qmux00_stream_with_len_no_fin() {
 
 #[test]
 fn qmux00_stream_with_len_and_fin() {
-    // 0x0b = STREAM | LEN | FIN, id=8, len=3, "bye".
-    let bytes = [0x0b, 0x08, 0x03, b'b', b'y', b'e'];
+    // 0x0f = STREAM | OFF | LEN | FIN, id=8, offset=0, len=3, "bye".
+    let bytes = [0x0f, 0x08, 0x00, 0x03, b'b', b'y', b'e'];
     let frame = Frame::Stream(Stream {
         id: sid(8),
+        offset: 0,
         data: Bytes::from_static(b"bye"),
         fin: true,
     });
     assert_round_trip(Version::QMux00, &bytes, &frame);
+}
+
+#[test]
+fn qmux00_still_decodes_stream_without_off() {
+    // Receiver compatibility: absence of OFF still means offset zero, and the
+    // receive path does not enforce continuity yet.
+    let decoded = Frame::decode(
+        Bytes::from_static(&[0x0a, 0x04, 0x02, b'h', b'i']),
+        Version::QMux00,
+    )
+    .expect("legacy STREAM decodes")
+    .expect("STREAM is returned");
+
+    match decoded {
+        Frame::Stream(stream) => {
+            assert_eq!(stream.offset, 0);
+            assert_eq!(stream.data.as_ref(), b"hi");
+        }
+        other => panic!("expected stream, got {other:?}"),
+    }
 }
 
 #[test]
@@ -309,6 +334,7 @@ fn record_datagram_then_stream_decodes_both() {
         .unwrap();
     let stream = Frame::Stream(Stream {
         id: sid(4),
+        offset: 0,
         data: Bytes::from_static(b"bye"),
         fin: false,
     })
@@ -375,6 +401,7 @@ fn qmux02_reset_stream_at_in_record() {
     let reset_at = [0x24u8, 0x04, 0x2a, 0x40, 0x80, 0x40, 0x40];
     let stream = Frame::Stream(Stream {
         id: sid(8),
+        offset: 0,
         data: Bytes::from_static(b"bye"),
         fin: false,
     })
@@ -403,6 +430,7 @@ fn qmux02_wire_matches_qmux01() {
     let frames: Vec<Frame> = vec![
         Frame::Stream(Stream {
             id: sid(4),
+            offset: 0,
             data: Bytes::from_static(b"hi"),
             fin: true,
         }),
@@ -564,6 +592,7 @@ fn qmux00_encoding_has_no_record_size_prefix() {
     let cases: Vec<Frame> = vec![
         Frame::Stream(Stream {
             id: sid(4),
+            offset: 0,
             data: Bytes::from_static(b"hi"),
             fin: false,
         }),
@@ -577,7 +606,7 @@ fn qmux00_encoding_has_no_record_size_prefix() {
         let bytes = frame.encode(Version::QMux00).unwrap();
         // The first byte must match the encoder's frame-type tag directly — not a size varint.
         match frame {
-            Frame::Stream(_) => assert_eq!(bytes[0], 0x0a, "stream without fin = type 0x0a"),
+            Frame::Stream(_) => assert_eq!(bytes[0], 0x0e, "stream without fin = type 0x0e"),
             Frame::MaxData(_) => assert_eq!(bytes[0], 0x10, "max_data = type 0x10"),
             Frame::ApplicationClose(_) => {
                 assert_eq!(bytes[0], 0x1d, "application_close = type 0x1d")

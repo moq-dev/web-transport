@@ -130,17 +130,19 @@ describe("WebTransport wire format", () => {
 
 describe("QMux draft-00 wire format", () => {
 	test("stream with LEN bit (no fin)", () => {
-		// 0x0a = STREAM | LEN, id=4, len=2, "hi"
-		const wire = bytes(0x0a, 0x04, 0x02, 0x68, 0x69);
+		// 0x0e = STREAM | OFF | LEN, id=4, offset=5, len=2, "hi"
+		const wire = bytes(0x0e, 0x04, 0x05, 0x02, 0x68, 0x69);
 		const frame: Frame.Data = {
 			type: "stream",
 			id: sid(4n),
+			offset: 5n,
 			data: bytes(0x68, 0x69),
 			fin: false,
 		};
 		const decoded = Frame.decode(wire, "qmux-00") as Frame.Data;
 		expect(decoded.type).toBe("stream");
 		expect(decoded.id.value.value).toBe(4n);
+		expect(decoded.offset).toBe(5n);
 		expect(arr(decoded.data)).toEqual([0x68, 0x69]);
 		expect(decoded.fin).toBe(false);
 
@@ -148,8 +150,8 @@ describe("QMux draft-00 wire format", () => {
 	});
 
 	test("stream with LEN and FIN bits", () => {
-		// 0x0b = STREAM | LEN | FIN
-		const wire = bytes(0x0b, 0x08, 0x03, 0x62, 0x79, 0x65);
+		// 0x0f = STREAM | OFF | LEN | FIN, offset=0
+		const wire = bytes(0x0f, 0x08, 0x00, 0x03, 0x62, 0x79, 0x65);
 		const frame: Frame.Data = {
 			type: "stream",
 			id: sid(8n),
@@ -159,10 +161,17 @@ describe("QMux draft-00 wire format", () => {
 		const decoded = Frame.decode(wire, "qmux-00") as Frame.Data;
 		expect(decoded.type).toBe("stream");
 		expect(decoded.id.value.value).toBe(8n);
+		expect(decoded.offset).toBe(0n);
 		expect(arr(decoded.data)).toEqual([0x62, 0x79, 0x65]);
 		expect(decoded.fin).toBe(true);
 
 		expect(arr(Frame.encode(frame, "qmux-00"))).toEqual(arr(wire));
+	});
+
+	test("stream without OFF still decodes as offset zero", () => {
+		const decoded = Frame.decode(bytes(0x0a, 0x04, 0x02, 0x68, 0x69), "qmux-00") as Frame.Data;
+		expect(decoded.offset).toBe(0n);
+		expect(arr(decoded.data)).toEqual([0x68, 0x69]);
 	});
 
 	test("max_data (2-byte varint payload)", () => {
@@ -247,7 +256,7 @@ describe("QMux draft-00 wire format", () => {
 	test("QMux00 encoding does NOT prepend a record size varint", () => {
 		// Regression guard for the WebSocket record-framing fix.
 		const cases: [Frame.Any, number][] = [
-			[{ type: "stream", id: sid(4n), data: bytes(0x68, 0x69), fin: false }, 0x0a],
+			[{ type: "stream", id: sid(4n), data: bytes(0x68, 0x69), fin: false }, 0x0e],
 			[{ type: "max_data", max: 1024n }, 0x10],
 			[{ type: "application_close", code: code(42n), reason: "bye" }, 0x1d],
 		];

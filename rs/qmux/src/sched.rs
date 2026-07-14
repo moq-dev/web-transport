@@ -291,6 +291,7 @@ mod tests {
     fn frame(id: StreamId, tag: u8) -> Frame {
         Frame::Stream(Stream {
             id,
+            offset: 0,
             data: Bytes::copy_from_slice(&[tag]),
             fin: false,
         })

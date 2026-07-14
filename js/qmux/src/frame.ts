@@ -12,12 +12,15 @@ export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
 /** Maximum size of a single QMux frame on the wire. */
 export const MAX_FRAME_SIZE = 16384;
 
-/** Maximum payload per STREAM frame, accounting for frame overhead (24 bytes). */
-export const MAX_FRAME_PAYLOAD = MAX_FRAME_SIZE - 24;
+/** Maximum payload per STREAM frame, accounting for four 8-byte header varints. */
+export const MAX_FRAME_PAYLOAD = MAX_FRAME_SIZE - 32;
 
 export interface Data {
 	type: "stream";
 	id: Stream.Id;
+	/** Byte offset of this payload. QMux senders always encode it; receivers
+	 * preserve it without enforcing continuity yet. Defaults to zero when omitted. */
+	offset?: bigint;
 	data: Uint8Array;
 	fin: boolean;
 }
@@ -310,18 +313,18 @@ function encodeWebTransport(frame: Any): Uint8Array {
 function encodeQMux(frame: Any): Uint8Array {
 	switch (frame.type) {
 		case "stream": {
-			// TODO(#294): Keep draft-02's offset-less behavior for compatibility.
-			// Once draft-03 is published and supported, emit OFF with the
-			// per-stream send offset and validate received offsets/terminal state.
-			// Always set LEN bit (0x02), type = 0x0a | fin_bit
-			const frameType = VarInt.from(0x0a | (frame.fin ? 0x01 : 0x00));
+			// Always set OFF (0x04) and LEN (0x02). Continuity validation remains
+			// deferred on the receive path.
+			const frameType = VarInt.from(0x0e | (frame.fin ? 0x01 : 0x00));
+			const offsetVi = VarInt.from(frame.offset ?? 0n);
 			const lengthVi = VarInt.from(frame.data.length);
 
-			const maxSize = 8 + 8 + 8 + frame.data.length;
+			const maxSize = 8 + 8 + 8 + 8 + frame.data.length;
 			let buffer = new Uint8Array(new ArrayBuffer(maxSize), 0, 0);
 
 			buffer = frameType.encode(buffer);
 			buffer = frame.id.value.encode(buffer);
+			buffer = offsetVi.encode(buffer);
 			buffer = lengthVi.encode(buffer);
 
 			buffer = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength + frame.data.length);
@@ -736,9 +739,10 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 		[v, buffer] = VarInt.decode(buffer);
 		const id = new Stream.Id(v);
 
-		// Skip offset if present
+		let offset = 0n;
 		if (hasOff) {
 			[v, buffer] = VarInt.decode(buffer);
+			offset = v.value;
 		}
 
 		let data: Uint8Array;
@@ -750,7 +754,7 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 			data = buffer;
 		}
 
-		return { type: "stream", id, data, fin: hasFin };
+		return { type: "stream", id, offset, data, fin: hasFin };
 	}
 
 	// RESET_STREAM
@@ -934,8 +938,10 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 		[v, buffer] = VarInt.decode(buffer);
 		const id = new Stream.Id(v);
 
+		let offset = 0n;
 		if (hasOff) {
 			[v, buffer] = VarInt.decode(buffer);
+			offset = v.value;
 		}
 
 		let data: Uint8Array;
@@ -948,7 +954,7 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 			buffer = buffer.slice(buffer.byteLength);
 		}
 
-		return [{ type: "stream", id, data, fin: hasFin }, buffer];
+		return [{ type: "stream", id, offset, data, fin: hasFin }, buffer];
 	}
 
 	// RESET_STREAM
