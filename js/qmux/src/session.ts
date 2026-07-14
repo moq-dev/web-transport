@@ -150,6 +150,98 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 	}
 }
 
+interface PendingIncomingStream<T> {
+	value: T;
+	onAccept: () => void;
+	onDrop: (err: Error) => void;
+}
+
+/** Application-facing incoming-stream acceptor with no implicit prefetch.
+ *
+ * A normal ReadableStream controller will happily queue past its high-water
+ * mark; `desiredSize` is only a backpressure signal. QMux cannot stop reading
+ * its underlying byte stream, so keep new streams in this explicit queue and
+ * transfer ownership only in response to an application read. The peer's
+ * MAX_STREAMS credit is replenished by `onAccept`, which bounds this pending
+ * queue to the stream count we advertised.
+ */
+class IncomingStreamQueue<T> {
+	readonly readable: ReadableStream<T>;
+
+	#controller!: ReadableStreamDefaultController<T>;
+	#pending: PendingIncomingStream<T>[] = [];
+	#pullResolve?: () => void;
+	#cancelled = false;
+	#closed = false;
+
+	constructor() {
+		this.readable = new ReadableStream<T>(
+			{
+				start: (controller) => {
+					this.#controller = controller;
+				},
+				pull: () => {
+					if (this.#deliver()) return;
+					return new Promise<void>((resolve) => {
+						this.#pullResolve = resolve;
+					});
+				},
+				cancel: () => {
+					this.#cancelled = true;
+					this.#dropPending(new Error("incoming stream acceptor cancelled"));
+					this.#resolvePull();
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+	}
+
+	push(value: T, onAccept: () => void, onDrop: (err: Error) => void): boolean {
+		if (this.#cancelled || this.#closed) return false;
+		this.#pending.push({ value, onAccept, onDrop });
+		if (this.#pullResolve) {
+			this.#deliver();
+			this.#resolvePull();
+		}
+		return true;
+	}
+
+	close(err?: Error): void {
+		if (this.#closed || this.#cancelled) return;
+		this.#closed = true;
+		this.#dropPending(err ?? new Error("session closed"));
+		try {
+			if (err) this.#controller.error(err);
+			else this.#controller.close();
+		} catch {}
+		this.#resolvePull();
+	}
+
+	#deliver(): boolean {
+		const item = this.#pending.shift();
+		if (!item) return false;
+		try {
+			this.#controller.enqueue(item.value);
+			item.onAccept();
+		} catch {
+			item.onDrop(new Error("incoming stream acceptor cancelled"));
+		}
+		return true;
+	}
+
+	#dropPending(err: Error): void {
+		const pending = this.#pending;
+		this.#pending = [];
+		for (const item of pending) item.onDrop(err);
+	}
+
+	#resolvePull(): void {
+		const resolve = this.#pullResolve;
+		this.#pullResolve = undefined;
+		resolve?.();
+	}
+}
+
 /** Options for opening a QMux Session over WebSocket. */
 export interface SessionOptions extends WebTransportOptions {
 	/** Application-level subprotocols to advertise via `Sec-WebSocket-Protocol`.
@@ -363,9 +455,9 @@ export default class Session implements WebTransport {
 	#closedReject: (err: Error) => void;
 
 	readonly incomingBidirectionalStreams: ReadableStream<WebTransportBidirectionalStream>;
-	#incomingBidirectionalStreams!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
+	#incomingBidirectionalQueue: IncomingStreamQueue<WebTransportBidirectionalStream>;
 	readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
-	#incomingUnidirectionalStreams!: ReadableStreamDefaultController<ReadableStream<Uint8Array>>;
+	#incomingUnidirectionalQueue: IncomingStreamQueue<ReadableStream<Uint8Array>>;
 
 	readonly datagrams = new Datagrams((data) => this.#sendDatagram(data));
 
@@ -460,21 +552,11 @@ export default class Session implements WebTransport {
 		// observe the rejection.
 		this.closed.catch(() => {});
 
-		this.incomingBidirectionalStreams = new ReadableStream<WebTransportBidirectionalStream>({
-			start: (controller) => {
-				this.#incomingBidirectionalStreams = controller;
-			},
-		});
+		this.#incomingBidirectionalQueue = new IncomingStreamQueue<WebTransportBidirectionalStream>();
+		this.incomingBidirectionalStreams = this.#incomingBidirectionalQueue.readable;
 
-		this.incomingUnidirectionalStreams = new ReadableStream<ReadableStream<Uint8Array>>({
-			start: (controller) => {
-				this.#incomingUnidirectionalStreams = controller;
-			},
-		});
-
-		if (!this.#incomingBidirectionalStreams || !this.#incomingUnidirectionalStreams) {
-			throw new Error("ReadableStream didn't call start");
-		}
+		this.#incomingUnidirectionalQueue = new IncomingStreamQueue<ReadableStream<Uint8Array>>();
+		this.incomingUnidirectionalStreams = this.#incomingUnidirectionalQueue.readable;
 
 		this.#connect(toWebSocketUrl(url), subprotocols);
 	}
@@ -851,9 +933,10 @@ export default class Session implements WebTransport {
 		return true;
 	}
 
-	/** Connection-level credit. Accounted at receipt: MAX_DATA is a coarse
-	 *  aggregate limit, and per-stream backpressure (below) is what throttles a
-	 *  slow reader. `recvDataConsumed` is cumulative. */
+	/** Connection-level credit. Accounted when bytes are delivered to the
+	 *  application or deliberately discarded, never merely on receipt. This keeps
+	 *  completed-but-unread streams inside the aggregate receive-memory window.
+	 *  `recvDataConsumed` is cumulative. */
 	#accountConnConsumed(bytes: number) {
 		if (!isQmux(this.#version) || bytes === 0) return;
 		this.#recvDataConsumed += BigInt(bytes);
@@ -995,9 +1078,30 @@ export default class Session implements WebTransport {
 				return;
 			}
 
+			let accepted = false;
+			let terminal = false;
+			let streamCreditReplenished = false;
+			const maybeReplenishStreamCredit = () => {
+				if (!accepted || !terminal || streamCreditReplenished) return;
+				streamCreditReplenished = true;
+				this.#replenishStreamCredit(frame.id.dir);
+			};
+			const onAccept = () => {
+				accepted = true;
+				maybeReplenishStreamCredit();
+			};
+			const onTerminal = () => {
+				terminal = true;
+				maybeReplenishStreamCredit();
+			};
+
 			const recvStream = new RecvStream(
-				(bytes) => this.#accountStreamConsumed(streamId, bytes),
-				() => {
+				(bytes) => {
+					this.#accountStreamConsumed(streamId, bytes);
+					this.#accountConnConsumed(bytes);
+				},
+				(discarded) => {
+					this.#accountConnConsumed(discarded);
 					this.#sendPriorityFrame({
 						type: "stop_sending",
 						id: frame.id,
@@ -1005,13 +1109,17 @@ export default class Session implements WebTransport {
 					});
 
 					this.#recvStreams.delete(streamId);
-					this.#replenishStreamCredit(frame.id.dir);
 					this.#maybeDeleteStreamFlow(streamId);
 				},
+				onTerminal,
 			);
 			this.#recvStreams.set(streamId, recvStream);
 			recv = recvStream;
 			const reader = recvStream.readable;
+
+			const onDrop = (err: Error) => {
+				this.#accountConnConsumed(recvStream.error(err));
+			};
 
 			if (frame.id.dir === Stream.Dir.Bi) {
 				// Incoming bidirectional stream
@@ -1044,27 +1152,15 @@ export default class Session implements WebTransport {
 				});
 				this.#attachSendOrder(writer, streamId, DEFAULT_SEND_ORDER);
 
-				try {
-					this.#incomingBidirectionalStreams.enqueue({ readable: reader, writable: writer });
-				} catch {
-					// The app cancelled the incoming-bidi acceptor while the session is
-					// still open (a closed session already returned at the #closed guard
-					// above). Keep the stream registered in #recvStreams — as in <=0.2.0 —
-					// so later in-flight frames for this id take the existing-stream path
-					// below instead of re-opening it (which would re-credit stream-count
-					// and re-emit STOP_SENDING per frame). Error the orphaned recv buffer
-					// so we don't retain bytes no reader can drain, then fall through so
-					// connection flow control is still accounted for this frame.
-					recv.error(new Error("incoming stream acceptor cancelled"));
+				if (!this.#incomingBidirectionalQueue.push({ readable: reader, writable: writer }, onAccept, onDrop)) {
+					// Keep the refused stream registered until FIN/RESET so in-flight frames
+					// cannot repeatedly reopen it. RecvStream rejects subsequent pushes,
+					// letting the receive path account them as deliberately discarded.
+					onDrop(new Error("incoming stream acceptor cancelled"));
 				}
 			} else {
-				try {
-					this.#incomingUnidirectionalStreams.enqueue(reader);
-				} catch {
-					// Acceptor cancelled mid-session; see the bidi branch. Keep the stream
-					// registered, drop its orphaned buffer, and fall through to account
-					// connection flow control below.
-					recv.error(new Error("incoming stream acceptor cancelled"));
+				if (!this.#incomingUnidirectionalQueue.push(reader, onAccept, onDrop)) {
+					onDrop(new Error("incoming stream acceptor cancelled"));
 				}
 			}
 		} else {
@@ -1077,18 +1173,15 @@ export default class Session implements WebTransport {
 		}
 
 		if (frame.data.byteLength > 0) {
-			recv.push(frame.data);
-			// Connection-level credit at receipt; stream-level credit is deferred to
-			// delivery (RecvStream.onConsume) so a slow reader backpressures the peer.
-			this.#accountConnConsumed(frame.data.byteLength);
+			// A refused/reset/cancelled stream discards new in-flight data. Discarded
+			// bytes free memory immediately and therefore count as consumed; buffered
+			// bytes advance both flow-control windows only when RecvStream delivers them.
+			if (!recv.push(frame.data)) this.#accountConnConsumed(frame.data.byteLength);
 		}
 
 		if (frame.fin) {
 			recv.finish();
 			this.#recvStreams.delete(streamId);
-			if (frame.id.serverInitiated !== this.#isServer) {
-				this.#replenishStreamCredit(frame.id.dir);
-			}
 			this.#maybeDeleteStreamFlow(streamId);
 		}
 	}
@@ -1106,11 +1199,8 @@ export default class Session implements WebTransport {
 		const recv = this.#recvStreams.get(streamId);
 		if (!recv) return;
 
-		recv.error(new Error(`RESET_STREAM: ${frame.code.value}`));
+		this.#accountConnConsumed(recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`)));
 		this.#recvStreams.delete(streamId);
-		if (frame.id.serverInitiated !== this.#isServer) {
-			this.#replenishStreamCredit(frame.id.dir);
-		}
 		this.#maybeDeleteStreamFlow(streamId);
 	}
 
@@ -1308,8 +1398,12 @@ export default class Session implements WebTransport {
 		this.#attachSendOrder(writer, streamIdVal, sendOrder);
 
 		const recvStream = new RecvStream(
-			(bytes) => this.#accountStreamConsumed(streamIdVal, bytes),
-			() => {
+			(bytes) => {
+				this.#accountStreamConsumed(streamIdVal, bytes);
+				this.#accountConnConsumed(bytes);
+			},
+			(discarded) => {
+				this.#accountConnConsumed(discarded);
 				this.#sendPriorityFrame({
 					type: "stop_sending",
 					id: streamId,
@@ -1396,12 +1490,8 @@ export default class Session implements WebTransport {
 		}
 
 		// Fail active streams so consumers unblock
-		try {
-			this.#incomingBidirectionalStreams.close();
-		} catch {}
-		try {
-			this.#incomingUnidirectionalStreams.close();
-		} catch {}
+		this.#incomingBidirectionalQueue.close(this.#closeReason);
+		this.#incomingUnidirectionalQueue.close(this.#closeReason);
 		// Pass the *reason*, not `#closed` (always an Error): a graceful
 		// app-initiated close leaves `#closeReason` unset, so the datagram
 		// readable closes cleanly instead of erroring, matching the incoming

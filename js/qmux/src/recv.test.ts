@@ -38,10 +38,9 @@ describe("RecvStream", () => {
 		for (let i = 0; i < 10; i++) recv.push(new Uint8Array(100));
 		await tick();
 
-		// The stream eagerly pulls at most its high-water mark (one chunk); the rest
-		// stays buffered and uncredited until read. Crucially, credit does NOT track
-		// receipt — otherwise this would be 1000.
-		expect(consumed).toBeLessThanOrEqual(100);
+		// A zero high-water mark prevents even one chunk from being prefetched into
+		// the ReadableStream before the application issues a read.
+		expect(consumed).toBe(0);
 	});
 
 	test("reading resumes crediting", async () => {
@@ -79,20 +78,21 @@ describe("RecvStream", () => {
 			() => {},
 		);
 		recv.push(new Uint8Array(50));
-		recv.error(new Error("RESET_STREAM"));
+		expect(recv.error(new Error("RESET_STREAM"))).toBe(50);
 		await expect(recv.readable.getReader().read()).rejects.toThrow("RESET_STREAM");
 	});
 
 	test("cancel invokes onCancel (STOP_SENDING)", async () => {
-		let cancelled = false;
+		let discarded = -1;
 		const recv = new RecvStream(
 			() => {},
-			() => {
-				cancelled = true;
+			(bytes) => {
+				discarded = bytes;
 			},
 		);
+		recv.push(new Uint8Array(25));
 		await recv.readable.getReader().cancel();
-		expect(cancelled).toBe(true);
+		expect(discarded).toBe(25);
 	});
 });
 
