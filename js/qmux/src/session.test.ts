@@ -17,7 +17,7 @@ class FakePeer {
 
 	readonly url: string;
 	readonly opened: Promise<{
-		readable: ReadableStream<Uint8Array | string>;
+		readable: ReadableStream<Uint8Array | ArrayBuffer | string>;
 		writable: WritableStream<Uint8Array>;
 		protocol: string;
 		extensions: string;
@@ -25,7 +25,7 @@ class FakePeer {
 	readonly closed: Promise<{ closeCode?: number; reason?: string }>;
 	#closedResolve: (info: { closeCode?: number; reason?: string }) => void;
 	#closedReject: (err: Error) => void;
-	#recv!: ReadableStreamDefaultController<Uint8Array | string>;
+	#recv!: ReadableStreamDefaultController<Uint8Array | ArrayBuffer | string>;
 	#writeBlocked: Promise<void> | undefined;
 	#unblockWrites: (() => void) | undefined;
 
@@ -36,7 +36,7 @@ class FakePeer {
 	constructor(url: string) {
 		this.url = url;
 		FakePeer.last = this;
-		const readable = new ReadableStream<Uint8Array | string>({
+		const readable = new ReadableStream<Uint8Array | ArrayBuffer | string>({
 			start: (c) => {
 				this.#recv = c;
 			},
@@ -90,6 +90,11 @@ class FakePeer {
 	 * (e.g. the no-length 0x30 datagram form). */
 	sendRaw(bytes: Uint8Array) {
 		this.#recv.enqueue(bytes);
+	}
+	/** Inject a binary record with the shape Chromium's native WebSocketStream
+	 * uses for incoming binary messages. */
+	sendArrayBuffer(frame: Frame.Any) {
+		this.#recv.enqueue(Uint8Array.from(Frame.encode(frame, "qmux-01")).buffer);
 	}
 	/** All frames the Session has written so far, decoded. */
 	received(): Frame.Any[] {
@@ -415,6 +420,17 @@ describe("Session integration (scripted peer)", () => {
 		peer.send({ type: "datagram", data: new Uint8Array([9, 8, 7]) });
 		const { value } = await session.datagrams.readable.getReader().read();
 		expect(Array.from(value as Uint8Array)).toEqual([9, 8, 7]);
+		session.close();
+	});
+
+	test("native WebSocketStream ArrayBuffer records are normalized before QMux decoding", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.sendArrayBuffer({ type: "datagram", data: new Uint8Array([4, 5, 6]) });
+		const { value } = await session.datagrams.readable.getReader().read();
+		expect(Array.from(value as Uint8Array)).toEqual([4, 5, 6]);
 		session.close();
 	});
 
