@@ -1379,8 +1379,8 @@ export default class Session implements WebTransport {
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = data.byteLength - offset;
 			// Cap by both the static frame-payload ceiling and the peer's record limit
-			// (qmux-01 only — once params are received). Leave 32 bytes of headroom for
-			// the STREAM frame header (frame type + stream id + length varints).
+			// (record-framed QMux only — once params are received). Leave 32 bytes of
+			// headroom for the STREAM frame header (type, stream ID, offset, and length).
 			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
 			if (usesRecords(this.#version) && this.#paramsReceived) {
 				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
