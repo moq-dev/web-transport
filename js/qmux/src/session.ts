@@ -767,10 +767,10 @@ export default class Session implements WebTransport {
 			return;
 		}
 		const now = Date.now();
-		if (now - this.#lastRecvAt > timeoutMs) {
-			// Peer has gone silent past the negotiated limit. Abnormal: without a
-			// rejection this is indistinguishable from a graceful close(), which also
-			// settles with closeCode 0.
+		if (now - Math.max(this.#lastRecvAt, this.#lastSendAt) > timeoutMs) {
+			// No frames have been sent or received within the negotiated limit. Abnormal:
+			// without a rejection this is indistinguishable from a graceful close(), which
+			// also settles with closeCode 0.
 			this.#closeReason ??= new Error("idle timeout");
 			this.#abort(0, "idle timeout");
 			this.#transportClose();

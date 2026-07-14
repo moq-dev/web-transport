@@ -338,8 +338,8 @@ fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
 /// The QMux keep-alive ping is *not* driven here — the timer task ([`TimerState`])
 /// owns the cadence and enqueues `QX_PING` on the control lane like any other
 /// frame. The writer only records *when* a send last landed (`last_send_at`) so
-/// the timer can decide whether a ping is due, independently of where this task is
-/// parked.
+/// the timer can schedule pings and idle closure independently of where this task
+/// is parked.
 struct WriterState<W: Writer> {
     writer: W,
     version: Version,
@@ -360,7 +360,7 @@ struct WriterState<W: Writer> {
     closed: watch::Sender<Option<Error>>,
 
     // Origin shared with the reader and timer, plus the millis (since `base`) at
-    // which our last send landed — published for the timer's keep-alive cadence.
+    // which our last send landed — published for keep-alive and idle scheduling.
     base: tokio::time::Instant,
     last_send_at: Arc<AtomicU64>,
 }
@@ -502,7 +502,7 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
-        // Publish send progress for the timer's keep-alive cadence.
+        // Publish send progress for the timer's keep-alive and idle scheduling.
         self.last_send_at.store(
             millis_since(self.base, tokio::time::Instant::now()),
             Ordering::Release,
@@ -522,8 +522,8 @@ impl<W: Writer> WriterState<W> {
 ///
 ///  - enqueues a `QX_PING` on the control lane once we've been silent on send for a
 ///    third of the idle window (the keep-alive cadence), and
-///  - closes the session once we've been silent on receive for a full idle window,
-///    deferred by at most one extra window while the reader or writer is
+///  - closes the session once we've been silent on send and receive for a full
+///    idle window, deferred by at most one extra window while the reader or writer is
 ///    backpressured — that's evidence the peer is alive and we simply can't get a
 ///    keep-alive through (or aren't reading its replies).
 ///
@@ -587,7 +587,12 @@ impl TimerState {
         let mut next_ping_seq: u64 = 0;
 
         loop {
-            let last_recv = instant_at(self.base, self.last_recv_at.load(Ordering::Acquire));
+            let last_activity = instant_at(
+                self.base,
+                self.last_recv_at
+                    .load(Ordering::Acquire)
+                    .max(self.last_send_at.load(Ordering::Acquire)),
+            );
             let ping_ref = instant_at(
                 self.base,
                 self.last_send_at.load(Ordering::Acquire).max(last_ping_ms),
@@ -597,7 +602,7 @@ impl TimerState {
             // idle deadline, so we don't busy-spin on an already-elapsed instant.
             let idle_wake = match deferred_since {
                 Some(since) => since + idle,
-                None => last_recv + idle,
+                None => last_activity + idle,
             };
             let wake = idle_wake.min(ping_ref + ping_every);
 
@@ -630,10 +635,16 @@ impl TimerState {
                 last_ping_ms = millis_since(self.base, now);
             }
 
-            // Idle close: due once we've been silent on receive for a full window.
-            let last_recv = instant_at(self.base, self.last_recv_at.load(Ordering::Acquire));
-            if now < last_recv + idle {
-                deferred_since = None; // receive progressed — not idle
+            // Idle close: due once we've been silent on send and receive for a full
+            // window. Draft-02 section 7.1 resets the timer for either direction.
+            let last_activity = instant_at(
+                self.base,
+                self.last_recv_at
+                    .load(Ordering::Acquire)
+                    .max(self.last_send_at.load(Ordering::Acquire)),
+            );
+            if now < last_activity + idle {
+                deferred_since = None; // send or receive progressed — not idle
                 continue;
             }
 
@@ -2188,6 +2199,7 @@ mod timer_tests {
     struct Harness {
         reader_backpressured: Arc<AtomicBool>,
         last_recv_at: Arc<AtomicU64>,
+        last_send_at: Arc<AtomicU64>,
         closed: watch::Sender<Option<Error>>,
         // Kept alive so the control lane the timer pings on doesn't close under it.
         _control_rx: mpsc::UnboundedReceiver<crate::Frame>,
@@ -2209,7 +2221,7 @@ mod timer_tests {
         let timer = TimerState {
             base,
             last_recv_at: last_recv_at.clone(),
-            last_send_at,
+            last_send_at: last_send_at.clone(),
             reader_backpressured: reader_backpressured.clone(),
             writer_backpressured: writer_backpressured.clone(),
             idle_timeout_ms,
@@ -2223,6 +2235,7 @@ mod timer_tests {
         Harness {
             reader_backpressured,
             last_recv_at,
+            last_send_at,
             closed,
             _control_rx,
         }
@@ -2287,6 +2300,25 @@ mod timer_tests {
         assert!(
             h.closed.borrow().is_none(),
             "a peer that keeps sending must not be idle-closed"
+        );
+    }
+
+    /// Successful outbound frames reset the same idle deadline as inbound frames.
+    /// A one-way sender must remain open while its writes continue beyond a full
+    /// idle window, even when the peer sends nothing back.
+    #[tokio::test]
+    async fn send_progress_averts_idle_close() {
+        let h = spawn_timer(100);
+
+        let base = tokio::time::Instant::now();
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let elapsed = base.elapsed().as_millis() as u64;
+            h.last_send_at.store(elapsed, Ordering::Release);
+        }
+        assert!(
+            h.closed.borrow().is_none(),
+            "a session that keeps sending must not be idle-closed"
         );
     }
 }

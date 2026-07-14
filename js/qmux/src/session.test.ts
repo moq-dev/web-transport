@@ -26,6 +26,8 @@ class FakePeer {
 	#closedResolve: (info: { closeCode?: number; reason?: string }) => void;
 	#closedReject: (err: Error) => void;
 	#recv!: ReadableStreamDefaultController<Uint8Array | string>;
+	#writeBlocked: Promise<void> | undefined;
+	#unblockWrites: (() => void) | undefined;
 
 	/** Raw chunks the Session has written. */
 	sent: Uint8Array[] = [];
@@ -40,7 +42,8 @@ class FakePeer {
 			},
 		});
 		const writable = new WritableStream<Uint8Array>({
-			write: (chunk) => {
+			write: async (chunk) => {
+				await this.#writeBlocked;
 				this.sent.push(chunk);
 			},
 		});
@@ -63,6 +66,16 @@ class FakePeer {
 		this.#closedReject(err);
 	}
 	setHighWaterMark() {}
+	blockWrites() {
+		const blocked = Promise.withResolvers<void>();
+		this.#writeBlocked = blocked.promise;
+		this.#unblockWrites = blocked.resolve;
+	}
+	unblockWrites() {
+		this.#unblockWrites?.();
+		this.#writeBlocked = undefined;
+		this.#unblockWrites = undefined;
+	}
 
 	// --- test controls ---
 	/** Inject a frame as if sent by the peer. */
@@ -294,18 +307,41 @@ describe("Session integration (scripted peer)", () => {
 			expect((err.cause as Error).message).toBe("connection reset");
 		});
 
-		test("an idle timeout rejects closed, rather than mimicking a graceful close", async () => {
+		test("an idle timeout rejects closed when neither direction makes progress", async () => {
 			// The sharpest case: an idle timeout used to resolve with { closeCode: 0,
 			// reason: "idle timeout" }, while a graceful close() with no args resolves
 			// with { closeCode: 0, reason: "" }. A dead peer and a clean shutdown differed
 			// only by a free-text string.
 			const { session, peer } = connect({ maxIdleTimeout: 150n });
 			await session.ready;
+			await waitFor(() => peer.has("transport_parameters"));
+			// A successfully written keep-alive is send activity under QMux. Block the
+			// sink so neither inbound nor outbound frames can reset the idle deadline.
+			peer.blockWrites();
 			peer.send({ type: "transport_parameters", params: peerParams() });
 
-			// ...and now the peer goes silent.
 			const err = await expectSessionFailure(session);
 			expect(err.message).toContain("idle timeout");
+			peer.unblockWrites();
+		});
+
+		test("outbound frame activity resets the idle timeout", async () => {
+			const { session, peer } = connect({ maxIdleTimeout: 120n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const writable = await session.createUnidirectionalStream();
+			const writer = writable.getWriter();
+			for (let i = 0; i < 6; i++) {
+				await new Promise((resolve) => setTimeout(resolve, 45));
+				await writer.write(new Uint8Array([i]));
+			}
+
+			// More than two idle windows elapsed without another inbound frame, but
+			// the successful STREAM writes above kept resetting the shared deadline.
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+			expect(await session.closed).toEqual({ closeCode: 0, reason: "" });
 		});
 
 		test("the standard reconnect idiom sees a drop", async () => {
