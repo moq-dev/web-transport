@@ -62,6 +62,11 @@ const _: () = assert!(
 pub struct Stream {
     /// The stream this data belongs to.
     pub id: StreamId,
+    /// Byte offset of this payload within the stream.
+    ///
+    /// Senders populate this field and always emit the OFF bit for QMux. The
+    /// receive path preserves it but does not yet enforce continuity.
+    pub offset: u64,
     /// The payload bytes.
     pub data: Bytes,
     /// Whether this is the final frame on the stream.
@@ -265,9 +270,11 @@ impl Frame {
 
             let id = StreamId(VarInt::decode(data)?);
 
-            if has_off {
-                let _offset = VarInt::decode(data)?;
-            }
+            let offset = if has_off {
+                VarInt::decode(data)?.into_inner()
+            } else {
+                0
+            };
 
             let stream_data = if has_len {
                 let len = VarInt::decode(data)?.into_inner();
@@ -282,6 +289,7 @@ impl Frame {
 
             return Ok(Some(Frame::Stream(Stream {
                 id,
+                offset,
                 data: stream_data,
                 fin: has_fin,
             })));
@@ -486,14 +494,13 @@ impl Frame {
     fn encode_qmux(&self, buf: &mut BytesMut) -> Result<(), Error> {
         match self {
             Frame::Stream(s) => {
-                // TODO(#294): Keep draft-02's offset-less behavior for compatibility.
-                // Once draft-03 is published and supported, emit OFF with the
-                // per-stream send offset and validate received offsets/terminal state.
-                // Always LEN bit (0x02), never OFF bit. Type = 0x0a | fin_bit
+                // Always set OFF (0x04) and LEN (0x02). Receivers preserve the
+                // offset but intentionally defer continuity enforcement.
                 let frame_type =
-                    VarInt::from_u32(STREAM_BASE | 0x02 | if s.fin { 0x01 } else { 0 });
+                    VarInt::from_u32(STREAM_BASE | 0x04 | 0x02 | if s.fin { 0x01 } else { 0 });
                 frame_type.encode(buf);
                 s.id.0.encode(buf);
+                VarInt::try_from(s.offset)?.encode(buf);
                 VarInt::try_from(s.data.len())?.encode(buf);
                 buf.put_slice(&s.data);
             }
@@ -627,6 +634,7 @@ impl Frame {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 Ok(Frame::Stream(Stream {
                     id,
+                    offset: 0,
                     data,
                     fin: false,
                 }))
@@ -635,6 +643,7 @@ impl Frame {
                 let id = StreamId(VarInt::decode(&mut data)?);
                 Ok(Frame::Stream(Stream {
                     id,
+                    offset: 0,
                     data,
                     fin: true,
                 }))
@@ -664,9 +673,11 @@ impl Frame {
 
             let id = StreamId(VarInt::decode(&mut data)?);
 
-            if has_off {
-                let _offset = VarInt::decode(&mut data)?;
-            }
+            let offset = if has_off {
+                VarInt::decode(&mut data)?.into_inner()
+            } else {
+                0
+            };
 
             let stream_data = if has_len {
                 let len = VarInt::decode(&mut data)?.into_inner();
@@ -680,6 +691,7 @@ impl Frame {
 
             return Ok(Some(Frame::Stream(Stream {
                 id,
+                offset,
                 data: stream_data,
                 fin: has_fin,
             })));

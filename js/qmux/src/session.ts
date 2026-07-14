@@ -1373,11 +1373,14 @@ export default class Session implements WebTransport {
 	}
 
 	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
+		const flow = this.#streamFlow.get(streamId);
+		if (!flow) throw new Error(`missing flow state for stream ${streamId}`);
+
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = data.byteLength - offset;
 			// Cap by both the static frame-payload ceiling and the peer's record limit
-			// (qmux-01 only — once params are received). Leave 32 bytes of headroom for
-			// the STREAM frame header (frame type + stream id + length varints).
+			// (record-framed QMux only — once params are received). Leave 32 bytes of
+			// headroom for the STREAM frame header (type, stream ID, offset, and length).
 			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
 			if (usesRecords(this.#version) && this.#paramsReceived) {
 				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
@@ -1391,11 +1394,16 @@ export default class Session implements WebTransport {
 			const sendable = Number(allowed);
 
 			const chunk = data.subarray(offset, offset + sendable);
+			const sendOffset = flow.sendOffset;
 
 			try {
-				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
-				const flow = this.#streamFlow.get(streamId);
-				if (flow) flow.sendOffset += BigInt(sendable);
+				await this.#enqueueStreamFrame(streamId, {
+					type: "stream",
+					id,
+					offset: sendOffset,
+					data: chunk,
+					fin: false,
+				});
 			} catch (e) {
 				// Return claimed credits on send failure
 				if (sendable > 0) {
@@ -1406,6 +1414,7 @@ export default class Session implements WebTransport {
 				throw e;
 			}
 
+			flow.sendOffset += BigInt(sendable);
 			offset += sendable;
 		}
 	}
@@ -1426,7 +1435,12 @@ export default class Session implements WebTransport {
 	/** Send the FIN. Routed through the stream's own queue so it stays ordered
 	 *  after that stream's data (not via the control lane, which would jump ahead). */
 	async #sendStreamFin(id: Stream.Id) {
-		await this.#enqueueStreamFrame(id.value.value, { type: "stream", id, data: new Uint8Array(), fin: true });
+		const streamId = id.value.value;
+		const offset = isQmux(this.#version) ? this.#streamFlow.get(streamId)?.sendOffset : undefined;
+		if (isQmux(this.#version) && offset === undefined) {
+			throw new Error(`missing flow state for stream ${streamId}`);
+		}
+		await this.#enqueueStreamFrame(streamId, { type: "stream", id, offset, data: new Uint8Array(), fin: true });
 	}
 
 	/** Enqueue a DATAGRAM frame on the scheduler's bounded, lossy datagram lane —

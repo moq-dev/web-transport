@@ -344,6 +344,46 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("sequential stream writes and FIN carry increasing OFF values", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		const writer = writable.getWriter();
+		await writer.write(new Uint8Array([1, 2, 3]));
+		await writer.write(new Uint8Array([4, 5]));
+		await writer.close();
+
+		await waitFor(() => peer.received().filter((frame) => frame.type === "stream").length === 3);
+		const streams = peer.received().filter((frame): frame is Frame.Data => frame.type === "stream");
+		expect(streams.map((frame) => frame.offset)).toEqual([0n, 3n, 5n]);
+		expect(streams.map((frame) => frame.fin)).toEqual([false, false, true]);
+
+		const streamTypes = peer.sent.map((record) => record[0]).filter((type) => type >= 0x08 && type <= 0x0f);
+		expect(streamTypes).toEqual([0x0e, 0x0e, 0x0f]);
+		session.close();
+	});
+
+	test("receive offsets are preserved but not enforced yet", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		peer.send({ type: "stream", id, offset: 0n, data: new Uint8Array([1, 2]), fin: false });
+		peer.send({ type: "stream", id, offset: 99n, data: new Uint8Array([3]), fin: true });
+
+		const incoming = await session.incomingUnidirectionalStreams.getReader().read();
+		if (incoming.done || !incoming.value) throw new Error("expected incoming stream");
+		const reader = incoming.value.getReader();
+		const first = await reader.read();
+		const second = await reader.read();
+		expect(Array.from(first.value ?? [])).toEqual([1, 2]);
+		expect(Array.from(second.value ?? [])).toEqual([3]);
+		session.close();
+	});
+
 	test("close() sends APPLICATION_CLOSE, resolves closed, and is idempotent", async () => {
 		const { session, peer } = connect();
 		await session.ready;

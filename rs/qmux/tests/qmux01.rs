@@ -80,6 +80,7 @@ fn record_round_trip_multiple_frames() {
     let frames = vec![
         Frame::Stream(Stream {
             id: stream_id,
+            offset: 0,
             data: Bytes::from_static(b"hello"),
             fin: false,
         }),

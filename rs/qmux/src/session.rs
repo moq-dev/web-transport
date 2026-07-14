@@ -578,6 +578,7 @@ mod writer_final_size_tests {
             .transmit(
                 Stream {
                     id,
+                    offset: 0,
                     data: Bytes::from_static(b"abc"),
                     fin: false,
                 }
@@ -2128,6 +2129,7 @@ impl generic::SendStream for SendStream {
 
             let frame = Stream {
                 id: self.id,
+                offset: self.offset,
                 data: buf.copy_to_bytes(to_send),
                 fin: false,
             };
@@ -2192,6 +2194,7 @@ impl generic::SendStream for SendStream {
 
         let frame = Stream {
             id: self.id,
+            offset: self.offset,
             data: Bytes::new(),
             fin: true,
         };
@@ -2572,6 +2575,55 @@ mod negotiate_tests {
 }
 
 #[cfg(test)]
+mod send_offset_tests {
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+    use web_transport_trait::SendStream as _;
+
+    use super::SendStream;
+    use crate::sched::PriorityQueue;
+    use crate::{Frame, StreamDir, StreamId};
+
+    #[tokio::test]
+    async fn sequential_writes_and_fin_carry_send_offsets() {
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let outbound = PriorityQueue::new(3);
+        let (control, _control_rx) = mpsc::unbounded_channel();
+        let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
+        let mut send = SendStream {
+            id,
+            outbound: outbound.clone(),
+            outbound_priority: control,
+            inbound_stopped: stop_rx,
+            offset: 0,
+            priority: 0,
+            closed: None,
+            fin: false,
+            stream_credit: None,
+            conn_credit: None,
+        };
+
+        send.write(&[1, 2, 3]).await.unwrap();
+        send.write(&[4, 5]).await.unwrap();
+        send.finish().unwrap();
+
+        let expected: &[(u64, &[u8], bool)] =
+            &[(0, &[1, 2, 3], false), (3, &[4, 5], false), (5, &[], true)];
+        for &(offset, data, fin) in expected {
+            let frame = outbound.pop().await.expect("queued STREAM frame");
+            match frame {
+                Frame::Stream(stream) => {
+                    assert_eq!(stream.offset, offset);
+                    assert_eq!(stream.data, Bytes::copy_from_slice(data));
+                    assert_eq!(stream.fin, fin);
+                }
+                other => panic!("expected STREAM, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod recv_open_tests {
     use std::time::Duration;
 
@@ -2647,8 +2699,13 @@ mod recv_open_tests {
     /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and
     /// receivable, since we're the client).
     fn uni_stream(index: u64, data: &'static [u8], fin: bool) -> Bytes {
+        uni_stream_at(index, 0, data, fin)
+    }
+
+    fn uni_stream_at(index: u64, offset: u64, data: &'static [u8], fin: bool) -> Bytes {
         Frame::Stream(Stream {
             id: StreamId::new(index, StreamDir::Uni, true),
+            offset,
             data: Bytes::from_static(data),
             fin,
         })
@@ -2694,6 +2751,20 @@ mod recv_open_tests {
             second.is_err(),
             "a late frame on a retired stream resurrected a new accepted stream"
         );
+    }
+
+    #[tokio::test]
+    async fn recv_stream_offsets_are_not_enforced_yet() {
+        let (session, tx) = scripted_session();
+
+        tx.send(uni_stream_at(0, 0, b"hello", false)).unwrap();
+        tx.send(uni_stream_at(0, 99, b"world", true)).unwrap();
+
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+        assert_eq!(recv.read_all().await.unwrap().as_ref(), b"helloworld");
     }
 
     /// A FIN for a higher stream index arriving before the first frame of a lower
@@ -3138,6 +3209,7 @@ mod qmux02_recv_tests {
         // A STREAM frame ahead of any params.
         let stream = Frame::Stream(Stream {
             id: StreamId::new(0, StreamDir::Uni, false),
+            offset: 0,
             data: Bytes::from_static(b"hi"),
             fin: false,
         })
@@ -3230,6 +3302,7 @@ mod qmux02_recv_tests {
         let id = StreamId::new(0, StreamDir::Uni, false);
         let stream = Frame::Stream(Stream {
             id,
+            offset: 0,
             data: Bytes::from_static(b"hi"),
             fin: false,
         })

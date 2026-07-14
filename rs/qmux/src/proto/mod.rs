@@ -17,8 +17,8 @@ pub use params::DEFAULT_MAX_RECORD_SIZE;
 pub const MAX_FRAME_SIZE: usize = 16384;
 
 /// Maximum payload size for a STREAM frame, accounting for frame overhead.
-/// Overhead: frame_type (up to 8) + stream_id (up to 8) + length (up to 8) = 24 bytes.
-pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 24;
+/// Overhead: frame type, stream ID, offset, and length (up to 8 bytes each).
+pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 32;
 
 /// Number of bytes a QUIC varint occupies when encoding `v`.
 pub(crate) const fn varint_size(v: u64) -> u64 {
