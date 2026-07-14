@@ -338,8 +338,8 @@ fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
 /// The QMux keep-alive ping is *not* driven here — the timer task ([`TimerState`])
 /// owns the cadence and enqueues `QX_PING` on the control lane like any other
 /// frame. The writer only records *when* a send last landed (`last_send_at`) so
-/// the timer can decide whether a ping is due, independently of where this task is
-/// parked.
+/// the timer can schedule pings and idle closure independently of where this task
+/// is parked.
 struct WriterState<W: Writer> {
     writer: W,
     version: Version,
@@ -360,7 +360,7 @@ struct WriterState<W: Writer> {
     closed: watch::Sender<Option<Error>>,
 
     // Origin shared with the reader and timer, plus the millis (since `base`) at
-    // which our last send landed — published for the timer's keep-alive cadence.
+    // which our last send landed — published for keep-alive and idle scheduling.
     base: tokio::time::Instant,
     last_send_at: Arc<AtomicU64>,
 }
@@ -502,7 +502,7 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
-        // Publish send progress for the timer's keep-alive cadence.
+        // Publish send progress for the timer's keep-alive and idle scheduling.
         self.last_send_at.store(
             millis_since(self.base, tokio::time::Instant::now()),
             Ordering::Release,
