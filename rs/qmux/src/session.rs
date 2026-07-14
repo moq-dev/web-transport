@@ -578,6 +578,7 @@ mod writer_final_size_tests {
             .transmit(
                 Stream {
                     id,
+                    offset: 0,
                     data: Bytes::from_static(b"abc"),
                     fin: false,
                 }
