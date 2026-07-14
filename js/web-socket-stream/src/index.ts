@@ -48,6 +48,30 @@ export interface WebSocketStreamLike {
 	setHighWaterMark?(bytes: number): void;
 }
 
+/** Chromium's native API yields binary messages as `ArrayBuffer`. The public
+ *  `WebSocketStreamLike` shape exposes normalized `Uint8Array` chunks so callers
+ *  see the same data type whether the native implementation or ponyfill wins. */
+type NativeWebSocketStreamData = WebSocketStreamData | ArrayBuffer;
+
+interface NativeWebSocketStreamOpenEvent {
+	readable: ReadableStream<NativeWebSocketStreamData>;
+	writable: WritableStream<WebSocketStreamData>;
+	extensions: string;
+	protocol: string;
+}
+
+interface NativeWebSocketStreamLike {
+	readonly url: string;
+	readonly opened: Promise<NativeWebSocketStreamOpenEvent>;
+	readonly closed: Promise<WebSocketStreamCloseEvent>;
+	close(closeInfo?: WebSocketStreamCloseInfo): void;
+}
+
+type NativeWebSocketStreamConstructor = new (
+	url: string,
+	options?: Pick<WebSocketStreamOptions, "protocols" | "signal">,
+) => NativeWebSocketStreamLike;
+
 /** The slice of the `WebSocket` API this ponyfill relies on. Both the browser
  *  `WebSocket` and Node's `ws` satisfy it. */
 export interface WebSocketLike {
@@ -219,12 +243,27 @@ export class WebSocketStream implements WebSocketStreamLike {
  *  socket). */
 export function openWebSocketStream(url: string | URL, options: WebSocketStreamOptions = {}): WebSocketStreamLike {
 	const href = typeof url === "string" ? url : url.toString();
-	const Native = (globalThis as { WebSocketStream?: typeof WebSocketStream }).WebSocketStream;
+	const Native = (globalThis as { WebSocketStream?: NativeWebSocketStreamConstructor }).WebSocketStream;
 	// Only delegate to a *genuinely* native global — if `install()` put this very
 	// ponyfill on the global, fall through so ponyfill-only options (e.g.
 	// highWaterMark) aren't dropped on the floor.
 	if (Native && Native !== WebSocketStream && !options.webSocket) {
-		return new Native(href, { protocols: options.protocols, signal: options.signal });
+		const native = new Native(href, { protocols: options.protocols, signal: options.signal });
+		return {
+			url: native.url,
+			opened: native.opened.then((event) => ({
+				...event,
+				readable: event.readable.pipeThrough(
+					new TransformStream<NativeWebSocketStreamData, WebSocketStreamData>({
+						transform(chunk, controller) {
+							controller.enqueue(chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk);
+						},
+					}),
+				),
+			})),
+			closed: native.closed,
+			close: (closeInfo) => native.close(closeInfo),
+		};
 	}
 	return new WebSocketStream(href, options);
 }
