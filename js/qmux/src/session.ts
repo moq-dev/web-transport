@@ -967,8 +967,8 @@ export default class Session implements WebTransport {
 	 *  application or deliberately discarded, never merely on receipt. This keeps
 	 *  completed-but-unread streams inside the aggregate receive-memory window.
 	 *  `recvDataConsumed` is cumulative. */
-	#accountConnConsumed(bytes: number) {
-		if (!isQmux(this.#version) || bytes === 0) return;
+	#accountConnConsumed(bytes: number | bigint) {
+		if (!isQmux(this.#version) || bytes === 0 || bytes === 0n) return;
 		this.#recvDataConsumed += BigInt(bytes);
 		this.#maybeSendMaxData();
 	}
@@ -1042,8 +1042,8 @@ export default class Session implements WebTransport {
 	 * zero final size, so tolerate a value below the bytes already received. The
 	 * stricter FINAL_SIZE_ERROR check starts with draft-03; meanwhile the larger
 	 * of the two values still prevents a reset from undoing flow-control usage. */
-	#accountReset(frame: Frame.ResetStream): boolean {
-		if (!isQmux(this.#version)) return true;
+	#accountReset(frame: Frame.ResetStream): bigint | null {
+		if (!isQmux(this.#version)) return 0n;
 
 		const streamId = frame.id.value.value;
 		const flow = this.#streamFlow.get(streamId);
@@ -1060,12 +1060,12 @@ export default class Session implements WebTransport {
 				? this.#ourParams.initialMaxStreamDataBidiRemote
 				: this.#ourParams.initialMaxStreamDataUni);
 		if (finalSize > recvMax || this.#recvDataOffset + gap > this.#recvDataMax) {
-			return false;
+			return null;
 		}
 
 		this.#recvDataOffset += gap;
 		if (flow) flow.recvOffset = finalSize;
-		return true;
+		return gap;
 	}
 
 	/** Delete stream flow state only when both send and recv sides are gone. */
@@ -1298,19 +1298,25 @@ export default class Session implements WebTransport {
 			}
 		}
 
-		if (!this.#accountReset(frame)) {
+		const resetGap = this.#accountReset(frame);
+		if (resetGap === null) {
 			this.#sendConnectionClose(1002, "flow control error");
 			this.#abort(1002, "flow control error");
 			return;
 		}
 
 		if (!recv) {
+			// The final-size gap consumes connection flow control, but it can never
+			// occupy receive memory, so it is immediately eligible to replenish the
+			// connection window.
+			this.#accountConnConsumed(resetGap);
 			if (isQmux(this.#version)) this.#recvOpen(frame.id.dir).record(frame.id.index);
 			this.#replenishStreamCredit(frame.id.dir);
 			return;
 		}
 
-		this.#accountConnConsumed(recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`)));
+		const discarded = recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`));
+		this.#accountConnConsumed(resetGap + BigInt(discarded));
 		this.#recvStreams.delete(streamId);
 		this.#maybeDeleteStreamFlow(streamId);
 	}

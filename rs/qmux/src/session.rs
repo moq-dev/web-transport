@@ -1150,6 +1150,12 @@ impl<R: Reader> SessionState<R> {
                     if !stream_ok || !self.conn_recv_credit.receive(gap) {
                         return Err(Error::FlowControlError);
                     }
+                    // The gap consumes connection flow control, but no bytes in
+                    // it can ever occupy receive memory. Make it immediately
+                    // eligible to replenish the connection window.
+                    if let Some(new_max) = self.conn_recv_credit.consume(gap) {
+                        self.control.send(Frame::MaxData(new_max)).ok();
+                    }
                 }
 
                 // Live stream: deliver the reset and drop it (it was recorded in
@@ -2796,13 +2802,32 @@ mod recv_open_tests {
         config.max_stream_data_uni = 10;
         let (session, tx) = scripted_session_with_config(config);
 
-        tx.send(uni_reset(0, 6)).unwrap();
-        tx.send(uni_stream(1, b"12345", false)).unwrap();
+        tx.send(uni_reset(0, 3)).unwrap();
+        tx.send(uni_stream(1, b"12345678", false)).unwrap();
 
         let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
             .await
             .expect("session did not close after cumulative MAX_DATA exhaustion");
         assert!(matches!(err, Error::FlowControlError), "got {err:?}");
+    }
+
+    /// A reset gap cannot occupy receive memory, so once it has been charged to
+    /// MAX_DATA it is immediately eligible to replenish the connection window.
+    #[tokio::test]
+    async fn reset_final_size_replenishes_connection_credit() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 10;
+        config.max_stream_data_uni = 10;
+        let (session, tx) = scripted_session_with_config(config);
+
+        tx.send(uni_reset(0, 6)).unwrap();
+        tx.send(uni_stream(1, b"12345", true)).unwrap();
+
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("connection credit was not replenished after reset")
+            .expect("accept_uni failed");
+        assert_eq!(recv.read_all().await.unwrap().as_ref(), b"12345");
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a

@@ -286,25 +286,43 @@ describe("Session integration (scripted peer)", () => {
 		await session.ready;
 		peer.send({ type: "transport_parameters", params: peerParams() });
 
-		// The reset-only stream consumes six bytes of connection credit even though
-		// no STREAM frame carried them. Five bytes on a second stream then exceed
-		// MAX_DATA (6 + 5 > 10).
+		// Three bytes do not cross the receive-window replenishment threshold. Eight
+		// bytes on a second stream therefore exceed MAX_DATA (3 + 8 > 10), proving
+		// the reset-only final size shares the cumulative connection budget.
 		peer.send({
 			type: "reset_stream",
 			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
 			code: VarInt.from(0),
-			finalSize: 6n,
+			finalSize: 3n,
 		});
 		peer.send({
 			type: "stream",
 			id: Stream.Id.create(1n, Stream.Dir.Uni, true),
-			data: new Uint8Array(5),
+			data: new Uint8Array(8),
 			fin: false,
 		});
 
 		const err = await expectSessionFailure(session);
 		expect(err.message).toContain("flow control error");
 		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
+	test("RESET_STREAM final_size replenishes connection credit once discarded", async () => {
+		const { session, peer } = connect({ maxData: 10n, maxStreamDataUni: 10n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({
+			type: "reset_stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+			code: VarInt.from(0),
+			finalSize: 6n,
+		});
+
+		await waitFor(() => peer.has("max_data"));
+		const update = peer.received().find((frame) => frame.type === "max_data") as Frame.MaxData;
+		expect(update.max).toBe(16n);
+		session.close();
 	});
 
 	test("draft-01 tolerates the legacy zero final_size after data", async () => {
