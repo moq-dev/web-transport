@@ -560,6 +560,27 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("accepted active streams do not recycle stream-count credit", async () => {
+		const { session, peer } = connect({ maxStreamsUni: 1n });
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		peer.send({ type: "stream", id, data: new Uint8Array([1]), fin: false });
+
+		const acceptor = session.incomingUnidirectionalStreams.getReader();
+		const accepted = await acceptor.read();
+		if (accepted.done || !accepted.value) throw new Error("expected an incoming stream");
+
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+		expect(peer.count("max_streams_uni")).toBe(0);
+
+		peer.send({ type: "stream", id, data: new Uint8Array(), fin: true });
+		await waitFor(() => peer.count("max_streams_uni") === 1);
+		session.close();
+	});
+
 	// Regression: a STREAM frame delivered by the read loop after the session has
 	// closed used to hit the already-closed incoming-stream controllers, and the
 	// throw escaped as an unhandled rejection because #handleStreamFrame was an

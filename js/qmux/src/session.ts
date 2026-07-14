@@ -1078,6 +1078,23 @@ export default class Session implements WebTransport {
 				return;
 			}
 
+			let accepted = false;
+			let terminal = false;
+			let streamCreditReplenished = false;
+			const maybeReplenishStreamCredit = () => {
+				if (!accepted || !terminal || streamCreditReplenished) return;
+				streamCreditReplenished = true;
+				this.#replenishStreamCredit(frame.id.dir);
+			};
+			const onAccept = () => {
+				accepted = true;
+				maybeReplenishStreamCredit();
+			};
+			const onTerminal = () => {
+				terminal = true;
+				maybeReplenishStreamCredit();
+			};
+
 			const recvStream = new RecvStream(
 				(bytes) => {
 					this.#accountStreamConsumed(streamId, bytes);
@@ -1094,12 +1111,12 @@ export default class Session implements WebTransport {
 					this.#recvStreams.delete(streamId);
 					this.#maybeDeleteStreamFlow(streamId);
 				},
+				onTerminal,
 			);
 			this.#recvStreams.set(streamId, recvStream);
 			recv = recvStream;
 			const reader = recvStream.readable;
 
-			const onAccept = () => this.#replenishStreamCredit(frame.id.dir);
 			const onDrop = (err: Error) => {
 				this.#accountConnConsumed(recvStream.error(err));
 			};
@@ -1182,7 +1199,7 @@ export default class Session implements WebTransport {
 		const recv = this.#recvStreams.get(streamId);
 		if (!recv) return;
 
-		this.#accountConnConsumed(recv.error(new Error(`RESET_STREAM: ${frame.code.value}`)));
+		this.#accountConnConsumed(recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`)));
 		this.#recvStreams.delete(streamId);
 		this.#maybeDeleteStreamFlow(streamId);
 	}

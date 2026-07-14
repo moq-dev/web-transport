@@ -17,6 +17,8 @@ export class RecvStream {
 	#fin = false;
 	#error?: Error;
 	#wake?: () => void;
+	#terminal = false;
+	#onTerminal: () => void;
 
 	/** The application-facing readable. */
 	readonly readable: ReadableStream<Uint8Array>;
@@ -26,8 +28,15 @@ export class RecvStream {
 	 *   to the reader. Drives MAX_STREAM_DATA.
 	 * @param onCancel Invoked with the number of discarded buffered bytes when the
 	 *   application cancels the readable (→ STOP_SENDING).
+	 * @param onTerminal Invoked once when FIN, RESET_STREAM, or local cancellation
+	 *   makes the receive side terminal.
 	 */
-	constructor(onConsume: (bytes: number) => void, onCancel: (discarded: number) => void) {
+	constructor(
+		onConsume: (bytes: number) => void,
+		onCancel: (discarded: number) => void,
+		onTerminal: () => void = () => {},
+	) {
+		this.#onTerminal = onTerminal;
 		this.readable = new ReadableStream<Uint8Array>(
 			{
 				pull: async (controller) => {
@@ -55,6 +64,7 @@ export class RecvStream {
 				cancel: () => {
 					this.#error ??= new Error("stream cancelled");
 					onCancel(this.#discard());
+					this.#notifyTerminal();
 					this.#signal();
 				},
 			},
@@ -73,7 +83,15 @@ export class RecvStream {
 	/** Mark end-of-stream; the readable closes once buffered data drains. */
 	finish(): void {
 		this.#fin = true;
+		this.#notifyTerminal();
 		this.#signal();
+	}
+
+	/** Abort the readable because the peer reset its sending side. */
+	reset(err: Error): number {
+		const discarded = this.error(err);
+		this.#notifyTerminal();
+		return discarded;
 	}
 
 	/** Abort the readable, discarding undelivered buffered data. */
@@ -90,6 +108,12 @@ export class RecvStream {
 		for (const chunk of this.#queue) bytes += chunk.byteLength;
 		this.#queue = [];
 		return bytes;
+	}
+
+	#notifyTerminal(): void {
+		if (this.#terminal) return;
+		this.#terminal = true;
+		this.#onTerminal();
 	}
 
 	#signal(): void {
