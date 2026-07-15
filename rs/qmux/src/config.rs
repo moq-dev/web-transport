@@ -72,7 +72,7 @@ pub struct Config {
     /// [`max_record_size`](Config::max_record_size). Datagrams are a
     /// record-framed-draft feature (QMux01+); this is ignored on QMux00 and the
     /// legacy `webtransport` format. Default:
-    /// [`DEFAULT_MAX_RECORD_SIZE`](crate::proto::DEFAULT_MAX_RECORD_SIZE).
+    /// 16382 bytes.
     pub max_datagram_frame_size: u64,
 
     /// How long [`Session::connect`](crate::Session::connect) /

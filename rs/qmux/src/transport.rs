@@ -8,6 +8,11 @@ use crate::Error;
 /// For WebSocket, this maps to individual WS binary messages.
 /// For TCP/TLS byte streams, the transport handles frame delimiting.
 ///
+/// Use [`Stream`] for arbitrary [`AsyncRead`](tokio::io::AsyncRead) +
+/// [`AsyncWrite`](tokio::io::AsyncWrite) byte streams. Implement this trait when
+/// integrating a transport with its own message boundaries, framing, or
+/// lifecycle that the built-in byte-stream and WebSocket adapters do not cover.
+///
 /// A transport splits into independently-owned send and receive halves so the
 /// session can drive them on separate tasks: a write blocked on transport
 /// backpressure must never stall reads (and vice versa). This decoupling is what

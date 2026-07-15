@@ -4,6 +4,9 @@ mod frame;
 mod params;
 mod version;
 
+#[cfg(test)]
+mod wire_format_tests;
+
 pub use frame::*;
 pub(crate) use params::*;
 pub use version::*;

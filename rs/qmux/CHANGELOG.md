@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- *(qmux)* the `Transport` trait now splits into `TransportWriter` + `TransportReader` halves via `Transport::split`; `send`/`recv`/`close` moved onto those halves and `TransportWriter::maintain` was added for timer-driven work (e.g. WebSocket keep-alive). Custom `Transport` implementations must adopt the new shape; the built-in TCP/TLS/Unix/WebSocket transports and `Session::connect`/`accept` are unaffected.
+- *(qmux)* the `Transport` trait now splits into `Writer` + `Reader` halves via `Transport::split`; `send`/`recv`/`close` moved onto those halves and `Writer::maintain` was added for timer-driven work (e.g. WebSocket keep-alive). Custom `Transport` implementations must adopt the new shape; the built-in TCP/TLS/Unix/WebSocket transports and `Session::connect`/`accept` are unaffected.
+- *(qmux)* the wire-format `proto` module is now internal. Use the session and stream APIs instead of constructing or matching protocol frames directly.
+- *(qmux)* `Version` and `KeepAlive` are now `#[non_exhaustive]`, and `StreamId` is now opaque with `StreamId::into_inner` for reading its encoded value. This prevents future protocol versions and configuration fields from causing incidental API breaks.
 
 ## [0.3.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.2.0...qmux-v0.3.1) - 2026-06-25
 
