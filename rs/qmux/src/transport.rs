@@ -583,7 +583,7 @@ mod ws_transport {
 
     use super::{Reader, Transport, Writer};
     use crate::ws::KeepAlive;
-    use crate::Error;
+    use crate::{Error, Version};
 
     type Message = tungstenite::Message;
 
@@ -614,13 +614,17 @@ mod ws_transport {
     pub(crate) struct WsTransport<T> {
         ws: T,
         keep_alive: Option<KeepAlive>,
+        record_limit: Option<usize>,
     }
 
     impl<T> WsTransport<T> {
-        pub fn new(ws: T) -> Self {
+        pub fn new(ws: T, version: Version, max_record_size: u64) -> Self {
             Self {
                 ws,
                 keep_alive: None,
+                record_limit: version
+                    .uses_records()
+                    .then(|| usize::try_from(max_record_size).unwrap_or(usize::MAX)),
             }
         }
 
@@ -713,7 +717,7 @@ mod ws_transport {
                 None => (None, None),
             };
             let (tx, rx) = mpsc::channel(WS_RECV_CHANNEL_CAPACITY);
-            let pump = tokio::spawn(ws_pump(stream, deadline, tx));
+            let pump = tokio::spawn(ws_pump(stream, deadline, self.record_limit, tx));
             (WsWriter { sink, ping }, WsReader { rx, pump })
         }
     }
@@ -779,6 +783,7 @@ mod ws_transport {
     async fn ws_pump<S>(
         mut stream: S,
         mut deadline: Option<DeadlineState>,
+        record_limit: Option<usize>,
         tx: mpsc::Sender<Result<Bytes, Error>>,
     ) where
         S: futures::Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
@@ -825,6 +830,14 @@ mod ws_transport {
 
             match message {
                 Message::Binary(data) => {
+                    if record_limit.is_some_and(|limit| data.len() > limit) {
+                        // Release the oversized allocation before waiting for room to
+                        // report the terminal error. In particular, never let it enter
+                        // the bounded record queue while the session is backpressured.
+                        drop(data);
+                        let _ = tx.send(Err(Error::FrameTooLarge)).await;
+                        return;
+                    }
                     if tx.send(Ok(data)).await.is_err() {
                         return; // session gone
                     }
@@ -894,7 +907,7 @@ mod ws_transport {
 
             let ka = KeepAlive::new(Duration::from_millis(10), Duration::from_millis(50));
             let (tx, mut rx) = mpsc::channel(1);
-            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), tx));
+            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), None, tx));
 
             // Model a session wedged on a full accept channel: don't read for well
             // over the 50ms keep-alive timeout while the pump is parked on delivery.
@@ -922,7 +935,7 @@ mod ws_transport {
 
             let ka = KeepAlive::new(Duration::from_millis(10), Duration::from_millis(50));
             let (tx, mut rx) = mpsc::channel(4);
-            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), tx));
+            let pump = tokio::spawn(ws_pump(stream, Some(DeadlineState::new(ka)), None, tx));
 
             let result = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
@@ -943,13 +956,30 @@ mod ws_transport {
             let _feed = feed;
 
             let (tx, mut rx) = mpsc::channel(4);
-            let pump = tokio::spawn(ws_pump(stream, None, tx));
+            let pump = tokio::spawn(ws_pump(stream, None, None, tx));
 
             // No deadline, so recv stays pending well past any keep-alive window.
             let pending = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
             assert!(pending.is_err(), "recv must not resolve without activity");
 
             pump.abort();
+        }
+
+        #[tokio::test]
+        async fn rejects_record_exceeding_max_before_queueing() {
+            let (feed, stream) = mock_stream();
+            feed.unbounded_send(Ok(Message::Binary(Bytes::from_static(b"oversized"))))
+                .unwrap();
+
+            let (tx, mut rx) = mpsc::channel(1);
+            let pump = tokio::spawn(ws_pump(stream, None, Some(4), tx));
+
+            assert!(matches!(rx.recv().await, Some(Err(Error::FrameTooLarge))));
+            assert!(
+                rx.recv().await.is_none(),
+                "pump must stop after the violation"
+            );
+            pump.await.unwrap();
         }
     }
 }

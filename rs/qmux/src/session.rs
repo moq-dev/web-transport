@@ -1304,10 +1304,10 @@ impl<R: Reader> SessionState<R> {
         }
         self.params_received = true;
 
-        // Draft-02: a peer that advertises `max_record_size` MUST NOT go below the
-        // default minimum. Values omit to the default (decode seeds it), so only an
-        // explicit smaller value trips this. Earlier drafts didn't enforce it.
-        if self.config.version == Version::QMux02
+        // Record-framed drafts: a peer that advertises `max_record_size` MUST NOT go
+        // below the default minimum. Omitted values decode to the default, so only
+        // an explicit smaller value trips this.
+        if self.config.version.uses_records()
             && params.max_record_size < crate::proto::DEFAULT_MAX_RECORD_SIZE
         {
             return Err(Error::TransportParameter);
@@ -3234,23 +3234,24 @@ mod qmux02_recv_tests {
         assert!(matches!(server.closed().await, Error::ProtocolViolation));
     }
 
-    /// A `max_record_size` below the default minimum is a TRANSPORT_PARAMETER_ERROR.
+    /// A `max_record_size` below the default minimum is a TRANSPORT_PARAMETER_ERROR
+    /// on every record-framed draft.
     #[tokio::test]
     async fn max_record_size_below_default_rejected() {
-        let (accept, mut raw) = raw_accept(Config::new(Version::QMux02));
+        for version in [Version::QMux01, Version::QMux02] {
+            let (accept, mut raw) = raw_accept(Config::new(version));
 
-        let mut params = Config::new(Version::QMux02).to_transport_params();
-        params.max_record_size = 100; // below DEFAULT_MAX_RECORD_SIZE (16382)
-        let frame = Frame::TransportParameters(params)
-            .encode(Version::QMux02)
-            .unwrap();
-        raw.write_all(&record(&frame)).await.unwrap();
-        raw.flush().await.unwrap();
+            let mut params = Config::new(version).to_transport_params();
+            params.max_record_size = 100; // below DEFAULT_MAX_RECORD_SIZE (16382)
+            let frame = Frame::TransportParameters(params).encode(version).unwrap();
+            raw.write_all(&record(&frame)).await.unwrap();
+            raw.flush().await.unwrap();
 
-        assert!(matches!(
-            accept.await.unwrap(),
-            Err(Error::TransportParameter)
-        ));
+            assert!(matches!(
+                accept.await.unwrap(),
+                Err(Error::TransportParameter)
+            ));
+        }
     }
 
     /// A QX_PING response echoing a sequence we never sent is a PROTOCOL_VIOLATION.

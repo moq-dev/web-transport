@@ -53,8 +53,8 @@ pub enum Error {
     ProtocolViolation,
 
     /// A transport parameter carried an illegal value — QMux's
-    /// TRANSPORT_PARAMETER_ERROR. Draft-02 raises this when a peer advertises a
-    /// `max_record_size` below the default minimum.
+    /// TRANSPORT_PARAMETER_ERROR. Record-framed drafts raise this when a peer
+    /// advertises a `max_record_size` below the default minimum.
     #[error("transport parameter error")]
     TransportParameter,
 

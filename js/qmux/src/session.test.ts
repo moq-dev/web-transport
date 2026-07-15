@@ -537,6 +537,34 @@ describe("Session integration (scripted peer)", () => {
 		expect(sentClose(peer)?.type).toBe("connection_close");
 	});
 
+	test("an oversized WebSocket record rejects closed before frame decoding", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		// An all-zero record is otherwise valid PADDING, so only the negotiated
+		// record-size limit should make this fatal.
+		peer.sendRaw(new Uint8Array(Number(DEFAULT_MAX_RECORD_SIZE) + 1));
+
+		await waitFor(() => peer.has("connection_close"));
+		await expectSessionFailure(session);
+		expect(sentCloseCode(peer)).toBe(1002);
+	});
+
+	test("draft-01 rejects max_record_size below the default minimum", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+
+		peer.send({
+			type: "transport_parameters",
+			params: peerParams({ maxRecordSize: DEFAULT_MAX_RECORD_SIZE - 1n }),
+		});
+
+		await waitFor(() => peer.has("connection_close"));
+		await expectSessionFailure(session);
+		expect(sentCloseCode(peer)).toBe(1002);
+	});
+
 	test("an unnegotiated RESET_STREAM_AT rejects closed and tells the peer why (1002)", async () => {
 		// The peer negotiates qmux-01, which never advertises `reset_stream_at`, so
 		// a RESET_STREAM_AT (0x24) frame is a protocol violation. Hand-built bytes:
