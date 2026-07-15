@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.3.1...qmux-v0.4.0) - 2026-07-15
+
+### Added
+
+- *(qmux)* add draft-ietf-quic-qmux-02 support ([#284](https://github.com/moq-dev/web-transport/pull/284))
+- *(qmux)* transport backpressure via a shared-state writer task ([#277](https://github.com/moq-dev/web-transport/pull/277))
+- *(qmux)* add datagram support (RFC 9221) ([#274](https://github.com/moq-dev/web-transport/pull/274))
+
+### Fixed
+
+- *(qmux)* enforce websocket record limits ([#317](https://github.com/moq-dev/web-transport/pull/317))
+- *(qmux)* encode stream offsets ([#311](https://github.com/moq-dev/web-transport/pull/311))
+- *(qmux)* honor RESET_STREAM final sizes ([#306](https://github.com/moq-dev/web-transport/pull/306))
+- *(qmux)* reset idle timeout on send activity ([#303](https://github.com/moq-dev/web-transport/pull/303))
+- *(qmux)* harden input validation ([#309](https://github.com/moq-dev/web-transport/pull/309))
+- *(qmux)* drop empty non-FIN receive frames ([#304](https://github.com/moq-dev/web-transport/pull/304))
+- *(qmux)* split APPLICATION_CLOSE (0x1d) from CONNECTION_CLOSE (0x1c) ([#292](https://github.com/moq-dev/web-transport/pull/292))
+- *(qmux)* move idle timeout + keep-alive to a dedicated timer task ([#282](https://github.com/moq-dev/web-transport/pull/282))
+- *(qmux)* tear down writer parked in an in-flight send() ([#281](https://github.com/moq-dev/web-transport/pull/281))
+- *(qmux)* datagram protocol-violation close (JS) + seal proto enums, rename transport halves ([#280](https://github.com/moq-dev/web-transport/pull/280))
+- *(qmux)* ignore post-terminal frames on retired recv streams ([#279](https://github.com/moq-dev/web-transport/pull/279))
+- *(qmux)* harden inbound DATAGRAM frame-size validation ([#278](https://github.com/moq-dev/web-transport/pull/278))
+
+### Other
+
+- *(qmux)* add cross-language interop smoke ([#316](https://github.com/moq-dev/web-transport/pull/316))
+- narrow qmux public API ([#313](https://github.com/moq-dev/web-transport/pull/313))
+- *(qmux)* defer stream offset enforcement ([#310](https://github.com/moq-dev/web-transport/pull/310))
+
 ### Added
 
 - *(qmux)* datagram support (RFC 9221) on QMux01: `send_datagram`/`recv_datagram`/`max_datagram_size` on `Session`, negotiated via the `max_datagram_frame_size` transport parameter and configured with `Config::max_datagram_frame_size` (enabled by default). Datagrams are unavailable on QMux00 and the legacy `webtransport` format.

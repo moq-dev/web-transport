@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.6.0...web-transport-proto-v0.6.1) - 2026-07-15
+
+### Other
+
+- *(deps)* bump the cargo group with 3 updates ([#270](https://github.com/moq-dev/web-transport/pull/270))
+
 ## [0.6.0](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.5.5...web-transport-proto-v0.6.0) - 2026-03-11
 
 ### Added
