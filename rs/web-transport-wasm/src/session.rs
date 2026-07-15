@@ -1,9 +1,11 @@
 use bytes::Bytes;
-use js_sys::{Reflect, Uint8Array};
+use js_sys::{Function, Reflect, Uint8Array};
 use url::Url;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    WebTransport, WebTransportBidirectionalStream, WebTransportCloseInfo, WebTransportSendStream,
+    WebTransport, WebTransportBidirectionalStream, WebTransportCloseInfo,
+    WebTransportDatagramDuplexStream, WebTransportSendStream, WritableStream,
 };
 
 use crate::{Error, RecvStream, SendStream};
@@ -21,6 +23,22 @@ pub struct Session {
     inner: WebTransport,
     url: Url,
     protocol: Option<String>,
+}
+
+/// The datagram writer. The current spec exposes it via `createWritable()`; the
+/// `.writable` property is deprecated, non-standard, and unimplemented by Safari
+/// (there `.writable` is `undefined`, so datagram sending throws). Prefer
+/// `createWritable()`, falling back to `.writable` for browsers that still have it.
+/// MDN — the `.writable` deprecation note and the feature-detect example:
+/// <https://developer.mozilla.org/en-US/docs/Web/API/WebTransportDatagramDuplexStream/writable>
+/// <https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/datagrams#writing_an_outgoing_datagram>
+fn datagram_writable(dg: &WebTransportDatagramDuplexStream) -> WritableStream {
+    Reflect::get(dg, &"createWritable".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<Function>().ok())
+        .and_then(|f| f.call0(dg).ok())
+        .and_then(|ws| ws.dyn_into::<WritableStream>().ok())
+        .unwrap_or_else(|| dg.writable())
 }
 
 impl Session {
@@ -85,7 +103,7 @@ impl Session {
 
     /// Send a datagram over the network.
     pub async fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
-        let mut writer = Writer::new(&self.inner.datagrams().writable())?;
+        let mut writer = Writer::new(&datagram_writable(&self.inner.datagrams()))?;
         writer.write(&Uint8Array::from(payload.as_ref())).await?;
         Ok(())
     }
