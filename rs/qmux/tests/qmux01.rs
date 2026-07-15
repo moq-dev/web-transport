@@ -4,11 +4,8 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use qmux::proto::{Frame, Ping, Stream};
-use qmux::{StreamId, Version};
+use qmux::Version;
 use tokio::net::TcpListener;
-use web_transport_proto::VarInt;
 use web_transport_trait::{RecvStream, SendStream, Session as _};
 
 /// Byte-level wire snapshot: QMux00 must NOT prepend a size varint, QMux01 must.
@@ -68,57 +65,6 @@ async fn wire_format_size_prefix_qmux01_only() {
         qmux01_bytes[size_len], 0xff,
         "expected QX_TRANSPORT_PARAMETERS frame type after the {size_len}-byte size varint"
     );
-}
-
-/// Round-trip multiple frames concatenated inside one record body.
-///
-/// Records can carry several frames, so `decode_record` must keep parsing
-/// until the buffer is exhausted and stop cleanly at the boundary.
-#[test]
-fn record_round_trip_multiple_frames() {
-    let stream_id = StreamId(VarInt::from_u32(0));
-    let frames = vec![
-        Frame::Stream(Stream {
-            id: stream_id,
-            offset: 0,
-            data: Bytes::from_static(b"hello"),
-            fin: false,
-        }),
-        Frame::Ping(Ping {
-            sequence: 42,
-            response: false,
-        }),
-        Frame::MaxData(1024),
-    ];
-
-    // Concatenate the encoded frames as a single record body — the same way the
-    // wire layer would lay them out inside one record.
-    let mut body = bytes::BytesMut::new();
-    for frame in &frames {
-        body.extend_from_slice(&frame.encode(Version::QMux01).unwrap());
-    }
-
-    let decoded = Frame::decode_record(body.freeze()).unwrap();
-    assert_eq!(decoded.len(), 3);
-
-    match &decoded[0] {
-        Frame::Stream(s) => {
-            assert_eq!(s.data.as_ref(), b"hello");
-            assert!(!s.fin);
-        }
-        other => panic!("expected Stream, got {other:?}"),
-    }
-    match &decoded[1] {
-        Frame::Ping(p) => {
-            assert_eq!(p.sequence, 42);
-            assert!(!p.response);
-        }
-        other => panic!("expected Ping, got {other:?}"),
-    }
-    match &decoded[2] {
-        Frame::MaxData(v) => assert_eq!(*v, 1024),
-        other => panic!("expected MaxData, got {other:?}"),
-    }
 }
 
 /// QMux00 round-trip over TCP, exercising the legacy wire format.

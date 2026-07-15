@@ -30,8 +30,6 @@ const CONNECTION_CLOSE: VarInt = VarInt::from_u32(0x1c);
 // varint costs 1-2 bytes. Both forms decode.
 const DATAGRAM_LEN: VarInt = VarInt::from_u32(0x31);
 
-const PADDING: VarInt = VarInt::from_u32(0x00);
-
 // QX_TRANSPORT_PARAMETERS magic: "\xffQMX\r\n\r\n"
 // This exceeds u32 range, so we use try_from at decode time and a pre-computed const for encode.
 const QX_TRANSPORT_PARAMETERS: u64 = 0x3f5153300d0a0d0a;
@@ -179,7 +177,6 @@ impl From<Bytes> for Datagram {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Frame {
-    Padding,
     ResetStream(ResetStream),
     StopSending(StopSending),
     ConnectionClose(ConnectionClose),
@@ -212,14 +209,12 @@ impl Frame {
     /// the transport layer is responsible for delimiting records (size
     /// varint on TCP/TLS; implicit on WebSocket message boundaries).
     pub fn encode(&self, version: Version) -> Result<Bytes, Error> {
-        // Reject record-layer frames (PADDING, QX_PING, DATAGRAM) for versions
+        // Reject record-layer frames (QX_PING, DATAGRAM) for versions
         // that don't use records, so a misrouted call can't accidentally emit
         // draft-01+ wire bytes on a draft-00 / webtransport session.
         if !version.uses_records() {
             match self {
-                Frame::Padding | Frame::Ping(_) | Frame::Datagram(_) => {
-                    return Err(Error::InvalidFrameType(0))
-                }
+                Frame::Ping(_) | Frame::Datagram(_) => return Err(Error::InvalidFrameType(0)),
                 _ => {}
             }
         }
@@ -572,9 +567,6 @@ impl Frame {
                 let payload = params.encode()?;
                 VarInt::try_from(payload.len())?.encode(buf);
                 buf.put_slice(&payload);
-            }
-            Frame::Padding => {
-                PADDING.encode(buf);
             }
             Frame::Ping(ping) => {
                 if ping.response {

@@ -11,7 +11,7 @@ pub enum StreamDir {
 
 /// A QUIC-style stream identifier encoding direction and initiator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StreamId(pub VarInt);
+pub struct StreamId(pub(crate) VarInt);
 
 impl StreamId {
     /// Create a new stream ID with the given sequence number, direction, and initiator.
@@ -24,6 +24,11 @@ impl StreamId {
             stream_id |= 0x01;
         }
         StreamId(VarInt::try_from(stream_id).expect("stream ID too large"))
+    }
+
+    /// Return the encoded QUIC stream ID value.
+    pub fn into_inner(self) -> u64 {
+        self.0.into_inner()
     }
 
     /// Returns the stream direction (bidirectional or unidirectional).

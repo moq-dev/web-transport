@@ -10,7 +10,7 @@ mod alpn;
 mod config;
 mod credit;
 mod error;
-pub mod proto;
+mod proto;
 mod protocol;
 mod sched;
 mod session;
@@ -35,6 +35,8 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+// Re-export the WebSocket dependencies so downstream integrations can use the
+// exact versions compatible with QMux's public WebSocket types.
 #[cfg(feature = "ws")]
 pub use tokio_tungstenite;
 

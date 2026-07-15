@@ -1243,8 +1243,6 @@ impl<R: Reader> SessionState<R> {
             | Frame::StreamDataBlocked { .. }
             | Frame::StreamsBlockedBidi(_)
             | Frame::StreamsBlockedUni(_) => {}
-            // PADDING is a no-op
-            Frame::Padding => {}
             // QX_PING: respond to requests, ignore responses.
             Frame::Ping(ping) => {
                 // Draft-02 tightens the sequence-number rules.

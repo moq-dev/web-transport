@@ -1,6 +1,7 @@
 /// The wire format version used for frame encoding/decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
+#[non_exhaustive]
 pub enum Version {
     /// Legacy "webtransport" wire format (WebSocket only).
     /// Frame type as u8, no flow control, simplified STREAM/RESET_STREAM/CONNECTION_CLOSE.

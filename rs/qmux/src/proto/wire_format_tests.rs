@@ -20,9 +20,13 @@
 //! encodes as `0x44 0x00`.
 
 use bytes::Bytes;
-use qmux::proto::{ApplicationClose, ConnectionClose, Frame, ResetStream, StopSending, Stream};
-use qmux::{Error, StreamId, Version};
 use web_transport_proto::VarInt;
+
+use super::{
+    ApplicationClose, ConnectionClose, Frame, Ping, ResetStream, StopSending, Stream,
+    DEFAULT_MAX_RECORD_SIZE,
+};
+use crate::{Error, StreamId, Version};
 
 /// Round-trip helper: hard-coded bytes ↔ expected frame, both directions.
 fn assert_round_trip(version: Version, bytes: &[u8], expected: &Frame) {
@@ -131,6 +135,54 @@ fn sid(v: u64) -> StreamId {
 
 fn code(v: u64) -> VarInt {
     VarInt::try_from(v).unwrap()
+}
+
+/// Round-trip multiple frames concatenated inside one record body.
+///
+/// Records can carry several frames, so `decode_record` must keep parsing
+/// until the buffer is exhausted and stop cleanly at the boundary.
+#[test]
+fn record_round_trip_multiple_frames() {
+    let frames = vec![
+        Frame::Stream(Stream {
+            id: sid(0),
+            offset: 0,
+            data: Bytes::from_static(b"hello"),
+            fin: false,
+        }),
+        Frame::Ping(Ping {
+            sequence: 42,
+            response: false,
+        }),
+        Frame::MaxData(1024),
+    ];
+
+    let mut body = bytes::BytesMut::new();
+    for frame in &frames {
+        body.extend_from_slice(&frame.encode(Version::QMux01).unwrap());
+    }
+
+    let decoded = Frame::decode_record(body.freeze()).unwrap();
+    assert_eq!(decoded.len(), 3);
+
+    match &decoded[0] {
+        Frame::Stream(stream) => {
+            assert_eq!(stream.data.as_ref(), b"hello");
+            assert!(!stream.fin);
+        }
+        other => panic!("expected Stream, got {other:?}"),
+    }
+    match &decoded[1] {
+        Frame::Ping(ping) => {
+            assert_eq!(ping.sequence, 42);
+            assert!(!ping.response);
+        }
+        other => panic!("expected Ping, got {other:?}"),
+    }
+    match &decoded[2] {
+        Frame::MaxData(value) => assert_eq!(*value, 1024),
+        other => panic!("expected MaxData, got {other:?}"),
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -568,7 +620,7 @@ fn qmux00_transport_parameters_initial_max_data_only() {
             // decode() seeds with DEFAULT_MAX_RECORD_SIZE per draft-01.
             assert_eq!(p.initial_max_stream_data_bidi_local, 0);
             assert_eq!(p.initial_max_streams_bidi, 0);
-            assert_eq!(p.max_record_size, qmux::proto::DEFAULT_MAX_RECORD_SIZE);
+            assert_eq!(p.max_record_size, DEFAULT_MAX_RECORD_SIZE);
             p
         }
         other => panic!("expected TransportParameters, got {other:?}"),

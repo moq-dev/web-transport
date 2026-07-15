@@ -15,6 +15,7 @@ use crate::{alpn, Config, Error, Session, Version};
 /// hours. Set this to send periodic Pings and close the session if no
 /// frame arrives within `timeout`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct KeepAlive {
     /// How often to send a Ping frame to the peer.
     pub interval: Duration,
