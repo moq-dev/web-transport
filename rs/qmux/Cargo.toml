@@ -45,3 +45,7 @@ web-transport-trait = { workspace = true }
 [[example]]
 name = "h3qx"
 required-features = ["tcp"]
+
+[[example]]
+name = "interop-server"
+required-features = ["ws"]

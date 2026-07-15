@@ -60,6 +60,8 @@ test:
 	cargo test --workspace --all-targets --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport --all-targets --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport-wasm --all-targets --all-features
+	bun run --cwd js/qmux test
+	bun run --cwd js/qmux test:interop
 
 # Automatically fix some issues.
 fix:
