@@ -695,6 +695,11 @@ export default class Session implements WebTransport {
 		this.#lastRecvAt = Date.now();
 		try {
 			if (usesRecords(this.#version)) {
+				if (BigInt(data.byteLength) > this.#ourParams.maxRecordSize) {
+					throw new Error(
+						`record exceeds our max_record_size (${data.byteLength} > ${this.#ourParams.maxRecordSize})`,
+					);
+				}
 				// Record-framed drafts: each WS message is a record with one or more frames
 				const frames = Frame.decodeRecord(data);
 				for (const frame of frames) {
@@ -804,10 +809,10 @@ export default class Session implements WebTransport {
 
 	#handleTransportParameters(params: TransportParams) {
 		if (this.#paramsReceived) return;
-		// Draft-02: an advertised max_record_size MUST NOT go below the default
-		// minimum. Omitted values decode to the default, so only an explicit
+		// Record-framed drafts: an advertised max_record_size MUST NOT go below the
+		// default minimum. Omitted values decode to the default, so only an explicit
 		// smaller value trips this (TRANSPORT_PARAMETER_ERROR).
-		if (this.#version === "qmux-02" && params.maxRecordSize < Frame.DEFAULT_MAX_RECORD_SIZE) {
+		if (usesRecords(this.#version) && params.maxRecordSize < Frame.DEFAULT_MAX_RECORD_SIZE) {
 			throw new Error("max_record_size below the default minimum");
 		}
 		this.#paramsReceived = true;

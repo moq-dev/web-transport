@@ -89,11 +89,9 @@ where
     /// this returns synchronously without awaiting in-band parameters.
     pub fn connect(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::new(
-            self.into_transport(),
-            false,
-            Config::negotiated(version, protocol),
-        )
+        let config = Config::negotiated(version, protocol);
+        let transport = self.into_transport(config.version, config.max_record_size);
+        Session::new(transport, false, config)
     }
 
     /// Wrap as a server-side session.
@@ -102,15 +100,13 @@ where
     /// negotiated subprotocol, so this returns synchronously.
     pub fn accept(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        Session::new(
-            self.into_transport(),
-            true,
-            Config::negotiated(version, protocol),
-        )
+        let config = Config::negotiated(version, protocol);
+        let transport = self.into_transport(config.version, config.max_record_size);
+        Session::new(transport, true, config)
     }
 
-    fn into_transport(self) -> WsTransport<T> {
-        let transport = WsTransport::new(self.ws);
+    fn into_transport(self, version: Version, max_record_size: u64) -> WsTransport<T> {
+        let transport = WsTransport::new(self.ws, version, max_record_size);
         match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
             None => transport,
@@ -252,16 +248,14 @@ impl Client {
             ));
         }
 
+        let config = Config::negotiated(version, protocol);
+        let transport = WsTransport::new(ws_stream, config.version, config.max_record_size);
         let transport = match self.keep_alive {
-            Some(ka) => WsTransport::new(ws_stream).with_keep_alive(ka),
-            None => WsTransport::new(ws_stream),
+            Some(ka) => transport.with_keep_alive(ka),
+            None => transport,
         };
         // Protocol came from the negotiated subprotocol, so no in-band wait.
-        Ok(Session::new(
-            transport,
-            false,
-            Config::negotiated(version, protocol),
-        ))
+        Ok(Session::new(transport, false, config))
     }
 }
 
@@ -409,15 +403,13 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
+        let config = Config::negotiated(version, protocol);
+        let transport = WsTransport::new(ws, config.version, config.max_record_size);
         let transport = match self.keep_alive {
-            Some(ka) => WsTransport::new(ws).with_keep_alive(ka),
-            None => WsTransport::new(ws),
+            Some(ka) => transport.with_keep_alive(ka),
+            None => transport,
         };
         // Protocol came from the negotiated subprotocol, so no in-band wait.
-        Ok(Session::new(
-            transport,
-            true,
-            Config::negotiated(version, protocol),
-        ))
+        Ok(Session::new(transport, true, config))
     }
 }
