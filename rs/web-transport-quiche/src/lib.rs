@@ -40,7 +40,7 @@ pub use recv::*;
 pub use send::*;
 pub use server::*;
 
-pub use ez::{CertResolver, CertificateDer, CertifiedKey, PrivateKeyDer, Settings};
+pub use ez::{CertResolver, CertificateDer, CertifiedKey, ClientAuth, PrivateKeyDer, Settings};
 
 pub use http;
 pub use web_transport_proto as proto;

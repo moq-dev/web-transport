@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use rustls_pki_types::CertificateDer;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
@@ -161,9 +162,16 @@ impl Drop for ConnectionClose {
 
 /// A QUIC connection that can create and accept streams.
 ///
-/// This is a handle to an established QUIC connection. It can be cloned to create
-/// multiple handles to the same connection. The connection will be closed when all
-/// handles are dropped.
+/// This is a handle to an *established* connection: it's only reachable through
+/// [Incoming::accept](super::Incoming::accept) or
+/// [Connecting::established](super::Connecting::established), both of which wait for
+/// the TLS handshake. So anything the handshake settles — [alpn](Connection::alpn),
+/// [server_name](Connection::server_name), [peer_certificates](Connection::peer_certificates) —
+/// is already known here, and a `None` means the value is genuinely absent rather
+/// than not yet available.
+///
+/// It can be cloned to create multiple handles to the same connection. The
+/// connection will be closed when all handles are dropped.
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<tokio_quiche::QuicConnection>,
@@ -294,8 +302,7 @@ impl Connection {
 
     /// Maximum size of a datagram that can be sent right now.
     ///
-    /// Returns `None` before the handshake completes or when datagrams are
-    /// disabled in the peer's transport parameters.
+    /// Returns `None` when datagrams are disabled in the peer's transport parameters.
     pub fn max_datagram_size(&self) -> Option<usize> {
         let v = self.dgram_max.load(Ordering::Relaxed);
         if v == 0 {
@@ -326,14 +333,31 @@ impl Connection {
         self.close.is_closed()
     }
 
-    /// Returns the negotiated ALPN protocol, if the handshake has completed.
+    /// Returns the negotiated ALPN protocol, or `None` if the peers negotiated none.
     pub fn alpn(&self) -> Option<Vec<u8>> {
         self.driver.lock().alpn().map(|a| a.to_vec())
     }
 
-    /// Returns the SNI server name from the TLS ClientHello, if the handshake has completed.
+    /// Returns the TLS server name, or `None` if the client sent no SNI.
+    ///
+    /// On a server this is the name the client asked for; on a client it's the name
+    /// it sent, which is the dial host unless [ClientBuilder::with_server_name](super::ClientBuilder::with_server_name)
+    /// overrode it.
     pub fn server_name(&self) -> Option<String> {
         self.driver.lock().server_name().map(|s| s.to_string())
+    }
+
+    /// Returns the peer's certificate chain, leaf first.
+    ///
+    /// The chain has already been verified according to the endpoint's
+    /// configuration: [ClientAuth](super::ClientAuth) on a server, or the
+    /// verification mode chosen on [ClientBuilder](super::ClientBuilder).
+    ///
+    /// A server returns `None` unless it requested a client certificate *and* the
+    /// client presented one, so this doubles as the "was this peer authenticated"
+    /// check under [ClientAuth::Optional](super::ClientAuth::Optional).
+    pub fn peer_certificates(&self) -> Option<Vec<CertificateDer<'static>>> {
+        self.driver.lock().peer_certificates().map(|c| c.to_vec())
     }
 
     /// Returns the most recent connection statistics snapshot.

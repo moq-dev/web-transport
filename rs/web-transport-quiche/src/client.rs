@@ -86,6 +86,15 @@ impl ClientBuilder {
         Self(self.0.with_root_certificates(roots))
     }
 
+    /// Use this name for SNI and certificate verification instead of the URL's host.
+    ///
+    /// The dial target is unchanged; only the name the server certificate must
+    /// match is. This is how you reach a host by IP, or through a tunnel, while
+    /// still verifying the certificate it was actually issued for.
+    pub fn with_server_name(self, name: impl Into<String>) -> Self {
+        Self(self.0.with_server_name(name))
+    }
+
     /// Accept the server certificate only if the SHA-256 of its DER encoding
     /// matches one of the provided hashes, bypassing CA verification.
     ///

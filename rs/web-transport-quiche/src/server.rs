@@ -77,9 +77,16 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerInit> {
         ))
     }
 
-    /// Use the provided [Settings] instead of the defaults.
+    /// Use the provided [Settings](ez::Settings) instead of the defaults.
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
+    }
+
+    /// Authenticate clients with mTLS.
+    ///
+    /// Defaults to [ez::ClientAuth::None].
+    pub fn with_client_auth(self, auth: ez::ClientAuth) -> Self {
+        Self(self.0.with_client_auth(auth))
     }
 }
 
@@ -99,9 +106,19 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
         Ok(Self(self.0.with_bind(addrs)?))
     }
 
-    /// Use the provided [Settings] instead of the defaults.
+    /// Use the provided [Settings](ez::Settings) instead of the defaults.
+    ///
+    /// **NOTE**: [Settings::verify_peer](ez::Settings::verify_peer) is ignored; use
+    /// [ServerBuilder::with_client_auth] to verify client certificates.
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
+    }
+
+    /// Authenticate clients with mTLS.
+    ///
+    /// Defaults to [ez::ClientAuth::None].
+    pub fn with_client_auth(self, auth: ez::ClientAuth) -> Self {
+        Self(self.0.with_client_auth(auth))
     }
 
     /// Configure the server to use a static certificate for TLS.

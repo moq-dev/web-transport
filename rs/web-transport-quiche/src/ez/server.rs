@@ -1,4 +1,3 @@
-use boring::ssl::NameType;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{io, marker::PhantomData};
@@ -15,7 +14,8 @@ use crate::ez::DriverState;
 
 use super::client::DGRAM_CHANNEL_CAPACITY;
 use super::{
-    CertResolver, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings,
+    CertResolver, ClientAuth, Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics,
+    Settings,
 };
 
 /// Used with [ServerBuilder] to require specific parameters.
@@ -34,6 +34,7 @@ pub struct ServerBuilder<M: Metrics = DefaultMetrics, S = ServerInit> {
     metrics: M,
     state: S,
     alpn: Vec<Vec<u8>>,
+    client_auth: ClientAuth,
 }
 
 impl Default for ServerBuilder<DefaultMetrics> {
@@ -52,6 +53,7 @@ impl ServerBuilder<DefaultMetrics, ServerInit> {
             metrics: m,
             state: ServerInit {},
             alpn: Vec::new(),
+            client_auth: ClientAuth::None,
         }
     }
 }
@@ -63,6 +65,7 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
             metrics: self.metrics,
             state: ServerWithListener { listeners: vec![] },
             alpn: self.alpn,
+            client_auth: self.client_auth,
         }
     }
 
@@ -90,6 +93,14 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Authenticate clients with mTLS.
+    ///
+    /// Defaults to [ClientAuth::None].
+    pub fn with_client_auth(mut self, auth: ClientAuth) -> Self {
+        self.client_auth = auth;
         self
     }
 }
@@ -129,8 +140,19 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     }
 
     /// Use the provided [Settings] instead of the defaults.
+    ///
+    /// **NOTE**: [Settings::verify_peer] is ignored; use [ServerBuilder::with_client_auth]
+    /// to verify client certificates.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Authenticate clients with mTLS.
+    ///
+    /// Defaults to [ClientAuth::None].
+    pub fn with_client_auth(mut self, auth: ClientAuth) -> Self {
+        self.client_auth = auth;
         self
     }
 
@@ -140,24 +162,45 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> io::Result<Server<M>> {
+        self.client_auth.validate()?;
+
         let alpn = std::mem::take(&mut self.alpn);
-        let hook = StaticCertHook { chain, key, alpn };
+        let client_auth = std::mem::take(&mut self.client_auth);
+        let hook = StaticCertHook {
+            chain,
+            key,
+            alpn,
+            client_auth,
+        };
 
         self.build_with_hook(Arc::new(hook))
     }
 
     /// Configure the server to use a dynamic certificate resolver for TLS.
     pub fn with_cert_resolver(mut self, resolver: Arc<dyn CertResolver>) -> io::Result<Server<M>> {
+        self.client_auth.validate()?;
+
         let alpn = std::mem::take(&mut self.alpn);
-        let hook = DynamicCertHook { resolver, alpn };
+        let client_auth = std::mem::take(&mut self.client_auth);
+        let hook = DynamicCertHook {
+            resolver,
+            alpn,
+            client_auth,
+        };
 
         self.build_with_hook(Arc::new(hook))
     }
 
     fn build_with_hook(
-        self,
+        mut self,
         hook: Arc<dyn tokio_quiche::quic::ConnectionHook + Send + Sync>,
     ) -> io::Result<Server<M>> {
+        // quiche applies `verify_peer` *after* the hook and would overwrite the
+        // verification mode installed there, downgrading a required client
+        // certificate to an optional one. On a server the same knob is expressed
+        // by [ClientAuth], which the hook has already applied.
+        self.settings.verify_peer = false;
+
         // ConnectionHook is only invoked when tls_cert is set, so we provide a dummy.
         let dummy_tls = TlsCertificatePaths {
             cert: "",
@@ -184,9 +227,17 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     }
 }
 
-/// A pre-accepted QUIC connection with the TLS handshake already complete.
+/// An incoming QUIC connection whose TLS handshake is still in flight.
 ///
-/// The peer address is available before calling [Incoming::accept].
+/// Only the addresses are known at this point, which is enough to [reject](Incoming::reject)
+/// a peer without paying for a handshake. Everything the handshake establishes —
+/// ALPN, SNI, peer certificates — lives on the [Connection] returned by
+/// [Incoming::accept], because none of it exists yet: the ClientHello is still an
+/// unparsed packet.
+///
+/// To choose a certificate or refuse a connection based on SNI, use
+/// [ServerBuilder::with_cert_resolver], which runs while the handshake is in
+/// progress — the last point where the server can still decide.
 pub struct Incoming {
     connection: Connection,
     driver: Lock<DriverState>,
@@ -201,18 +252,6 @@ impl Incoming {
     /// Returns the local socket address for this connection.
     pub fn local_addr(&self) -> SocketAddr {
         self.connection.local_addr()
-    }
-
-    /// Returns the negotiated ALPN protocol, if the handshake has completed.
-    pub fn alpn(&self) -> Option<Vec<u8>> {
-        self.driver.lock().alpn().map(|a| a.to_vec())
-    }
-
-    /// Returns the SNI server name from the TLS ClientHello.
-    ///
-    /// Available immediately, before [Incoming::accept] is called.
-    pub fn server_name(&self) -> Option<String> {
-        self.driver.lock().server_name().map(|s| s.to_string())
     }
 
     /// Reject the connection with an error code and reason.
@@ -275,13 +314,7 @@ impl<M: Metrics> Server<M> {
     ) -> io::Result<()> {
         let mut rx = socket.into_inner();
         while let Some(initial) = rx.recv().await {
-            let mut initial = initial?;
-
-            // Capture the SNI server name from the TLS ClientHello before starting the handshake.
-            let server_name = initial
-                .ssl_mut()
-                .servername(NameType::HOST_NAME)
-                .map(|s| s.to_string());
+            let initial = initial?;
 
             let accept_bi = flume::unbounded();
             let accept_uni = flume::unbounded();
@@ -290,7 +323,6 @@ impl<M: Metrics> Server<M> {
             let dgram_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let state = Lock::new(DriverState::new(true));
-            state.lock().set_server_name(server_name);
             let session = Driver::new(
                 state.clone(),
                 accept_bi.0,
