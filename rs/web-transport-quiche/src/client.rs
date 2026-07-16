@@ -104,6 +104,26 @@ impl ClientBuilder {
         Self(self.0.with_server_certificate_hashes(hashes))
     }
 
+    /// Send a PING on this interval, keeping an idle connection alive.
+    ///
+    /// Disabled by default. This must be shorter than the peer's
+    /// [Settings::max_idle_timeout] to have any effect; a third of it is a
+    /// reasonable choice.
+    pub fn with_keep_alive(self, interval: std::time::Duration) -> Self {
+        Self(self.0.with_keep_alive(interval))
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(self, enabled: bool) -> Self {
+        Self(self.0.with_gso(enabled))
+    }
+
     /// Connect to the WebTransport server at the given URL.
     ///
     /// DNS resolution and socket setup happen eagerly. The returned [Connecting]
@@ -116,13 +136,7 @@ impl ClientBuilder {
         request: impl Into<ConnectRequest>,
     ) -> Result<Connecting, ClientError> {
         let request = request.into();
-
-        let port = request.url.port().unwrap_or(443);
-
-        let host = match request.url.host() {
-            Some(host) => host.to_string(),
-            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
-        };
+        let (host, port) = Self::target(&request)?;
 
         let connecting = self.0.connect(&host, port).await?;
 
@@ -130,6 +144,20 @@ impl ClientBuilder {
             connecting,
             request,
         })
+    }
+
+    /// The host and port to dial for a request.
+    fn target(request: &ConnectRequest) -> Result<(String, u16), ClientError> {
+        // `Host` renders IPv6 in URL form, bracketed, which is not what a
+        // resolver or a TLS server name wants.
+        let host = match request.url.host() {
+            Some(url::Host::Domain(host)) => host.to_string(),
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Ipv6(ip)) => ip.to_string(),
+            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
+        };
+
+        Ok((host, request.url.port().unwrap_or(443)))
     }
 }
 

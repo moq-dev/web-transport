@@ -1,9 +1,11 @@
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::ez::socket::capabilities;
 use crate::ez::tls::{ClientHook, ClientVerify};
 use crate::ez::DriverState;
 
@@ -30,6 +32,8 @@ pub struct ClientBuilder {
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     verify: ClientVerify,
     server_name: Option<String>,
+    keep_alive: Option<Duration>,
+    gso: bool,
 }
 
 impl Default for ClientBuilder {
@@ -50,7 +54,31 @@ impl ClientBuilder {
             tls: None,
             verify: ClientVerify::Default,
             server_name: None,
+            keep_alive: None,
+            gso: true,
         }
+    }
+
+    /// Send a PING on this interval, keeping an idle connection alive.
+    ///
+    /// Disabled by default. This must be shorter than the peer's
+    /// [Settings::max_idle_timeout] to have any effect; a third of it is a
+    /// reasonable choice.
+    pub fn with_keep_alive(mut self, interval: Duration) -> Self {
+        self.keep_alive = Some(interval);
+        self
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(mut self, enabled: bool) -> Self {
+        self.gso = enabled;
+        self
     }
 
     /// Listen for incoming packets on the given socket.
@@ -161,18 +189,16 @@ impl ClientBuilder {
 
         socket.connect(remote).await?;
 
+        // Enable the offloads the kernel supports before the socket is wrapped;
+        // `from_udp` starts with everything disabled.
+        let capabilities = capabilities(&socket, self.gso);
+
         // Connect to the server using the addr we just resolved.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut socket = tokio_quiche::socket::Socket::<
             Arc<tokio::net::UdpSocket>,
             Arc<tokio::net::UdpSocket>,
         >::from_udp(socket)?;
-
-        // Enable UDP GSO/GRO offload where the kernel supports it (Linux only).
-        // This mirrors the server listener and cuts syscall overhead at high
-        // throughput; it's a no-op if send/recv don't share one FD.
-        #[cfg(target_os = "linux")]
-        socket.apply_max_capabilities();
+        socket.capabilities = capabilities;
 
         // Only the fully-insecure path (no verification of any kind) deserves a
         // warning; hash- and root-based verification still authenticate the peer.
@@ -222,6 +248,7 @@ impl ClientBuilder {
             dgram_in.0,
             dgram_out.1,
             dgram_max.clone(),
+            self.keep_alive,
         );
 
         let conn = tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, app)

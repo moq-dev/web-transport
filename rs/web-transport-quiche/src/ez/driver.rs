@@ -7,7 +7,8 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    task::{Poll, Waker},
+    task::{Context, Poll, Waker},
+    time::Duration,
 };
 use tokio_quiche::{
     buf_factory::BufFactory,
@@ -236,6 +237,42 @@ impl DriverState {
     }
 }
 
+/// Periodically asks quiche to make the next packet ack-eliciting, keeping an
+/// otherwise silent connection out of the peer's idle timeout and holding NAT
+/// bindings open.
+struct KeepAlive {
+    period: Duration,
+    /// Created on the first poll so the timer registers with the runtime that
+    /// actually drives the connection, not whoever built the endpoint.
+    ticker: Option<tokio::time::Interval>,
+}
+
+impl KeepAlive {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            ticker: None,
+        }
+    }
+
+    /// Returns true when a keep-alive is due.
+    fn poll(&mut self, cx: &mut Context) -> bool {
+        let period = self.period;
+        let ticker = self.ticker.get_or_insert_with(|| {
+            // The first tick is one period out; `interval` would instead fire
+            // immediately and ping a connection that just finished handshaking.
+            let start = tokio::time::Instant::now() + period;
+            let mut ticker = tokio::time::interval_at(start, period);
+            // A late tick means the connection was busy, which is exactly when a
+            // keep-alive is unnecessary. Don't replay the backlog.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker
+        });
+
+        ticker.poll_tick(cx).is_ready()
+    }
+}
+
 pub(super) struct Driver {
     state: Lock<DriverState>,
 
@@ -253,6 +290,8 @@ pub(super) struct Driver {
     // Writable datagram size in bytes, published once at handshake. 0 means the
     // peer didn't negotiate the datagram extension.
     dgram_max: Arc<AtomicUsize>,
+
+    keep_alive: Option<KeepAlive>,
 }
 
 impl Driver {
@@ -263,6 +302,7 @@ impl Driver {
         dgram_in: flume::Sender<Bytes>,
         dgram_out: flume::Receiver<Bytes>,
         dgram_max: Arc<AtomicUsize>,
+        keep_alive: Option<Duration>,
     ) -> Self {
         Self {
             state,
@@ -274,6 +314,7 @@ impl Driver {
             dgram_in,
             dgram_out,
             dgram_max,
+            keep_alive: keep_alive.map(KeepAlive::new),
         }
     }
 
@@ -486,6 +527,16 @@ impl Driver {
             return Poll::Pending;
         }
 
+        // quiche only adds a PING if the next packet wouldn't already be
+        // ack-eliciting, so a tick on a busy connection costs nothing.
+        let mut keep_alive = false;
+        if let Some(k) = self.keep_alive.as_mut() {
+            if k.poll(&mut Context::from_waker(waker)) {
+                qconn.send_ack_eliciting()?;
+                keep_alive = true;
+            }
+        }
+
         // Snapshot stats while we hold an immutable view; stored under the lock below.
         let stats = ConnectionStats::from_quiche(qconn);
 
@@ -549,7 +600,9 @@ impl Driver {
             self.flush_send(qconn, stream_id)?;
         }
 
-        if sleep {
+        // Returning Ready hands control back to the io loop, which flushes the
+        // scheduled PING to the socket.
+        if sleep && !keep_alive {
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
