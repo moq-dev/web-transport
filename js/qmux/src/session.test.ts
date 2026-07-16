@@ -1201,6 +1201,23 @@ describe("Session.accept (server role)", () => {
 		await expectSessionFailure(session);
 	});
 
+	test("ArrayBuffer chunks decode on a transport we were handed directly", async () => {
+		// `openWebSocketStream` normalizes the native API's ArrayBuffer chunks, but
+		// accept() gets the transport as-is — and Chromium's WebSocketStream yields
+		// ArrayBuffer. Without normalization in the read loop this throws
+		// "Expected ArrayBuffer for the first argument" out of the varint decoder
+		// and the session never opens a stream.
+		const { session, peer } = accept();
+		await session.ready;
+		peer.sendArrayBuffer({ type: "transport_parameters", params: peerParams() });
+
+		// Decoding the params is what grants the stream-count credit this claims.
+		const writable = await session.createUnidirectionalStream();
+		await writable.getWriter().write(new Uint8Array([1]));
+		expect((await firstStreamId(peer)).serverInitiated).toBe(true);
+		session.close();
+	});
+
 	test("the wire format comes from the socket's negotiated subprotocol", async () => {
 		const { session, peer } = accept({ protocol: "qmux-01.moq-lite-04" });
 		await session.ready;

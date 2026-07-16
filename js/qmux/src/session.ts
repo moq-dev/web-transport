@@ -755,7 +755,7 @@ export default class Session implements WebTransport {
 		);
 	}
 
-	async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array | string>) {
+	async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array | ArrayBuffer | string>) {
 		try {
 			while (true) {
 				const { value, done } = await reader.read();
@@ -767,7 +767,12 @@ export default class Session implements WebTransport {
 					this.#abort(1003, "text frames are not valid for QMux");
 					return;
 				}
-				this.#onData(value);
+				// `openWebSocketStream` normalizes the native API's ArrayBuffer chunks,
+				// but a transport handed straight to the constructor or [[accept]]
+				// hasn't been through it — and Chromium's WebSocketStream yields
+				// ArrayBuffer. Normalize here so every inbound path reaches the decoder
+				// as a Uint8Array.
+				this.#onData(value instanceof ArrayBuffer ? new Uint8Array(value) : value);
 			}
 		} catch (err) {
 			this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream read error");
