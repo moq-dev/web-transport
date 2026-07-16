@@ -98,7 +98,44 @@ impl<M: Metrics> ClientBuilder<M> {
         Self(self.0.with_server_certificate_hashes(hashes))
     }
 
+    /// Override the TLS server name (SNI) used for the handshake and hostname
+    /// verification.
+    ///
+    /// Defaults to the host in the URL passed to [ClientBuilder::connect], which
+    /// is almost always what you want. Set it explicitly to reach a server whose
+    /// certificate names a different host than the one you're dialing.
+    ///
+    /// The URL is otherwise unaffected: the `:authority` sent in the CONNECT
+    /// request still comes from the URL.
+    pub fn with_server_name(self, name: impl Into<String>) -> Self {
+        Self(self.0.with_server_name(name))
+    }
+
+    /// Send a PING on this interval, keeping an idle connection alive.
+    ///
+    /// Disabled by default. This must be shorter than the peer's
+    /// [Settings::max_idle_timeout] to have any effect; a third of it is a
+    /// reasonable choice.
+    pub fn with_keep_alive(self, interval: std::time::Duration) -> Self {
+        Self(self.0.with_keep_alive(interval))
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(self, enabled: bool) -> Self {
+        Self(self.0.with_gso(enabled))
+    }
+
     /// Connect to the WebTransport server at the given URL.
+    ///
+    /// The URL host is resolved via DNS and the first address is used. Resolve
+    /// it yourself and call [ClientBuilder::connect_to] to choose the address,
+    /// for example to prefer a particular address family.
     ///
     /// DNS resolution and socket setup happen eagerly. The returned [Connecting]
     /// has an [established](Connecting::established) method to complete the full handshake
@@ -110,13 +147,7 @@ impl<M: Metrics> ClientBuilder<M> {
         request: impl Into<ConnectRequest>,
     ) -> Result<Connecting, ClientError> {
         let request = request.into();
-
-        let port = request.url.port().unwrap_or(443);
-
-        let host = match request.url.host() {
-            Some(host) => host.to_string(),
-            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
-        };
+        let (host, port) = Self::target(&request)?;
 
         let connecting = self.0.connect(&host, port).await?;
 
@@ -124,6 +155,47 @@ impl<M: Metrics> ClientBuilder<M> {
             connecting,
             request,
         })
+    }
+
+    /// Connect to the WebTransport server at an already-resolved address.
+    ///
+    /// The URL still supplies the request itself, including the TLS server name
+    /// unless [ClientBuilder::with_server_name] overrides it. Only the address
+    /// to dial is taken from `remote`.
+    ///
+    /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
+    pub async fn connect_to(
+        mut self,
+        request: impl Into<ConnectRequest>,
+        remote: std::net::SocketAddr,
+    ) -> Result<Connecting, ClientError> {
+        let request = request.into();
+        let (host, _) = Self::target(&request)?;
+
+        // `ez::connect_to` has no host to fall back on, so pin down the name the
+        // URL implies unless the caller already chose one.
+        self.0 = self.0.with_default_server_name(host);
+
+        let connecting = self.0.connect_to(remote).await?;
+
+        Ok(Connecting {
+            connecting,
+            request,
+        })
+    }
+
+    /// The host and port to dial for a request.
+    fn target(request: &ConnectRequest) -> Result<(String, u16), ClientError> {
+        // `Host` renders IPv6 in URL form, bracketed, which is not what a
+        // resolver or a TLS server name wants.
+        let host = match request.url.host() {
+            Some(url::Host::Domain(host)) => host.to_string(),
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Ipv6(ip)) => ip.to_string(),
+            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
+        };
+
+        Ok((host, request.url.port().unwrap_or(443)))
     }
 }
 

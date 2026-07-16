@@ -1,9 +1,12 @@
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::ez::socket::capabilities;
 use crate::ez::tls::{ClientHook, ClientVerify};
 use crate::ez::DriverState;
 
@@ -24,7 +27,13 @@ pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     socket: Option<tokio::net::UdpSocket>,
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     verify: ClientVerify,
+    // Held for API symmetry with ServerBuilder: `connect_with_config` has no
+    // metrics hook, so tokio-quiche never reports client-side metrics.
+    #[allow(dead_code)]
     metrics: M,
+    server_name: Option<String>,
+    keep_alive: Option<Duration>,
+    gso: bool,
 }
 
 impl Default for ClientBuilder<DefaultMetrics> {
@@ -45,23 +54,19 @@ impl<M: Metrics> ClientBuilder<M> {
             socket: None,
             tls: None,
             verify: ClientVerify::Default,
+            server_name: None,
+            keep_alive: None,
+            gso: true,
         }
     }
 
     /// Listen for incoming packets on the given socket.
     ///
     /// Defaults to an ephemeral port if not specified.
-    pub fn with_socket(self, socket: std::net::UdpSocket) -> io::Result<Self> {
+    pub fn with_socket(mut self, socket: std::net::UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        let socket = tokio::net::UdpSocket::from_std(socket)?;
-
-        Ok(Self {
-            socket: Some(socket),
-            settings: self.settings,
-            metrics: self.metrics,
-            tls: self.tls,
-            verify: self.verify,
-        })
+        self.socket = Some(tokio::net::UdpSocket::from_std(socket)?);
+        Ok(self)
     }
 
     /// Listen for incoming packets on the given address.
@@ -84,17 +89,53 @@ impl<M: Metrics> ClientBuilder<M> {
 
     /// Optional: Use a client certificate for mTLS.
     pub fn with_single_cert(
-        self,
+        mut self,
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Self {
-        Self {
-            tls: Some((chain, key)),
-            settings: self.settings,
-            metrics: self.metrics,
-            socket: self.socket,
-            verify: self.verify,
-        }
+        self.tls = Some((chain, key));
+        self
+    }
+
+    /// Override the TLS server name (SNI) used for the handshake and hostname
+    /// verification.
+    ///
+    /// [ClientBuilder::connect] defaults this to the host it was given, which is
+    /// almost always what you want. Set it explicitly to reach a server whose
+    /// certificate names a different host than the one you're dialing, and to
+    /// name the peer for [ClientBuilder::connect_to].
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    /// Set the TLS server name unless [ClientBuilder::with_server_name] already
+    /// chose one, so an explicit override always wins.
+    pub(crate) fn with_default_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name.get_or_insert_with(|| name.into());
+        self
+    }
+
+    /// Send a PING on this interval, keeping an idle connection alive.
+    ///
+    /// Disabled by default. This must be shorter than the peer's
+    /// [Settings::max_idle_timeout] to have any effect; a third of it is a
+    /// reasonable choice.
+    pub fn with_keep_alive(mut self, interval: Duration) -> Self {
+        self.keep_alive = Some(interval);
+        self
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(mut self, enabled: bool) -> Self {
+        self.gso = enabled;
+        self
     }
 
     /// Verify the server certificate against an explicit set of root
@@ -116,49 +157,59 @@ impl<M: Metrics> ClientBuilder<M> {
 
     /// Connect to the QUIC server at the given host and port.
     ///
+    /// The host is resolved via DNS and the first address is used. Resolve the
+    /// host yourself and call [ClientBuilder::connect_to] to choose the address,
+    /// for example to prefer a particular address family.
+    ///
+    /// Unless [ClientBuilder::with_server_name] overrides it, `host` is also the
+    /// TLS server name.
+    ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connecting> {
+    pub async fn connect(self, host: &str, port: u16) -> io::Result<Connecting> {
+        let mut remotes = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::HostUnreachable, err.to_string()))?;
+
+        let remote = remotes.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "no addresses found for host",
+            )
+        })?;
+
+        self.with_default_server_name(host).connect_to(remote).await
+    }
+
+    /// Connect to the QUIC server at an already-resolved address.
+    ///
+    /// [ClientBuilder::with_server_name] is required, as there's no host name to
+    /// derive the TLS server name from.
+    ///
+    /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
+    pub async fn connect_to(mut self, remote: SocketAddr) -> io::Result<Connecting> {
+        let server_name = self.server_name.take().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connect_to requires with_server_name",
+            )
+        })?;
+
         if self.socket.is_none() {
             self = self.with_bind("[::]:0")?;
         }
 
         let socket = self.socket.take().unwrap();
-
-        let mut remotes = match tokio::net::lookup_host((host, port)).await {
-            Ok(remotes) => remotes,
-            Err(err) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::HostUnreachable,
-                    err.to_string(),
-                ));
-            }
-        };
-
-        // Return the first entry.
-        let remote = match remotes.next() {
-            Some(remote) => remote,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::HostUnreachable,
-                    "no addresses found for host",
-                ))
-            }
-        };
-
         socket.connect(remote).await?;
 
-        // Connect to the server using the addr we just resolved.
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        // Enable the offloads the kernel supports before the socket is wrapped;
+        // `from_udp` starts with everything disabled.
+        let capabilities = capabilities(&socket, self.gso);
+
         let mut socket = tokio_quiche::socket::Socket::<
             Arc<tokio::net::UdpSocket>,
             Arc<tokio::net::UdpSocket>,
         >::from_udp(socket)?;
-
-        // Enable UDP GSO/GRO offload where the kernel supports it (Linux only).
-        // This mirrors the server listener and cuts syscall overhead at high
-        // throughput; it's a no-op if send/recv don't share one FD.
-        #[cfg(target_os = "linux")]
-        socket.apply_max_capabilities();
+        socket.capabilities = capabilities;
 
         // Only the fully-insecure path (no verification of any kind) deserves a
         // warning; hash- and root-based verification still authenticate the peer.
@@ -205,11 +256,13 @@ impl<M: Metrics> ClientBuilder<M> {
             dgram_in.0,
             dgram_out.1,
             dgram_max.clone(),
+            self.keep_alive,
         );
 
-        let conn = tokio_quiche::quic::connect_with_config(socket, Some(host), &params, app)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let conn =
+            tokio_quiche::quic::connect_with_config(socket, Some(&server_name), &params, app)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
 
         let conn = Connection::new(
             conn,

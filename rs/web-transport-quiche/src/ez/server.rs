@@ -1,15 +1,17 @@
 use boring::ssl::NameType;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{io, marker::PhantomData};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
-use tokio_quiche::socket::{QuicListener, SocketCapabilities};
+use tokio_quiche::socket::QuicListener;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
+use crate::ez::socket::capabilities;
 use crate::ez::tls::{DynamicCertHook, StaticCertHook};
 use crate::ez::DriverState;
 
@@ -25,7 +27,17 @@ pub struct ServerInit {}
 /// Used with [ServerBuilder] to require at least one listener.
 #[derive(Default)]
 pub struct ServerWithListener {
-    listeners: Vec<QuicListener>,
+    listeners: Vec<Listener>,
+}
+
+/// A listener, in insertion order so [Server::local_addrs] matches the order the
+/// caller added them.
+enum Listener {
+    /// Supplied by the caller and used as-is.
+    Ready(QuicListener),
+    /// Opened by us. It stays a bare socket until the build step, the first
+    /// point where every option affecting it is known.
+    Socket(tokio::net::UdpSocket),
 }
 
 /// Construct a QUIC server using sane defaults.
@@ -34,6 +46,8 @@ pub struct ServerBuilder<M: Metrics = DefaultMetrics, S = ServerInit> {
     metrics: M,
     state: S,
     alpn: Vec<Vec<u8>>,
+    keep_alive: Option<Duration>,
+    gso: bool,
 }
 
 impl Default for ServerBuilder<DefaultMetrics> {
@@ -52,6 +66,8 @@ impl ServerBuilder<DefaultMetrics, ServerInit> {
             metrics: m,
             state: ServerInit {},
             alpn: Vec::new(),
+            keep_alive: None,
+            gso: true,
         }
     }
 }
@@ -61,8 +77,10 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
         ServerBuilder {
             settings: self.settings,
             metrics: self.metrics,
-            state: ServerWithListener { listeners: vec![] },
+            state: ServerWithListener::default(),
             alpn: self.alpn,
+            keep_alive: self.keep_alive,
+            gso: self.gso,
         }
     }
 
@@ -92,33 +110,40 @@ impl<M: Metrics> ServerBuilder<M, ServerInit> {
         self.settings = settings;
         self
     }
+
+    /// Send a PING to each client on this interval, keeping idle connections alive.
+    ///
+    /// See [ServerBuilder::with_keep_alive](ServerBuilder::<M, ServerWithListener>::with_keep_alive).
+    pub fn with_keep_alive(mut self, interval: Duration) -> Self {
+        self.keep_alive = Some(interval);
+        self
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// See [ServerBuilder::with_gso](ServerBuilder::<M, ServerWithListener>::with_gso).
+    pub fn with_gso(mut self, enabled: bool) -> Self {
+        self.gso = enabled;
+        self
+    }
 }
 
 impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     /// Configure the server to use the provided QUIC listener.
+    ///
+    /// The listener is used as-is: it carries its own capabilities and
+    /// connection ID generator, so [ServerBuilder::with_gso] does not apply.
     pub fn with_listener(mut self, listener: QuicListener) -> Self {
-        self.state.listeners.push(listener);
+        self.state.listeners.push(Listener::Ready(listener));
         self
     }
 
     /// Listen for incoming packets on the given socket.
-    pub fn with_socket(self, socket: std::net::UdpSocket) -> io::Result<Self> {
+    pub fn with_socket(mut self, socket: std::net::UdpSocket) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
-
-        // TODO Modify quiche to add other platform support.
-        #[cfg(target_os = "linux")]
-        let capabilities = SocketCapabilities::apply_all_and_get_compatibility(&socket);
-        #[cfg(not(target_os = "linux"))]
-        let capabilities = SocketCapabilities::default();
-
-        let listener = QuicListener {
-            socket,
-            cid_generator: Arc::new(SimpleConnectionIdGenerator),
-            capabilities,
-        };
-
-        Ok(self.with_listener(listener))
+        self.state.listeners.push(Listener::Socket(socket));
+        Ok(self)
     }
 
     /// Listen for incoming packets on the given address.
@@ -131,6 +156,31 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Send a PING to each client on this interval, keeping idle connections alive.
+    ///
+    /// Disabled by default. A server usually wants to let idle clients time out
+    /// rather than hold them open, so reach for this only when something in the
+    /// path (a NAT or load balancer) drops silent flows sooner than
+    /// [Settings::max_idle_timeout] would.
+    pub fn with_keep_alive(mut self, interval: Duration) -> Self {
+        self.keep_alive = Some(interval);
+        self
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// This applies to sockets from [ServerBuilder::with_socket] and
+    /// [ServerBuilder::with_bind] only, not to a [ServerBuilder::with_listener]
+    /// listener. Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(mut self, enabled: bool) -> Self {
+        self.gso = enabled;
         self
     }
 
@@ -169,18 +219,29 @@ impl<M: Metrics> ServerBuilder<M, ServerWithListener> {
             connection_hook: Some(hook),
         };
 
-        // Capture local addresses before the listeners are consumed.
-        let local_addrs: Vec<SocketAddr> = self
+        let listeners: Vec<QuicListener> = self
             .state
             .listeners
-            .iter()
-            .map(|l| l.socket.local_addr().unwrap())
+            .into_iter()
+            .map(|listener| match listener {
+                Listener::Ready(listener) => listener,
+                Listener::Socket(socket) => QuicListener {
+                    capabilities: capabilities(&socket, self.gso),
+                    socket,
+                    cid_generator: Arc::new(SimpleConnectionIdGenerator),
+                },
+            })
             .collect();
 
+        // Capture local addresses before the listeners are consumed.
+        let local_addrs: Vec<SocketAddr> = listeners
+            .iter()
+            .map(|l| l.socket.local_addr())
+            .collect::<io::Result<_>>()?;
+
         let params = tokio_quiche::ConnectionParams::new_server(self.settings, dummy_tls, hooks);
-        let server =
-            tokio_quiche::listen_with_capabilities(self.state.listeners, params, self.metrics)?;
-        Ok(Server::new(server, local_addrs))
+        let server = tokio_quiche::listen_with_capabilities(listeners, params, self.metrics)?;
+        Ok(Server::new(server, local_addrs, self.keep_alive))
     }
 }
 
@@ -250,6 +311,7 @@ impl<M: Metrics> Server<M> {
     fn new(
         sockets: Vec<tokio_quiche::QuicConnectionStream<M>>,
         local_addrs: Vec<SocketAddr>,
+        keep_alive: Option<Duration>,
     ) -> Self {
         let mut tasks = JoinSet::default();
 
@@ -258,7 +320,7 @@ impl<M: Metrics> Server<M> {
         for socket in sockets {
             let accept = accept.0.clone();
             // TODO close all when one errors
-            tasks.spawn(Self::run_socket(socket, accept));
+            tasks.spawn(Self::run_socket(socket, accept, keep_alive));
         }
 
         Self {
@@ -272,6 +334,7 @@ impl<M: Metrics> Server<M> {
     async fn run_socket(
         socket: tokio_quiche::QuicConnectionStream<M>,
         accept: mpsc::Sender<Incoming>,
+        keep_alive: Option<Duration>,
     ) -> io::Result<()> {
         let mut rx = socket.into_inner();
         while let Some(initial) = rx.recv().await {
@@ -298,6 +361,7 @@ impl<M: Metrics> Server<M> {
                 dgram_in.0,
                 dgram_out.1,
                 dgram_max.clone(),
+                keep_alive,
             );
 
             let inner = initial.start(session);

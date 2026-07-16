@@ -81,10 +81,27 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerInit> {
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
     }
+
+    /// Send a PING to each client on this interval, keeping idle connections alive.
+    ///
+    /// See [ServerBuilder::with_keep_alive](ServerBuilder::<M, ez::ServerWithListener>::with_keep_alive).
+    pub fn with_keep_alive(self, interval: std::time::Duration) -> Self {
+        Self(self.0.with_keep_alive(interval))
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// See [ServerBuilder::with_gso](ServerBuilder::<M, ez::ServerWithListener>::with_gso).
+    pub fn with_gso(self, enabled: bool) -> Self {
+        Self(self.0.with_gso(enabled))
+    }
 }
 
 impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
     /// Configure the server to use the provided QUIC listener.
+    ///
+    /// The listener is used as-is: it carries its own capabilities and
+    /// connection ID generator, so [ServerBuilder::with_gso] does not apply.
     pub fn with_listener(self, listener: tokio_quiche::socket::QuicListener) -> Self {
         Self(self.0.with_listener(listener))
     }
@@ -102,6 +119,29 @@ impl<M: ez::Metrics> ServerBuilder<M, ez::ServerWithListener> {
     /// Use the provided [Settings] instead of the defaults.
     pub fn with_settings(self, settings: ez::Settings) -> Self {
         Self(self.0.with_settings(settings))
+    }
+
+    /// Send a PING to each client on this interval, keeping idle connections alive.
+    ///
+    /// Disabled by default. A server usually wants to let idle clients time out
+    /// rather than hold them open, so reach for this only when something in the
+    /// path (a NAT or load balancer) drops silent flows sooner than
+    /// [Settings::max_idle_timeout](ez::Settings::max_idle_timeout) would.
+    pub fn with_keep_alive(self, interval: std::time::Duration) -> Self {
+        Self(self.0.with_keep_alive(interval))
+    }
+
+    /// Enable UDP generic segmentation offload (GSO), on by default.
+    ///
+    /// GSO cuts syscall overhead at high throughput by handing the kernel
+    /// several packets at once, but some NICs and virtual network stacks
+    /// mishandle it. Turn it off if large sends are being dropped.
+    ///
+    /// This applies to sockets from [ServerBuilder::with_socket] and
+    /// [ServerBuilder::with_bind] only, not to a [ServerBuilder::with_listener]
+    /// listener. Only Linux supports GSO; elsewhere this does nothing.
+    pub fn with_gso(self, enabled: bool) -> Self {
+        Self(self.0.with_gso(enabled))
     }
 
     /// Configure the server to use a static certificate for TLS.

@@ -38,6 +38,18 @@ fn make_ca_chain() -> Result<(
     Vec<CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 )> {
+    make_ca_chain_for(vec!["localhost".into(), "127.0.0.1".into()])
+}
+
+/// [make_ca_chain], but with an explicit set of leaf SANs.
+#[allow(clippy::type_complexity)]
+fn make_ca_chain_for(
+    sans: Vec<String>,
+) -> Result<(
+    CertificateDer<'static>,
+    Vec<CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+)> {
     let ca_key = KeyPair::generate().context("ca key")?;
     let mut ca_params = CertificateParams::new(Vec::new()).context("ca params")?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -48,8 +60,7 @@ fn make_ca_chain() -> Result<(
     let ca_cert = ca_params.self_signed(&ca_key).context("self-sign ca")?;
 
     let leaf_key = KeyPair::generate().context("leaf key")?;
-    let mut leaf_params = CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])
-        .context("leaf params")?;
+    let mut leaf_params = CertificateParams::new(sans).context("leaf params")?;
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "localhost");
@@ -251,6 +262,93 @@ async fn custom_roots_reject() -> Result<()> {
         "handshake must fail when the server cert chains to an untrusted root"
     );
 
+    server.abort();
+    Ok(())
+}
+
+/// A URL for the literal address, which the `localhost`-only leaf below does
+/// *not* cover.
+fn ip_url_for(addr: SocketAddr) -> Result<Url> {
+    Ok(Url::parse(&format!("https://{addr}/"))?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_name_override_accept() -> Result<()> {
+    init_tracing();
+
+    // Leaf covers `localhost` only, so dialing the address literal can only work
+    // if the TLS server name is decoupled from the dial target.
+    let (ca_root, chain, key) = make_ca_chain_for(vec!["localhost".into()])?;
+    let (addr, server) = spawn_server(chain, key).await?;
+
+    let session = ClientBuilder::default()
+        .with_bind(loopback_for(addr))?
+        .with_root_certificates(vec![ca_root])
+        .with_server_name("localhost")
+        .connect(ip_url_for(addr)?)
+        .await?
+        .established()
+        .await
+        .context("handshake should succeed when SNI names a host the cert covers")?;
+
+    session.close(0, "bye");
+    session.closed().await;
+    server.abort();
+    Ok(())
+}
+
+/// The control for `server_name_override_accept`: without the override the
+/// dial target is the server name, and the cert doesn't cover it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_name_override_required() -> Result<()> {
+    init_tracing();
+
+    let (ca_root, chain, key) = make_ca_chain_for(vec!["localhost".into()])?;
+    let (addr, server) = spawn_server(chain, key).await?;
+
+    let url = ip_url_for(addr)?;
+    let client_bind = loopback_for(addr);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async move {
+        ClientBuilder::default()
+            .with_bind(client_bind)?
+            .with_root_certificates(vec![ca_root])
+            .connect(url)
+            .await?
+            .established()
+            .await
+    })
+    .await
+    .context("handshake neither succeeded nor failed within the timeout")?;
+
+    assert!(
+        result.is_err(),
+        "handshake must fail when the cert does not cover the dialed host"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+/// `connect_to` skips DNS but still takes the server name from the URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_to_resolved_addr() -> Result<()> {
+    init_tracing();
+
+    let (ca_root, chain, key) = make_ca_chain()?;
+    let (addr, server) = spawn_server(chain, key).await?;
+
+    let session = ClientBuilder::default()
+        .with_bind(loopback_for(addr))?
+        .with_root_certificates(vec![ca_root])
+        .connect_to(url_for(addr)?, addr)
+        .await?
+        .established()
+        .await
+        .context("handshake should succeed against an already-resolved address")?;
+
+    session.close(0, "bye");
+    session.closed().await;
     server.abort();
     Ok(())
 }

@@ -11,6 +11,7 @@ mod lock;
 mod recv;
 mod send;
 mod server;
+mod socket;
 mod stream;
 pub mod tls;
 
