@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.10](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.9...web-transport-quinn-v0.11.10) - 2026-07-15
+
+### Added
+
+- *(quinn)* wrap send_datagram_wait and datagram_send_buffer_space ([#275](https://github.com/moq-dev/web-transport/pull/275))
+
 ## [0.11.9](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.8...web-transport-quinn-v0.11.9) - 2026-04-07
 
 ### Other

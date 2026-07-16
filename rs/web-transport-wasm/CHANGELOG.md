@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.9](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.8...web-transport-wasm-v0.5.9) - 2026-07-15
+
+### Fixed
+
+- *(wasm)* send datagrams via createWritable(), not deprecated .writable ([#315](https://github.com/moq-dev/web-transport/pull/315))
+
 ## [0.5.8](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.7...web-transport-wasm-v0.5.8) - 2026-06-14
 
 ### Added

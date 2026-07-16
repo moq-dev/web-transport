@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.4.2...web-transport-quiche-v0.4.3) - 2026-07-15
+
+### Fixed
+
+- *(quiche)* wait for driver before reporting closed ([#308](https://github.com/moq-dev/web-transport/pull/308))
+- fix quiche async write shutdown ([#305](https://github.com/moq-dev/web-transport/pull/305))
+
+### Other
+
+- *(deps)* bump the cargo group with 3 updates ([#270](https://github.com/moq-dev/web-transport/pull/270))
+
 ## [0.4.2](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.4.1...web-transport-quiche-v0.4.2) - 2026-06-24
 
 ### Added
