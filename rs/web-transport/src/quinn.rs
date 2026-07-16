@@ -173,9 +173,10 @@ impl Session {
         self.inner.closed().await.into()
     }
 
-    /// Return the URL used to create the session.
-    pub fn url(&self) -> &Url {
-        &self.inner.request().url
+    /// Return the URL used to create the session, or `None` for a raw QUIC
+    /// session established without an HTTP/3 CONNECT request.
+    pub fn url(&self) -> Option<&Url> {
+        self.inner.request().map(|request| &request.url)
     }
 
     /// Return the application protocol used to create the session.

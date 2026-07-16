@@ -66,7 +66,8 @@ pub struct Connection {
     settings: Option<Arc<h3::Settings>>,
 
     // The request and response that were sent and received.
-    request: ConnectRequest,
+    // The request is None for a raw QUIC session.
+    request: Option<ConnectRequest>,
     response: ConnectResponse,
 
     // Opening a stream is two steps — take the stream, then write the WebTransport
@@ -158,7 +159,7 @@ impl Connection {
             header_uni,
             header_bi,
             header_datagram,
-            request: connect.request.clone(),
+            request: Some(connect.request.clone()),
             response: connect.response.clone(),
             settings: Some(Arc::new(settings)),
             open_uni: OpenUni::Idle,
@@ -171,10 +172,10 @@ impl Connection {
             parked_closed: Parked::default(),
         };
 
+        tracing::debug!(url = %connect.request.url, "WebTransport connection established");
+
         // Run a background task to check if the connect stream is closed.
         tokio::spawn(this.clone().run_closed(connect));
-
-        tracing::debug!(url = %this.request().url, "WebTransport connection established");
 
         this
     }
@@ -376,15 +377,14 @@ impl Connection {
         self.conn.closed().await.into()
     }
 
-    /// Create a new session from a raw QUIC connection and a URL.
+    /// Create a new session from a raw QUIC connection.
     ///
-    /// This is used to pretend like a QUIC connection is a WebTransport session.
-    /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
-    pub fn raw(
-        conn: ez::Connection,
-        request: impl Into<ConnectRequest>,
-        response: impl Into<ConnectResponse>,
-    ) -> Self {
+    /// This is used to pretend like a QUIC connection is a WebTransport session,
+    /// making it easier to support WebTransport and raw QUIC simultaneously.
+    ///
+    /// There is no CONNECT request, so [`Self::request`] returns `None`. The response
+    /// is supplied by the caller to carry the negotiated ALPN via [`Self::protocol`].
+    pub fn raw(conn: ez::Connection, response: impl Into<ConnectResponse>) -> Self {
         let drop = Arc::new(ConnectionDrop { conn: conn.clone() });
         Self {
             conn,
@@ -395,7 +395,7 @@ impl Connection {
             header_datagram: Default::default(),
             accept: None,
             settings: None,
-            request: request.into(),
+            request: None,
             response: response.into(),
             open_uni: OpenUni::Idle,
             open_bi: OpenBi::Idle,
@@ -408,8 +408,10 @@ impl Connection {
         }
     }
 
-    pub fn request(&self) -> &ConnectRequest {
-        &self.request
+    /// Returns the [`ConnectRequest`] if this session was established over HTTP/3,
+    /// or `None` for a raw QUIC session.
+    pub fn request(&self) -> Option<&ConnectRequest> {
+        self.request.as_ref()
     }
 
     pub fn response(&self) -> &ConnectResponse {
