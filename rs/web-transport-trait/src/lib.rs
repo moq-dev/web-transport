@@ -138,11 +138,24 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 pub trait SendStream: MaybeSend {
     type Error: Error;
 
-    /// Write some of the buffer to the stream.
+    /// Write some of the buffer to the stream, returning how many bytes were
+    /// written. See [`write_buf`](Self::write_buf) for the cancel-safety contract,
+    /// which this shares.
     fn write(&mut self, buf: &[u8])
         -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend;
 
-    /// Write the given buffer to the stream, advancing the internal position.
+    /// Write some of the given buffer to the stream, advancing it by the number of
+    /// bytes written. This may be less than the whole buffer, so callers loop (or
+    /// use [`write_all`](Self::write_all)).
+    ///
+    /// # Cancel safety
+    ///
+    /// Implementations must be cancel safe: if the returned future is dropped
+    /// before it resolves, `buf` must not have been advanced past what the peer
+    /// will actually receive. Callers race writes against other work, so a byte
+    /// taken from `buf` but never sent becomes a silent hole in the stream, which
+    /// the peer decodes as a truncated or garbage frame. Wait for send capacity
+    /// *before* consuming from `buf`, never after.
     fn write_buf<B: Buf + MaybeSend>(
         &mut self,
         buf: &mut B,
