@@ -7,7 +7,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use crate::ez::tls::{ClientHook, ClientVerify};
 use crate::ez::DriverState;
 
-use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
+use super::{Connection, ConnectionError, Driver, Lock, Settings};
 
 // Local buffer between the application and the driver task — *not* the QUIC
 // datagram queue (configured via `Settings::dgram_send_max_queue_len`). It
@@ -19,30 +19,33 @@ use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, 
 pub(super) const DGRAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Construct a QUIC client using sane defaults.
-pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
+///
+/// Unlike [ServerBuilder](super::ServerBuilder), there is no metrics
+/// counterpart. `tokio-quiche` hardcodes its own `DefaultMetrics` inside
+/// `quic::connect_with_config`, so there is no client-side hook to attach a
+/// custom [Metrics](super::Metrics) implementation to.
+pub struct ClientBuilder {
     settings: Settings,
     socket: Option<tokio::net::UdpSocket>,
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     verify: ClientVerify,
     server_name: Option<String>,
-    metrics: M,
 }
 
-impl Default for ClientBuilder<DefaultMetrics> {
+impl Default for ClientBuilder {
     fn default() -> Self {
-        Self::with_metrics(DefaultMetrics)
+        Self::new()
     }
 }
 
-impl<M: Metrics> ClientBuilder<M> {
-    /// Create a new client builder with custom metrics.
-    pub fn with_metrics(m: M) -> Self {
+impl ClientBuilder {
+    /// Create a new client builder.
+    pub fn new() -> Self {
         let mut settings = Settings::default();
         settings.verify_peer = true;
 
         Self {
             settings,
-            metrics: m,
             socket: None,
             tls: None,
             verify: ClientVerify::Default,
@@ -59,11 +62,7 @@ impl<M: Metrics> ClientBuilder<M> {
 
         Ok(Self {
             socket: Some(socket),
-            settings: self.settings,
-            metrics: self.metrics,
-            tls: self.tls,
-            verify: self.verify,
-            server_name: self.server_name,
+            ..self
         })
     }
 
@@ -93,11 +92,7 @@ impl<M: Metrics> ClientBuilder<M> {
     ) -> Self {
         Self {
             tls: Some((chain, key)),
-            settings: self.settings,
-            metrics: self.metrics,
-            socket: self.socket,
-            verify: self.verify,
-            server_name: self.server_name,
+            ..self
         }
     }
 
