@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { WebSocketLike, WebSocketStreamLike } from "@moq/web-socket-stream";
 import { SessionError } from "./error.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_MAX_RECORD_SIZE, type TransportParams } from "./frame.ts";
@@ -33,7 +34,12 @@ class FakePeer {
 	sent: Uint8Array[] = [];
 	closeInfo: { closeCode?: number; reason?: string } | undefined;
 
-	constructor(url: string) {
+	/** `options` mirrors the native `WebSocketStream` constructor, which
+	 *  `openWebSocketStream` calls with `{protocols, signal}` — hence `protocol`
+	 *  (the *negotiated* value, which only `Session.accept` tests set) rather than
+	 *  a positional argument that call would fill in. */
+	constructor(url: string, options?: { protocol?: string }) {
+		const protocol = options?.protocol ?? "qmux-01";
 		this.url = url;
 		FakePeer.last = this;
 		const readable = new ReadableStream<Uint8Array | ArrayBuffer | string>({
@@ -47,7 +53,7 @@ class FakePeer {
 				this.sent.push(chunk);
 			},
 		});
-		this.opened = Promise.resolve({ readable, writable, protocol: "qmux-01", extensions: "" });
+		this.opened = Promise.resolve({ readable, writable, protocol, extensions: "" });
 		const closed = Promise.withResolvers<{ closeCode?: number; reason?: string }>();
 		this.closed = closed.promise;
 		this.#closedResolve = closed.resolve;
@@ -105,6 +111,34 @@ class FakePeer {
 	}
 	count(type: Frame.Any["type"]): number {
 		return this.received().filter((f) => f.type === type).length;
+	}
+}
+
+/** A plain `WebSocket` as a server host hands it over: already open, with the
+ *  subprotocol picked during the upgrade. `Session.accept` has to wrap this
+ *  itself — there's no `WebSocketStream` in sight. */
+class FakeServerSocket implements WebSocketLike {
+	binaryType = "blob";
+	bufferedAmount = 0;
+	readyState = 1; // OPEN
+	extensions = "";
+	sent: Array<string | ArrayBufferLike | ArrayBufferView> = [];
+
+	onopen: ((ev: unknown) => void) | null = null;
+	onmessage: ((ev: { data: unknown }) => void) | null = null;
+	onerror: ((ev: unknown) => void) | null = null;
+	onclose: ((ev: { code?: number; reason?: string }) => void) | null = null;
+
+	constructor(
+		readonly url: string,
+		readonly protocol: string,
+	) {}
+
+	send(data: string | ArrayBufferLike | ArrayBufferView): void {
+		this.sent.push(data);
+	}
+	close(): void {
+		this.readyState = 3; // CLOSED
 	}
 }
 
@@ -1074,5 +1108,131 @@ describe("Session integration (scripted peer)", () => {
 		const err = await settleTo(session.createBidirectionalStream());
 		expect(err).toBeInstanceOf(Error);
 		expect((err as Error).message).toBe("Connection closed: 5 done");
+	});
+});
+
+/** Hand `Session.accept` a scripted socket, standing in for one a host handed us
+ *  after an HTTP upgrade. The subprotocol is already negotiated at this point, so
+ *  the peer reports it rather than the session advertising it. */
+function accept(options?: { config?: Config; protocol?: string }): { session: Session; peer: FakePeer } {
+	const peer = new FakePeer("wss://example/test", { protocol: options?.protocol });
+	const session = Session.accept(peer as unknown as WebSocketStreamLike, {
+		// Idle timer off so a stray interval can't interfere with the test.
+		config: { maxIdleTimeout: 0n, ...options?.config },
+	});
+	return { session, peer };
+}
+
+/** The first STREAM frame the session put on the wire. */
+async function firstStreamId(peer: FakePeer): Promise<Stream.Id> {
+	await waitFor(() => peer.has("stream"));
+	return (peer.received().find((f) => f.type === "stream") as Frame.Data).id;
+}
+
+describe("Session.accept (server role)", () => {
+	test("streams we open are server-initiated", async () => {
+		// The whole point of the role: a server minting client-initiated ids would
+		// collide with the client's own streams.
+		const { session, peer } = accept();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		await writable.getWriter().write(new Uint8Array([1]));
+
+		const id = await firstStreamId(peer);
+		expect(id.serverInitiated).toBe(true);
+		expect(id.dir).toBe(Stream.Dir.Uni);
+		session.close();
+	});
+
+	test("bidi streams we open are server-initiated", async () => {
+		const { session, peer } = accept();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const stream = await session.createBidirectionalStream();
+		await stream.writable.getWriter().write(new Uint8Array([1]));
+
+		const id = await firstStreamId(peer);
+		expect(id.serverInitiated).toBe(true);
+		expect(id.dir).toBe(Stream.Dir.Bi);
+		session.close();
+	});
+
+	test("a client-initiated stream arrives as an incoming stream", async () => {
+		const { session, peer } = accept();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		// Client-initiated (isServer: false) — the mirror of what a client session
+		// accepts, and what a client session would reject as a violation.
+		peer.send({
+			type: "stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, false),
+			data: new Uint8Array([7, 8, 9]),
+			fin: true,
+		});
+
+		const reader = session.incomingUnidirectionalStreams.getReader();
+		const { value: incoming } = await reader.read();
+		const { value } = await (incoming as ReadableStream<Uint8Array>).getReader().read();
+		expect(value).toEqual(new Uint8Array([7, 8, 9]));
+		reader.releaseLock();
+		session.close();
+	});
+
+	test("a peer using our own role's stream ids is a protocol violation", async () => {
+		const { session, peer } = accept();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		// Only the server may open server-initiated uni streams; a client sending
+		// one is either confused or spoofing our side of the id space.
+		peer.send({
+			type: "stream",
+			id: Stream.Id.create(0n, Stream.Dir.Uni, true),
+			data: new Uint8Array([1]),
+			fin: false,
+		});
+
+		await waitFor(() => peer.has("connection_close"));
+		expect(sentCloseCode(peer)).toBe(1002);
+		await expectSessionFailure(session);
+	});
+
+	test("the wire format comes from the socket's negotiated subprotocol", async () => {
+		const { session, peer } = accept({ protocol: "qmux-01.moq-lite-04" });
+		await session.ready;
+		expect(session.protocol).toBe("moq-lite-04");
+		// A QMux draft was negotiated, so we owe the peer our parameters.
+		await waitFor(() => peer.has("transport_parameters"));
+		session.close();
+	});
+
+	test("the protocol option stands in for a socket that doesn't report one", async () => {
+		// Without the override this negotiates the legacy `webtransport` wire format
+		// and misreads every QMux frame the peer sends.
+		const peer = new FakePeer("wss://example/test", { protocol: "" });
+		const session = Session.accept(peer as unknown as WebSocketStreamLike, {
+			config: { maxIdleTimeout: 0n },
+			protocol: "qmux-01.moq-lite-04",
+		});
+		await session.ready;
+		expect(session.protocol).toBe("moq-lite-04");
+		await waitFor(() => peer.has("transport_parameters"));
+		session.close();
+	});
+
+	test("a plain WebSocket is adopted, not just a WebSocketStream", async () => {
+		// What Deno.upgradeWebSocket / `ws` actually hand back.
+		const ws = new FakeServerSocket("wss://example/test", "qmux-01");
+		const session = Session.accept(ws, { config: { maxIdleTimeout: 0n } });
+		await session.ready;
+
+		await waitFor(() => ws.sent.length > 0);
+		const [params] = Frame.decodeRecord(ws.sent[0] as Uint8Array);
+		expect(params.type).toBe("transport_parameters");
+		session.close();
 	});
 });
