@@ -1,10 +1,7 @@
 use std::sync::Arc;
 use web_transport_proto::ConnectRequest;
 
-use crate::{
-    ez::{self, DefaultMetrics, Metrics},
-    h3, Connection, Settings,
-};
+use crate::{ez, h3, Connection, Settings};
 
 /// An error returned when connecting to a WebTransport endpoint.
 #[derive(thiserror::Error, Debug, Clone)]
@@ -32,24 +29,24 @@ impl From<std::io::Error> for ClientError {
 }
 
 /// Construct a WebTransport client using sane defaults.
-pub struct ClientBuilder<M: Metrics = DefaultMetrics>(ez::ClientBuilder<M>);
+///
+/// Unlike [ServerBuilder](crate::ServerBuilder), there is no `with_metrics`
+/// counterpart. `tokio-quiche` hardcodes its own `DefaultMetrics` on the client
+/// path, so custom [Metrics](ez::Metrics) are server-only.
+pub struct ClientBuilder(ez::ClientBuilder);
 
-impl Default for ClientBuilder<DefaultMetrics> {
+impl Default for ClientBuilder {
     fn default() -> Self {
-        Self(ez::ClientBuilder::default())
+        Self::new()
     }
 }
 
-impl ClientBuilder<DefaultMetrics> {
-    /// Create a new client builder with custom metrics.
-    ///
-    /// Use [ClientBuilder::default] if you don't care about metrics.
-    pub fn with_metrics<M: Metrics>(m: M) -> ClientBuilder<M> {
-        ClientBuilder(ez::ClientBuilder::with_metrics(m))
+impl ClientBuilder {
+    /// Create a new client builder.
+    pub fn new() -> Self {
+        Self(ez::ClientBuilder::new())
     }
-}
 
-impl<M: Metrics> ClientBuilder<M> {
     /// Listen for incoming packets on the given socket.
     ///
     /// Defaults to an ephemeral port if not specified.
