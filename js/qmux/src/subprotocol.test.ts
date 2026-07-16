@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveSubprotocols } from "./session.ts";
+import { resolveSubprotocols, selectSubprotocol } from "./session.ts";
 
 // The bare version ALPNs the polyfill appends when `requireProtocol` is false.
 const BARE = ["qmux-02", "qmux-01", "qmux-00", "webtransport"];
@@ -47,5 +47,51 @@ describe("resolveSubprotocols", () => {
 
 	test("a bare entry with no versions mapping throws", () => {
 		expect(() => resolveSubprotocols(["moq-lite-04"], {}, true)).toThrow();
+	});
+});
+
+describe("selectSubprotocol", () => {
+	const OPTIONS = { protocols: ["moq-lite-04"], versions: { "moq-lite-04": null }, requireProtocol: true };
+
+	test("picks the offered pair", () => {
+		expect(selectSubprotocol(["qmux-01.moq-lite-04"], OPTIONS)).toBe("qmux-01.moq-lite-04");
+	});
+
+	test("parses a raw comma-separated header", () => {
+		// What `req.headers.get("sec-websocket-protocol")` actually hands back.
+		expect(selectSubprotocol("qmux-00.moq-lite-04, qmux-01.moq-lite-04", OPTIONS)).toBe("qmux-01.moq-lite-04");
+	});
+
+	test("our preference wins, not the client's", () => {
+		// The client lists qmux-00 first; we prefer the newest draft we support.
+		// Matching the client's order here would silently pin every session to the
+		// oldest draft any peer still offers.
+		expect(selectSubprotocol(["qmux-00.moq-lite-04", "qmux-02.moq-lite-04"], OPTIONS)).toBe("qmux-02.moq-lite-04");
+	});
+
+	test("falls back to a bare version ALPN when the client pins no app protocol", () => {
+		expect(selectSubprotocol(["qmux-01"], { protocols: ["moq-lite-04"], versions: { "moq-lite-04": null } })).toBe(
+			"qmux-01",
+		);
+	});
+
+	test("requireProtocol refuses a client offering only bare ALPNs", () => {
+		expect(selectSubprotocol(["qmux-01", "webtransport"], OPTIONS)).toBeUndefined();
+	});
+
+	test("no overlap yields undefined", () => {
+		expect(selectSubprotocol(["qmux-01.something-else"], OPTIONS)).toBeUndefined();
+	});
+
+	test("an absent or empty header yields undefined", () => {
+		// A client that offered nothing can't be speaking a version we chose for it.
+		expect(selectSubprotocol(null, OPTIONS)).toBeUndefined();
+		expect(selectSubprotocol("", OPTIONS)).toBeUndefined();
+		expect(selectSubprotocol([], OPTIONS)).toBeUndefined();
+		expect(selectSubprotocol(undefined, OPTIONS)).toBeUndefined();
+	});
+
+	test("a legacy client gets the webtransport wire format by default", () => {
+		expect(selectSubprotocol("webtransport", {})).toBe("webtransport");
 	});
 });

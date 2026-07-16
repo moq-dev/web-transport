@@ -1,4 +1,9 @@
-import { openWebSocketStream, type WebSocketStreamLike } from "@moq/web-socket-stream";
+import {
+	openWebSocketStream,
+	type WebSocketLike,
+	WebSocketStream,
+	type WebSocketStreamLike,
+} from "@moq/web-socket-stream";
 import { Credit, replenishWindow } from "./credit.ts";
 import { SessionError } from "./error.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
@@ -303,8 +308,36 @@ export interface SessionOptions extends WebTransportOptions {
 	sendBufferSize?: number;
 }
 
+/** Options for accepting a QMux Session on an already-negotiated socket.
+ *
+ * The handshake is done by the time [[Session.accept]] is called, so the
+ * subprotocol options ([[SessionOptions.protocols]], `versions`,
+ * `requireProtocol`) don't apply — see [[selectSubprotocol]], which consumes
+ * them during the upgrade instead.
+ */
+export interface AcceptOptions extends Pick<SessionOptions, "config" | "sendBufferSize"> {
+	/** The negotiated `Sec-WebSocket-Protocol` value, for hosts that don't expose
+	 *  it on the socket.
+	 *
+	 *  [[Session.accept]] reads `socket.protocol` by default, which is where the
+	 *  wire-format version comes from. Set this when the socket reports an empty
+	 *  protocol despite one having been negotiated — otherwise the session falls
+	 *  back to the legacy `webtransport` wire format and the peer's QMux frames
+	 *  are misread. Pass the full wire value (e.g. `"qmux-02.moq-lite-04"`), not
+	 *  the bare app protocol. */
+	protocol?: string;
+}
+
 /** Default send-buffer high-water mark (bytes) for the WebSocketStream ponyfill. */
 const DEFAULT_SEND_BUFFER_SIZE = 64 * 1024;
+
+/** Present the caller's socket as a `WebSocketStreamLike`, whichever they passed.
+ *
+ * A `WebSocketStream` (native or ponyfill) already has the shape; a plain
+ * `WebSocket` gets wrapped, which takes ownership of its event handlers. */
+function toWebSocketStream(socket: WebSocketLike | WebSocketStreamLike, highWaterMark: number): WebSocketStreamLike {
+	return "opened" in socket ? socket : WebSocketStream.adopt(socket, { highWaterMark });
+}
 
 /** Get the subprotocol prefix for a QMux wire-format version. */
 function versionPrefix(version: Version): string {
@@ -384,6 +417,51 @@ export function resolveSubprotocols(
 	return out;
 }
 
+/** Choose the `Sec-WebSocket-Protocol` value to accept from a client's offer.
+ *
+ * The server role performs the WebSocket handshake itself (`Deno.upgradeWebSocket`,
+ * `ws`, `Bun.serve`, ...), so it — not this library — picks the subprotocol. This
+ * is the server-side mirror of [[resolveSubprotocols]]: it expands the same
+ * `protocols` + `versions` pair into the wire forms this session supports, in
+ * preference order, and returns the first one the client offered. Pass the result
+ * to the host's upgrade call, then hand the accepted socket to [[Session.accept]],
+ * which derives the wire-format version from it.
+ *
+ * `offered` accepts the raw `Sec-WebSocket-Protocol` header (comma-separated) or
+ * an already-split list. Returns `undefined` when nothing matches, which the
+ * caller should turn into a failed upgrade rather than accepting the socket:
+ * completing the handshake with no subprotocol negotiates the legacy
+ * `webtransport` wire format, which is unlikely to be what the client wanted.
+ *
+ * Preference is ours, not the client's — the first entry in `protocols` that the
+ * client also offered wins, matching the Rust `qmux::ws::Server`.
+ *
+ * @example
+ * ```ts
+ * const protocol = selectSubprotocol(req.headers.get("sec-websocket-protocol"), {
+ *   protocols: ["moq-transport-17"],
+ *   versions: { "moq-transport-17": null },
+ * });
+ * if (!protocol) return new Response("no supported protocol", { status: 400 });
+ * const { socket, response } = Deno.upgradeWebSocket(req, { protocol });
+ * ```
+ */
+export function selectSubprotocol(
+	offered: string | readonly string[] | null | undefined,
+	options?: Pick<SessionOptions, "protocols" | "versions" | "requireProtocol">,
+): string | undefined {
+	const wanted = typeof offered === "string" ? offered.split(",") : (offered ?? []);
+	const client = new Set(wanted.map((p) => p.trim()).filter((p) => p !== ""));
+	if (client.size === 0) return undefined;
+
+	const ours = resolveSubprotocols(
+		options?.protocols ?? [],
+		options?.versions ?? {},
+		options?.requireProtocol ?? false,
+	);
+	return ours.find((p) => client.has(p));
+}
+
 /** Pick the QMux wire-format version from a negotiated subprotocol. */
 function detectVersion(negotiated: string): WireFormat {
 	for (const v of QMUX_VERSIONS) {
@@ -451,7 +529,13 @@ export default class Session implements WebTransport {
 	#wss?: WebSocketStreamLike;
 	#scheduler?: SendScheduler;
 	#sendBufferSize: number;
+	// The stream-id role: false dials (client), true accepts (server). Set by
+	// [[Session.accept]]; every id we mint and every id we allow the peer to mint
+	// keys off it.
 	#isServer = false;
+	// [[AcceptOptions.protocol]]: stands in for `socket.protocol` when the host
+	// doesn't expose the negotiated subprotocol.
+	#protocolOverride?: string;
 	#closed?: Error;
 	#closeReason?: Error;
 
@@ -530,7 +614,7 @@ export default class Session implements WebTransport {
 	#lastPingRecv?: bigint;
 	#idleTimer?: ReturnType<typeof setInterval>;
 
-	/** Open a QMux session over WebSocket against `url`.
+	/** Open a QMux session as the **client**, dialing `url`.
 	 *
 	 * The polyfill constructs the underlying `WebSocket` itself. Pass the
 	 * application-level ALPNs in `options.protocols` plus a `versions`
@@ -541,8 +625,13 @@ export default class Session implements WebTransport {
 	 * Once the handshake completes, the QMux wire-format version is derived
 	 * from the negotiated `Sec-WebSocket-Protocol`. `.protocol` exposes the
 	 * application protocol with the QMux prefix stripped.
+	 *
+	 * Pass an already-connected `WebSocket` (or `WebSocketStream`) instead of a
+	 * URL to run the client role over a socket you opened yourself — the
+	 * subprotocol was chosen when you created it, so `options.protocols` and
+	 * `options.versions` are ignored. See [[Session.accept]] for the server role.
 	 */
-	constructor(url: string | URL, options?: SessionOptions) {
+	constructor(source: string | URL | WebSocketLike | WebSocketStreamLike, options?: SessionOptions) {
 		if (options?.requireUnreliable) {
 			throw new Error("not allowed to use WebSocket; requireUnreliable is true");
 		}
@@ -550,11 +639,12 @@ export default class Session implements WebTransport {
 			console.warn("serverCertificateHashes is not supported; trying anyway");
 		}
 
-		const subprotocols = resolveSubprotocols(
-			options?.protocols ?? [],
-			options?.versions ?? {},
-			options?.requireProtocol ?? false,
-		);
+		const dial = typeof source === "string" || source instanceof URL;
+		// Resolve before any other setup so a bad protocols/versions pairing throws
+		// from the constructor rather than failing the handshake later.
+		const subprotocols = dial
+			? resolveSubprotocols(options?.protocols ?? [], options?.versions ?? {}, options?.requireProtocol ?? false)
+			: [];
 
 		// Merge user config with defaults
 		this.#config = { ...DEFAULT_CONFIG, ...options?.config };
@@ -588,24 +678,58 @@ export default class Session implements WebTransport {
 		this.#incomingUnidirectionalQueue = new IncomingStreamQueue<ReadableStream<Uint8Array>>();
 		this.incomingUnidirectionalStreams = this.#incomingUnidirectionalQueue.readable;
 
-		this.#connect(toWebSocketUrl(url), subprotocols);
+		this.#attach(
+			dial
+				? // Open the transport via `WebSocketStream` — native when present (real
+					// backpressure), else the ponyfill over a plain `WebSocket`. One code
+					// path for both, so the path exercised in tests is the one Chromium
+					// runs natively.
+					openWebSocketStream(toWebSocketUrl(source as string | URL), {
+						protocols: subprotocols,
+						highWaterMark: this.#sendBufferSize,
+					})
+				: toWebSocketStream(source as WebSocketLike | WebSocketStreamLike, this.#sendBufferSize),
+		);
 	}
 
-	/** Open the transport via `WebSocketStream` — native when present (real
-	 *  backpressure), else the ponyfill over a plain `WebSocket`. One code path
-	 *  for both, so the path exercised in tests is the one Chromium runs natively. */
-	#connect(url: string, subprotocols: string[]) {
-		const wss = openWebSocketStream(url, {
-			protocols: subprotocols,
-			highWaterMark: this.#sendBufferSize,
-		});
+	/** Open a QMux session as the **server**, over a socket you have already
+	 *  accepted from an HTTP upgrade.
+	 *
+	 * The host performs the WebSocket handshake (`Deno.upgradeWebSocket`, `ws`,
+	 * ...), so by the time you get here the subprotocol is already negotiated:
+	 * the wire-format version and `.protocol` are read off the socket rather than
+	 * advertised. Use [[selectSubprotocol]] to pick that value during the upgrade.
+	 *
+	 * The returned session is a `WebTransport`, identical to a client session
+	 * apart from the stream-id role — so it accepts peer-initiated streams and
+	 * opens server-initiated ones.
+	 *
+	 * @example
+	 * ```ts
+	 * const { socket, response } = Deno.upgradeWebSocket(req, { protocol });
+	 * const session = Session.accept(socket, { config });
+	 * await session.ready;
+	 * ```
+	 */
+	static accept(socket: WebSocketLike | WebSocketStreamLike, options?: AcceptOptions): Session {
+		const session = new Session(socket, options);
+		// Applied after construction, which is safe because both transports settle
+		// `opened` asynchronously: #startSession, every stream id, and every inbound
+		// frame are interpreted strictly later than this.
+		session.#isServer = true;
+		session.#protocolOverride = options?.protocol;
+		return session;
+	}
+
+	/** Drive the session off an opened transport, whichever way we got it. */
+	#attach(wss: WebSocketStreamLike) {
 		this.#wss = wss;
 
 		wss.opened.then(
 			(conn) => {
 				// The session may have been closed before the socket finished opening.
 				if (this.#closed) return;
-				this.#startSession(conn.protocol, new WritableStreamSink(conn.writable));
+				this.#startSession(this.#protocolOverride ?? conn.protocol, new WritableStreamSink(conn.writable));
 				void this.#readLoop(conn.readable.getReader());
 			},
 			(err: unknown) => {
@@ -631,7 +755,7 @@ export default class Session implements WebTransport {
 		);
 	}
 
-	async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array | string>) {
+	async #readLoop(reader: ReadableStreamDefaultReader<Uint8Array | ArrayBuffer | string>) {
 		try {
 			while (true) {
 				const { value, done } = await reader.read();
@@ -643,7 +767,12 @@ export default class Session implements WebTransport {
 					this.#abort(1003, "text frames are not valid for QMux");
 					return;
 				}
-				this.#onData(value);
+				// `openWebSocketStream` normalizes the native API's ArrayBuffer chunks,
+				// but a transport handed straight to the constructor or [[accept]]
+				// hasn't been through it — and Chromium's WebSocketStream yields
+				// ArrayBuffer. Normalize here so every inbound path reaches the decoder
+				// as a Uint8Array.
+				this.#onData(value instanceof ArrayBuffer ? new Uint8Array(value) : value);
 			}
 		} catch (err) {
 			this.#closeReason ??= err instanceof Error ? err : new Error("WebSocketStream read error");

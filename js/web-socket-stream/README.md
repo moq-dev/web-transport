@@ -54,6 +54,23 @@ import { WebSocketStream } from "@moq/web-socket-stream"
 const wss = new WebSocketStream("wss://example.com", { webSocket: WebSocket, highWaterMark: 32 * 1024 })
 ```
 
+### Adopting an existing socket
+
+A server has no URL to dial: the socket arrives from an HTTP upgrade, already open and with its
+subprotocol negotiated. `adopt` wraps one in place, resolving `opened` without waiting for an
+`onopen` that has already fired:
+
+```ts
+import { WebSocketStream } from "@moq/web-socket-stream"
+
+const { socket, response } = Deno.upgradeWebSocket(req)
+const wss = WebSocketStream.adopt(socket)
+const { readable, writable } = await wss.opened
+```
+
+Adoption takes ownership of the socket's event handlers, so adopt it before anything else reads from
+it — messages delivered beforehand are dropped by the platform rather than buffered.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
