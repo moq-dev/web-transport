@@ -2121,33 +2121,35 @@ impl generic::SendStream for SendStream {
         while buf.has_remaining() {
             let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
 
-            // Claim flow control credit
+            // Wait for queue capacity and flow-control credit *before* taking any
+            // bytes out of `buf`. Callers race this future against other work (moq
+            // re-prioritizes a stream mid-write), so every await here has to leave
+            // the caller's buffer untouched: dropping the future returns the permit
+            // and claims no credit, and the caller just retries. Taking the bytes
+            // first and awaiting after would let a cancel strand them — gone from
+            // `buf` but never queued, a silent hole the peer decodes as garbage.
+            let permit = tokio::select! {
+                result = self.outbound.reserve() => result?,
+                Some(stop) = self.inbound_stopped.recv() => return Err(self.recv_stop(stop.code)),
+            };
+
             let allowed = self.claim_credit(chunk_len).await?;
             let to_send = allowed as usize;
 
+            // Committed: no await between taking the bytes and queueing them.
             let frame = Stream {
                 id: self.id,
                 offset: self.offset,
                 data: buf.copy_to_bytes(to_send),
                 fin: false,
             };
-
-            tokio::select! {
-                result = self.outbound.push(self.priority, self.id, frame.into()) => {
-                    if result.is_err() {
-                        // Release credit since data was never sent
-                        self.release_credit(to_send as u64);
-                        return Err(Error::Closed);
-                    }
-                    self.offset += to_send as u64;
-                    total += to_send;
-                }
-                Some(stop) = self.inbound_stopped.recv() => {
-                    // Release credit since data was never sent
-                    self.release_credit(to_send as u64);
-                    return Err(self.recv_stop(stop.code));
-                }
+            if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
+                // The session closed while we held the permit; the data was never sent.
+                self.release_credit(to_send as u64);
+                return Err(err);
             }
+            self.offset += to_send as u64;
+            total += to_send;
         }
 
         Ok(total)
@@ -2618,6 +2620,166 @@ mod send_offset_tests {
                 other => panic!("expected STREAM, got {other:?}"),
             }
         }
+    }
+}
+
+/// `write_buf` must not lose bytes when its future is dropped.
+///
+/// Callers race writes against other work — moq's publisher selects a write
+/// against the stream's priority-change channel, which fires on every group
+/// boundary — so a write parked on a full queue or on flow control gets
+/// cancelled and retried constantly. Cancelling has to leave the caller's buffer
+/// untouched: a byte taken from `buf` but never queued is a silent hole in the
+/// stream, which the peer decodes as a truncated or garbage frame on an
+/// otherwise healthy, cleanly-finished stream.
+#[cfg(test)]
+mod write_cancel_tests {
+    use bytes::{Buf, Bytes};
+    use tokio::sync::mpsc;
+    use web_transport_trait::SendStream as _;
+
+    use super::SendStream;
+    use crate::credit::Credit;
+    use crate::sched::PriorityQueue;
+    use crate::{Frame, StreamDir, StreamId};
+
+    fn send_stream(
+        outbound: PriorityQueue,
+        stream_credit: Option<Credit>,
+        conn_credit: Option<Credit>,
+    ) -> SendStream {
+        let (control, _control_rx) = mpsc::unbounded_channel();
+        let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
+        SendStream {
+            id: StreamId::new(0, StreamDir::Uni, false),
+            outbound,
+            outbound_priority: control,
+            inbound_stopped: stop_rx,
+            offset: 0,
+            priority: 0,
+            closed: None,
+            fin: false,
+            stream_credit,
+            conn_credit,
+        }
+    }
+
+    /// Drive `write_buf` while repeatedly cancelling it, mirroring moq's
+    /// publisher racing a write against its priority-change channel. Returns the
+    /// bytes taken from the buffer.
+    ///
+    /// Note we can't measure via `write_buf`'s return value: it reports bytes
+    /// queued by *this call*, so cancelling during a later chunk's wait discards
+    /// the running total for chunks already queued. That loses the count, not the
+    /// data (`write_all` re-checks the buffer rather than trusting the count), so
+    /// the queue itself is the source of truth for what actually got sent.
+    async fn cancel_writes(send: &mut SendStream, buf: &mut Bytes) -> usize {
+        let start = buf.remaining();
+        for _ in 0..50 {
+            tokio::select! {
+                result = send.write_buf(buf) => { result.expect("write_buf"); }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        start - buf.remaining()
+    }
+
+    /// Total STREAM payload bytes sitting in the queue.
+    async fn drain(outbound: &PriorityQueue) -> usize {
+        outbound.close();
+        let mut queued = 0;
+        while let Some(frame) = outbound.pop().await {
+            if let Frame::Stream(stream) = frame {
+                queued += stream.data.len();
+            }
+        }
+        queued
+    }
+
+    /// Cancelled while waiting for outbound queue capacity. A write that never
+    /// gets a slot must not take anything from the buffer; before the
+    /// reserve/permit split each cancelled call had already `copy_to_bytes`'d a
+    /// ~16 KB chunk out of `buf` and dropped it on the floor.
+    #[tokio::test]
+    async fn cancelled_write_blocked_on_queue_consumes_nothing() {
+        // Capacity 1, already occupied and never drained: every write parks.
+        let outbound = PriorityQueue::new(1);
+        let mut filler = send_stream(outbound.clone(), None, None);
+        filler.write(&[0xFF]).await.unwrap();
+
+        let mut send = send_stream(outbound.clone(), None, None);
+        let mut buf = Bytes::from(vec![0xAB_u8; 1024 * 1024]);
+        let consumed = cancel_writes(&mut send, &mut buf).await;
+
+        assert_eq!(
+            consumed, 0,
+            "write_buf never got a queue slot but still took {consumed} bytes \
+             from the buffer",
+        );
+    }
+
+    /// A write that never reaches the wire must not spend flow-control credit
+    /// either. Claiming credit and *then* awaiting a queue slot strands the claim
+    /// when the wait is cancelled, and since the peer only replenishes credit for
+    /// data it actually received, a stream cancelled often enough starves itself
+    /// into a permanent stall.
+    #[tokio::test]
+    async fn cancelled_write_blocked_on_queue_spends_no_credit() {
+        const WINDOW: u64 = 64 * 1024;
+
+        let outbound = PriorityQueue::new(1);
+        let mut filler = send_stream(outbound.clone(), None, None);
+        filler.write(&[0xFF]).await.unwrap();
+
+        let stream_credit = Credit::new(WINDOW);
+        let conn_credit = Credit::new(WINDOW);
+        let mut send = send_stream(
+            outbound,
+            Some(stream_credit.clone()),
+            Some(conn_credit.clone()),
+        );
+
+        let mut buf = Bytes::from(vec![0xAB_u8; 1024 * 1024]);
+        cancel_writes(&mut send, &mut buf).await;
+
+        // Nothing was queued, so the whole window must still be available.
+        assert_eq!(
+            stream_credit.try_claim(WINDOW),
+            WINDOW,
+            "cancelled writes leaked stream credit",
+        );
+        assert_eq!(
+            conn_credit.try_claim(WINDOW),
+            WINDOW,
+            "cancelled writes leaked connection credit",
+        );
+    }
+
+    /// Cancelled while waiting for flow-control credit, with the queue draining
+    /// normally: every byte taken from the buffer must be in the queue.
+    #[tokio::test]
+    async fn cancelled_write_blocked_on_credit_queues_what_it_consumes() {
+        // Roomy queue; an exhausted, never-replenished window is what blocks.
+        let outbound = PriorityQueue::new(64);
+        let stream_credit = Credit::new(32 * 1024);
+        let conn_credit = Credit::new(64 * 1024 * 1024);
+
+        let mut send = send_stream(outbound.clone(), Some(stream_credit), Some(conn_credit));
+        let mut buf = Bytes::from(vec![0xAB_u8; 1024 * 1024]);
+        let consumed = cancel_writes(&mut send, &mut buf).await;
+        let queued = drain(&outbound).await;
+
+        assert_eq!(
+            consumed,
+            queued,
+            "write_buf took {consumed} bytes from the buffer but only {queued} \
+             reached the queue — {} bytes silently dropped by cancellation",
+            consumed.saturating_sub(queued),
+        );
+        assert!(
+            consumed > 0,
+            "expected the window's worth of data to get through"
+        );
     }
 }
 
