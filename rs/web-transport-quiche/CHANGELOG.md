@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.4.3...web-transport-quiche-v0.5.0) - 2026-07-16
+
+### Added
+
+- *(quiche)* add keep-alive, GSO opt-out, and dial/SNI split ([#321](https://github.com/moq-dev/web-transport/pull/321))
+- *(quiche)* [**breaking**] add mTLS client auth and TLS server name control ([#325](https://github.com/moq-dev/web-transport/pull/325))
+
+### Fixed
+
+- *(quiche)* drop ClientBuilder::with_metrics, which silently ignored its argument ([#322](https://github.com/moq-dev/web-transport/pull/322))
+
 ## [0.4.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.4.2...web-transport-quiche-v0.4.3) - 2026-07-15
 
 ### Fixed

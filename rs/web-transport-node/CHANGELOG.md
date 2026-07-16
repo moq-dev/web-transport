@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.4...web-transport-node-v0.0.5) - 2026-07-16
+
+### Fixed
+
+- *(node)* republish with napi-rs 3.10 ([#320](https://github.com/moq-dev/web-transport/pull/320))
+
 ### Fixed
 
 - Require napi-rs 3.10.0 or newer to prevent cross-isolate `Buffer` drops from crashing Node.js and Deno processes ([#319](https://github.com/moq-dev/web-transport/issues/319))

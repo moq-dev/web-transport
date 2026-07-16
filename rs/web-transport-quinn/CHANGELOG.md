@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.11](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.10...web-transport-quinn-v0.11.11) - 2026-07-16
+
+### Fixed
+
+- *(qmux)* make write_buf cancel safe so a dropped write can't lose bytes ([#323](https://github.com/moq-dev/web-transport/pull/323))
+
 ## [0.11.10](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.9...web-transport-quinn-v0.11.10) - 2026-07-15
 
 ### Added
