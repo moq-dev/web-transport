@@ -309,11 +309,21 @@ impl Permit {
     /// Append `frame` to `id`'s FIFO using the reserved slot. Never blocks.
     ///
     /// Consumes the permit, so the reservation can't be reused or double-sent.
-    pub fn send(mut self, priority: u8, id: StreamId, frame: Frame) {
-        self.armed = false;
+    /// Fails if the queue closed while the permit was outstanding: the consumer
+    /// has already stopped popping, so enqueuing here would strand the frame and
+    /// report success for data that will never be sent.
+    pub fn send(mut self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
         let mut inner = self.queue.inner.lock().unwrap();
+        if inner.closed {
+            // Release the lock before returning: `self` still counts as armed, so
+            // its `Drop` re-locks to hand the slot back.
+            drop(inner);
+            return Err(Error::Closed);
+        }
+        self.armed = false;
         // `reserve` already counted this frame against `len`.
         self.queue.enqueue_locked(&mut inner, priority, id, frame);
+        Ok(())
     }
 }
 
@@ -373,8 +383,7 @@ mod tests {
         id: StreamId,
         frame: Frame,
     ) -> Result<(), Error> {
-        q.reserve().await?.send(priority, id, frame);
-        Ok(())
+        q.reserve().await?.send(priority, id, frame)
     }
 
     #[tokio::test]
@@ -545,7 +554,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!blocked.is_finished(), "reserve should block while full");
 
-        permit.send(5, a, frame(a, 1));
+        permit.send(5, a, frame(a, 1)).unwrap();
         // Still full: the permit became a real frame rather than freeing the slot.
         tokio::task::yield_now().await;
         assert!(
@@ -592,6 +601,36 @@ mod tests {
         q.pop().await.unwrap();
         push(&q, 5, a, frame(a, 2)).await.unwrap();
         assert_eq!(tag_of(&q.pop().await.unwrap()), 2);
+    }
+
+    /// A permit reserved before `close` must not enqueue after it: `pop` has
+    /// already reported the queue drained and the consumer is gone, so the frame
+    /// would sit there forever while the writer was told it was sent.
+    #[tokio::test]
+    async fn send_after_close_fails() {
+        let q = PriorityQueue::new(4);
+        let a = sid(0);
+
+        let permit = q.reserve().await.unwrap();
+        q.close();
+
+        // The consumer has already given up on this queue.
+        assert!(q.pop().await.is_none());
+        assert!(matches!(permit.send(5, a, frame(a, 1)), Err(Error::Closed)));
+        assert!(
+            q.pop().await.is_none(),
+            "a rejected send must queue nothing"
+        );
+    }
+
+    /// Dropping a permit after close must not panic or underflow `len`.
+    #[tokio::test]
+    async fn drop_after_close_is_clean() {
+        let q = PriorityQueue::new(4);
+        let permit = q.reserve().await.unwrap();
+        q.close();
+        drop(permit);
+        assert!(q.pop().await.is_none());
     }
 
     #[tokio::test]

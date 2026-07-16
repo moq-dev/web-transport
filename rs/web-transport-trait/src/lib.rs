@@ -151,11 +151,13 @@ pub trait SendStream: MaybeSend {
     /// # Cancel safety
     ///
     /// Implementations must be cancel safe: if the returned future is dropped
-    /// before it resolves, `buf` must not have been advanced past what the peer
-    /// will actually receive. Callers race writes against other work, so a byte
-    /// taken from `buf` but never sent becomes a silent hole in the stream, which
-    /// the peer decodes as a truncated or garbage frame. Wait for send capacity
-    /// *before* consuming from `buf`, never after.
+    /// before it resolves, `buf` must not have been advanced past the bytes the
+    /// implementation accepted for sending. (Whether they reach the peer is a
+    /// separate matter — a reset or a dead connection can still discard accepted
+    /// bytes.) Callers race writes against other work, so a byte taken from `buf`
+    /// but never accepted becomes a silent hole in the stream, which the peer
+    /// decodes as a truncated or garbage frame. Wait for send capacity *before*
+    /// consuming from `buf`, never after.
     fn write_buf<B: Buf + MaybeSend>(
         &mut self,
         buf: &mut B,

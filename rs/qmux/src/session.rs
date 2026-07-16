@@ -2143,7 +2143,11 @@ impl generic::SendStream for SendStream {
                 data: buf.copy_to_bytes(to_send),
                 fin: false,
             };
-            permit.send(self.priority, self.id, frame.into());
+            if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
+                // The session closed while we held the permit; the data was never sent.
+                self.release_credit(to_send as u64);
+                return Err(err);
+            }
             self.offset += to_send as u64;
             total += to_send;
         }
