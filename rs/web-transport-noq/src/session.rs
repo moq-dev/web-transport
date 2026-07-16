@@ -54,8 +54,8 @@ pub struct Session {
     // Uses OnceLock for set-once, first-writer-wins semantics with lock-free reads.
     error: Arc<OnceLock<SessionError>>,
 
-    // The request sent by the client.
-    request: ConnectRequest,
+    // The request sent by the client, or None for a raw QUIC session.
+    request: Option<ConnectRequest>,
 
     // The response sent by the server.
     response: ConnectResponse,
@@ -93,7 +93,7 @@ impl Session {
             settings: Some(Arc::new(settings)),
             connect_send: Arc::new(Mutex::new(Some(connect.send))),
             error: error.clone(),
-            request: connect.request.clone(),
+            request: Some(connect.request.clone()),
             response: connect.response.clone(),
         };
 
@@ -479,15 +479,14 @@ impl Session {
         }
     }
 
-    /// Create a new session from a raw QUIC connection and a URL.
+    /// Create a new session from a raw QUIC connection.
     ///
-    /// This is used to pretend like a QUIC connection is a WebTransport session.
-    /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
-    pub fn raw(
-        conn: noq::Connection,
-        request: impl Into<ConnectRequest>,
-        response: impl Into<ConnectResponse>,
-    ) -> Self {
+    /// This is used to pretend like a QUIC connection is a WebTransport session,
+    /// making it easier to support WebTransport and raw QUIC simultaneously.
+    ///
+    /// There is no CONNECT request, so [`Self::request`] returns `None`. The response
+    /// is supplied by the caller to carry the negotiated ALPN via [`Self::protocol`].
+    pub fn raw(conn: noq::Connection, response: impl Into<ConnectResponse>) -> Self {
         Self {
             conn,
             session_id: None,
@@ -498,13 +497,15 @@ impl Session {
             settings: None,
             connect_send: Arc::new(Mutex::new(None)),
             error: Arc::new(OnceLock::new()),
-            request: request.into(),
+            request: None,
             response: response.into(),
         }
     }
 
-    pub fn request(&self) -> &ConnectRequest {
-        &self.request
+    /// Returns the [`ConnectRequest`] if this session was established over HTTP/3,
+    /// or `None` for a raw QUIC session.
+    pub fn request(&self) -> Option<&ConnectRequest> {
+        self.request.as_ref()
     }
 
     pub fn response(&self) -> &ConnectResponse {

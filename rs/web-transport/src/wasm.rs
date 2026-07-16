@@ -108,8 +108,11 @@ impl Session {
     }
 
     /// Return the URL used to create the session.
-    pub fn url(&self) -> &Url {
-        self.0.url()
+    ///
+    /// Always `Some` on this platform; the browser API has no raw QUIC session.
+    /// Matches the native signature so callers compile on both targets.
+    pub fn url(&self) -> Option<&Url> {
+        Some(self.0.url())
     }
 
     /// Return the application protocol used to create the session.
