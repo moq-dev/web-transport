@@ -13,7 +13,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 bytes = "1"
 http = "1"
-napi = { version = "3", features = ["async", "napi8"] }
+napi = { version = "3.10.0", features = ["async", "napi8"] }
 napi-derive = "3"
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["sync"] }
