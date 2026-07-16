@@ -86,6 +86,15 @@ impl ClientBuilder {
         Self(self.0.with_root_certificates(roots))
     }
 
+    /// Use this name for SNI and certificate verification instead of the URL's host.
+    ///
+    /// The dial target is unchanged; only the name the server certificate must
+    /// match is. This is how you reach a host by IP, or through a tunnel, while
+    /// still verifying the certificate it was actually issued for.
+    pub fn with_server_name(self, name: impl Into<String>) -> Self {
+        Self(self.0.with_server_name(name))
+    }
+
     /// Accept the server certificate only if the SHA-256 of its DER encoding
     /// matches one of the provided hashes, bypassing CA verification.
     ///
@@ -93,19 +102,6 @@ impl ClientBuilder {
     /// usual way to reach a relay using a short-lived self-signed certificate.
     pub fn with_server_certificate_hashes(self, hashes: Vec<[u8; 32]>) -> Self {
         Self(self.0.with_server_certificate_hashes(hashes))
-    }
-
-    /// Override the TLS server name (SNI) used for the handshake and hostname
-    /// verification.
-    ///
-    /// Defaults to the host in the URL passed to [ClientBuilder::connect], which
-    /// is almost always what you want. Set it explicitly to reach a server whose
-    /// certificate names a different host than the one you're dialing.
-    ///
-    /// The URL is otherwise unaffected: the `:authority` sent in the CONNECT
-    /// request still comes from the URL.
-    pub fn with_server_name(self, name: impl Into<String>) -> Self {
-        Self(self.0.with_server_name(name))
     }
 
     /// Send a PING on this interval, keeping an idle connection alive.
@@ -130,10 +126,6 @@ impl ClientBuilder {
 
     /// Connect to the WebTransport server at the given URL.
     ///
-    /// The URL host is resolved via DNS and the first address is used. Resolve
-    /// it yourself and call [ClientBuilder::connect_to] to choose the address,
-    /// for example to prefer a particular address family.
-    ///
     /// DNS resolution and socket setup happen eagerly. The returned [Connecting]
     /// has an [established](Connecting::established) method to complete the full handshake
     /// (TLS + SETTINGS + CONNECT).
@@ -147,33 +139,6 @@ impl ClientBuilder {
         let (host, port) = Self::target(&request)?;
 
         let connecting = self.0.connect(&host, port).await?;
-
-        Ok(Connecting {
-            connecting,
-            request,
-        })
-    }
-
-    /// Connect to the WebTransport server at an already-resolved address.
-    ///
-    /// The URL still supplies the request itself, including the TLS server name
-    /// unless [ClientBuilder::with_server_name] overrides it. Only the address
-    /// to dial is taken from `remote`.
-    ///
-    /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect_to(
-        mut self,
-        request: impl Into<ConnectRequest>,
-        remote: std::net::SocketAddr,
-    ) -> Result<Connecting, ClientError> {
-        let request = request.into();
-        let (host, _) = Self::target(&request)?;
-
-        // `ez::connect_to` has no host to fall back on, so pin down the name the
-        // URL implies unless the caller already chose one.
-        self.0 = self.0.with_default_server_name(host);
-
-        let connecting = self.0.connect_to(remote).await?;
 
         Ok(Connecting {
             connecting,

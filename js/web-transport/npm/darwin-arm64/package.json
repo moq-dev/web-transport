@@ -1,6 +1,6 @@
 {
 	"name": "@moq/web-transport-darwin-arm64",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"cpu": [
 		"arm64"
 	],

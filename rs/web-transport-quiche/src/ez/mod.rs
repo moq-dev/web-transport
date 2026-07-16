@@ -26,6 +26,6 @@ use driver::*;
 use lock::*;
 
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-pub use tls::{CertResolver, CertifiedKey};
+pub use tls::{CertResolver, CertifiedKey, ClientAuth};
 pub use tokio_quiche::metrics::{DefaultMetrics, Metrics};
 pub use tokio_quiche::settings::QuicSettings as Settings;

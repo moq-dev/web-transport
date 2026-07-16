@@ -76,6 +76,9 @@ type NativeWebSocketStreamConstructor = new (
  *  `WebSocket` and Node's `ws` satisfy it. */
 export interface WebSocketLike {
 	binaryType: string;
+	/** Absent on some server-side implementations; only used to report
+	 *  {@link WebSocketStreamLike.url} for an adopted socket. */
+	readonly url?: string;
 	readonly bufferedAmount: number;
 	readonly readyState: number;
 	readonly protocol: string;
@@ -104,6 +107,7 @@ export interface WebSocketStreamOptions {
 	highWaterMark?: number;
 }
 
+const CONNECTING = 0;
 const OPEN = 1;
 const DEFAULT_HIGH_WATER_MARK = 64 * 1024;
 
@@ -137,14 +141,20 @@ export class WebSocketStream implements WebSocketStreamLike {
 	#ws: WebSocketLike;
 	#highWaterMark: number;
 
-	constructor(url: string, options: WebSocketStreamOptions = {}) {
-		this.url = url;
-
-		const Ctor = options.webSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
-		if (!Ctor) {
-			throw new Error("No WebSocket implementation found; pass options.webSocket");
+	/** Dial `url`, or wrap a socket you already have (see {@link WebSocketStream.adopt}). */
+	constructor(source: string | WebSocketLike, options: WebSocketStreamOptions = {}) {
+		let ws: WebSocketLike;
+		if (typeof source === "string") {
+			const Ctor = options.webSocket ?? (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket;
+			if (!Ctor) {
+				throw new Error("No WebSocket implementation found; pass options.webSocket");
+			}
+			ws = new Ctor(source, options.protocols);
+			this.url = source;
+		} else {
+			ws = source;
+			this.url = source.url ?? "";
 		}
-		const ws = new Ctor(url, options.protocols);
 		ws.binaryType = "arraybuffer";
 		this.#ws = ws;
 		this.#highWaterMark = Math.max(1, Math.floor(options.highWaterMark ?? DEFAULT_HIGH_WATER_MARK));
@@ -204,11 +214,40 @@ export class WebSocketStream implements WebSocketStreamLike {
 			closed.resolve({ closeCode: event.code ?? 1006, reason: event.reason ?? "" });
 		};
 
+		// An adopted socket may already have finished (or missed) its handshake, in
+		// which case `onopen`/`onclose` will never fire — settle from readyState.
+		if (ws.readyState !== CONNECTING) {
+			if (ws.readyState === OPEN) {
+				opened.resolve({ readable, writable, extensions: ws.extensions, protocol: ws.protocol });
+			} else {
+				opened.reject(new Error("WebSocket is already closed"));
+				try {
+					controller?.close();
+				} catch {}
+				closed.resolve({ closeCode: 1006, reason: "" });
+			}
+		}
+
 		const { signal } = options;
 		if (signal) {
 			if (signal.aborted) ws.close();
 			else signal.addEventListener("abort", () => ws.close(), { once: true });
 		}
+	}
+
+	/** Wrap a socket that already exists — typically one a server accepted from an
+	 *  HTTP upgrade (`Deno.upgradeWebSocket`, `ws`, ...), where there is no URL to
+	 *  dial and the handshake (including subprotocol selection) is already done.
+	 *
+	 *  Ownership transfers: this overwrites the socket's `onopen`/`onmessage`/
+	 *  `onerror`/`onclose` handlers, so adopt it before anything else reads from
+	 *  it — messages delivered before adoption are dropped by the platform, not
+	 *  buffered. A socket that is already open resolves {@link opened} without
+	 *  waiting for an `onopen` that has already fired (or was never going to).
+	 *
+	 *  `options.protocols` and `options.webSocket` are ignored; the socket exists. */
+	static adopt(ws: WebSocketLike, options: Pick<WebSocketStreamOptions, "highWaterMark" | "signal"> = {}) {
+		return new WebSocketStream(ws, options);
 	}
 
 	close(closeInfo: WebSocketStreamCloseInfo = {}): void {

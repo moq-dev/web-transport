@@ -26,6 +26,72 @@ pub trait CertResolver: Send + Sync {
     fn resolve(&self, server_name: Option<&str>) -> Option<CertifiedKey>;
 }
 
+/// How a server authenticates clients (mTLS).
+///
+/// The chain a client presents is only validated against these roots; mapping it
+/// to an application identity is left to the caller, via
+/// [Connection::peer_certificates](super::Connection::peer_certificates).
+#[derive(Default)]
+pub enum ClientAuth {
+    /// Don't request a client certificate.
+    #[default]
+    None,
+
+    /// Request a client certificate and verify it against these roots.
+    ///
+    /// Clients that present no certificate are still accepted; a certificate
+    /// that doesn't chain to one of these roots fails the handshake.
+    Optional(Vec<CertificateDer<'static>>),
+
+    /// Require every client to present a certificate chaining to these roots.
+    Required(Vec<CertificateDer<'static>>),
+}
+
+impl ClientAuth {
+    /// Check this policy by applying it to a throwaway context.
+    ///
+    /// A [ConnectionHook] can only report failure by returning `None`, which
+    /// falls back to a context with no client authentication at all. Bad roots
+    /// have to fail here, where the error reaches the caller, rather than
+    /// downgrading the policy at handshake time.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        let mut probe = SslContextBuilder::new(SslMethod::tls()).map_err(io::Error::other)?;
+        apply_client_auth(&mut probe, self)
+    }
+}
+
+/// Request and verify client certificates according to `auth`.
+fn apply_client_auth(builder: &mut SslContextBuilder, auth: &ClientAuth) -> io::Result<()> {
+    let (roots, mode) = match auth {
+        ClientAuth::None => return Ok(()),
+        ClientAuth::Optional(roots) => (roots, SslVerifyMode::PEER),
+        ClientAuth::Required(roots) => (
+            roots,
+            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        ),
+    };
+
+    if roots.is_empty() {
+        // An empty store rejects every chain, so this would silently refuse all
+        // (or, when optional, all certificate-bearing) clients.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "client authentication requires at least one root certificate",
+        ));
+    }
+
+    let mut store = X509StoreBuilder::new().map_err(io::Error::other)?;
+    for der in roots {
+        let root = X509::from_der(der.as_ref()).map_err(io::Error::other)?;
+        store.add_cert(root).map_err(io::Error::other)?;
+    }
+
+    builder.set_cert_store_builder(store);
+    builder.set_verify(mode);
+
+    Ok(())
+}
+
 fn der_to_boring_key(key: &PrivateKeyDer) -> Result<PKey<Private>, boring::error::ErrorStack> {
     match key {
         PrivateKeyDer::Pkcs8(d) => PKey::private_key_from_der(d.secret_pkcs8_der()),
@@ -66,6 +132,7 @@ pub(crate) struct StaticCertHook {
     pub chain: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
     pub alpn: Vec<Vec<u8>>,
+    pub client_auth: ClientAuth,
 }
 
 impl ConnectionHook for StaticCertHook {
@@ -75,6 +142,10 @@ impl ConnectionHook for StaticCertHook {
     ) -> Option<SslContextBuilder> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())
             .inspect_err(|err| tracing::warn!(%err, "failed to create SSL context"))
+            .ok()?;
+
+        apply_client_auth(&mut builder, &self.client_auth)
+            .inspect_err(|err| tracing::warn!(%err, "failed to configure client authentication"))
             .ok()?;
 
         // Set the leaf certificate.
@@ -131,6 +202,7 @@ impl ConnectionHook for StaticCertHook {
 pub(crate) struct DynamicCertHook {
     pub resolver: Arc<dyn CertResolver>,
     pub alpn: Vec<Vec<u8>>,
+    pub client_auth: ClientAuth,
 }
 
 impl ConnectionHook for DynamicCertHook {
@@ -140,6 +212,10 @@ impl ConnectionHook for DynamicCertHook {
     ) -> Option<SslContextBuilder> {
         let mut builder = SslContextBuilder::new(SslMethod::tls())
             .inspect_err(|err| tracing::warn!(%err, "failed to create SSL context"))
+            .ok()?;
+
+        apply_client_auth(&mut builder, &self.client_auth)
+            .inspect_err(|err| tracing::warn!(%err, "failed to configure client authentication"))
             .ok()?;
 
         let resolver = self.resolver.clone();

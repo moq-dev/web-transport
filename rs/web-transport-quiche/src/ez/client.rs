@@ -1,5 +1,4 @@
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_quiche::settings::{CertificateKind, Hooks, TlsCertificatePaths};
@@ -60,62 +59,6 @@ impl ClientBuilder {
         }
     }
 
-    /// Listen for incoming packets on the given socket.
-    ///
-    /// Defaults to an ephemeral port if not specified.
-    pub fn with_socket(mut self, socket: std::net::UdpSocket) -> io::Result<Self> {
-        socket.set_nonblocking(true)?;
-        self.socket = Some(tokio::net::UdpSocket::from_std(socket)?);
-        Ok(self)
-    }
-
-    /// Listen for incoming packets on the given address.
-    ///
-    /// Defaults to an ephemeral port if not specified.
-    pub fn with_bind<A: std::net::ToSocketAddrs>(self, addrs: A) -> io::Result<Self> {
-        // We use std to avoid async
-        let socket = std::net::UdpSocket::bind(addrs)?;
-        self.with_socket(socket)
-    }
-
-    /// Use the provided [Settings] instead of the defaults.
-    ///
-    /// WARNING: [Settings::verify_peer] is set to false by default.
-    /// This will completely bypass certificate verification and is generally not recommended.
-    pub fn with_settings(mut self, settings: Settings) -> Self {
-        self.settings = settings;
-        self
-    }
-
-    /// Optional: Use a client certificate for mTLS.
-    pub fn with_single_cert(
-        mut self,
-        chain: Vec<CertificateDer<'static>>,
-        key: PrivateKeyDer<'static>,
-    ) -> Self {
-        self.tls = Some((chain, key));
-        self
-    }
-
-    /// Override the TLS server name (SNI) used for the handshake and hostname
-    /// verification.
-    ///
-    /// [ClientBuilder::connect] defaults this to the host it was given, which is
-    /// almost always what you want. Set it explicitly to reach a server whose
-    /// certificate names a different host than the one you're dialing, and to
-    /// name the peer for [ClientBuilder::connect_to].
-    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
-        self.server_name = Some(name.into());
-        self
-    }
-
-    /// Set the TLS server name unless [ClientBuilder::with_server_name] already
-    /// chose one, so an explicit override always wins.
-    pub(crate) fn with_default_server_name(mut self, name: impl Into<String>) -> Self {
-        self.server_name.get_or_insert_with(|| name.into());
-        self
-    }
-
     /// Send a PING on this interval, keeping an idle connection alive.
     ///
     /// Disabled by default. This must be shorter than the peer's
@@ -138,6 +81,60 @@ impl ClientBuilder {
         self
     }
 
+    /// Listen for incoming packets on the given socket.
+    ///
+    /// Defaults to an ephemeral port if not specified.
+    pub fn with_socket(self, socket: std::net::UdpSocket) -> io::Result<Self> {
+        socket.set_nonblocking(true)?;
+        let socket = tokio::net::UdpSocket::from_std(socket)?;
+
+        Ok(Self {
+            socket: Some(socket),
+            ..self
+        })
+    }
+
+    /// Listen for incoming packets on the given address.
+    ///
+    /// Defaults to an ephemeral port if not specified.
+    pub fn with_bind<A: std::net::ToSocketAddrs>(self, addrs: A) -> io::Result<Self> {
+        // We use std to avoid async
+        let socket = std::net::UdpSocket::bind(addrs)?;
+        self.with_socket(socket)
+    }
+
+    /// Use the provided [Settings] instead of the defaults.
+    ///
+    /// WARNING: [Settings::verify_peer] is set to false by default.
+    /// This will completely bypass certificate verification and is generally not recommended.
+    pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    /// Optional: Use a client certificate for mTLS.
+    pub fn with_single_cert(
+        self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Self {
+        Self {
+            tls: Some((chain, key)),
+            ..self
+        }
+    }
+
+    /// Use this name for SNI and certificate verification instead of the host
+    /// passed to [ClientBuilder::connect].
+    ///
+    /// The dial target is unchanged; only the name the server certificate must
+    /// match is. This is how you reach a host by IP, or through a tunnel, while
+    /// still verifying the certificate it was actually issued for.
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
     /// Verify the server certificate against an explicit set of root
     /// certificates instead of the system trust store.
     pub fn with_root_certificates(mut self, roots: Vec<CertificateDer<'static>>) -> Self {
@@ -157,54 +154,46 @@ impl ClientBuilder {
 
     /// Connect to the QUIC server at the given host and port.
     ///
-    /// The host is resolved via DNS and the first address is used. Resolve the
-    /// host yourself and call [ClientBuilder::connect_to] to choose the address,
-    /// for example to prefer a particular address family.
-    ///
-    /// Unless [ClientBuilder::with_server_name] overrides it, `host` is also the
-    /// TLS server name.
+    /// `host` is the dial target: it's resolved via DNS and, unless
+    /// [ClientBuilder::with_server_name] overrides it, is also the name the
+    /// server's certificate must match.
     ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect(self, host: &str, port: u16) -> io::Result<Connecting> {
-        let mut remotes = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|err| io::Error::new(io::ErrorKind::HostUnreachable, err.to_string()))?;
-
-        let remote = remotes.next().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::HostUnreachable,
-                "no addresses found for host",
-            )
-        })?;
-
-        self.with_default_server_name(host).connect_to(remote).await
-    }
-
-    /// Connect to the QUIC server at an already-resolved address.
-    ///
-    /// [ClientBuilder::with_server_name] is required, as there's no host name to
-    /// derive the TLS server name from.
-    ///
-    /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
-    pub async fn connect_to(mut self, remote: SocketAddr) -> io::Result<Connecting> {
-        let server_name = self.server_name.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "connect_to requires with_server_name",
-            )
-        })?;
-
+    pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connecting> {
         if self.socket.is_none() {
             self = self.with_bind("[::]:0")?;
         }
 
         let socket = self.socket.take().unwrap();
+
+        let mut remotes = match tokio::net::lookup_host((host, port)).await {
+            Ok(remotes) => remotes,
+            Err(err) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    err.to_string(),
+                ));
+            }
+        };
+
+        // Return the first entry.
+        let remote = match remotes.next() {
+            Some(remote) => remote,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    "no addresses found for host",
+                ))
+            }
+        };
+
         socket.connect(remote).await?;
 
         // Enable the offloads the kernel supports before the socket is wrapped;
         // `from_udp` starts with everything disabled.
         let capabilities = capabilities(&socket, self.gso);
 
+        // Connect to the server using the addr we just resolved.
         let mut socket = tokio_quiche::socket::Socket::<
             Arc<tokio::net::UdpSocket>,
             Arc<tokio::net::UdpSocket>,
@@ -240,6 +229,9 @@ impl ClientBuilder {
             (None, Hooks::default())
         };
 
+        // quiche uses this for both SNI and the certificate's hostname check.
+        let server_name = self.server_name.as_deref().unwrap_or(host);
+
         let params = tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);
 
         let accept_bi = flume::unbounded();
@@ -259,10 +251,9 @@ impl ClientBuilder {
             self.keep_alive,
         );
 
-        let conn =
-            tokio_quiche::quic::connect_with_config(socket, Some(&server_name), &params, app)
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        let conn = tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, app)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         let conn = Connection::new(
             conn,

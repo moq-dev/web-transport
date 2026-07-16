@@ -221,3 +221,91 @@ describe("WebSocketStream ponyfill", () => {
 		}
 	});
 });
+
+describe("WebSocketStream.adopt", () => {
+	/** A socket handed over by a server after the upgrade: already OPEN, with the
+	 *  subprotocol chosen during the handshake. */
+	function accepted(protocol = "p1"): FakeWebSocket {
+		const ws = new FakeWebSocket("wss://x/y", protocol);
+		ws.readyState = 1; // OPEN
+		return ws;
+	}
+
+	test("an already-open socket resolves opened without an onopen event", async () => {
+		// The server's socket opened before we ever saw it, so `onopen` has already
+		// fired (or never will). Waiting for it would hang the session forever.
+		const wss = WebSocketStream.adopt(accepted());
+		const { protocol } = await wss.opened;
+		expect(protocol).toBe("p1");
+	});
+
+	test("adopted sockets carry data both ways", async () => {
+		const ws = accepted();
+		const wss = WebSocketStream.adopt(ws);
+		const { readable, writable } = await wss.opened;
+
+		await writable.getWriter().write(new Uint8Array([1, 2, 3]));
+		expect(ws.sent).toEqual([new Uint8Array([1, 2, 3])]);
+
+		ws.message(new Uint8Array([4, 5]).buffer);
+		const { value } = await readable.getReader().read();
+		expect(value).toEqual(new Uint8Array([4, 5]));
+	});
+
+	test("url and binaryType come off the adopted socket", async () => {
+		const ws = accepted();
+		const wss = WebSocketStream.adopt(ws);
+		expect(wss.url).toBe("wss://x/y");
+		expect(ws.binaryType).toBe("arraybuffer");
+	});
+
+	test("a socket still connecting waits for onopen", async () => {
+		// Deno hands back a CONNECTING socket: the upgrade response hasn't been
+		// written yet. Settling `opened` from readyState here would be premature.
+		const ws = new FakeWebSocket("wss://x/y", "p1");
+		const wss = WebSocketStream.adopt(ws);
+		let opened = false;
+		void wss.opened.then(() => {
+			opened = true;
+		});
+		await tick();
+		expect(opened).toBe(false);
+
+		ws.open();
+		await wss.opened;
+		expect(opened).toBe(true);
+	});
+
+	test("adopting a closed socket rejects opened rather than hanging", async () => {
+		const ws = new FakeWebSocket("wss://x/y", "p1");
+		ws.readyState = 3; // CLOSED
+		const wss = WebSocketStream.adopt(ws);
+		expect(wss.opened).rejects.toThrow(/already closed/);
+		expect(await wss.closed).toEqual({ closeCode: 1006, reason: "" });
+	});
+
+	test("backpressure applies to an adopted socket", async () => {
+		const ws = accepted();
+		ws.bufferedAmount = 100;
+		const wss = WebSocketStream.adopt(ws, { highWaterMark: 10 });
+		expect(wss.highWaterMark).toBe(10);
+
+		const { writable } = await wss.opened;
+		let written = false;
+		void writable
+			.getWriter()
+			.write(new Uint8Array([1]))
+			.then(() => {
+				written = true;
+			});
+		await tick(2);
+		expect(written).toBe(false); // parked until the buffer drains
+
+		// The ponyfill re-checks `bufferedAmount` on a timer, so poll rather than
+		// assume how many turns the drain takes.
+		ws.bufferedAmount = 0;
+		const deadline = Date.now() + 1000;
+		while (!written && Date.now() < deadline) await tick();
+		expect(written).toBe(true);
+	});
+});

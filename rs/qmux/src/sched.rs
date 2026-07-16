@@ -70,8 +70,8 @@ pub struct PriorityQueue {
 }
 
 impl PriorityQueue {
-    /// Create a queue holding at most `capacity` frames total before `push`
-    /// blocks.
+    /// Create a queue holding at most `capacity` frames total before `reserve`
+    /// blocks. Outstanding [`Permit`]s count against the bound.
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -86,13 +86,18 @@ impl PriorityQueue {
         }
     }
 
-    /// Append a frame to `id`'s FIFO, blocking while the queue is full.
+    /// Reserve one slot, blocking while the queue is full.
     ///
-    /// Cancel-safe: the mutation happens synchronously right before returning,
-    /// so if the caller's `select!` drops this future before it resolves, no
-    /// frame is enqueued (matching the old `outbound.send` race against
-    /// `inbound_stopped`).
-    pub async fn push(&self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
+    /// Await this *before* building the frame: the returned [`Permit`] enqueues
+    /// synchronously, so a caller can move bytes out of a source buffer and into
+    /// the queue with no await in between. Awaiting capacity and committing the
+    /// frame in one step instead (the obvious `push(frame).await`) leaves a
+    /// window where a cancelled future has already taken the caller's bytes but
+    /// not queued them, silently punching a hole in the stream.
+    ///
+    /// Cancel-safe: the slot is claimed synchronously right before returning, so
+    /// dropping this future reserves nothing.
+    pub async fn reserve(&self) -> Result<Permit, Error> {
         loop {
             // Register interest *before* checking, so a `notify_one` that fires
             // between our check and `.await` isn't lost.
@@ -103,8 +108,13 @@ impl PriorityQueue {
                     return Err(Error::Closed);
                 }
                 if inner.len < self.capacity {
-                    self.push_locked(&mut inner, priority, id, frame);
-                    return Ok(());
+                    // Hold the slot against the capacity bound until the permit
+                    // is used or dropped.
+                    inner.len += 1;
+                    return Ok(Permit {
+                        queue: self.clone(),
+                        armed: true,
+                    });
                 }
             }
             notified.await;
@@ -126,6 +136,14 @@ impl PriorityQueue {
     }
 
     fn push_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
+        self.enqueue_locked(inner, priority, id, frame);
+        inner.len += 1;
+    }
+
+    /// Append `frame` to `id`'s FIFO without touching `len`. Callers own the
+    /// capacity accounting: `push_now` bumps it after the fact, while a
+    /// [`Permit`] already reserved its slot in `reserve`.
+    fn enqueue_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
         match inner.streams.get_mut(&id) {
             Some(slot) => {
                 // Already scheduled (its band points at `id`); just append.
@@ -138,7 +156,6 @@ impl PriorityQueue {
                 inner.arm(id, priority);
             }
         }
-        inner.len += 1;
         self.non_empty.notify_one();
     }
 
@@ -276,6 +293,53 @@ impl PriorityQueue {
     }
 }
 
+/// One reserved slot in a [`PriorityQueue`], from [`PriorityQueue::reserve`].
+///
+/// Holds its slot against the capacity bound until [`Permit::send`] fills it or
+/// it is dropped, which returns the slot. Separating the (awaited) reservation
+/// from the (synchronous) send is what lets a caller commit bytes to the queue
+/// without an await in between, so a cancelled write can't lose them.
+pub struct Permit {
+    queue: PriorityQueue,
+    /// Cleared by `send`; a permit still armed at drop returns its slot.
+    armed: bool,
+}
+
+impl Permit {
+    /// Append `frame` to `id`'s FIFO using the reserved slot. Never blocks.
+    ///
+    /// Consumes the permit, so the reservation can't be reused or double-sent.
+    /// Fails if the queue closed while the permit was outstanding: the consumer
+    /// has already stopped popping, so enqueuing here would strand the frame and
+    /// report success for data that will never be sent.
+    pub fn send(mut self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
+        let mut inner = self.queue.inner.lock().unwrap();
+        if inner.closed {
+            // Release the lock before returning: `self` still counts as armed, so
+            // its `Drop` re-locks to hand the slot back.
+            drop(inner);
+            return Err(Error::Closed);
+        }
+        self.armed = false;
+        // `reserve` already counted this frame against `len`.
+        self.queue.enqueue_locked(&mut inner, priority, id, frame);
+        Ok(())
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        {
+            let mut inner = self.queue.inner.lock().unwrap();
+            inner.len -= 1;
+        }
+        self.queue.has_space.notify_one();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,14 +375,25 @@ mod tests {
         }
     }
 
+    /// Reserve and send in one step. The scheduling tests care about ordering and
+    /// capacity, not the cancellation split, so they read better without it.
+    async fn push(
+        q: &PriorityQueue,
+        priority: u8,
+        id: StreamId,
+        frame: Frame,
+    ) -> Result<(), Error> {
+        q.reserve().await?.send(priority, id, frame)
+    }
+
     #[tokio::test]
     async fn higher_priority_first() {
         let q = PriorityQueue::new(8);
         let lo = sid(0);
         let hi = sid(1);
 
-        q.push(10, lo, frame(lo, b'l')).await.unwrap();
-        q.push(200, hi, frame(hi, b'h')).await.unwrap();
+        push(&q, 10, lo, frame(lo, b'l')).await.unwrap();
+        push(&q, 200, hi, frame(hi, b'h')).await.unwrap();
 
         // High priority drains first.
         assert_eq!(tag_of(&q.pop().await.unwrap()), b'h');
@@ -331,10 +406,10 @@ mod tests {
         let a = sid(0);
         let b = sid(1);
 
-        q.push(5, a, frame(a, 1)).await.unwrap();
-        q.push(5, a, frame(a, 2)).await.unwrap();
-        q.push(5, b, frame(b, 1)).await.unwrap();
-        q.push(5, b, frame(b, 2)).await.unwrap();
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+        push(&q, 5, a, frame(a, 2)).await.unwrap();
+        push(&q, 5, b, frame(b, 1)).await.unwrap();
+        push(&q, 5, b, frame(b, 2)).await.unwrap();
 
         // Round-robin between equal-priority streams: a, b, a, b.
         assert_eq!(id_of(&q.pop().await.unwrap()), a);
@@ -349,7 +424,7 @@ mod tests {
         let a = sid(0);
 
         for i in 0..4u8 {
-            q.push(5, a, frame(a, i)).await.unwrap();
+            push(&q, 5, a, frame(a, i)).await.unwrap();
         }
         for i in 0..4u8 {
             assert_eq!(tag_of(&q.pop().await.unwrap()), i);
@@ -363,9 +438,9 @@ mod tests {
         let hi = sid(1);
 
         // Two frames each, lo enqueued first.
-        q.push(10, lo, frame(lo, 1)).await.unwrap();
-        q.push(10, lo, frame(lo, 2)).await.unwrap();
-        q.push(20, hi, frame(hi, 1)).await.unwrap();
+        push(&q, 10, lo, frame(lo, 1)).await.unwrap();
+        push(&q, 10, lo, frame(lo, 2)).await.unwrap();
+        push(&q, 20, hi, frame(hi, 1)).await.unwrap();
 
         // Promote lo above hi; its frames keep their order.
         q.set_priority(lo, 100);
@@ -395,10 +470,10 @@ mod tests {
     async fn close_unblocks_push() {
         let q = PriorityQueue::new(1);
         let a = sid(0);
-        q.push(5, a, frame(a, 1)).await.unwrap();
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
 
         let q2 = q.clone();
-        let handle = tokio::spawn(async move { q2.push(5, sid(1), frame(sid(1), 2)).await });
+        let handle = tokio::spawn(async move { push(&q2, 5, sid(1), frame(sid(1), 2)).await });
         tokio::task::yield_now().await;
         q.close();
         assert!(matches!(handle.await.unwrap(), Err(Error::Closed)));
@@ -408,11 +483,11 @@ mod tests {
     async fn backpressure_blocks_at_capacity() {
         let q = PriorityQueue::new(2);
         let a = sid(0);
-        q.push(5, a, frame(a, 1)).await.unwrap();
-        q.push(5, a, frame(a, 2)).await.unwrap();
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+        push(&q, 5, a, frame(a, 2)).await.unwrap();
 
         let q2 = q.clone();
-        let pushing = tokio::spawn(async move { q2.push(5, a, frame(a, 3)).await });
+        let pushing = tokio::spawn(async move { push(&q2, 5, a, frame(a, 3)).await });
         tokio::task::yield_now().await;
         assert!(!pushing.is_finished(), "push should block while full");
 
@@ -427,9 +502,9 @@ mod tests {
         let a = sid(0);
         let b = sid(1);
 
-        q.push(5, a, frame(a, 1)).await.unwrap();
-        q.push(5, a, frame(a, 2)).await.unwrap();
-        q.push(5, b, frame(b, 9)).await.unwrap();
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+        push(&q, 5, a, frame(a, 2)).await.unwrap();
+        push(&q, 5, b, frame(b, 9)).await.unwrap();
 
         // Reset `a`: its queued frames vanish, `b`'s survive.
         assert_eq!(q.remove(a), 2);
@@ -445,12 +520,12 @@ mod tests {
         let q = PriorityQueue::new(2);
         let a = sid(0);
         let b = sid(1);
-        q.push(5, a, frame(a, 1)).await.unwrap();
-        q.push(5, a, frame(a, 2)).await.unwrap();
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+        push(&q, 5, a, frame(a, 2)).await.unwrap();
 
         // Queue is full; a push for `b` blocks.
         let q2 = q.clone();
-        let pushing = tokio::spawn(async move { q2.push(5, b, frame(b, 1)).await });
+        let pushing = tokio::spawn(async move { push(&q2, 5, b, frame(b, 1)).await });
         tokio::task::yield_now().await;
         assert!(!pushing.is_finished(), "push should block while full");
 
@@ -464,5 +539,110 @@ mod tests {
     async fn remove_unknown_stream_is_noop() {
         let q = PriorityQueue::new(8);
         assert_eq!(q.remove(sid(99)), 0); // must not panic or underflow
+    }
+
+    #[tokio::test]
+    async fn reserved_permit_holds_capacity() {
+        let q = PriorityQueue::new(1);
+        let a = sid(0);
+
+        // An un-sent permit still occupies the queue's only slot.
+        let permit = q.reserve().await.unwrap();
+
+        let q2 = q.clone();
+        let blocked = tokio::spawn(async move { q2.reserve().await.map(|_| ()) });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished(), "reserve should block while full");
+
+        permit.send(5, a, frame(a, 1)).unwrap();
+        // Still full: the permit became a real frame rather than freeing the slot.
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "sending a permit must not free its slot"
+        );
+
+        q.pop().await.unwrap();
+        blocked.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_permit_returns_capacity() {
+        let q = PriorityQueue::new(1);
+
+        let q2 = q.clone();
+        let blocked = tokio::spawn(async move { q2.reserve().await.map(|_| ()) });
+
+        {
+            let _permit = q.reserve().await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(!blocked.is_finished(), "reserve should block while full");
+            // Dropped here: the caller changed its mind (or was cancelled).
+        }
+
+        // The freed slot must wake the waiter, or a cancelled write wedges the
+        // queue forever.
+        blocked.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_reserve_holds_nothing() {
+        let q = PriorityQueue::new(1);
+        let a = sid(0);
+
+        // Fill the queue, then abandon a blocked reserve.
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+        tokio::select! {
+            _ = q.reserve() => panic!("reserve should not succeed while full"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        // The abandoned reserve must not have leaked the slot it was waiting for.
+        q.pop().await.unwrap();
+        push(&q, 5, a, frame(a, 2)).await.unwrap();
+        assert_eq!(tag_of(&q.pop().await.unwrap()), 2);
+    }
+
+    /// A permit reserved before `close` must not enqueue after it: `pop` has
+    /// already reported the queue drained and the consumer is gone, so the frame
+    /// would sit there forever while the writer was told it was sent.
+    #[tokio::test]
+    async fn send_after_close_fails() {
+        let q = PriorityQueue::new(4);
+        let a = sid(0);
+
+        let permit = q.reserve().await.unwrap();
+        q.close();
+
+        // The consumer has already given up on this queue.
+        assert!(q.pop().await.is_none());
+        assert!(matches!(permit.send(5, a, frame(a, 1)), Err(Error::Closed)));
+        assert!(
+            q.pop().await.is_none(),
+            "a rejected send must queue nothing"
+        );
+    }
+
+    /// Dropping a permit after close must not panic or underflow `len`.
+    #[tokio::test]
+    async fn drop_after_close_is_clean() {
+        let q = PriorityQueue::new(4);
+        let permit = q.reserve().await.unwrap();
+        q.close();
+        drop(permit);
+        assert!(q.pop().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_unblocks_reserve() {
+        let q = PriorityQueue::new(1);
+        let a = sid(0);
+        push(&q, 5, a, frame(a, 1)).await.unwrap();
+
+        let q2 = q.clone();
+        let handle = tokio::spawn(async move { q2.reserve().await.map(|_| ()) });
+        tokio::task::yield_now().await;
+        q.close();
+        assert!(matches!(handle.await.unwrap(), Err(Error::Closed)));
     }
 }
