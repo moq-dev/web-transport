@@ -11,7 +11,8 @@ This library builds on top of [tokio-quiche](https://docs.rs/tokio-quiche/latest
 
 [quiche-ez](ez) is a wrapper around `tokio-quiche` that provides an async API.
 It tries to cover as many warts as possible but it's still limited by the poor `tokio_quiche` API.
-For example, it's only possible to provide a single TLS certificate and it needs to be on disk.
+For example, `tokio_quiche` only accepts a single TLS certificate loaded from disk, so certificates
+are configured through a BoringSSL hook instead.
 
 If this library becomes popular, I can spin `quiche-ez` off into a separate crate that performs the Tokio networking itself.
 It should result in better performance too.

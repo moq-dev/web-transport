@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use rustls_pki_types::CertificateDer;
 use std::{
     collections::{hash_map, HashMap, HashSet},
     future::poll_fn,
@@ -39,11 +40,21 @@ pub(super) struct DriverState {
     close_requested: ConnectionClosed,
     closed: ConnectionClosed,
 
+    /// Whether the handshake has completed, and with it every value below.
+    ///
+    /// Tracked separately from those values because each is independently
+    /// optional: a connection can be established without, say, negotiating an
+    /// ALPN, so their absence can't stand in for "not established yet".
+    established: bool,
+
     /// The negotiated ALPN protocol, set after the handshake completes.
     alpn: Option<Vec<u8>>,
 
     /// The SNI server name from the TLS ClientHello, set after the handshake completes.
     server_name: Option<String>,
+
+    /// The peer's certificate chain, set after the handshake completes.
+    peer_certs: Option<Vec<CertificateDer<'static>>>,
 
     /// Wakers waiting for the handshake to complete.
     handshake_wakers: Vec<Waker>,
@@ -71,8 +82,10 @@ impl DriverState {
             closed: ConnectionClosed::default(),
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
+            established: false,
             alpn: None,
             server_name: None,
+            peer_certs: None,
             handshake_wakers: Vec::new(),
             stats: ConnectionStats::default(),
         }
@@ -121,16 +134,16 @@ impl DriverState {
         self.server_name.as_deref()
     }
 
-    /// Sets the SNI server name (captured from the TLS ClientHello).
-    pub fn set_server_name(&mut self, name: Option<String>) {
-        self.server_name = name;
+    /// Returns the peer's verified certificate chain, leaf first.
+    pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+        self.peer_certs.as_deref()
     }
 
     /// Poll for handshake completion.
     /// Returns Ready once the handshake completes, or if the connection is closed.
     pub fn poll_handshake(&mut self, waker: &Waker) -> Poll<Result<(), ConnectionError>> {
         // Check if already established
-        if self.alpn.is_some() {
+        if self.established {
             return Poll::Ready(Ok(()));
         }
 
@@ -272,6 +285,21 @@ impl Driver {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
 
+        // SNI is only readable once BoringSSL has parsed the ClientHello, which
+        // doesn't happen until the handshake runs — before that quiche is still
+        // holding the Initial packet as unparsed bytes.
+        let server_name = qconn.server_name().map(|s| s.to_string());
+
+        // Copy the peer's chain out of quiche, which only lends it for as long as
+        // the connection is alive. It's already been verified by the handshake we
+        // just completed; on a server it's `None` unless client auth was requested.
+        let peer_certs = qconn.peer_cert_chain().map(|chain| {
+            chain
+                .into_iter()
+                .map(|der| CertificateDer::from(der.to_vec()))
+                .collect()
+        });
+
         // Publish the writable MTU once the handshake completes. The negotiated
         // value is fixed for the lifetime of the connection.
         self.dgram_max.store(
@@ -282,6 +310,11 @@ impl Driver {
         let wakers = {
             let mut state = self.state.lock();
             state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
+            state.server_name = server_name;
+            state.peer_certs = peer_certs;
+            // Publish all of the above before marking the handshake complete: this
+            // is what `Connection`'s accessors promise are already populated.
+            state.established = true;
             state.complete_handshake()
         };
 
@@ -733,6 +766,23 @@ impl<T> DriverOpen<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_completes_without_an_alpn() {
+        // The established flag, not the ALPN, is what resolves the handshake: a
+        // connection that negotiates no ALPN must still hand back a Connection
+        // rather than wait forever.
+        let mut state = DriverState::new(false);
+        let waker = Waker::noop();
+
+        assert!(state.poll_handshake(waker).is_pending());
+
+        state.established = true;
+        let _ = state.complete_handshake();
+
+        assert!(state.alpn().is_none());
+        assert!(matches!(state.poll_handshake(waker), Poll::Ready(Ok(()))));
+    }
 
     #[test]
     fn closed_waits_for_driver_completion() {

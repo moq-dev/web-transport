@@ -24,6 +24,7 @@ pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     socket: Option<tokio::net::UdpSocket>,
     tls: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
     verify: ClientVerify,
+    server_name: Option<String>,
     metrics: M,
 }
 
@@ -45,6 +46,7 @@ impl<M: Metrics> ClientBuilder<M> {
             socket: None,
             tls: None,
             verify: ClientVerify::Default,
+            server_name: None,
         }
     }
 
@@ -61,6 +63,7 @@ impl<M: Metrics> ClientBuilder<M> {
             metrics: self.metrics,
             tls: self.tls,
             verify: self.verify,
+            server_name: self.server_name,
         })
     }
 
@@ -94,7 +97,19 @@ impl<M: Metrics> ClientBuilder<M> {
             metrics: self.metrics,
             socket: self.socket,
             verify: self.verify,
+            server_name: self.server_name,
         }
+    }
+
+    /// Use this name for SNI and certificate verification instead of the host
+    /// passed to [ClientBuilder::connect].
+    ///
+    /// The dial target is unchanged; only the name the server certificate must
+    /// match is. This is how you reach a host by IP, or through a tunnel, while
+    /// still verifying the certificate it was actually issued for.
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
     }
 
     /// Verify the server certificate against an explicit set of root
@@ -115,6 +130,10 @@ impl<M: Metrics> ClientBuilder<M> {
     }
 
     /// Connect to the QUIC server at the given host and port.
+    ///
+    /// `host` is the dial target: it's resolved via DNS and, unless
+    /// [ClientBuilder::with_server_name] overrides it, is also the name the
+    /// server's certificate must match.
     ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
     pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connecting> {
@@ -189,6 +208,9 @@ impl<M: Metrics> ClientBuilder<M> {
             (None, Hooks::default())
         };
 
+        // quiche uses this for both SNI and the certificate's hostname check.
+        let server_name = self.server_name.as_deref().unwrap_or(host);
+
         let params = tokio_quiche::ConnectionParams::new_client(self.settings, tls_cert, hooks);
 
         let accept_bi = flume::unbounded();
@@ -207,7 +229,7 @@ impl<M: Metrics> ClientBuilder<M> {
             dgram_max.clone(),
         );
 
-        let conn = tokio_quiche::quic::connect_with_config(socket, Some(host), &params, app)
+        let conn = tokio_quiche::quic::connect_with_config(socket, Some(server_name), &params, app)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
