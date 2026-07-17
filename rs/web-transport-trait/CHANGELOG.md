@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.3.6...web-transport-trait-v0.3.7) - 2026-07-16
+
+### Fixed
+
+- *(qmux)* make write_buf cancel safe so a dropped write can't lose bytes ([#323](https://github.com/moq-dev/web-transport/pull/323))
+
 ## [0.3.6](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.3.5...web-transport-trait-v0.3.6) - 2026-06-11
 
 ### Added
