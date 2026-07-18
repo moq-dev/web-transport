@@ -1,10 +1,16 @@
 mod util;
 
-use std::future::Future;
-use std::time::Duration;
+use std::{
+    future::{poll_fn, Future},
+    task::{ready, Context, Poll},
+    time::Duration,
+};
 
-pub use crate::util::{MaybeSend, MaybeSync};
+pub use crate::util::{MaybeSend, MaybeSync, OpState};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// The standard result type returned by poll-based transport operations.
+pub type PollResult<T, E> = Poll<Result<T, E>>;
 
 /// Connection-level statistics.
 ///
@@ -58,7 +64,7 @@ impl Stats for StatsUnavailable {}
 
 /// Error trait for WebTransport operations.
 ///
-/// Implementations must be Send + Sync + 'static for use across async boundaries.
+/// Implementations must be `Send + Sync + 'static` on native targets.
 pub trait Error: std::error::Error + MaybeSend + MaybeSync + 'static {
     /// Returns the error code and reason if this was an application error.
     ///
@@ -80,22 +86,59 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     type RecvStream: RecvStream;
     type Error: Error;
 
+    /// Poll for a unidirectional stream created by the peer.
+    ///
+    /// Only one pending waiter is supported for each session operation class;
+    /// polling the same operation from another task may replace the registered
+    /// waker. [`poll_closed`](Self::poll_closed) supports multiple waiters.
+    fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, Self::Error>>;
+
     /// Block until the peer creates a new unidirectional stream.
-    fn accept_uni(&self)
-        -> impl Future<Output = Result<Self::RecvStream, Self::Error>> + MaybeSend;
+    fn accept_uni(
+        &self,
+    ) -> impl Future<Output = Result<Self::RecvStream, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_accept_uni(cx))
+    }
+
+    /// Poll for a bidirectional stream created by the peer.
+    fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> PollResult<(Self::SendStream, Self::RecvStream), Self::Error>;
 
     /// Block until the peer creates a new bidirectional stream.
     fn accept_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend
+    {
+        poll_fn(|cx| self.poll_accept_bi(cx))
+    }
+
+    /// Open a new bidirectional stream, which may block when there are too many concurrent streams.
+    /// An in-progress open remains owned by the session while it is not polled.
+    /// The next call resumes that operation rather than abandoning stream credit.
+    fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> PollResult<(Self::SendStream, Self::RecvStream), Self::Error>;
 
     /// Open a new bidirectional stream, which may block when there are too many concurrent streams.
     fn open_bi(
         &self,
-    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend
+    {
+        poll_fn(|cx| self.poll_open_bi(cx))
+    }
 
     /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
-    fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, Self::Error>> + MaybeSend;
+    /// An in-progress open remains owned by the session while it is not polled.
+    /// The next call resumes that operation rather than abandoning stream credit.
+    fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>>;
+
+    /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
+    fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_open_uni(cx))
+    }
 
     /// Send a datagram over the network.
     ///
@@ -108,8 +151,13 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// - ???
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error>;
 
+    /// Poll for a datagram from the network.
+    fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>>;
+
     /// Receive a datagram over the network.
-    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend;
+    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_recv_datagram(cx))
+    }
 
     /// The maximum size of a datagram that can be sent.
     fn max_datagram_size(&self) -> usize;
@@ -122,8 +170,16 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// Close the connection immediately with a code and reason.
     fn close(&self, code: u32, reason: &str);
 
+    /// Poll until the connection is closed by either side.
+    ///
+    /// Unlike the other session poll methods, implementations must support
+    /// multiple concurrent waiters for closure.
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Self::Error>;
+
     /// Block until the connection is closed by either side.
-    fn closed(&self) -> impl Future<Output = Self::Error> + MaybeSend;
+    fn closed(&self) -> impl Future<Output = Self::Error> + MaybeSend {
+        poll_fn(|cx| self.poll_closed(cx))
+    }
 
     /// Return connection-level statistics, if supported.
     fn stats(&self) -> impl Stats {
@@ -141,8 +197,15 @@ pub trait SendStream: MaybeSend {
     /// Write some of the buffer to the stream, returning how many bytes were
     /// written. See [`write_buf`](Self::write_buf) for the cancel-safety contract,
     /// which this shares.
-    fn write(&mut self, buf: &[u8])
-        -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend;
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
+
+    /// Write some of the buffer to the stream.
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_write(cx, buf))
+    }
 
     /// Write some of the given buffer to the stream, advancing it by the number of
     /// bytes written. This may be less than the whole buffer, so callers loop (or
@@ -164,7 +227,7 @@ pub trait SendStream: MaybeSend {
     ) -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend {
         async move {
             let chunk = buf.chunk();
-            let size = self.write(chunk).await?;
+            let size = poll_fn(|cx| self.poll_write(cx, chunk)).await?;
             buf.advance(size);
             Ok(size)
         }
@@ -176,9 +239,8 @@ pub trait SendStream: MaybeSend {
         chunk: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         async move {
-            // Just so the arg isn't mut
             let mut c = chunk;
-            self.write_buf(&mut c).await?;
+            self.write_all_buf(&mut c).await?;
             Ok(())
         }
     }
@@ -231,7 +293,7 @@ pub trait SendStream: MaybeSend {
     /// The peer may not receive the reset code if the stream is already closed.
     fn reset(&mut self, code: u32);
 
-    /// Block until the stream is closed by either side.
+    /// Poll until the stream is closed by either side.
     ///
     /// This includes:
     /// - We sent a RESET_STREAM via [SendStream::reset]
@@ -241,7 +303,12 @@ pub trait SendStream: MaybeSend {
     /// Some implementations do not support FIN acknowledgement, in which case this will block until the FIN is sent.
     ///
     /// NOTE: This takes a &mut to match Quinn and to simplify the implementation.
-    fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+
+    /// Block until the stream is closed by either side.
+    fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_closed(cx))
+    }
 }
 
 /// An incoming stream of bytes from the peer.
@@ -251,13 +318,20 @@ pub trait SendStream: MaybeSend {
 pub trait RecvStream: MaybeSend {
     type Error: Error;
 
-    /// Read the next chunk of data, up to the max size.
-    ///
-    /// This returns a chunk of data instead of copying, which may be more efficient.
+    /// Poll to read some data into the provided slice.
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>>;
+
+    /// Read some data into the provided slice.
     fn read(
         &mut self,
         dst: &mut [u8],
-    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend;
+    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_read(cx, dst))
+    }
 
     /// Read some data into the provided buffer.
     ///
@@ -289,12 +363,28 @@ pub trait RecvStream: MaybeSend {
         &mut self,
         max: usize,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + MaybeSend {
-        async move {
-            // Don't allocate too much. Write your own if you want to increase this buffer.
-            let mut buf = BytesMut::with_capacity(max.min(8 * 1024));
+        poll_fn(move |cx| self.poll_read_chunk(cx, max))
+    }
 
-            // TODO Test this, I think it will work?
-            Ok(self.read_buf(&mut buf).await?.map(|_| buf.freeze()))
+    /// Poll for the next chunk of data, up to the maximum size.
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        // Don't allocate too much. Override this method to avoid the copy or to
+        // use a larger per-poll buffer.
+        let mut buf = BytesMut::with_capacity(max.min(8 * 1024));
+        let dst = unsafe {
+            std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
+        };
+
+        match ready!(self.poll_read(cx, dst))? {
+            Some(size) if size > 0 => {
+                unsafe { buf.advance_mut(size) };
+                Poll::Ready(Ok(Some(buf.freeze())))
+            }
+            _ => Poll::Ready(Ok(None)),
         }
     }
 
@@ -310,7 +400,12 @@ pub trait RecvStream: MaybeSend {
     /// - We received a RESET_STREAM via [SendStream::reset]
     /// - We sent a STOP_SENDING via [RecvStream::stop]
     /// - We received a FIN via [SendStream::finish] and read all data.
-    fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+
+    /// Block until the stream has been closed by either side.
+    fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_closed(cx))
+    }
 
     /// A helper to keep reading until the stream is closed.
     fn read_all(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend {

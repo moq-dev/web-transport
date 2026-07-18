@@ -1,6 +1,6 @@
 use std::{
     pin::{pin, Pin},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::{BufMut, Bytes};
@@ -30,11 +30,37 @@ impl RecvStream {
         self.inner.read(buf).await.map_err(Into::into)
     }
 
+    /// Poll for some data and copy it into the buffer.
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<Option<usize>, StreamError>> {
+        let chunk =
+            ready!(self.inner.poll_read_chunk(cx.waker(), buf.len())).map_err(StreamError::from)?;
+        let size = chunk.map(|chunk| {
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            chunk.len()
+        });
+        Poll::Ready(Ok(size))
+    }
+
     /// Read a chunk of data from the stream.
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, StreamError> {
         self.inner.read_chunk(max).await.map_err(Into::into)
+    }
+
+    /// Poll for the next chunk of data without copying.
+    pub fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, StreamError>> {
+        self.inner
+            .poll_read_chunk(cx.waker(), max)
+            .map(|result| result.map_err(Into::into))
     }
 
     /// Read data into a mutable buffer and return the amount read.
@@ -59,6 +85,13 @@ impl RecvStream {
     /// Block until the stream has been reset and return the error code.
     pub async fn closed(&mut self) -> Result<(), StreamError> {
         self.inner.closed().await.map_err(Into::into)
+    }
+
+    /// Poll until the stream is closed.
+    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner
+            .poll_closed(cx.waker())
+            .map(|result| result.map_err(Into::into))
     }
 }
 
@@ -85,20 +118,27 @@ impl AsyncRead for RecvStream {
 impl web_transport_trait::RecvStream for RecvStream {
     type Error = StreamError;
 
-    async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        self.read(dst).await
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        self.poll_read(cx, dst)
     }
 
-    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        // More efficient than the default read_chunk implementation.
-        self.read_chunk(max).await
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        self.poll_read_chunk(cx, max)
     }
 
     fn stop(&mut self, code: u32) {
         self.stop(code);
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.closed().await
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_closed(cx)
     }
 }

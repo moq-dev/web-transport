@@ -251,7 +251,7 @@ impl RecvStream {
         poll_fn(|cx| self.poll_read_chunk(cx.waker(), max)).await
     }
 
-    fn poll_read_chunk(
+    pub(crate) fn poll_read_chunk(
         &mut self,
         waker: &Waker,
         max: usize,
@@ -325,7 +325,7 @@ impl RecvStream {
         self.state.lock().is_closed()
     }
 
-    fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub(crate) fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
         if let Poll::Ready(res) = self.state.lock().poll_closed(waker) {
             return Poll::Ready(res);
         }

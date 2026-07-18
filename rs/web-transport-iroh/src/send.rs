@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use iroh::endpoint;
 
 use crate::{ClosedStream, SessionError, WriteError};
@@ -16,11 +16,15 @@ use crate::{ClosedStream, SessionError, WriteError};
 #[derive(Debug)]
 pub struct SendStream {
     stream: endpoint::SendStream,
+    closed: web_transport_trait::OpState<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: endpoint::SendStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            closed: Default::default(),
+        }
     }
 
     /// Abruptly reset the stream with the provided error code. See [`iroh::endpoint::SendStream::reset`].
@@ -132,29 +136,28 @@ impl web_transport_trait::SendStream for SendStream {
         Ok(())
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Self::write(self, buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        Pin::new(&mut self.stream)
+            .poll_write(cx, buf)
+            .map(|result| result.map_err(Into::into))
     }
 
-    async fn write_buf<B: Buf + web_transport_trait::MaybeSend>(
-        &mut self,
-        buf: &mut B,
-    ) -> Result<usize, Self::Error> {
-        // This can avoid making a copy when Buf is Bytes, as Quinn will allocate anyway.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
-    }
-
-    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
-        self.write_chunk(chunk).await
-    }
-
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        match self.stopped().await? {
-            Some(code) => Err(WriteError::Stopped(code)),
-            None => Ok(()),
-        }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let stopped = self.stream.stopped();
+        self.closed.poll(cx, || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(endpoint::StoppedError::ConnectionLost(error)) => {
+                    Err(WriteError::SessionError(error.into()))
+                }
+                Err(endpoint::StoppedError::ZeroRttRejected) => {
+                    unreachable!("0-RTT not supported")
+                }
+            }
+        })
     }
 }

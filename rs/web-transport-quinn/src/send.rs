@@ -2,7 +2,7 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -17,11 +17,16 @@ use crate::{ClosedStream, SessionError, WriteError};
 pub struct SendStream {
     stream: quinn::SendStream,
     error: Arc<OnceLock<SessionError>>,
+    closed: web_transport_trait::OpState<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: quinn::SendStream, error: Arc<OnceLock<SessionError>>) -> Self {
-        Self { stream, error }
+        Self {
+            stream,
+            error,
+            closed: Default::default(),
+        }
     }
 
     /// Replace connection-level errors with the stored session error if available.
@@ -162,8 +167,10 @@ impl web_transport_trait::SendStream for SendStream {
         Self::finish(self).map_err(|_| WriteError::ClosedStream)
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Self::write(self, buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let size = ready!(Pin::new(&mut self.stream).poll_write(cx, buf))
+            .map_err(|error| self.map_error(error))?;
+        Poll::Ready(Ok(size))
     }
 
     // `write_buf` is deliberately left to the trait's default, which writes out of
@@ -173,17 +180,23 @@ impl web_transport_trait::SendStream for SendStream {
     // drops the future (moq re-prioritizes a stream mid-write) strands the chunk —
     // gone from `buf` but never sent, a silent hole in the stream.
 
-    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
-        // Sound to keep zero-copy here: the caller hands over ownership, so there is
-        // no buffer position to get out of sync with a cancelled write.
-        self.write_chunk(chunk).await
-    }
-
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        // NOTE: This used to require &mut in an older version of Quinn.
-        match self.stopped().await? {
-            Some(code) => Err(WriteError::Stopped(code)),
-            None => Ok(()),
-        }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let stopped = self.stream.stopped();
+        let error = self.error.clone();
+        self.closed.poll(cx, || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
+                    Err(WriteError::SessionError(
+                        error.get().cloned().unwrap_or_else(|| conn_err.into()),
+                    ))
+                }
+                Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
+            }
+        })
     }
 }

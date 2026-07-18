@@ -113,7 +113,13 @@ impl ConnectionClosed {
             return Poll::Ready(state.err.clone().unwrap());
         }
 
-        state.wakers.push(waker.clone());
+        if !state
+            .wakers
+            .iter()
+            .any(|registered| registered.will_wake(waker))
+        {
+            state.wakers.push(waker.clone());
+        }
 
         Poll::Pending
     }
@@ -324,6 +330,11 @@ impl Connection {
     /// Wait until the connection is closed (or acknowledged) by the remote, returning the error.
     pub async fn closed(&self) -> ConnectionError {
         self.close.wait().await
+    }
+
+    /// Poll until the connection is closed (or acknowledged) by the remote.
+    pub fn poll_closed(&self, waker: &Waker) -> Poll<ConnectionError> {
+        self.driver.lock().closed(waker)
     }
 
     /// Returns true if the connection is closed by either side.
