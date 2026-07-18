@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
+use web_transport_trait::OpState;
 
 // "conn" in ascii; if you see this then close(code)
 // hex: 0x636E6E6F, or 0x52E50ACE926F as an HTTP error code
@@ -50,6 +51,9 @@ pub struct Connection {
     // The accept logic is stateful, so use an Arc<Mutex> to share it.
     accept: Option<Arc<Mutex<SessionAccept>>>,
 
+    // Futures for APIs whose underlying transport does not expose polling.
+    ops: Arc<Mutex<ConnectionOps>>,
+
     // Cache the headers in front of each stream we open.
     header_uni: Vec<u8>,
     header_bi: Vec<u8>,
@@ -63,6 +67,15 @@ pub struct Connection {
     // The request and response that were sent and received.
     request: ConnectRequest,
     response: ConnectResponse,
+}
+
+#[derive(Default)]
+struct ConnectionOps {
+    accept_uni: OpState<Result<RecvStream, SessionError>>,
+    accept_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    open_uni: OpState<Result<SendStream, SessionError>>,
+    open_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    recv_datagram: OpState<Result<Bytes, SessionError>>,
 }
 
 impl Connection {
@@ -95,6 +108,7 @@ impl Connection {
             conn,
             drop,
             accept: Some(Arc::new(Mutex::new(accept))),
+            ops: Default::default(),
             session_id: Some(session_id),
             header_uni,
             header_bi,
@@ -166,15 +180,22 @@ impl Connection {
     /// Waits for a new incoming unidirectional stream from the remote peer.
     /// Returns a [RecvStream] that can be used to read data from the stream.
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
+        poll_fn(|cx| self.poll_accept_uni(cx)).await
+    }
+
+    /// Poll for a new unidirectional stream from the remote peer.
+    pub fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, SessionError>> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx)).await
-        } else {
-            self.conn
-                .accept_uni()
+            return accept.lock().unwrap().poll_accept_uni(cx);
+        }
+
+        let conn = self.conn.clone();
+        self.ops.lock().unwrap().accept_uni.poll(cx, || async move {
+            conn.accept_uni()
                 .await
                 .map(RecvStream::new)
                 .map_err(Into::into)
-        }
+        })
     }
 
     /// Accept a new bidirectional stream.
@@ -182,15 +203,25 @@ impl Connection {
     /// Waits for a new incoming bidirectional stream from the remote peer.
     /// Returns a ([SendStream], [RecvStream]) pair for sending and receiving data.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
+        poll_fn(|cx| self.poll_accept_bi(cx)).await
+    }
+
+    /// Poll for a new bidirectional stream from the remote peer.
+    pub fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx)).await
-        } else {
-            self.conn
-                .accept_bi()
+            return accept.lock().unwrap().poll_accept_bi(cx);
+        }
+
+        let conn = self.conn.clone();
+        self.ops.lock().unwrap().accept_bi.poll(cx, || async move {
+            conn.accept_bi()
                 .await
                 .map(|(send, recv)| (SendStream::new(send), RecvStream::new(recv)))
                 .map_err(Into::into)
-        }
+        })
     }
 
     /// Open a new unidirectional stream.
@@ -198,13 +229,20 @@ impl Connection {
     /// Creates a new outgoing unidirectional stream to the remote peer.
     /// Returns a [SendStream] that can be used to send data.
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self.conn.open_uni().await?;
+        poll_fn(|cx| self.poll_open_uni(cx)).await
+    }
 
-        send.write_all(&self.header_uni)
-            .await
-            .map_err(SessionError::Header)?;
-
-        Ok(SendStream::new(send))
+    /// Poll to open a new unidirectional stream.
+    pub fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, SessionError>> {
+        let conn = self.conn.clone();
+        let header = self.header_uni.clone();
+        self.ops.lock().unwrap().open_uni.poll(cx, || async move {
+            let mut send = conn.open_uni().await?;
+            send.write_all(&header)
+                .await
+                .map_err(SessionError::Header)?;
+            Ok(SendStream::new(send))
+        })
     }
 
     /// Open a new bidirectional stream.
@@ -212,13 +250,23 @@ impl Connection {
     /// Creates a new outgoing bidirectional stream to the remote peer.
     /// Returns a ([SendStream], [RecvStream]) pair for sending and receiving data.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self.conn.open_bi().await?;
+        poll_fn(|cx| self.poll_open_bi(cx)).await
+    }
 
-        send.write_all(&self.header_bi)
-            .await
-            .map_err(SessionError::Header)?;
-
-        Ok((SendStream::new(send), RecvStream::new(recv)))
+    /// Poll to open a new bidirectional stream.
+    pub fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        let conn = self.conn.clone();
+        let header = self.header_bi.clone();
+        self.ops.lock().unwrap().open_bi.poll(cx, || async move {
+            let (mut send, recv) = conn.open_bi().await?;
+            send.write_all(&header)
+                .await
+                .map_err(SessionError::Header)?;
+            Ok((SendStream::new(send), RecvStream::new(recv)))
+        })
     }
 
     /// Asynchronously receives an application datagram from the remote peer.
@@ -227,26 +275,36 @@ impl Connection {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received bytes.
     pub async fn read_datagram(&self) -> Result<Bytes, SessionError> {
-        let mut datagram = self
-            .conn
-            .read_datagram()
-            .await
-            .map_err(SessionError::from)?;
+        poll_fn(|cx| self.poll_recv_datagram(cx)).await
+    }
 
-        let mut cursor = Cursor::new(&datagram);
+    /// Poll for an application datagram from the remote peer.
+    pub fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {
+        let conn = self.conn.clone();
+        let session_id = self.session_id;
+        self.ops
+            .lock()
+            .unwrap()
+            .recv_datagram
+            .poll(cx, || async move {
+                let mut datagram = conn.read_datagram().await.map_err(SessionError::from)?;
 
-        if let Some(session_id) = self.session_id {
-            // We have to check and strip the session ID from the datagram.
-            let actual_id = VarInt::decode(&mut cursor).map_err(|_| SessionError::Unknown)?;
-            if actual_id != session_id {
-                return Err(SessionError::Unknown);
-            }
-        }
+                let mut cursor = Cursor::new(&datagram);
 
-        // Return the datagram without the session ID.
-        let datagram = datagram.split_off(cursor.position() as usize);
+                if let Some(session_id) = session_id {
+                    // We have to check and strip the session ID from the datagram.
+                    let actual_id =
+                        VarInt::decode(&mut cursor).map_err(|_| SessionError::Unknown)?;
+                    if actual_id != session_id {
+                        return Err(SessionError::Unknown);
+                    }
+                }
 
-        Ok(datagram)
+                // Return the datagram without the session ID.
+                let datagram = datagram.split_off(cursor.position() as usize);
+
+                Ok(datagram)
+            })
     }
 
     /// Sends an application datagram to the remote peer.
@@ -304,6 +362,11 @@ impl Connection {
         self.conn.closed().await.into()
     }
 
+    /// Poll until the session is closed.
+    pub fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<SessionError> {
+        self.conn.poll_closed(cx.waker()).map(Into::into)
+    }
+
     /// Create a new session from a raw QUIC connection and a URL.
     ///
     /// This is used to pretend like a QUIC connection is a WebTransport session.
@@ -322,6 +385,7 @@ impl Connection {
             header_bi: Default::default(),
             header_datagram: Default::default(),
             accept: None,
+            ops: Default::default(),
             settings: None,
             request: request.into(),
             response: response.into(),
@@ -381,28 +445,34 @@ impl web_transport_trait::Session for Connection {
     type RecvStream = RecvStream;
     type Error = SessionError;
 
-    async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
-        self.accept_uni().await
+    fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, SessionError>> {
+        self.poll_accept_uni(cx)
     }
 
-    async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        self.accept_bi().await
+    fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        self.poll_accept_bi(cx)
     }
 
-    async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        self.open_bi().await
+    fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        self.poll_open_bi(cx)
     }
 
-    async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        self.open_uni().await
+    fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, SessionError>> {
+        self.poll_open_uni(cx)
     }
 
     fn send_datagram(&self, payload: bytes::Bytes) -> Result<(), Self::Error> {
         self.send_datagram(payload)
     }
 
-    async fn recv_datagram(&self) -> Result<bytes::Bytes, SessionError> {
-        self.read_datagram().await
+    fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<bytes::Bytes, SessionError>> {
+        self.poll_recv_datagram(cx)
     }
 
     fn max_datagram_size(&self) -> usize {
@@ -417,8 +487,8 @@ impl web_transport_trait::Session for Connection {
         self.close(code, reason)
     }
 
-    async fn closed(&self) -> SessionError {
-        self.closed().await
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<SessionError> {
+        self.poll_closed(cx)
     }
 
     fn stats(&self) -> impl web_transport_trait::Stats {

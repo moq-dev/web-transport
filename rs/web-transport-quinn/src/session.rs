@@ -5,12 +5,13 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context, Poll, Waker},
+    task::{ready, Context, Poll, Waker},
     time::Duration,
 };
 
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
+use web_transport_trait::OpState;
 
 use crate::{
     proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
@@ -36,6 +37,8 @@ pub struct Session {
     // The accept logic is stateful, so use an Arc<Mutex> to share it.
     accept: Option<Arc<Mutex<SessionAccept>>>,
 
+    ops: Arc<Mutex<SessionOps>>,
+
     // Cache the headers in front of each stream we open.
     header_uni: Vec<u8>,
     header_bi: Vec<u8>,
@@ -59,6 +62,17 @@ pub struct Session {
 
     // The response sent by the server.
     response: ConnectResponse,
+}
+
+#[derive(Default)]
+struct SessionOps {
+    accept_uni: OpState<Result<RecvStream, SessionError>>,
+    accept_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    open_uni: OpState<Result<SendStream, SessionError>>,
+    open_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    recv_datagram: OpState<Result<Bytes, SessionError>>,
+    closed: OpState<SessionError>,
+    closed_wakers: Vec<Waker>,
 }
 
 impl Session {
@@ -86,6 +100,7 @@ impl Session {
         let this = Self {
             conn,
             accept: Some(Arc::new(Mutex::new(accept))),
+            ops: Default::default(),
             session_id: Some(session_id),
             header_uni,
             header_bi,
@@ -504,6 +519,7 @@ impl Session {
             header_bi: Default::default(),
             header_datagram: Default::default(),
             accept: None,
+            ops: Default::default(),
             settings: None,
             connect_send: Arc::new(Mutex::new(None)),
             error: Arc::new(OnceLock::new()),
@@ -836,36 +852,88 @@ impl web_transport_trait::Session for Session {
     type RecvStream = RecvStream;
     type Error = SessionError;
 
-    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        Self::accept_uni(self).await
+    fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .accept_uni
+            .poll(cx, || async move { Session::accept_uni(&session).await })
     }
 
-    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::accept_bi(self).await
+    fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .accept_bi
+            .poll(cx, || async move { Session::accept_bi(&session).await })
     }
 
-    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::open_bi(self).await
+    fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .open_bi
+            .poll(cx, || async move { Session::open_bi(&session).await })
     }
 
-    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-        Self::open_uni(self).await
+    fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .open_uni
+            .poll(cx, || async move { Session::open_uni(&session).await })
     }
 
     fn close(&self, code: u32, reason: &str) {
         Self::close(self, code, reason.as_bytes());
     }
 
-    async fn closed(&self) -> Self::Error {
-        Self::closed(self).await
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        let mut ops = self.ops.lock().unwrap();
+        if !ops
+            .closed_wakers
+            .iter()
+            .any(|registered| registered.will_wake(cx.waker()))
+        {
+            ops.closed_wakers.push(cx.waker().clone());
+        }
+        let error = ready!(ops
+            .closed
+            .poll(cx, || async move { Session::closed(&session).await }));
+        for waker in std::mem::take(&mut ops.closed_wakers) {
+            waker.wake();
+        }
+        Poll::Ready(error)
     }
 
     fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
         Self::send_datagram(self, data)
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        Self::read_datagram(self).await
+    fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .recv_datagram
+            .poll(cx, || async move { Session::read_datagram(&session).await })
     }
 
     fn max_datagram_size(&self) -> usize {

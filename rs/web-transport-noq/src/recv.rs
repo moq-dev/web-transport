@@ -1,8 +1,9 @@
 use std::{
+    future::Future,
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -141,16 +142,18 @@ impl web_transport_trait::RecvStream for RecvStream {
         Self::stop(self, code).ok();
     }
 
-    async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        self.read(dst).await
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        let size = ready!(self.inner.poll_read(cx, dst)).map_err(|error| self.map_error(error))?;
+        Poll::Ready(Ok((size != 0 || dst.is_empty()).then_some(size)))
     }
 
-    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        self.read_chunk(max).await
-    }
-
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.received_reset().await?;
-        Ok(())
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut closed = std::pin::pin!(self.received_reset());
+        ready!(closed.as_mut().poll(cx)).map_err(ReadError::SessionError)?;
+        Poll::Ready(Ok(()))
     }
 }

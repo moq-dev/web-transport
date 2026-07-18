@@ -2,10 +2,10 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 use crate::{ClosedStream, SessionError, WriteError};
 
@@ -17,11 +17,16 @@ use crate::{ClosedStream, SessionError, WriteError};
 pub struct SendStream {
     stream: noq::SendStream,
     error: Arc<OnceLock<SessionError>>,
+    closed: web_transport_trait::OpState<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: noq::SendStream, error: Arc<OnceLock<SessionError>>) -> Self {
-        Self { stream, error }
+        Self {
+            stream,
+            error,
+            closed: Default::default(),
+        }
     }
 
     /// Replace connection-level errors with the stored session error if available.
@@ -164,27 +169,27 @@ impl web_transport_trait::SendStream for SendStream {
         Self::finish(self).map_err(|_| WriteError::ClosedStream)
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Self::write(self, buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let size = ready!(Pin::new(&mut self.stream).poll_write(cx, buf))
+            .map_err(|error| self.map_error(error))?;
+        Poll::Ready(Ok(size))
     }
 
-    async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
-        // This can avoid making a copy when Buf is Bytes, as Noq will allocate anyway.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
-    }
-
-    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
-        self.write_chunk(chunk).await
-    }
-
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        // NOTE: This used to require &mut in an older version of Noq.
-        match self.stopped().await? {
-            Some(code) => Err(WriteError::Stopped(code)),
-            None => Ok(()),
-        }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let stopped = self.stream.stopped();
+        let error = self.error.clone();
+        self.closed.poll(cx, || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(noq::StoppedError::ConnectionLost(conn_err)) => Err(WriteError::SessionError(
+                    error.get().cloned().unwrap_or_else(|| conn_err.into()),
+                )),
+                Err(noq::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
+            }
+        })
     }
 }

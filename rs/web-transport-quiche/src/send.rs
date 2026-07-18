@@ -32,6 +32,18 @@ impl SendStream {
         self.inner.write(buf).await.map_err(Into::into)
     }
 
+    /// Poll to write some data to the stream.
+    pub fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, StreamError>> {
+        let mut buf = io::Cursor::new(buf);
+        self.inner
+            .poll_write_buf(cx, &mut buf)
+            .map(|result| result.map_err(Into::into))
+    }
+
     /// Write data from a buffer to the stream, returning the size written.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, StreamError> {
         self.inner.write_buf(buf).await.map_err(Into::into)
@@ -70,6 +82,13 @@ impl SendStream {
     /// Wait until the stream has been stopped and return the error code.
     pub async fn closed(&mut self) -> Result<(), StreamError> {
         self.inner.closed().await.map_err(Into::into)
+    }
+
+    /// Poll until the stream is closed.
+    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamError>> {
+        self.inner
+            .poll_closed(cx.waker())
+            .map(|result| result.map_err(Into::into))
     }
 }
 
@@ -110,8 +129,8 @@ impl AsyncWrite for SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = StreamError;
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.write(buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        self.poll_write(cx, buf)
     }
 
     fn set_priority(&mut self, order: u8) {
@@ -126,7 +145,7 @@ impl web_transport_trait::SendStream for SendStream {
         self.finish()
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.closed().await
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.poll_closed(cx)
     }
 }

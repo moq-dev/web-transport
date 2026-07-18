@@ -113,11 +113,11 @@ async fn higher_priority_completes_first() {
         hi.set_priority(200);
 
         // Fill the queue with low-priority data first.
-        lo.write(&vec![b'L'; LO_LEN]).await.unwrap();
+        lo.write_all(&vec![b'L'; LO_LEN]).await.unwrap();
         lo.finish().unwrap();
 
         // Then enqueue the small high-priority payload.
-        hi.write(&vec![b'H'; HI_LEN]).await.unwrap();
+        hi.write_all(&vec![b'H'; HI_LEN]).await.unwrap();
         hi.finish().unwrap();
 
         // Return the client so the session stays alive and the test can await
@@ -181,11 +181,11 @@ async fn equal_priority_interleaves() {
 
         // Both write bulk concurrently so frames from each are queued together.
         let wa = async {
-            a.write(&vec![b'A'; LEN]).await.unwrap();
+            a.write_all(&vec![b'A'; LEN]).await.unwrap();
             a.finish().unwrap();
         };
         let wb = async {
-            b.write(&vec![b'B'; LEN]).await.unwrap();
+            b.write_all(&vec![b'B'; LEN]).await.unwrap();
             b.finish().unwrap();
         };
         tokio::join!(wa, wb);
@@ -242,7 +242,7 @@ async fn control_precedes_data_backlog() {
     // while we issue the reset below. The writer keeps `client` alive (and thus
     // the session) until we abort it during cleanup.
     let bulk_writer = tokio::spawn(async move {
-        bulk.write(&vec![b'B'; LO_LEN]).await.ok();
+        bulk.write_all(&vec![b'B'; LO_LEN]).await.ok();
         client.closed().await;
     });
 
@@ -286,14 +286,14 @@ async fn mid_stream_set_priority_preserves_order() {
         let mut s = client.open_uni().await.unwrap();
         s.set_priority(5);
 
-        filler.write(&vec![b'F'; 200 * 1024]).await.unwrap();
+        filler.write_all(&vec![b'F'; 200 * 1024]).await.unwrap();
         filler.finish().unwrap();
 
         // Write the first half at low priority, bump priority, write the rest.
         let mid = payload.len() / 2;
-        s.write(&payload[..mid]).await.unwrap();
+        s.write_all(&payload[..mid]).await.unwrap();
         s.set_priority(250); // promote mid-stream
-        s.write(&payload[mid..]).await.unwrap();
+        s.write_all(&payload[mid..]).await.unwrap();
         s.finish().unwrap();
 
         client
@@ -329,7 +329,7 @@ async fn teardown_unblocks_blocked_writer() {
     // Spawn a writer that will fill the queue and then block.
     let handle = tokio::spawn(async move {
         // Far more than the 8-frame queue capacity worth of data.
-        s.write(&vec![b'Z'; 1024 * 1024]).await
+        s.write_all(&vec![b'Z'; 1024 * 1024]).await
     });
 
     // Give it a moment to fill the queue and park.

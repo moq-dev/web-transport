@@ -33,7 +33,7 @@ This project is broken up into quite a few different crates:
 -   [web-transport-wasm](web-transport-wasm) wraps the [browser API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API)
 -   [web-transport-ffi](rs/web-transport-ffi) exposes the WebTransport client/server through [UniFFI](https://mozilla.github.io/uniffi-rs/) for Python, Kotlin, and Swift.
 - [qmux](qmux) implements QMux (draft-ietf-quic-qmux) over TCP/TLS/WebSocket, with backwards compatibility for the legacy WebTransport-over-WebSocket wire format.
-- [web-transport-trait](web-transport-trait) defines an async trait, currently implemented by [web-transport-quinn](web-transport-quinn) and [qmux](qmux).
+- [web-transport-trait](web-transport-trait) defines poll-based traits with async adapters, implemented by the native backends and [qmux](qmux).
 -   [web-transport-proto](web-transport-proto) a bare minimum implementation of HTTP/3 just to establish the WebTransport session.
 
 ## Language bindings

@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Waker, ready},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -15,6 +15,7 @@ use n0_future::{
     stream::{Stream, StreamExt},
 };
 use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt};
+use web_transport_trait::OpState;
 
 use crate::{
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
@@ -33,6 +34,18 @@ use crate::{
 pub struct Session {
     conn: Connection,
     h3: Option<H3SessionState>,
+    ops: Arc<Mutex<SessionOps>>,
+}
+
+#[derive(Default)]
+struct SessionOps {
+    accept_uni: OpState<Result<RecvStream, SessionError>>,
+    accept_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    open_uni: OpState<Result<SendStream, SessionError>>,
+    open_bi: OpState<Result<(SendStream, RecvStream), SessionError>>,
+    recv_datagram: OpState<Result<Bytes, SessionError>>,
+    closed: OpState<SessionError>,
+    closed_wakers: Vec<Waker>,
 }
 
 impl Session {
@@ -41,7 +54,11 @@ impl Session {
     /// This is used to pretend like a QUIC connection is a WebTransport session.
     /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
     pub fn raw(conn: Connection) -> Self {
-        Self { conn, h3: None }
+        Self {
+            conn,
+            h3: None,
+            ops: Default::default(),
+        }
     }
 
     /// Connect using an established QUIC connection if you want to create the connection yourself.
@@ -68,7 +85,11 @@ impl Session {
     /// Creates a session from pre-established HTTP/3 handshake components.
     pub fn new_h3(conn: Connection, settings: Settings, mut connect: Connected) -> Self {
         let h3 = H3SessionState::connect(conn.clone(), settings, &connect);
-        let this = Session { conn, h3: Some(h3) };
+        let this = Session {
+            conn,
+            h3: Some(h3),
+            ops: Default::default(),
+        };
         // Run a background task to check if the connect stream is closed.
         let this2 = this.clone();
         tokio::spawn(async move {
@@ -531,36 +552,89 @@ impl web_transport_trait::Session for Session {
     type RecvStream = RecvStream;
     type Error = SessionError;
 
-    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        Self::accept_uni(self).await
+    fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .accept_uni
+            .poll(cx, || async move { Session::accept_uni(&session).await })
     }
 
-    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::accept_bi(self).await
+    fn poll_accept_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .accept_bi
+            .poll(cx, || async move { Session::accept_bi(&session).await })
     }
 
-    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::open_bi(self).await
+    fn poll_open_bi(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .open_bi
+            .poll(cx, || async move { Session::open_bi(&session).await })
     }
 
-    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-        Self::open_uni(self).await
+    fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .open_uni
+            .poll(cx, || async move { Session::open_uni(&session).await })
     }
 
     fn close(&self, code: u32, reason: &str) {
         Self::close(self, code, reason.as_bytes());
     }
 
-    async fn closed(&self) -> Self::Error {
-        Self::closed(self).await
+    fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        let mut ops = self.ops.lock().unwrap();
+        if !ops
+            .closed_wakers
+            .iter()
+            .any(|registered| registered.will_wake(cx.waker()))
+        {
+            ops.closed_wakers.push(cx.waker().clone());
+        }
+        let error = ready!(
+            ops.closed
+                .poll(cx, || async move { Session::closed(&session).await })
+        );
+        for waker in std::mem::take(&mut ops.closed_wakers) {
+            waker.wake();
+        }
+        Poll::Ready(error)
     }
 
     fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
         Self::send_datagram(self, data)
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        Self::read_datagram(self).await
+    fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+        let mut session = self.clone();
+        session.ops = Default::default();
+        self.ops
+            .lock()
+            .unwrap()
+            .recv_datagram
+            .poll(cx, || async move { Session::read_datagram(&session).await })
     }
 
     fn max_datagram_size(&self) -> usize {

@@ -7,18 +7,19 @@
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new browser API powered by [QUIC](https://www.rfc-editor.org/rfc/rfc9000.html) intended as a replacement for WebSockets.
 Most importantly, QUIC supports multiple independent data streams.
 
-This crate provides a WebTransport trait for Send runtimes.
+This crate provides poll-based WebTransport traits with async convenience methods.
+Consumers can drive sessions and streams directly with a standard
+`std::task::Context`, while callers that prefer async/await use the provided
+methods built on `poll_fn`.
 
 -   Quinn: [web-transport-quinn](../web-transport-quinn)
 -   Noq: [web-transport-noq](../web-transport-noq)
 -   WebSocket / TCP / TLS: [qmux](../qmux)
-- Quiche+Tokio: TODO
+-   Quiche+Tokio: [web-transport-quiche](../web-transport-quiche)
+-   Iroh: [web-transport-iroh](../web-transport-iroh)
 
 If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
 
-## Why Send?
-Async traits are awful because you have to choose either `Send` or `!Send`.
-We could define a separate `!Send` trait but I currently don't have a use-case for it.
-
-I would like to implement a sans I/O trait at some point for `quiche` and `quinn-proto`.
-Again, I just currently don't have a use-case, and I'm not even sure how feasible it would be.
+The poll surface is runtime-independent. Native implementations are `Send` and
+`Sync`; those bounds are conditional on WASM so the same traits can also describe
+browser transports.
