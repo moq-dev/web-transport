@@ -1,7 +1,7 @@
 {
 	"name": "@moq/web-socket-stream",
 	"author": "Luke Curley <kixelated@gmail.com>",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "A WebSocketStream polyfill: a plain WebSocket wrapped as { readable, writable } streams with backpressure",
 	"type": "module",
 	"license": "(MIT OR Apache-2.0)",
