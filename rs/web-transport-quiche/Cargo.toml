@@ -14,6 +14,12 @@ categories = ["network-programming", "web-programming"]
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+# Honor `Settings::keylog_file` and `SSLKEYLOGFILE`. tokio-quiche gates the keylog
+# behind its own feature, so without this it warns and logs nothing. Off by default:
+# a keylog decrypts every connection the process makes.
+keylog = ["tokio-quiche/capture_keylogs"]
+
 [dependencies]
 boring = "4"
 bytes = "1"
