@@ -18,6 +18,9 @@ all-features = true
 default = ["aws-lc-rs"]
 aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
 ring = ["quinn/rustls-ring", "rustls/ring"]
+# Unlocks `quinn::TransportConfig::qlog_stream` and `quinn::QlogConfig`, which this
+# crate re-exports but cannot enable on a caller's behalf.
+qlog = ["quinn/qlog"]
 
 [dependencies]
 bytes = "1"

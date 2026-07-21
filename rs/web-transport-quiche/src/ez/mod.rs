@@ -28,4 +28,6 @@ use lock::*;
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 pub use tls::{CertResolver, CertifiedKey, ClientAuth};
 pub use tokio_quiche::metrics::{DefaultMetrics, Metrics};
+/// Compression applied to the qlog traces written to [`Settings::qlog_dir`].
+pub use tokio_quiche::settings::QlogCompression;
 pub use tokio_quiche::settings::QuicSettings as Settings;
