@@ -18,6 +18,9 @@ all-features = true
 default = ["aws-lc-rs"]
 aws-lc-rs = ["noq/aws-lc-rs", "rustls/aws-lc-rs"]
 ring = ["noq/ring", "rustls/ring"]
+# Unlocks `noq::TransportConfig::qlog_*`, which this crate re-exports but cannot
+# enable on a caller's behalf.
+qlog = ["noq/qlog"]
 
 [dependencies]
 bytes = "1"
