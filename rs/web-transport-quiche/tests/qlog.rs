@@ -9,4 +9,5 @@ fn settings_expose_qlog() {
     settings.qlog_compression = QlogCompression::Gzip;
 
     assert_eq!(settings.qlog_dir.as_deref(), Some("/tmp/qlog"));
+    assert_eq!(settings.qlog_compression, QlogCompression::Gzip);
 }
