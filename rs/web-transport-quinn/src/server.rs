@@ -6,6 +6,8 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+use crate::client::{controller_factory, transport_config, ControllerFactory};
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
@@ -19,8 +21,7 @@ use crate::{
 pub struct ServerBuilder {
     provider: crypto::Provider,
     addr: std::net::SocketAddr,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    congestion_controller: Option<ControllerFactory>,
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -48,17 +49,7 @@ impl ServerBuilder {
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            // TODO BBR is also higher throughput in theory.
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::CubicConfig::default()))
-            }
-            CongestionControl::Default => None,
-        };
-
+        self.congestion_controller = controller_factory(algorithm);
         self
     }
 
@@ -69,6 +60,23 @@ impl ServerBuilder {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Server, ServerError> {
+        let transport = transport_config(self.congestion_controller.as_ref());
+        let config = self.config(chain, key, transport)?;
+
+        let server = quinn::Endpoint::server(config, self.addr)
+            .map_err(|e| ServerError::IoError(e.into()))?;
+
+        Ok(Server::new(server))
+    }
+
+    /// Build the quinn config, taking the transport separately so the caller (and the
+    /// tests) can tell which one ends up attached.
+    fn config(
+        &self,
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> Result<quinn::ServerConfig, ServerError> {
         // Standard Quinn setup
         let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -78,12 +86,10 @@ impl ServerBuilder {
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // this one is important
 
         let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        config.transport_config(transport);
 
-        let server = quinn::Endpoint::server(config, self.addr)
-            .map_err(|e| ServerError::IoError(e.into()))?;
-
-        Ok(Server::new(server))
+        Ok(config)
     }
 }
 
@@ -203,5 +209,50 @@ impl core::ops::Deref for Request {
 
     fn deref(&self) -> &Self::Target {
         &self.connect
+    }
+}
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+mod tests {
+    use super::*;
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+
+    fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let chain = vec![CertificateDer::from(key.cert.der().to_vec())];
+        let der = rcgen::KeyPair::serialize_der(&key.signing_key);
+
+        (chain, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
+    }
+
+    /// `ServerBuilder::new` goes through [crypto::default_provider], which panics when
+    /// both backends are compiled in and no process-wide default is installed. Pick one
+    /// here rather than mutating global state from a test.
+    fn builder() -> ServerBuilder {
+        #[cfg(feature = "aws-lc-rs")]
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        ServerBuilder {
+            provider,
+            addr: "[::]:0".parse().unwrap(),
+            congestion_controller: None,
+        }
+    }
+
+    /// quinn installs its own default transport config, so the builder's has to be
+    /// attached explicitly or every server knob (congestion control) silently no-ops.
+    #[test]
+    fn builder_transport_reaches_the_config() {
+        let (chain, key) = self_signed();
+
+        let builder = builder().with_congestion_control(CongestionControl::LowLatency);
+        assert!(builder.congestion_controller.is_some());
+
+        let transport = transport_config(builder.congestion_controller.as_ref());
+        let config = builder.config(chain, key, transport.clone()).unwrap();
+
+        assert!(Arc::ptr_eq(&config.transport, &transport));
     }
 }

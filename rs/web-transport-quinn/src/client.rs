@@ -26,14 +26,42 @@ pub enum CongestionControl {
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+pub(crate) type ControllerFactory =
+    Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>;
+
+/// Turn a [CongestionControl] choice into the factory quinn wants.
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+pub(crate) fn controller_factory(algorithm: CongestionControl) -> Option<ControllerFactory> {
+    match algorithm {
+        CongestionControl::LowLatency => Some(Arc::new(quinn::congestion::BbrConfig::default())),
+        // TODO BBR is also higher throughput in theory.
+        CongestionControl::Throughput => Some(Arc::new(quinn::congestion::CubicConfig::default())),
+        CongestionControl::Default => None,
+    }
+}
+
+/// The transport config shared by both builders, so the client and server can't
+/// drift on which knobs actually get applied.
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+pub(crate) fn transport_config(
+    congestion_controller: Option<&ControllerFactory>,
+) -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    if let Some(cc) = congestion_controller {
+        transport.congestion_controller_factory(cc.clone());
+    }
+
+    Arc::new(transport)
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
 #[derive(Clone)]
 pub struct ClientBuilder {
     provider: crypto::Provider,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    congestion_controller: Option<ControllerFactory>,
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -48,17 +76,7 @@ impl ClientBuilder {
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            // TODO BBR is also higher throughput in theory.
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::CubicConfig::default()))
-            }
-            CongestionControl::Default => None,
-        };
-
+        self.congestion_controller = controller_factory(algorithm);
         self
     }
 
@@ -142,13 +160,7 @@ impl ClientBuilder {
 
         let client_config = QuicClientConfig::try_from(crypto).unwrap();
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
-
-        let mut transport = quinn::TransportConfig::default();
-        if let Some(cc) = &self.congestion_controller {
-            transport.congestion_controller_factory(cc.clone());
-        }
-
-        client_config.transport_config(transport.into());
+        client_config.transport_config(transport_config(self.congestion_controller.as_ref()));
 
         let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
         Ok(Client {
