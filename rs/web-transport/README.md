@@ -12,6 +12,9 @@ This crate provides a generic WebTransport implementation depending on the platf
 -   Native: [web-transport-quinn](../web-transport-quinn)
 -   WASM: [web-transport-wasm](../web-transport-wasm)
 
+WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
+[web-transport-wasm](../web-transport-wasm/README.md#requirements).
+
 
 ## Why no trait?
 
