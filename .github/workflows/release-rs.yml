@@ -25,12 +25,16 @@ jobs:
       # Generating a GitHub token, so that PRs and tags created by
       # the release-plz-action can trigger actions workflows.
       # `app-id` is deprecated in favor of `client-id`.
+      # Without permission-* inputs the token inherits everything the App
+      # installation can do; release-plz only needs these two.
       - name: Generate GitHub token
         uses: actions/create-github-app-token@v3
         id: generate-token
         with:
           client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
 
       - name: Checkout repository
         uses: actions/checkout@v7
