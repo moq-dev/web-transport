@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.9](https://github.com/moq-dev/web-transport/compare/web-transport-v0.10.8...web-transport-v0.10.9) - 2026-07-22
+
+### Added
+
+- *(wasm)* fail with a clear error when web_sys_unstable_apis is unset ([#336](https://github.com/moq-dev/web-transport/pull/336))
+
 ## [0.10.8](https://github.com/moq-dev/web-transport/compare/web-transport-v0.10.7...web-transport-v0.10.8) - 2026-07-16
 
 ### Other
