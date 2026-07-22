@@ -1,4 +1,4 @@
-# Authenticates as the moq-bot GitHub App (APP_ID / APP_PRIVATE_KEY) so the release PR
+# Authenticates as the moq-bot GitHub App (APP_CLIENT_ID / APP_PRIVATE_KEY) so the release PR
 # and the auto-pushed web-transport-ffi-v* tag trigger workflows; GITHUB_TOKEN-authored
 # refs deliberately do not, which would leave the release PR unchecked and the downstream
 # release-py/release-kt/release-swift workflows unfired.
@@ -24,11 +24,12 @@ jobs:
     steps:
       # Generating a GitHub token, so that PRs and tags created by
       # the release-plz-action can trigger actions workflows.
+      # `app-id` is deprecated in favor of `client-id`.
       - name: Generate GitHub token
         uses: actions/create-github-app-token@v3
         id: generate-token
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Checkout repository
