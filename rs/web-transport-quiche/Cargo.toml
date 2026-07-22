@@ -21,7 +21,7 @@ all-features = true
 keylog = ["tokio-quiche/capture_keylogs"]
 
 [dependencies]
-boring = "4"
+boring = "5"
 bytes = "1"
 flume = "0.12"
 futures = "0.3"
