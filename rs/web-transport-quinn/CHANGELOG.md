@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.12](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.11...web-transport-quinn-v0.11.12) - 2026-07-22
+
+### Other
+
+- Expose qlog configuration, and fix the quinn server's transport config ([#334](https://github.com/moq-dev/web-transport/pull/334))
+
 ## [0.11.11](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.10...web-transport-quinn-v0.11.11) - 2026-07-16
 
 ### Fixed

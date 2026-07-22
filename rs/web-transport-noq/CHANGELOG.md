@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.2.0...web-transport-noq-v0.2.1) - 2026-07-22
+
+### Other
+
+- Expose qlog configuration, and fix the quinn server's transport config ([#334](https://github.com/moq-dev/web-transport/pull/334))
+
 ## [0.1.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.1.0...web-transport-noq-v0.1.1) - 2026-05-24
 
 ### Other
