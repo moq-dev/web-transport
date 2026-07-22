@@ -1,6 +1,7 @@
-# Uses APP_ID / APP_PRIVATE_KEY secrets so the auto-pushed web-transport-ffi-v* tag fires
-# the downstream release-py/release-kt/release-swift workflows. If the App credentials
-# aren't configured, fall back to GITHUB_TOKEN — but tags won't trigger workflows in that case.
+# Authenticates as the moq-bot GitHub App (APP_ID / APP_PRIVATE_KEY) so the release PR
+# and the auto-pushed web-transport-ffi-v* tag trigger workflows; GITHUB_TOKEN-authored
+# refs deliberately do not, which would leave the release PR unchecked and the downstream
+# release-py/release-kt/release-swift workflows unfired.
 name: release-rs
 
 permissions:
@@ -23,11 +24,9 @@ jobs:
     steps:
       # Generating a GitHub token, so that PRs and tags created by
       # the release-plz-action can trigger actions workflows.
-      # Optional: falls back to GITHUB_TOKEN if the App isn't configured.
       - name: Generate GitHub token
         uses: actions/create-github-app-token@v3
         id: generate-token
-        continue-on-error: true
         with:
           app-id: ${{ secrets.APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
@@ -36,7 +35,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ steps.generate-token.outputs.token || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.generate-token.outputs.token }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,5 +43,5 @@ jobs:
       - name: Run release-plz
         uses: MarcoIeni/release-plz-action@v0.5
         env:
-          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
