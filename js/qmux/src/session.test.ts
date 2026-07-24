@@ -528,13 +528,44 @@ describe("Session integration (scripted peer)", () => {
 			for (let i = 0; i < 6; i++) {
 				await new Promise((resolve) => setTimeout(resolve, 45));
 				await writer.write(new Uint8Array([i]));
+				// The peer answers every other write, as a live peer responding to the
+				// keep-alive would. A send restarts the deadline only once per receive
+				// (RFC 9000 §10.1), so proof of life has to keep arriving.
+				if (i % 2 === 0) peer.send({ type: "ping_response", sequence: BigInt(i) });
 			}
 
-			// More than two idle windows elapsed without another inbound frame, but
-			// the successful STREAM writes above kept resetting the shared deadline.
+			// More than two idle windows elapsed with only occasional inbound frames,
+			// but the successful STREAM writes kept resetting the shared deadline.
 			expect(peer.has("connection_close")).toBe(false);
 			session.close();
 			expect(await session.closed).toEqual({ closeCode: 0, reason: "" });
+		});
+
+		test("a silent peer idle-closes even while our own writes land", async () => {
+			// The dead-peer case: nothing ever arrives again, but the socket still
+			// accepts everything we send. Our own keep-alive pings advance the send
+			// clock, so counting every send as activity left the deadline permanently
+			// in the future and the session never closed.
+			const { session, peer } = connect({ maxIdleTimeout: 120n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const writable = await session.createUnidirectionalStream();
+			const writer = writable.getWriter();
+			const writes = (async () => {
+				try {
+					for (let i = 0; i < 12; i++) {
+						await new Promise((resolve) => setTimeout(resolve, 45));
+						await writer.write(new Uint8Array([i]));
+					}
+				} catch {
+					// The session closes out from under the writer; that's the point.
+				}
+			})();
+
+			const err = await expectSessionFailure(session);
+			expect(err.message).toContain("idle timeout");
+			await writes;
 		});
 
 		test("the standard reconnect idiom sees a drop", async () => {

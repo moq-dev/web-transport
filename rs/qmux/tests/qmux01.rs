@@ -209,3 +209,77 @@ async fn qmux01_ping_keeps_idle_session_alive() {
 
     client.close(0, "done");
 }
+
+/// The other half of that contract: a peer that goes SILENT must be idle-closed,
+/// even while our own writes keep landing.
+///
+/// This is what a vanished host or a dropped network looks like on a stream
+/// transport (Unix socket, TCP, WebSocket): no close, no EOF, just nothing ever
+/// arriving again while the socket happily accepts everything we send. Our own
+/// keep-alive pings advance the send clock every idle/3, so counting every send as
+/// activity left the deadline permanently in the future and the session lived until
+/// the process died. Only a *received* frame proves the peer is still there.
+#[tokio::test]
+async fn qmux01_silent_peer_is_idle_closed() {
+    use qmux::transport::Stream;
+    use qmux::{Config, Error, Session};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_io, proxy_client) = tokio::io::duplex(64 * 1024);
+    let (proxy_server, server_io) = tokio::io::duplex(64 * 1024);
+    let silenced = Arc::new(AtomicBool::new(false));
+
+    // Proxy the two sockets so one direction can be cut without closing either.
+    // Client→server always flows, so the client's writes keep succeeding and its
+    // pings still reach a peer that dutifully answers them. Server→client is drained
+    // but discarded once silenced, so the client hears nothing while its own send
+    // clock keeps advancing — the exact shape of the bug.
+    let (mut client_rx, mut client_tx) = tokio::io::split(proxy_client);
+    let (mut server_rx, mut server_tx) = tokio::io::split(proxy_server);
+    let upstream =
+        tokio::spawn(async move { tokio::io::copy(&mut client_rx, &mut server_tx).await });
+    let downstream = tokio::spawn({
+        let silenced = silenced.clone();
+        async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match server_rx.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                if silenced.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if client_tx.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut config = Config::new(Version::QMux01);
+    config.max_idle_timeout = 150;
+    let ta = Stream::new(client_io, config.version, config.max_record_size);
+    let tb = Stream::new(server_io, config.version, config.max_record_size);
+    let (client, server) = tokio::join!(
+        Session::connect(ta, config.clone()),
+        Session::accept(tb, config),
+    );
+    let client = client.unwrap();
+    let _server = server.unwrap();
+
+    silenced.store(true, Ordering::Relaxed);
+
+    // One idle window to notice, plus at most one more for the send credit.
+    let reason = tokio::time::timeout(Duration::from_secs(1), client.closed())
+        .await
+        .expect("a silent peer must idle-close, even while our own sends land");
+    assert!(matches!(reason, Error::IdleTimeout), "got {reason:?}");
+
+    upstream.abort();
+    downstream.abort();
+}

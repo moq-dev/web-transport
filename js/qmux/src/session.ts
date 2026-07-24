@@ -608,6 +608,11 @@ export default class Session implements WebTransport {
 	// QMux01 idle-timeout tracking (engaged once we've received the peer's params).
 	#lastRecvAt = Date.now();
 	#lastSendAt = Date.now();
+	// Deadline bookkeeping for #idleActivityAt: the newest receive observed, the
+	// send last allowed to restart the deadline, and whether a send may restart it.
+	#recvSeen = 0;
+	#sendResetAt = 0;
+	#sendCredit = true;
 	#nextPingSeq = 0;
 	// Highest sequence seen in a received QX_PING request (draft-02 requires them
 	// to strictly increase). Undefined until the first request arrives.
@@ -1007,13 +1012,39 @@ export default class Session implements WebTransport {
 		this.#idleTimer = setInterval(() => this.#idleTick(Number(timeoutMs)), tickMs);
 	}
 
+	/**
+	 * Newest activity that counts toward the idle deadline.
+	 *
+	 * A received frame always restarts the timer: it is the only direct proof the
+	 * peer is still there. A send restarts it too, but at most once per receive
+	 * (RFC 9000 §10.1). That proviso is what keeps the deadline reachable: our own
+	 * keep-alive pings advance `#lastSendAt`, so counting every send would let them
+	 * restart the very deadline they exist to test, and a peer that goes silent
+	 * while its socket still accepts our writes would never be reclaimed.
+	 *
+	 * Crediting the first send after each receive is what still lets a mostly
+	 * one-way sender stay open — its peer answers the keep-alive, and each answer
+	 * re-arms the credit.
+	 */
+	#idleActivityAt(): number {
+		if (this.#lastRecvAt > this.#recvSeen) {
+			this.#recvSeen = this.#lastRecvAt;
+			this.#sendCredit = true;
+		}
+		if (this.#sendCredit && this.#lastSendAt > this.#sendResetAt) {
+			this.#sendResetAt = this.#lastSendAt;
+			this.#sendCredit = false;
+		}
+		return Math.max(this.#recvSeen, this.#sendResetAt);
+	}
+
 	#idleTick(timeoutMs: number) {
 		if (this.#closed) {
 			if (this.#idleTimer) clearInterval(this.#idleTimer);
 			return;
 		}
 		const now = Date.now();
-		if (now - Math.max(this.#lastRecvAt, this.#lastSendAt) > timeoutMs) {
+		if (now - this.#idleActivityAt() > timeoutMs) {
 			// No frames have been sent or received within the negotiated limit. Abnormal:
 			// without a rejection this is indistinguishable from a graceful close(), which
 			// also settles with closeCode 0.
