@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/moq-dev/web-transport/compare/qmux-v0.4.1...qmux-v0.4.2) - 2026-07-24
+
+### Fixed
+
+- *(qmux)* only let a send restart the idle timer once per receive ([#341](https://github.com/moq-dev/web-transport/pull/341))
+
 ## [0.4.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.4.0...qmux-v0.4.1) - 2026-07-16
 
 ### Added
