@@ -827,7 +827,7 @@ impl TimerState {
             // not itself buy another window (see [`IdleActivity`]).
             let last_activity = instant_at(self.base, self.observe_activity(&mut activity));
             if now < last_activity + idle {
-                deferred_since = None; // send or receive progressed — not idle
+                deferred_since = None; // qualifying activity progressed — not idle
                 continue;
             }
 
