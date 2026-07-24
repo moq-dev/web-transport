@@ -655,10 +655,10 @@ mod writer_final_size_tests {
 ///
 ///  - enqueues a `QX_PING` on the control lane once we've been silent on send for a
 ///    third of the idle window (the keep-alive cadence), and
-///  - closes the session once we've been silent on send and receive for a full
-///    idle window, deferred by at most one extra window while the reader or writer is
-///    backpressured — that's evidence the peer is alive and we simply can't get a
-///    keep-alive through (or aren't reading its replies).
+///  - closes the session once a full idle window passes with no activity that counts
+///    (see [`IdleActivity`]), deferred by at most one extra window while the reader or
+///    writer is backpressured — that's evidence the peer is alive and we simply can't
+///    get a keep-alive through (or aren't reading its replies).
 ///
 /// Only meaningful for the record-framed drafts (QMux01+) — the versions that
 /// negotiate an idle timeout — so it isn't spawned otherwise.
@@ -683,7 +683,65 @@ struct TimerState {
     pings_sent: Arc<AtomicU64>,
 }
 
+/// Decides which of the reader's and writer's clocks currently count as "activity"
+/// for the idle deadline.
+///
+/// A received frame always restarts the timer: it is the only direct proof the peer
+/// is still there. A send restarts it too, but at most once per receive (RFC 9000
+/// §10.1). That proviso is what keeps the deadline reachable: our own keep-alive
+/// pings advance `last_send_at`, so counting every send would let them restart the
+/// very deadline they exist to test, and a peer that goes silent while its socket
+/// still accepts our writes would never be reclaimed.
+///
+/// Crediting the first send after each receive is what still lets a mostly one-way
+/// sender stay open — its peer answers the keep-alive, and each answer re-arms the
+/// credit.
+struct IdleActivity {
+    /// Newest `last_recv_at` observed so far.
+    recv_seen: u64,
+    /// The send we last allowed to restart the deadline.
+    send_reset_at: u64,
+    /// Whether a send may restart the deadline (a receive has landed since the last
+    /// one that did).
+    send_credit: bool,
+}
+
+impl IdleActivity {
+    /// Start from the receive that established the session; the peer has just been
+    /// heard from, so a send may restart the deadline immediately.
+    fn new(recv_at: u64) -> Self {
+        Self {
+            recv_seen: recv_at,
+            send_reset_at: recv_at,
+            send_credit: true,
+        }
+    }
+
+    /// Fold in the latest clocks and return the millis of the newest activity that
+    /// counts toward the idle deadline.
+    fn observe(&mut self, recv_at: u64, send_at: u64) -> u64 {
+        if recv_at > self.recv_seen {
+            self.recv_seen = recv_at;
+            self.send_credit = true;
+        }
+        if self.send_credit && send_at > self.send_reset_at {
+            self.send_reset_at = send_at;
+            self.send_credit = false;
+        }
+        self.recv_seen.max(self.send_reset_at)
+    }
+}
+
 impl TimerState {
+    /// Read both clocks and fold them into `activity`, returning the millis of the
+    /// newest activity that counts toward the idle deadline.
+    fn observe_activity(&self, activity: &mut IdleActivity) -> u64 {
+        activity.observe(
+            self.last_recv_at.load(Ordering::Acquire),
+            self.last_send_at.load(Ordering::Acquire),
+        )
+    }
+
     async fn run(mut self) {
         let mut closed_rx = self.closed.subscribe();
 
@@ -718,14 +776,10 @@ impl TimerState {
         // `last_send_at` frozen) doesn't make us re-enqueue one on every wake-up.
         let mut last_ping_ms = self.last_send_at.load(Ordering::Acquire);
         let mut next_ping_seq: u64 = 0;
+        let mut activity = IdleActivity::new(self.last_recv_at.load(Ordering::Acquire));
 
         loop {
-            let last_activity = instant_at(
-                self.base,
-                self.last_recv_at
-                    .load(Ordering::Acquire)
-                    .max(self.last_send_at.load(Ordering::Acquire)),
-            );
+            let last_activity = instant_at(self.base, self.observe_activity(&mut activity));
             let ping_ref = instant_at(
                 self.base,
                 self.last_send_at.load(Ordering::Acquire).max(last_ping_ms),
@@ -768,14 +822,10 @@ impl TimerState {
                 last_ping_ms = millis_since(self.base, now);
             }
 
-            // Idle close: due once we've been silent on send and receive for a full
-            // window. Draft-02 section 7.1 resets the timer for either direction.
-            let last_activity = instant_at(
-                self.base,
-                self.last_recv_at
-                    .load(Ordering::Acquire)
-                    .max(self.last_send_at.load(Ordering::Acquire)),
-            );
+            // Idle close: due once a full window has passed with no qualifying
+            // activity. Re-read the clocks; the ping we may have just enqueued does
+            // not itself buy another window (see [`IdleActivity`]).
+            let last_activity = instant_at(self.base, self.observe_activity(&mut activity));
             if now < last_activity + idle {
                 deferred_since = None; // send or receive progressed — not idle
                 continue;
@@ -2523,23 +2573,60 @@ mod timer_tests {
         );
     }
 
-    /// Successful outbound frames reset the same idle deadline as inbound frames.
-    /// A one-way sender must remain open while its writes continue beyond a full
-    /// idle window, even when the peer sends nothing back.
+    /// Successful outbound frames reset the same idle deadline as inbound frames,
+    /// so a mostly one-way sender stays open across many idle windows while its
+    /// peer is still answering — here at a keep-alive-like cadence, far slower
+    /// than the writes.
     #[tokio::test]
     async fn send_progress_averts_idle_close() {
         let h = spawn_timer(100);
 
         let base = tokio::time::Instant::now();
-        for _ in 0..6 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        for i in 0..12 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
             let elapsed = base.elapsed().as_millis() as u64;
             h.last_send_at.store(elapsed, Ordering::Release);
+            // The peer answers roughly every third write, as a live peer
+            // responding to QX_PING would.
+            if i % 3 == 0 {
+                h.last_recv_at.store(elapsed, Ordering::Release);
+            }
         }
         assert!(
             h.closed.borrow().is_none(),
-            "a session that keeps sending must not be idle-closed"
+            "a one-way sender whose peer still answers must not be idle-closed"
         );
+    }
+
+    /// A peer that has gone silent must be closed even while our own side keeps
+    /// sending successfully.
+    ///
+    /// Only a *received* frame proves the peer is alive. Our keep-alive pings (and
+    /// any application writes into a socket that still accepts them) advance
+    /// `last_send_at`, so letting every send reset the deadline lets us hold a dead
+    /// session open by talking to ourselves — the timeout can never fire.
+    #[tokio::test]
+    async fn idle_close_when_peer_silent_despite_our_sends() {
+        let h = spawn_timer(100);
+
+        // Our writes keep landing for well over two idle windows; the peer never
+        // says anything back.
+        let base = tokio::time::Instant::now();
+        let pump = tokio::spawn({
+            let last_send_at = h.last_send_at.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    last_send_at.store(base.elapsed().as_millis() as u64, Ordering::Release);
+                }
+            }
+        });
+
+        let reason = tokio::time::timeout(Duration::from_millis(600), closed_reason(&h))
+            .await
+            .expect("a silent peer must idle-close even while we keep sending");
+        assert!(matches!(reason, Error::IdleTimeout), "got {reason:?}");
+        pump.abort();
     }
 }
 
