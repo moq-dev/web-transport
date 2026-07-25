@@ -26,14 +26,15 @@ export class RecvStream {
 	/**
 	 * @param onConsume Invoked with each chunk's byte length as it is delivered
 	 *   to the reader. Drives MAX_STREAM_DATA.
-	 * @param onCancel Invoked with the number of discarded buffered bytes when the
-	 *   application cancels the readable (→ STOP_SENDING).
+	 * @param onCancel Invoked with the number of discarded buffered bytes, and the reason the
+	 *   application passed to `cancel()`, when the application cancels the readable
+	 *   (→ STOP_SENDING, whose code comes from that reason).
 	 * @param onTerminal Invoked once when FIN, RESET_STREAM, or local cancellation
 	 *   makes the receive side terminal.
 	 */
 	constructor(
 		onConsume: (bytes: number) => void,
-		onCancel: (discarded: number) => void,
+		onCancel: (discarded: number, reason: unknown) => void,
 		onTerminal: () => void = () => {},
 	) {
 		this.#onTerminal = onTerminal;
@@ -61,9 +62,9 @@ export class RecvStream {
 					// an unaccepted stream's hidden ReadableStream queue.
 					onConsume(chunk.byteLength);
 				},
-				cancel: () => {
+				cancel: (reason: unknown) => {
 					this.#error ??= new Error("stream cancelled");
-					onCancel(this.#discard());
+					onCancel(this.#discard(), reason);
 					this.#notifyTerminal();
 					this.#signal();
 				},

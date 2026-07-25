@@ -79,6 +79,29 @@ try {
 Don't reach for `closeCode` to tell the two apart — close codes are application-defined, so an app
 closing with `1006` is indistinguishable from a dropped socket. The settled state is the signal.
 
+### Stream reset codes
+
+A reset carries an application error code in both directions, like native WebTransport:
+
+```ts
+import { StreamError } from "@moq/qmux"
+
+// Send RESET_STREAM with code 26.
+await stream.writable.abort(new StreamError("RESET_STREAM", 26))
+
+// Receive one: the code is a field, not text buried in the message.
+try {
+	await reader.read()
+} catch (err) {
+	// err.source === "stream"
+	console.warn("reset by peer with code", err.streamErrorCode)
+}
+```
+
+The outgoing code comes off the reason passed to `abort()` / `cancel()`, so any `WebTransportError`
+(native or the exported `StreamError`) sends its `streamErrorCode` and anything else sends 0.
+`STOP_SENDING` works the same way, erroring the sender's writable with the code the peer chose.
+
 ### Polyfill
 
 Install as a global `WebTransport` polyfill:

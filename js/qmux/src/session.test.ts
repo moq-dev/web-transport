@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { WebSocketLike, WebSocketStreamLike } from "@moq/web-socket-stream";
-import { SessionError } from "./error.ts";
+import { SessionError, StreamError } from "./error.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_MAX_RECORD_SIZE, type TransportParams } from "./frame.ts";
 import Session, { type Config } from "./session.ts";
@@ -277,6 +277,104 @@ describe("Session integration (scripted peer)", () => {
 		await waitFor(() => peer.has("reset_stream"));
 		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
 		expect(reset.finalSize).toBe(3n);
+		session.close();
+	});
+
+	test("aborting with a WebTransportError sends its streamErrorCode", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		await writable.abort(new StreamError("RESET_STREAM", 26));
+
+		await waitFor(() => peer.has("reset_stream"));
+		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
+		expect(reset.code.value).toBe(26n);
+		session.close();
+	});
+
+	test("aborting with a plain error sends code 0", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		await writable.abort(new Error("cancel"));
+
+		await waitFor(() => peer.has("reset_stream"));
+		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
+		expect(reset.code.value).toBe(0n);
+		session.close();
+	});
+
+	test("cancelling with a WebTransportError sends its streamErrorCode as STOP_SENDING", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		peer.send({ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: false });
+
+		const reader = session.incomingUnidirectionalStreams.getReader();
+		const incoming = await reader.read();
+		if (!incoming.value) throw new Error("expected an incoming stream");
+		await incoming.value.cancel(new StreamError("STOP_SENDING", 2));
+
+		await waitFor(() => peer.has("stop_sending"));
+		const stop = peer.received().find((f) => f.type === "stop_sending") as Frame.StopSending;
+		expect(stop.code.value).toBe(2n);
+		session.close();
+	});
+
+	test("a received RESET_STREAM errors the readable with the peer's code", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+		peer.send({ type: "stream", id, data: new Uint8Array([1, 2, 3]), fin: false });
+
+		const reader = session.incomingUnidirectionalStreams.getReader();
+		const incoming = await reader.read();
+		if (!incoming.value) throw new Error("expected an incoming stream");
+
+		// Drain what arrived before the reset, so the next read is the one that observes it.
+		const stream = incoming.value.getReader();
+		expect((await stream.read()).value).toEqual(new Uint8Array([1, 2, 3]));
+
+		peer.send({ type: "reset_stream", id, code: VarInt.from(31), finalSize: 3n });
+
+		// The code is the point: an application distinguishing "cancelled, move on" from
+		// "data is missing" reads it off the error rather than parsing the message.
+		const err = await stream.read().then(
+			() => undefined,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).source).toBe("stream");
+		expect((err as StreamError).streamErrorCode).toBe(31);
+		session.close();
+	});
+
+	test("a received STOP_SENDING errors the writable with the peer's code", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		const writable = await session.createUnidirectionalStream();
+		const writer = writable.getWriter();
+		await writer.write(new Uint8Array([1, 2, 3]));
+
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, false);
+		peer.send({ type: "stop_sending", id, code: VarInt.from(2) });
+
+		const err = await writer.closed.then(
+			() => undefined,
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).streamErrorCode).toBe(2);
 		session.close();
 	});
 

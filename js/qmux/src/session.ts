@@ -5,7 +5,7 @@ import {
 	type WebSocketStreamLike,
 } from "@moq/web-socket-stream";
 import { Credit, replenishWindow } from "./credit.ts";
-import { SessionError } from "./error.ts";
+import { resetCode, SessionError, StreamError } from "./error.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD, usesRecords } from "./frame.ts";
@@ -1341,12 +1341,12 @@ export default class Session implements WebTransport {
 					this.#accountStreamConsumed(streamId, bytes);
 					this.#accountConnConsumed(bytes);
 				},
-				(discarded) => {
+				(discarded, reason) => {
 					this.#accountConnConsumed(discarded);
 					this.#sendPriorityFrame({
 						type: "stop_sending",
 						id: frame.id,
-						code: VarInt.from(0),
+						code: VarInt.from(resetCode(reason)),
 					});
 
 					this.#recvStreams.delete(streamId);
@@ -1377,7 +1377,7 @@ export default class Session implements WebTransport {
 						this.#sendPriorityFrame({
 							type: "reset_stream",
 							id: frame.id,
-							code: VarInt.from(0),
+							code: VarInt.from(resetCode(e)),
 							finalSize: this.#sendFinalSize(streamId),
 						});
 
@@ -1480,7 +1480,7 @@ export default class Session implements WebTransport {
 			return;
 		}
 
-		const discarded = recv.reset(new Error(`RESET_STREAM: ${frame.code.value}`));
+		const discarded = recv.reset(new StreamError("RESET_STREAM", Number(frame.code.value)));
 		this.#accountConnConsumed(resetGap + BigInt(discarded));
 		this.#recvStreams.delete(streamId);
 		this.#maybeDeleteStreamFlow(streamId);
@@ -1491,9 +1491,10 @@ export default class Session implements WebTransport {
 		const stream = this.#sendStreams.get(streamId);
 		if (!stream) return;
 
-		stream.error(new Error(`STOP_SENDING: ${frame.code.value}`));
+		const stopped = new StreamError("STOP_SENDING", Number(frame.code.value));
+		stream.error(stopped);
 		this.#sendStreams.delete(streamId);
-		this.#scheduler?.dropStream(streamId, new Error(`STOP_SENDING: ${frame.code.value}`));
+		this.#scheduler?.dropStream(streamId, stopped);
 
 		this.#sendPriorityFrame({
 			type: "reset_stream",
@@ -1685,7 +1686,7 @@ export default class Session implements WebTransport {
 				this.#sendPriorityFrame({
 					type: "reset_stream",
 					id: streamId,
-					code: VarInt.from(0),
+					code: VarInt.from(resetCode(e)),
 					finalSize: this.#sendFinalSize(streamIdVal),
 				});
 
@@ -1707,12 +1708,12 @@ export default class Session implements WebTransport {
 				this.#accountStreamConsumed(streamIdVal, bytes);
 				this.#accountConnConsumed(bytes);
 			},
-			(discarded) => {
+			(discarded, reason) => {
 				this.#accountConnConsumed(discarded);
 				this.#sendPriorityFrame({
 					type: "stop_sending",
 					id: streamId,
-					code: VarInt.from(0),
+					code: VarInt.from(resetCode(reason)),
 				});
 
 				this.#recvStreams.delete(streamIdVal);
@@ -1765,7 +1766,7 @@ export default class Session implements WebTransport {
 				session.#sendPriorityFrame({
 					type: "reset_stream",
 					id: streamId,
-					code: VarInt.from(0),
+					code: VarInt.from(resetCode(e)),
 					finalSize: session.#sendFinalSize(streamIdVal),
 				});
 
