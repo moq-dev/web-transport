@@ -19,19 +19,19 @@ export class SessionError extends Error implements Pick<WebTransportError, "sour
 	}
 }
 
-/** A stream reset by the peer, shaped like the `WebTransportError` the WebTransport spec
- *  requires a reset stream to error with.
+/** A stream reset, shaped like the `WebTransportError` the WebTransport spec requires a reset
+ *  stream to error with. Pass one to `abort()` / `cancel()` to send a code of your own.
  *
  *  Same reasoning as {@link SessionError}: mint our own rather than reach for a global the
- *  runnning environment does not have. The code the peer sent is the whole point of this
- *  error, so it goes in `streamErrorCode` where a consumer already looks for it, rather
+ *  running environment does not have. The code is the whole point of this error, so it leads
+ *  the constructor and goes in `streamErrorCode` where a consumer already looks for it, rather
  *  than being formatted into the message and lost.
  */
 export class StreamError extends Error implements Pick<WebTransportError, "source" | "streamErrorCode"> {
 	readonly source = "stream" as const;
 	readonly streamErrorCode: number;
 
-	constructor(message: string, code: number) {
+	constructor(code: number, message = "stream reset") {
 		super(`${message}: ${code}`);
 		this.name = "WebTransportError";
 		this.streamErrorCode = code;
@@ -49,8 +49,19 @@ export function resetCode(reason: unknown): number {
 	if (typeof reason !== "object" || reason === null) return 0;
 
 	const { streamErrorCode } = reason as { streamErrorCode?: unknown };
-	if (typeof streamErrorCode !== "number" || !Number.isFinite(streamErrorCode)) return 0;
+	if (typeof streamErrorCode !== "number") return 0;
 
-	// The IDL type is `unsigned long`, so wrap like the platform would.
+	// The IDL type is `unsigned long`, so wrap like the platform would. This also folds a
+	// fractional or non-finite value to an integer rather than putting it on the wire.
 	return streamErrorCode >>> 0;
+}
+
+/** Narrow a code off the wire to the `unsigned long` a `streamErrorCode` is.
+ *
+ *  A frame's code is a varint, so a peer can encode one far wider than the IDL type (and wider
+ *  than `Number` holds exactly). Truncating keeps `streamErrorCode` a value the WebTransport
+ *  API can actually represent, and matches what {@link resetCode} puts on the wire.
+ */
+export function streamCode(code: bigint): number {
+	return Number(BigInt.asUintN(32, code));
 }

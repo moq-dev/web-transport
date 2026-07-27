@@ -87,7 +87,7 @@ A reset carries an application error code in both directions, like native WebTra
 import { StreamError } from "@moq/qmux"
 
 // Send RESET_STREAM with code 26.
-await stream.writable.abort(new StreamError("RESET_STREAM", 26))
+await stream.writable.abort(new StreamError(26))
 
 // Receive one: the code is a field, not text buried in the message.
 try {

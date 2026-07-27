@@ -5,7 +5,7 @@ import {
 	type WebSocketStreamLike,
 } from "@moq/web-socket-stream";
 import { Credit, replenishWindow } from "./credit.ts";
-import { resetCode, SessionError, StreamError } from "./error.ts";
+import { resetCode, SessionError, StreamError, streamCode } from "./error.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
 import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD, usesRecords } from "./frame.ts";
@@ -1480,7 +1480,7 @@ export default class Session implements WebTransport {
 			return;
 		}
 
-		const discarded = recv.reset(new StreamError("RESET_STREAM", Number(frame.code.value)));
+		const discarded = recv.reset(new StreamError(streamCode(frame.code.value), "RESET_STREAM"));
 		this.#accountConnConsumed(resetGap + BigInt(discarded));
 		this.#recvStreams.delete(streamId);
 		this.#maybeDeleteStreamFlow(streamId);
@@ -1491,7 +1491,7 @@ export default class Session implements WebTransport {
 		const stream = this.#sendStreams.get(streamId);
 		if (!stream) return;
 
-		const stopped = new StreamError("STOP_SENDING", Number(frame.code.value));
+		const stopped = new StreamError(streamCode(frame.code.value), "STOP_SENDING");
 		stream.error(stopped);
 		this.#sendStreams.delete(streamId);
 		this.#scheduler?.dropStream(streamId, stopped);

@@ -286,7 +286,7 @@ describe("Session integration (scripted peer)", () => {
 		peer.send({ type: "transport_parameters", params: peerParams() });
 
 		const writable = await session.createUnidirectionalStream();
-		await writable.abort(new StreamError("RESET_STREAM", 26));
+		await writable.abort(new StreamError(26, "RESET_STREAM"));
 
 		await waitFor(() => peer.has("reset_stream"));
 		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
@@ -319,7 +319,7 @@ describe("Session integration (scripted peer)", () => {
 		const reader = session.incomingUnidirectionalStreams.getReader();
 		const incoming = await reader.read();
 		if (!incoming.value) throw new Error("expected an incoming stream");
-		await incoming.value.cancel(new StreamError("STOP_SENDING", 2));
+		await incoming.value.cancel(new StreamError(2, "STOP_SENDING"));
 
 		await waitFor(() => peer.has("stop_sending"));
 		const stop = peer.received().find((f) => f.type === "stop_sending") as Frame.StopSending;
