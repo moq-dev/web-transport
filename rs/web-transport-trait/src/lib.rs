@@ -146,6 +146,23 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 ///
 /// QUIC streams have flow control, which means the send rate is limited by the peer's receive window.
 /// The stream will be closed with a graceful FIN when dropped.
+///
+/// # Implementing `poll_*`
+///
+/// A `poll_*` method may keep its own progress across calls, and often should —
+/// [`poll_write_buf`](Self::poll_write_buf) will typically have reserved send
+/// capacity by the time it returns [`Poll::Pending`], and starting over would give
+/// that back. What it must not keep is anything belonging to the *caller*:
+///
+/// - Nothing about `buf` may be assumed to survive. Every call gets a fresh
+///   argument, and a caller is free to retry a pending write with a shorter buffer.
+///   Retained progress must be reconciled against the buffer actually presented,
+///   not the one that started the operation.
+/// - Whatever ends the stream — [`reset`](Self::reset), [`finish`](Self::finish), a
+///   peer STOP_SENDING seen by [`poll_closed`](Self::poll_closed) — must release
+///   retained progress. Nothing else will: the guards at the top of a write return
+///   early once the stream is closed, so no later call reaches the cleanup, and a
+///   reservation held past that point is leaked for the life of the stream.
 pub trait SendStream: MaybeSend {
     type Error: Error;
 
@@ -286,6 +303,9 @@ pub trait SendStream: MaybeSend {
 ///
 /// All bytes are flushed in order and the stream is flow controlled.
 /// The stream will be closed with STOP_SENDING code=0 when dropped.
+///
+/// See [`SendStream`] for the rules a `poll_*` implementation follows about what it
+/// may and may not retain between calls.
 pub trait RecvStream: MaybeSend {
     type Error: Error;
 
