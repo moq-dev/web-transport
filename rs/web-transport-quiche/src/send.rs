@@ -110,8 +110,23 @@ impl AsyncWrite for SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = StreamError;
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.write(buf).await
+    fn poll_write_buf<B: Buf + web_transport_trait::MaybeSend>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<Result<usize, Self::Error>> {
+        // `ez` returns Pending before touching `buf` and then takes the bytes with
+        // `copy_to_bytes`, so this satisfies the partial-write contract and stays
+        // zero-copy when `B` is `Bytes`.
+        self.inner.poll_write_buf(cx, buf).map_err(Into::into)
+    }
+
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut buf: &[u8],
+    ) -> Poll<Result<usize, Self::Error>> {
+        self.poll_write_buf(cx, &mut buf)
     }
 
     fn set_priority(&mut self, order: u8) {
@@ -126,7 +141,7 @@ impl web_transport_trait::SendStream for SendStream {
         self.finish()
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.closed().await
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_closed(cx.waker()).map_err(Into::into)
     }
 }

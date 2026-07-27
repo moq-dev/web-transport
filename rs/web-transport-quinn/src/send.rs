@@ -2,7 +2,7 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -17,11 +17,18 @@ use crate::{ClosedStream, SessionError, WriteError};
 pub struct SendStream {
     stream: quinn::SendStream,
     error: Arc<OnceLock<SessionError>>,
+
+    // Retains the `stopped()` future across `poll_closed` calls.
+    closed: web_transport_trait::OpState<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: quinn::SendStream, error: Arc<OnceLock<SessionError>>) -> Self {
-        Self { stream, error }
+        Self {
+            stream,
+            error,
+            closed: Default::default(),
+        }
     }
 
     /// Replace connection-level errors with the stored session error if available.
@@ -162,28 +169,49 @@ impl web_transport_trait::SendStream for SendStream {
         Self::finish(self).map_err(|_| WriteError::ClosedStream)
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Self::write(self, buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let size = ready!(quinn::SendStream::poll_write(
+            Pin::new(&mut self.stream),
+            cx,
+            buf
+        ))
+        .map_err(|e| self.map_error(e))?;
+        Poll::Ready(Ok(size))
     }
 
-    // `write_buf` is deliberately left to the trait's default, which writes out of
-    // `buf.chunk()` and advances only by what Quinn accepted. Overriding it to
-    // `copy_to_bytes` up front and then await the zero-copy `write_chunk` would be
-    // faster but loses data: `write_chunk` is not cancel safe, so a caller that
-    // drops the future (moq re-prioritizes a stream mid-write) strands the chunk —
-    // gone from `buf` but never sent, a silent hole in the stream.
+    // `poll_write_buf` is deliberately left to the trait's default, which writes out
+    // of `buf.chunk()` and advances only by what Quinn accepted. Overriding it to
+    // `copy_to_bytes` up front and then write the zero-copy `write_chunk` would be
+    // faster but loses data: the chunk would be gone from `buf` before Quinn accepted
+    // it, a silent hole in the stream if the write does not complete.
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
         // Sound to keep zero-copy here: the caller hands over ownership, so there is
-        // no buffer position to get out of sync with a cancelled write.
+        // no buffer position to get out of sync with an incomplete write.
         self.write_chunk(chunk).await
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        // NOTE: This used to require &mut in an older version of Quinn.
-        match self.stopped().await? {
-            Some(code) => Err(WriteError::Stopped(code)),
-            None => Ok(()),
-        }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // `stopped()` registers with the connection's notifier on first poll, so the
+        // future has to be retained — recreating it each poll would drop the
+        // registration and never wake.
+        let stopped = self.stream.stopped();
+        let error = self.error.clone();
+
+        self.closed.poll(cx, move || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
+                    Err(WriteError::SessionError(
+                        error.get().cloned().unwrap_or_else(|| conn_err.into()),
+                    ))
+                }
+                Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
+            }
+        })
     }
 }

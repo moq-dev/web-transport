@@ -59,7 +59,7 @@ async fn send_settings(session: &Session) -> anyhow::Result<()> {
     settings.enable_webtransport(1);
     settings.encode(&mut buf);
 
-    uni.write(&buf).await?;
+    uni.write_all(&buf).await?;
     uni.finish()?;
 
     println!("  sent SETTINGS (enable_webtransport=1)");
@@ -96,7 +96,7 @@ async fn run_client(session: Session) -> anyhow::Result<()> {
 
     let mut buf = BytesMut::new();
     request.encode(&mut buf)?;
-    send.write(&buf).await?;
+    send.write_all(&buf).await?;
     send.finish()?;
     println!("[client] sent CONNECT request");
 
@@ -136,7 +136,7 @@ async fn run_server(session: Session) -> anyhow::Result<()> {
 
     let mut buf = BytesMut::new();
     response.encode(&mut buf)?;
-    send.write(&buf).await?;
+    send.write_all(&buf).await?;
     send.finish()?;
     println!("[server] sent 200 OK");
 

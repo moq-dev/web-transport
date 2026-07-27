@@ -1,10 +1,10 @@
 use std::{
     io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use iroh::endpoint;
 
 use crate::{ClosedStream, SessionError, WriteError};
@@ -16,11 +16,17 @@ use crate::{ClosedStream, SessionError, WriteError};
 #[derive(Debug)]
 pub struct SendStream {
     stream: endpoint::SendStream,
+
+    // Retains the `stopped()` future across `poll_closed` calls.
+    closed: web_transport_trait::OpState<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: endpoint::SendStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            closed: Default::default(),
+        }
     }
 
     /// Abruptly reset the stream with the provided error code. See [`iroh::endpoint::SendStream::reset`].
@@ -132,29 +138,46 @@ impl web_transport_trait::SendStream for SendStream {
         Ok(())
     }
 
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        Self::write(self, buf).await
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let size = ready!(endpoint::SendStream::poll_write(
+            Pin::new(&mut self.stream),
+            cx,
+            buf
+        ))?;
+        Poll::Ready(Ok(size))
     }
 
-    async fn write_buf<B: Buf + web_transport_trait::MaybeSend>(
-        &mut self,
-        buf: &mut B,
-    ) -> Result<usize, Self::Error> {
-        // This can avoid making a copy when Buf is Bytes, as Quinn will allocate anyway.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
-    }
+    // `poll_write_buf` is deliberately left to the trait's default. Taking the bytes
+    // with `copy_to_bytes` up front to feed the zero-copy `write_chunk` would save a
+    // copy, but `write_chunk` is not cancel safe: an incomplete write would leave the
+    // chunk gone from `buf` but only partly sent, a silent hole in the stream.
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+        // Sound to keep zero-copy here: the caller hands over ownership, so there is
+        // no buffer position to get out of sync with an incomplete write.
         self.write_chunk(chunk).await
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        match self.stopped().await? {
-            Some(code) => Err(WriteError::Stopped(code)),
-            None => Ok(()),
-        }
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // `stopped()` registers with the connection's notifier when it is created, so
+        // the future has to be retained — rebuilding it each poll would drop the
+        // registration and never wake.
+        let stopped = self.stream.stopped();
+
+        self.closed.poll(cx, move || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(endpoint::StoppedError::ConnectionLost(e)) => {
+                    Err(WriteError::SessionError(e.into()))
+                }
+                Err(endpoint::StoppedError::ZeroRttRejected) => {
+                    unreachable!("0-RTT not supported")
+                }
+            }
+        })
     }
 }

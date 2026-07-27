@@ -249,10 +249,11 @@ impl SendStream {
         poll_fn(|cx| self.poll_write_buf(cx, &mut buf)).await
     }
 
-    // Write some of the buffer to the stream, advancing the internal position.
-    //
-    // Returns the number of bytes written for convenience.
-    fn poll_write_buf<B: Buf>(
+    /// Poll to write some of the buffer to the stream, advancing the internal
+    /// position.
+    ///
+    /// Returns the number of bytes written for convenience.
+    pub fn poll_write_buf<B: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -352,7 +353,8 @@ impl SendStream {
         self.state.lock().is_closed()
     }
 
-    fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    /// Poll until the stream is closed by either side. See [`SendStream::closed`].
+    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
         if let Poll::Ready(res) = self.state.lock().poll_closed(waker) {
             return Poll::Ready(res);
         }

@@ -4,11 +4,12 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
+    task::{ready, Context, Poll},
 };
 
 use crate::config::Config;
 use crate::credit::Credit;
-use crate::sched::PriorityQueue;
+use crate::sched::{Permit, PriorityQueue};
 use crate::transport::{Reader, Transport, Writer};
 use crate::{
     proto::varint_size, ApplicationClose, ConnectionClose, Error, Frame, ResetStream, StopSending,
@@ -627,6 +628,7 @@ mod writer_final_size_tests {
             fin: false,
             stream_credit: Some(stream_credit.clone()),
             conn_credit: Some(conn_credit.clone()),
+            write: Default::default(),
         };
 
         assert_eq!(
@@ -1090,6 +1092,7 @@ impl<R: Reader> SessionState<R> {
                             } else {
                                 None
                             },
+                            write: Default::default(),
                         };
 
                         self.streams
@@ -1838,6 +1841,7 @@ impl generic::Session for Session {
             } else {
                 None
             },
+            write: Default::default(),
         };
 
         // Register the backend before returning the frontend, so the stream exists
@@ -1893,6 +1897,7 @@ impl generic::Session for Session {
             } else {
                 None
             },
+            write: Default::default(),
         };
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2046,6 +2051,9 @@ pub struct SendStream {
     // Flow control (None for WebTransport version)
     stream_credit: Option<Credit>,
     conn_credit: Option<Credit>,
+
+    // Retains an in-progress `reserve` across `poll_write_buf` calls.
+    write: generic::OpState<Result<(Permit, u64), Error>>,
 }
 
 impl SendStream {
@@ -2087,29 +2095,39 @@ impl SendStream {
         }
     }
 
-    /// Try to claim flow control credit for sending `desired` bytes.
-    /// Returns the number of bytes we're allowed to send.
-    async fn claim_credit(&mut self, desired: u64) -> Result<u64, Error> {
-        let (stream_credit, conn_credit) = match (&self.stream_credit, &self.conn_credit) {
+    /// Reserve a queue slot and claim flow control credit for sending up to
+    /// `desired` bytes, resolving to the permit and the amount allowed.
+    ///
+    /// This resolves only once both are in hand, so it holds no claimed credit
+    /// while pending: dropping it returns the permit and claims nothing. That is
+    /// what lets `poll_write_buf` retain it across polls without leaking credit,
+    /// and what lets it commit the caller's bytes with nothing to await in
+    /// between.
+    ///
+    /// It deliberately does not watch `inbound_stopped`. It borrows nothing from
+    /// the stream, so it cannot; instead `poll_write_buf` checks for a
+    /// STOP_SENDING before every poll, which registers the waker that wakes a
+    /// write blocked here.
+    async fn reserve(
+        outbound: PriorityQueue,
+        stream_credit: Option<Credit>,
+        conn_credit: Option<Credit>,
+        desired: u64,
+    ) -> Result<(Permit, u64), Error> {
+        let permit = outbound.reserve().await?;
+
+        let (stream_credit, conn_credit) = match (stream_credit, conn_credit) {
             (Some(s), Some(c)) => (s, c),
-            _ => return Ok(desired), // No flow control
+            _ => return Ok((permit, desired)), // No flow control
         };
 
         loop {
             // 1. Try to claim stream credit
             let stream_claimed = stream_credit.try_claim(desired);
             if stream_claimed == 0 {
-                // Wait for stream credit or stop_sending
-                tokio::select! {
-                    result = stream_credit.claim(desired) => {
-                        let claimed = result?;
-                        // Release and retry the full loop to coordinate with conn credit
-                        stream_credit.release(claimed);
-                    }
-                    Some(stop) = self.inbound_stopped.recv() => {
-                        return Err(self.recv_stop(stop.code));
-                    }
-                }
+                // Release and retry the full loop to coordinate with conn credit
+                let claimed = stream_credit.claim(desired).await?;
+                stream_credit.release(claimed);
                 continue;
             }
 
@@ -2117,15 +2135,8 @@ impl SendStream {
             let conn_claimed = conn_credit.try_claim(stream_claimed);
             if conn_claimed == 0 {
                 stream_credit.release(stream_claimed);
-                tokio::select! {
-                    result = conn_credit.claim(1) => {
-                        let claimed = result?;
-                        conn_credit.release(claimed); // Release, retry full loop
-                    }
-                    Some(stop) = self.inbound_stopped.recv() => {
-                        return Err(self.recv_stop(stop.code));
-                    }
-                }
+                let claimed = conn_credit.claim(1).await?;
+                conn_credit.release(claimed); // Release, retry full loop
                 continue;
             }
 
@@ -2134,7 +2145,7 @@ impl SendStream {
                 stream_credit.release(stream_claimed - conn_claimed);
             }
 
-            return Ok(conn_claimed);
+            return Ok((permit, conn_claimed));
         }
     }
 }
@@ -2150,59 +2161,77 @@ impl Drop for SendStream {
 impl generic::SendStream for SendStream {
     type Error = Error;
 
-    async fn write(&mut self, mut buf: &[u8]) -> Result<usize, Self::Error> {
-        let size = buf.len();
-        let b = &mut buf;
-        self.write_buf(b).await?;
-        Ok(size - b.len())
+    fn poll_write(&mut self, cx: &mut Context<'_>, mut buf: &[u8]) -> Poll<Result<usize, Error>> {
+        self.poll_write_buf(cx, &mut buf)
     }
 
-    async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
+    fn poll_write_buf<B: Buf + generic::MaybeSend>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<Result<usize, Error>> {
         if let Some(error) = &self.closed {
-            return Err(error.clone());
+            return Poll::Ready(Err(error.clone()));
         }
 
         if self.fin {
-            return Err(Error::StreamClosed);
+            return Poll::Ready(Err(Error::StreamClosed));
         }
 
-        let mut total = 0;
-
-        while buf.has_remaining() {
-            let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
-
-            // Wait for queue capacity and flow-control credit *before* taking any
-            // bytes out of `buf`. Callers race this future against other work (moq
-            // re-prioritizes a stream mid-write), so every await here has to leave
-            // the caller's buffer untouched: dropping the future returns the permit
-            // and claims no credit, and the caller just retries. Taking the bytes
-            // first and awaiting after would let a cancel strand them — gone from
-            // `buf` but never queued, a silent hole the peer decodes as garbage.
-            let permit = tokio::select! {
-                result = self.outbound.reserve() => result?,
-                Some(stop) = self.inbound_stopped.recv() => return Err(self.recv_stop(stop.code)),
-            };
-
-            let allowed = self.claim_credit(chunk_len).await?;
-            let to_send = allowed as usize;
-
-            // Committed: no await between taking the bytes and queueing them.
-            let frame = Stream {
-                id: self.id,
-                offset: self.offset,
-                data: buf.copy_to_bytes(to_send),
-                fin: false,
-            };
-            if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
-                // The session closed while we held the permit; the data was never sent.
-                self.release_credit(to_send as u64);
-                return Err(err);
+        // Check for a STOP_SENDING before anything else. Polling here also registers
+        // the waker, so a write parked below on queue capacity or flow control is
+        // woken by the peer giving up on the stream.
+        match self.inbound_stopped.poll_recv(cx) {
+            Poll::Ready(Some(stop)) => {
+                self.write.clear();
+                return Poll::Ready(Err(self.recv_stop(stop.code)));
             }
-            self.offset += to_send as u64;
-            total += to_send;
+            Poll::Ready(None) | Poll::Pending => {}
         }
 
-        Ok(total)
+        let desired = buf.chunk().len().min(MAX_FRAME_PAYLOAD);
+        if desired == 0 {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Wait for queue capacity and flow-control credit *before* taking any bytes
+        // out of `buf`. Callers race writes against other work (moq re-prioritizes a
+        // stream mid-write), so a `Pending` here has to leave the caller's buffer
+        // untouched. Taking the bytes first and waiting after would strand them —
+        // gone from `buf` but never queued, a silent hole the peer decodes as
+        // garbage. The reservation is retained across polls so a `Pending` resumes
+        // it rather than giving the slot back and queueing behind other streams.
+        let outbound = self.outbound.clone();
+        let stream_credit = self.stream_credit.clone();
+        let conn_credit = self.conn_credit.clone();
+        let (permit, allowed) = ready!(self.write.poll(cx, || Self::reserve(
+            outbound,
+            stream_credit,
+            conn_credit,
+            desired as u64
+        )))?;
+
+        // `buf` may have shrunk since the reservation started — nothing stops a
+        // caller from retrying a pending write with a shorter buffer — so send what
+        // it has now and hand the excess credit back.
+        let to_send = (allowed as usize).min(buf.chunk().len());
+        self.release_credit(allowed - to_send as u64);
+
+        // Committed: nothing to wait on between taking the bytes and queueing them.
+        let frame = Stream {
+            id: self.id,
+            offset: self.offset,
+            data: buf.copy_to_bytes(to_send),
+            fin: false,
+        };
+        if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
+            // The session closed while we held the permit; the data was never sent.
+            self.release_credit(to_send as u64);
+            return Poll::Ready(Err(err));
+        }
+        self.offset += to_send as u64;
+
+        Poll::Ready(Ok(to_send))
     }
 
     /// Set the stream's send priority; higher values are sent first.
@@ -2260,15 +2289,15 @@ impl generic::SendStream for SendStream {
         Ok(())
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(error) = &self.closed {
-            return Err(error.clone());
+            return Poll::Ready(Err(error.clone()));
         }
 
-        match self.inbound_stopped.recv().await {
+        Poll::Ready(match ready!(self.inbound_stopped.poll_recv(cx)) {
             Some(stop) => Err(self.recv_stop(stop.code)),
             None => Err(Error::Closed),
-        }
+        })
     }
 }
 
@@ -2346,6 +2375,29 @@ impl RecvStream {
         Some(data)
     }
 
+    /// Poll both inbound channels for the next STREAM frame, preferring a
+    /// RESET_STREAM because it is terminal.
+    ///
+    /// The session is only gone once *both* channels are closed; a single closed
+    /// channel leaves the other one registered for wakeup, so this still parks
+    /// rather than reporting a close the peer never sent.
+    fn poll_inbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream, Error>> {
+        let reset_closed = match self.inbound_reset.poll_recv(cx) {
+            Poll::Ready(Some(reset)) => return Poll::Ready(Err(self.recv_reset(reset.code))),
+            Poll::Ready(None) => true,
+            Poll::Pending => false,
+        };
+
+        match self.inbound_data.poll_recv(cx) {
+            Poll::Ready(Some(stream)) => {
+                assert_eq!(stream.id, self.id);
+                Poll::Ready(Ok(stream))
+            }
+            Poll::Ready(None) if reset_closed => Poll::Ready(Err(Error::Closed)),
+            Poll::Ready(None) | Poll::Pending => Poll::Pending,
+        }
+    }
+
     /// Report consumed bytes to flow control, sending window updates as needed.
     fn report_consumed(&self, len: u64) {
         if !self.version.is_qmux() {
@@ -2391,56 +2443,59 @@ impl Drop for RecvStream {
 impl generic::RecvStream for RecvStream {
     type Error = Error;
 
-    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
         loop {
             if let Some(data) = self.take_buffered(max) {
-                return Ok(Some(data));
+                return Poll::Ready(Ok(Some(data)));
             }
 
             if self.fin {
-                return Ok(None);
+                return Poll::Ready(Ok(None));
             }
 
             if let Some(error) = &self.closed {
-                return Err(error.clone());
+                return Poll::Ready(Err(error.clone()));
             }
 
-            tokio::select! {
-                Some(stream) = self.inbound_data.recv() => {
-                    assert_eq!(stream.id, self.id);
-                    self.fin = stream.fin;
-                    self.recv_data(stream.data);
-                }
-                Some(reset) = self.inbound_reset.recv() => {
-                    return Err(self.recv_reset(reset.code));
-                }
-                else => return Err(Error::Closed),
-            }
+            let stream = ready!(self.poll_inbound(cx))?;
+            self.fin = stream.fin;
+            self.recv_data(stream.data);
         }
     }
 
-    async fn read_buf<B: BufMut + Send>(
+    fn poll_read_buf<B: BufMut + generic::MaybeSend>(
         &mut self,
+        cx: &mut Context<'_>,
         buf: &mut B,
-    ) -> Result<Option<usize>, Self::Error> {
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
         if let Some(data) = self.take_buffered(buf.remaining_mut()) {
             let to_read = data.len();
             buf.put(data);
-            return Ok(Some(to_read));
+            return Poll::Ready(Ok(Some(to_read)));
         }
 
-        Ok(match self.read_chunk(buf.remaining_mut()).await? {
-            Some(data) if !data.is_empty() => {
-                let size = data.len();
-                buf.put(data);
-                Some(size)
-            }
-            _ => None,
-        })
+        Poll::Ready(Ok(
+            match ready!(self.poll_read_chunk(cx, buf.remaining_mut()))? {
+                Some(data) if !data.is_empty() => {
+                    let size = data.len();
+                    buf.put(data);
+                    Some(size)
+                }
+                _ => None,
+            },
+        ))
     }
 
-    async fn read(&mut self, mut buf: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        self.read_buf(&mut buf).await
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut buf: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        self.poll_read_buf(cx, &mut buf)
     }
 
     fn stop(&mut self, code: u32) {
@@ -2451,31 +2506,21 @@ impl generic::RecvStream for RecvStream {
         self.closed = Some(Error::StreamStop(code));
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         if let Some(error) = &self.closed {
-            return Err(error.clone());
+            return Poll::Ready(Err(error.clone()));
         }
 
         loop {
             if self.fin {
-                return Ok(());
+                return Poll::Ready(Ok(()));
             }
 
-            tokio::select! {
-                Some(reset) = self.inbound_reset.recv() => {
-                    return Err(self.recv_reset(reset.code));
-                }
-                // Observing the FIN means draining data frames, which have to
-                // queue behind anything a partial read left unread.
-                Some(stream) = self.inbound_data.recv() => {
-                    assert_eq!(stream.id, self.id);
-                    self.recv_data(stream.data);
-                    self.fin = stream.fin;
-                }
-                else => {
-                    return Err(Error::Closed);
-                }
-            }
+            // Observing the FIN means draining data frames, which have to queue
+            // behind anything a partial read left unread.
+            let stream = ready!(self.poll_inbound(cx))?;
+            self.recv_data(stream.data);
+            self.fin = stream.fin;
         }
     }
 }
@@ -2716,6 +2761,7 @@ mod send_offset_tests {
             fin: false,
             stream_credit: None,
             conn_credit: None,
+            write: Default::default(),
         };
 
         send.write(&[1, 2, 3]).await.unwrap();
@@ -2749,6 +2795,11 @@ mod send_offset_tests {
 /// otherwise healthy, cleanly-finished stream.
 #[cfg(test)]
 mod write_cancel_tests {
+    use std::{
+        sync::Arc,
+        task::{Context, Poll, Wake, Waker},
+    };
+
     use bytes::{Buf, Bytes};
     use tokio::sync::mpsc;
     use web_transport_trait::SendStream as _;
@@ -2757,6 +2808,16 @@ mod write_cancel_tests {
     use crate::credit::Credit;
     use crate::sched::PriorityQueue;
     use crate::{Frame, StreamDir, StreamId};
+
+    struct Noop;
+
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn waker() -> Waker {
+        Waker::from(Arc::new(Noop))
+    }
 
     fn send_stream(
         outbound: PriorityQueue,
@@ -2776,6 +2837,7 @@ mod write_cancel_tests {
             fin: false,
             stream_credit,
             conn_credit,
+            write: Default::default(),
         }
     }
 
@@ -2895,6 +2957,76 @@ mod write_cancel_tests {
             consumed > 0,
             "expected the window's worth of data to get through"
         );
+    }
+
+    /// A `Pending` poll keeps its reservation instead of starting over.
+    ///
+    /// This is the difference between a `poll_*` method and a `poll_fn` around a
+    /// fresh future: rebuilding the reservation each poll would hand the queue
+    /// slot back and re-queue behind every other stream, so a write could be
+    /// starved indefinitely by a busy connection.
+    #[tokio::test]
+    async fn pending_write_retains_its_reservation() {
+        // Capacity 1, already occupied: the write parks in `reserve`.
+        let outbound = PriorityQueue::new(1);
+        let mut filler = send_stream(outbound.clone(), None, None);
+        filler.write(&[0xFF]).await.unwrap();
+
+        let mut send = send_stream(outbound, None, None);
+        let mut buf = Bytes::from(vec![0xAB_u8; 1024]);
+
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(send.poll_write_buf(&mut cx, &mut buf).is_pending());
+        assert!(send.write.is_pending(), "the reservation was abandoned");
+    }
+
+    /// A retried write may arrive with a shorter buffer than the one that started
+    /// the reservation — nothing in the API stops a caller from doing that. The
+    /// write must send what the buffer actually has and hand the surplus credit
+    /// back, rather than trusting the amount it reserved for.
+    #[tokio::test]
+    async fn pending_write_tolerates_a_shorter_retry_buffer() {
+        const WINDOW: u64 = 64 * 1024;
+
+        // Capacity 1, occupied, so the first poll parks in `reserve`.
+        let outbound = PriorityQueue::new(1);
+        let mut filler = send_stream(outbound.clone(), None, None);
+        filler.write(&[0xFF]).await.unwrap();
+
+        let stream_credit = Credit::new(WINDOW);
+        let conn_credit = Credit::new(WINDOW);
+        let mut send = send_stream(
+            outbound.clone(),
+            Some(stream_credit.clone()),
+            Some(conn_credit.clone()),
+        );
+
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut long = Bytes::from(vec![0xAB_u8; 4096]);
+        assert!(send.poll_write_buf(&mut cx, &mut long).is_pending());
+
+        // Free the slot so the retained reservation can resolve, then retry with a
+        // buffer far shorter than the 4096 bytes it reserved for.
+        outbound.pop().await.unwrap();
+        let mut short = Bytes::from(vec![0xCD_u8; 8]);
+        let written = loop {
+            match send.poll_write_buf(&mut cx, &mut short) {
+                Poll::Ready(result) => break result.expect("write_buf"),
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        };
+
+        assert_eq!(written, 8, "wrote past the end of the retry buffer");
+        assert_eq!(short.remaining(), 0);
+        assert_eq!(drain(&outbound).await, 8);
+
+        // Only the 8 bytes actually sent may stay claimed; the rest of the
+        // reservation goes back to the window.
+        assert_eq!(stream_credit.try_claim(WINDOW), WINDOW - 8);
+        assert_eq!(conn_credit.try_claim(WINDOW), WINDOW - 8);
     }
 }
 

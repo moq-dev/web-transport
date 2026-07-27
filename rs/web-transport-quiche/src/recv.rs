@@ -1,6 +1,6 @@
 use std::{
     pin::{pin, Pin},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::{BufMut, Bytes};
@@ -85,20 +85,37 @@ impl AsyncRead for RecvStream {
 impl web_transport_trait::RecvStream for RecvStream {
     type Error = StreamError;
 
-    async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        self.read(dst).await
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        // Chunks are the native shape here; the default would copy through a
+        // temporary buffer.
+        self.inner
+            .poll_read_chunk(cx.waker(), max)
+            .map_err(Into::into)
     }
 
-    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        // More efficient than the default read_chunk implementation.
-        self.read_chunk(max).await
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        let Some(chunk) = ready!(self.poll_read_chunk(cx, dst.len()))? else {
+            return Poll::Ready(Ok(None));
+        };
+
+        let size = chunk.len();
+        dst[..size].copy_from_slice(&chunk);
+        Poll::Ready(Ok(Some(size)))
     }
 
     fn stop(&mut self, code: u32) {
         self.stop(code);
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.closed().await
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_closed(cx.waker()).map_err(Into::into)
     }
 }

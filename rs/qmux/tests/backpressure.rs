@@ -112,7 +112,7 @@ async fn reads_are_not_blocked_by_a_stalled_writer() {
     let client_writer = client.clone();
     let writer = tokio::spawn(async move {
         let mut s = client_writer.open_uni().await.unwrap();
-        let _ = s.write(&vec![b'C'; 512 * 1024]).await; // blocks; may error on teardown
+        let _ = s.write_all(&vec![b'C'; 512 * 1024]).await; // blocks; may error on teardown
         client_writer // keep the session alive
     });
 
@@ -125,7 +125,7 @@ async fn reads_are_not_blocked_by_a_stalled_writer() {
 
     // The server (ungated) sends a stream to the client.
     let mut ss = server.open_uni().await.unwrap();
-    ss.write(b"hello from server").await.unwrap();
+    ss.write_all(b"hello from server").await.unwrap();
     ss.finish().unwrap();
 
     // The client must accept and read it despite its own writer being wedged.
@@ -162,7 +162,7 @@ async fn datagrams_are_shed_under_backpressure() {
     let client_filler = client.clone();
     let filler = tokio::spawn(async move {
         let mut s = client_filler.open_uni().await.unwrap();
-        let _ = s.write(&vec![b'F'; 512 * 1024]).await;
+        let _ = s.write_all(&vec![b'F'; 512 * 1024]).await;
         client_filler
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -241,7 +241,7 @@ async fn idle_timeout_deferred_but_bounded_under_backpressure() {
     let client_writer = client.clone();
     let writer = tokio::spawn(async move {
         let mut s = client_writer.open_uni().await.unwrap();
-        let _ = s.write(&vec![b'X'; 256 * 1024]).await;
+        let _ = s.write_all(&vec![b'X'; 256 * 1024]).await;
         client_writer
     });
 

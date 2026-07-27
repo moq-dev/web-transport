@@ -31,7 +31,7 @@ async fn qmux02_tcp_stream_round_trip() {
         let payload = recv.read_all().await.unwrap();
 
         let mut send = session.open_uni().await.unwrap();
-        send.write(&payload).await.unwrap();
+        send.write_all(&payload).await.unwrap();
         send.finish().unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

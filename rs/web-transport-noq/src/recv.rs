@@ -1,8 +1,9 @@
 use std::{
+    future::Future,
     io,
-    pin::Pin,
+    pin::{pin, Pin},
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -141,16 +142,29 @@ impl web_transport_trait::RecvStream for RecvStream {
         Self::stop(self, code).ok();
     }
 
-    async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-        self.read(dst).await
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        let size = ready!(self.inner.poll_read(cx, dst)).map_err(|e| self.map_error(e))?;
+
+        // Noq reports EOF as a zero-length read, which is only meaningful when we
+        // asked for something.
+        Poll::Ready(Ok((size != 0 || dst.is_empty()).then_some(size)))
     }
 
+    // NOTE: `poll_read_chunk` is left to the trait's default, which copies. Noq's
+    // zero-copy chunk read is only reachable through the async `read_chunk` below,
+    // and that future borrows the stream, so it can't be retained in an `OpState`.
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
         self.read_chunk(max).await
     }
 
-    async fn closed(&mut self) -> Result<(), Self::Error> {
-        self.received_reset().await?;
-        Ok(())
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // `received_reset` is documented as cancel safe: it re-registers the waker
+        // on every poll and holds no state, so a fresh future each call is correct.
+        ready!(pin!(self.received_reset()).poll(cx)).map_err(ReadError::SessionError)?;
+        Poll::Ready(Ok(()))
     }
 }

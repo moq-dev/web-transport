@@ -1,7 +1,93 @@
-//! Utility traits for conditional Send/Sync bounds.
+//! Utility traits for conditional Send/Sync bounds, and a retained future for
+//! exposing async operations through a `poll_*` API.
 //!
-//! These traits allow the same code to work on both native and WASM targets,
-//! where WASM doesn't support Send/Sync.
+//! The Send/Sync traits allow the same code to work on both native and WASM
+//! targets, where WASM doesn't support Send/Sync.
+
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Mutex,
+    task::{ready, Context, Poll},
+};
+
+#[cfg(not(target_family = "wasm"))]
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+#[cfg(target_family = "wasm")]
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
+
+/// A future retained across `poll` calls, used to expose an async operation as
+/// a `poll_*` method.
+///
+/// The future is created on the first poll, kept while it is pending, and
+/// dropped once it resolves so the next poll starts a fresh operation.
+///
+/// Retention is the whole point: a `poll_*` method that built a fresh future
+/// every call would discard whatever the operation had already done before it
+/// returned `Pending` — a claimed stream credit, a reserved queue slot, or a
+/// waker registration that only the original future would be woken for.
+///
+/// Each slot drives one operation at a time. Cloning yields an idle slot; the
+/// in-progress future stays with the original.
+pub struct OpState<T> {
+    // The Mutex is here so the enclosing type stays Sync: a boxed Send future
+    // is not itself Sync. Polling goes through `&mut self` and uses `get_mut`,
+    // so there is no runtime locking on that path.
+    future: Mutex<Option<BoxFuture<T>>>,
+}
+
+impl<T> OpState<T> {
+    /// Returns whether an operation is currently in progress.
+    pub fn is_pending(&self) -> bool {
+        self.future.lock().unwrap().is_some()
+    }
+
+    /// Abandon the operation in progress, if any.
+    pub fn clear(&mut self) {
+        *self.future.get_mut().unwrap() = None;
+    }
+}
+
+impl<T: 'static> OpState<T> {
+    /// Poll the operation in progress, starting one with `make` when idle.
+    ///
+    /// `make` is only called when there is no operation in progress, so the
+    /// caller can build its argument lazily rather than on every poll.
+    pub fn poll<F>(&mut self, cx: &mut Context<'_>, make: impl FnOnce() -> F) -> Poll<T>
+    where
+        F: Future<Output = T> + crate::MaybeSend + 'static,
+    {
+        let state = self.future.get_mut().unwrap();
+        let future = state.get_or_insert_with(|| Box::pin(make()));
+        let output = ready!(future.as_mut().poll(cx));
+        *state = None;
+        Poll::Ready(output)
+    }
+}
+
+impl<T> Default for OpState<T> {
+    fn default() -> Self {
+        Self {
+            future: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> Clone for OpState<T> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<T> std::fmt::Debug for OpState<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpState")
+            .field("pending", &self.is_pending())
+            .finish()
+    }
+}
 
 /// A trait that is Send on native targets and empty on WASM.
 #[cfg(not(target_family = "wasm"))]
@@ -30,3 +116,82 @@ impl<T> MaybeSend for T {}
 
 #[cfg(target_family = "wasm")]
 impl<T> MaybeSync for T {}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::{pending, ready},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    use super::OpState;
+
+    struct Noop;
+
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn waker() -> Waker {
+        Waker::from(Arc::new(Noop))
+    }
+
+    #[test]
+    fn pending_future_is_retained() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut state = OpState::default();
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        for _ in 0..2 {
+            let starts = starts.clone();
+            assert!(state
+                .poll(&mut cx, move || {
+                    starts.fetch_add(1, Ordering::Relaxed);
+                    pending::<()>()
+                })
+                .is_pending());
+        }
+
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn completed_future_is_cleared() {
+        let mut state = OpState::default();
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(state.poll(&mut cx, || ready(1)), Poll::Ready(1));
+        assert!(!state.is_pending());
+        assert_eq!(state.poll(&mut cx, || ready(2)), Poll::Ready(2));
+    }
+
+    #[test]
+    fn cleared_future_restarts() {
+        let mut state = OpState::default();
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(state.poll(&mut cx, pending::<()>).is_pending());
+        state.clear();
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn clone_has_an_independent_idle_slot() {
+        let mut state = OpState::default();
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(state.poll(&mut cx, pending::<()>).is_pending());
+
+        let clone = state.clone();
+        assert!(state.is_pending());
+        assert!(!clone.is_pending());
+    }
+}

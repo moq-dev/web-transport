@@ -88,7 +88,7 @@ async fn qmux00_tcp_round_trip_unchanged() {
         let payload = recv.read_all().await.unwrap();
 
         let mut send = session.open_uni().await.unwrap();
-        send.write(&payload).await.unwrap();
+        send.write_all(&payload).await.unwrap();
         send.finish().unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -131,7 +131,7 @@ async fn qmux01_tcp_stream_and_ping() {
         let payload = recv.read_all().await.unwrap();
 
         let mut send = session.open_uni().await.unwrap();
-        send.write(&payload).await.unwrap();
+        send.write_all(&payload).await.unwrap();
         send.finish().unwrap();
 
         // Hold the session open long enough for the client to receive the response
