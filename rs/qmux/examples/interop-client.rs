@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{bail, Context as _};
 use bytes::Bytes;
 use qmux::{Session, Version};
-use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
+use web_transport_trait::{PollSendStream as _, RecvStream as _, SendStream as _, Session as _};
 
 const PROTOCOL: &str = "qmux-interop";
 const PAYLOAD_LEN: usize = 1_200_000;

@@ -92,7 +92,7 @@ impl tokio::io::AsyncRead for RecvStream {
     }
 }
 
-impl web_transport_trait::RecvStream for RecvStream {
+impl web_transport_trait::PollRecvStream for RecvStream {
     type Error = ReadError;
 
     fn stop(&mut self, code: u32) {
@@ -111,17 +111,19 @@ impl web_transport_trait::RecvStream for RecvStream {
         Poll::Ready(Ok((size != 0 || dst.is_empty()).then_some(size)))
     }
 
-    // NOTE: `poll_read_chunk` is left to the trait's default, which copies. The
-    // zero-copy chunk read is only reachable through the async `read_chunk` below,
-    // and that future borrows the stream, so it can't be retained in an `OpState`.
-    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        self.read_chunk(max).await
-    }
-
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // `received_reset` is documented as cancel safe: it re-registers the waker
         // on every poll and holds no state, so a fresh future each call is correct.
         ready!(pin!(self.received_reset()).poll(cx)).map_err(ReadError::SessionError)?;
         Poll::Ready(Ok(()))
+    }
+}
+
+impl web_transport_trait::RecvStream for RecvStream {
+    // NOTE: `poll_read_chunk` is left to the trait's default, which copies. The
+    // zero-copy chunk read is only reachable through the async `read_chunk` below,
+    // and that future borrows the stream, so it can't be retained in an `OpState`.
+    async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
+        self.read_chunk(max).await
     }
 }

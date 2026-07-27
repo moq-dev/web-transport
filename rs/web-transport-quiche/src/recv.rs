@@ -82,7 +82,7 @@ impl AsyncRead for RecvStream {
     }
 }
 
-impl web_transport_trait::RecvStream for RecvStream {
+impl web_transport_trait::PollRecvStream for RecvStream {
     type Error = StreamError;
 
     fn poll_read_chunk(
@@ -119,3 +119,5 @@ impl web_transport_trait::RecvStream for RecvStream {
         self.inner.poll_closed(cx.waker()).map_err(Into::into)
     }
 }
+
+impl web_transport_trait::RecvStream for RecvStream {}

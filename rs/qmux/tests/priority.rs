@@ -11,7 +11,7 @@ use bytes::Bytes;
 use qmux::transport::{Reader, Writer};
 use qmux::{Config, Error, Session, Transport, Version};
 use tokio::sync::mpsc;
-use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
+use web_transport_trait::{PollSendStream as _, RecvStream as _, SendStream as _, Session as _};
 
 /// An in-memory transport that relays whole messages between a connected pair,
 /// adding a fixed per-`send` delay to create backpressure.

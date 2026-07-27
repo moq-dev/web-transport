@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use qmux::{Session, Version};
 use url::Url;
 use web_transport_proto::{ConnectRequest, ConnectResponse, Settings};
-use web_transport_trait::{RecvStream, SendStream, Session as _};
+use web_transport_trait::{PollSendStream as _, RecvStream, SendStream, Session as _};
 
 /// The ALPN for HTTP/3 over QMux draft-01.
 const H3QX_ALPN: &str = "h3qx-01";

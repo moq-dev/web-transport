@@ -84,8 +84,11 @@ pub trait Error: std::error::Error + MaybeSend + MaybeSync + 'static {
 /// Session operations are async because every backend implements them that way.
 /// To drive them from a `poll` loop instead, wrap the session in
 /// [`SessionPoll`], which retains each in-progress operation across polls.
-/// Streams are poll-native, so [`SendStream`] and [`RecvStream`] expose
-/// `poll_*` methods directly.
+/// Streams are poll-native and keep their poll surface in separate traits:
+/// [`PollSendStream`] and [`PollRecvStream`].
+///
+/// Unlike those, this trait requires `Send + Sync`, so a thread-pinned session is
+/// not expressible today — see the crate README.
 pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     type SendStream: SendStream + 'static;
     type RecvStream: RecvStream + 'static;
@@ -142,12 +145,14 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     }
 }
 
-/// An outgoing stream of bytes to the peer.
+/// The `poll`-based half of an outgoing stream.
 ///
-/// QUIC streams have flow control, which means the send rate is limited by the peer's receive window.
-/// The stream will be closed with a graceful FIN when dropped.
+/// This trait carries no `Send` bound. A transport whose streams are pinned to one
+/// thread — a thread-per-core `io_uring` runtime, say — can implement it and be
+/// driven from a poll loop; it just won't get [`SendStream`]'s async conveniences,
+/// which need `Send` futures.
 ///
-/// # Implementing `poll_*`
+/// # Retaining state between calls
 ///
 /// A `poll_*` method may keep its own progress across calls, and often should —
 /// [`poll_write_buf`](Self::poll_write_buf) will typically have reserved send
@@ -163,7 +168,7 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 ///   retained progress. Nothing else will: the guards at the top of a write return
 ///   early once the stream is closed, so no later call reaches the cleanup, and a
 ///   reservation held past that point is leaked for the life of the stream.
-pub trait SendStream: MaybeSend {
+pub trait PollSendStream {
     type Error: Error;
 
     /// Poll to write some of the buffer to the stream, returning how many bytes
@@ -171,34 +176,25 @@ pub trait SendStream: MaybeSend {
     /// partial-write contract, which this shares.
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
 
-    /// Write some of the buffer to the stream, returning how many bytes were
-    /// written.
-    fn write(
-        &mut self,
-        buf: &[u8],
-    ) -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend {
-        poll_fn(move |cx| self.poll_write(cx, buf))
-    }
-
     /// Poll to write some of the given buffer to the stream, advancing it by the
     /// number of bytes written. This may be less than the whole buffer, so callers
-    /// loop (or use [`write_all_buf`](Self::write_all_buf)).
+    /// loop (or use [`SendStream::write_all_buf`]).
     ///
     /// # Partial writes
     ///
     /// Implementations must not advance `buf` past the bytes they accepted for
     /// sending. (Whether those bytes reach the peer is a separate matter — a reset
     /// or a dead connection can still discard accepted bytes.) A returned
-    /// [`Poll::Pending`], or a dropped [`write_buf`](Self::write_buf) future, must
-    /// leave `buf` exactly where the accepted bytes end. Callers race writes
-    /// against other work, so a byte taken from `buf` but never accepted becomes a
-    /// silent hole in the stream, which the peer decodes as a truncated or garbage
-    /// frame. Wait for send capacity *before* consuming from `buf`, never after.
+    /// [`Poll::Pending`], or a dropped [`SendStream::write_buf`] future, must leave
+    /// `buf` exactly where the accepted bytes end. Callers race writes against other
+    /// work, so a byte taken from `buf` but never accepted becomes a silent hole in
+    /// the stream, which the peer decodes as a truncated or garbage frame. Wait for
+    /// send capacity *before* consuming from `buf`, never after.
     ///
     /// Override this to avoid a copy when the underlying transport can take
     /// ownership of `buf`'s bytes — see [`Buf::copy_to_bytes`], which is free for
     /// a [`Bytes`] source.
-    fn poll_write_buf<B: Buf + MaybeSend>(
+    fn poll_write_buf<B: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -208,11 +204,64 @@ pub trait SendStream: MaybeSend {
         Poll::Ready(Ok(size))
     }
 
+    /// Set the stream's priority.
+    ///
+    /// Streams with higher values will be sent first, but are not guaranteed to arrive first.
+    /// This matches the W3C WebTransport `sendOrder` convention (and quinn's scheduler).
+    fn set_priority(&mut self, order: u8);
+
+    /// Mark the stream as finished, erroring on any future writes.
+    ///
+    /// [PollSendStream::reset] can still be called to abandon any queued data.
+    /// [PollSendStream::poll_closed] should resolve when the FIN is acknowledged by the peer.
+    ///
+    /// NOTE: Quinn implicitly calls this on Drop, but it's a common footgun.
+    /// Implementations SHOULD [PollSendStream::reset] on Drop instead.
+    fn finish(&mut self) -> Result<(), Self::Error>;
+
+    /// Immediately closes the stream and discards any remaining data.
+    ///
+    /// This translates into a RESET_STREAM QUIC code.
+    /// The peer may not receive the reset code if the stream is already closed.
+    fn reset(&mut self, code: u32);
+
+    /// Poll until the stream is closed by either side.
+    ///
+    /// This includes:
+    /// - We sent a RESET_STREAM via [PollSendStream::reset]
+    /// - We received a STOP_SENDING via [PollRecvStream::stop]
+    /// - A FIN is acknowledged by the peer via [PollSendStream::finish]
+    ///
+    /// Some implementations do not support FIN acknowledgement, in which case this will block until the FIN is sent.
+    ///
+    /// NOTE: This takes a &mut to match Quinn and to simplify the implementation.
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+/// An outgoing stream of bytes to the peer.
+///
+/// QUIC streams have flow control, which means the send rate is limited by the peer's receive window.
+/// The stream will be closed with a graceful FIN when dropped.
+///
+/// Every method here is a provided method over [`PollSendStream`], so a backend
+/// implements the poll surface and then opts in with an empty `impl SendStream for
+/// MyStream {}`. Overriding is still allowed, and is how a transport that can take
+/// ownership of a [`Bytes`] keeps [`write_chunk`](Self::write_chunk) zero-copy.
+pub trait SendStream: PollSendStream + MaybeSend {
+    /// Write some of the buffer to the stream, returning how many bytes were
+    /// written.
+    fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend {
+        poll_fn(move |cx| self.poll_write(cx, buf))
+    }
+
     /// Write some of the given buffer to the stream, advancing it by the number of
     /// bytes written. This may be less than the whole buffer, so callers loop (or
     /// use [`write_all_buf`](Self::write_all_buf)).
     ///
-    /// See [`poll_write_buf`](Self::poll_write_buf) for the partial-write contract.
+    /// See [`PollSendStream::poll_write_buf`] for the partial-write contract.
     fn write_buf<B: Buf + MaybeSend>(
         &mut self,
         buf: &mut B,
@@ -260,53 +309,20 @@ pub trait SendStream: MaybeSend {
         }
     }
 
-    /// Set the stream's priority.
-    ///
-    /// Streams with higher values will be sent first, but are not guaranteed to arrive first.
-    /// This matches the W3C WebTransport `sendOrder` convention (and quinn's scheduler).
-    fn set_priority(&mut self, order: u8);
-
-    /// Mark the stream as finished, erroring on any future writes.
-    ///
-    /// [SendStream::reset] can still be called to abandon any queued data.
-    /// [SendStream::closed] should return when the FIN is acknowledged by the peer.
-    ///
-    /// NOTE: Quinn implicitly calls this on Drop, but it's a common footgun.
-    /// Implementations SHOULD [SendStream::reset] on Drop instead.
-    fn finish(&mut self) -> Result<(), Self::Error>;
-
-    /// Immediately closes the stream and discards any remaining data.
-    ///
-    /// This translates into a RESET_STREAM QUIC code.
-    /// The peer may not receive the reset code if the stream is already closed.
-    fn reset(&mut self, code: u32);
-
-    /// Poll until the stream is closed by either side.
-    ///
-    /// This includes:
-    /// - We sent a RESET_STREAM via [SendStream::reset]
-    /// - We received a STOP_SENDING via [RecvStream::stop]
-    /// - A FIN is acknowledged by the peer via [SendStream::finish]
-    ///
-    /// Some implementations do not support FIN acknowledgement, in which case this will block until the FIN is sent.
-    ///
-    /// NOTE: This takes a &mut to match Quinn and to simplify the implementation.
-    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
-
     /// Block until the stream is closed by either side.
+    ///
+    /// See [`PollSendStream::poll_closed`] for what counts as closed.
     fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         poll_fn(|cx| self.poll_closed(cx))
     }
 }
 
-/// An incoming stream of bytes from the peer.
+/// The `poll`-based half of an incoming stream.
 ///
-/// All bytes are flushed in order and the stream is flow controlled.
-/// The stream will be closed with STOP_SENDING code=0 when dropped.
-///
-/// See [`SendStream`] for the rules a `poll_*` implementation follows about what it
-/// may and may not retain between calls.
-pub trait RecvStream: MaybeSend {
+/// Like [`PollSendStream`], this carries no `Send` bound, so a thread-pinned
+/// transport can implement it. See [`PollSendStream`] for the rules about what a
+/// `poll_*` method may retain between calls.
+pub trait PollRecvStream {
     type Error: Error;
 
     /// Poll to read some data into the provided slice.
@@ -318,16 +334,6 @@ pub trait RecvStream: MaybeSend {
         dst: &mut [u8],
     ) -> Poll<Result<Option<usize>, Self::Error>>;
 
-    /// Read some data into the provided slice.
-    ///
-    /// The number of bytes read is returned, or None if the stream is closed.
-    fn read(
-        &mut self,
-        dst: &mut [u8],
-    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
-        poll_fn(move |cx| self.poll_read(cx, dst))
-    }
-
     /// Poll to read some data into the provided buffer.
     ///
     /// The number of bytes read is returned, or None if the stream is closed.
@@ -335,7 +341,7 @@ pub trait RecvStream: MaybeSend {
     ///
     /// Override this to avoid a copy when the underlying transport already owns
     /// the bytes as a [`Bytes`], which can be handed to [`BufMut::put`] directly.
-    fn poll_read_buf<B: BufMut + MaybeSend>(
+    fn poll_read_buf<B: BufMut>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -351,17 +357,6 @@ pub trait RecvStream: MaybeSend {
         unsafe { buf.advance_mut(size) };
 
         Poll::Ready(Ok(Some(size)))
-    }
-
-    /// Read some data into the provided buffer.
-    ///
-    /// The number of bytes read is returned, or None if the stream is closed.
-    /// The buffer will be advanced by the number of bytes read.
-    fn read_buf<B: BufMut + MaybeSend>(
-        &mut self,
-        buf: &mut B,
-    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
-        poll_fn(move |cx| self.poll_read_buf(cx, buf))
     }
 
     /// Poll for the next chunk of data, up to the max size.
@@ -381,6 +376,51 @@ pub trait RecvStream: MaybeSend {
         ))
     }
 
+    /// Send a `STOP_SENDING` QUIC code, informing the peer that no more data will be read.
+    ///
+    /// An implementation MUST do this on Drop otherwise flow control will be leaked.
+    /// Call this method manually if you want to specify a code yourself.
+    fn stop(&mut self, code: u32);
+
+    /// Poll until the stream has been closed by either side.
+    ///
+    /// This includes:
+    /// - We received a RESET_STREAM via [PollSendStream::reset]
+    /// - We sent a STOP_SENDING via [PollRecvStream::stop]
+    /// - We received a FIN via [PollSendStream::finish] and read all data.
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+/// An incoming stream of bytes from the peer.
+///
+/// All bytes are flushed in order and the stream is flow controlled.
+/// The stream will be closed with STOP_SENDING code=0 when dropped.
+///
+/// Every method here is a provided method over [`PollRecvStream`], so a backend
+/// implements the poll surface and then opts in with an empty `impl RecvStream for
+/// MyStream {}`.
+pub trait RecvStream: PollRecvStream + MaybeSend {
+    /// Read some data into the provided slice.
+    ///
+    /// The number of bytes read is returned, or None if the stream is closed.
+    fn read(
+        &mut self,
+        dst: &mut [u8],
+    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
+        poll_fn(move |cx| self.poll_read(cx, dst))
+    }
+
+    /// Read some data into the provided buffer.
+    ///
+    /// The number of bytes read is returned, or None if the stream is closed.
+    /// The buffer will be advanced by the number of bytes read.
+    fn read_buf<B: BufMut + MaybeSend>(
+        &mut self,
+        buf: &mut B,
+    ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
+        poll_fn(move |cx| self.poll_read_buf(cx, buf))
+    }
+
     /// Read the next chunk of data, up to the max size.
     ///
     /// This returns a chunk of data instead of copying, which may be more efficient.
@@ -391,21 +431,9 @@ pub trait RecvStream: MaybeSend {
         poll_fn(move |cx| self.poll_read_chunk(cx, max))
     }
 
-    /// Send a `STOP_SENDING` QUIC code, informing the peer that no more data will be read.
-    ///
-    /// An implementation MUST do this on Drop otherwise flow control will be leaked.
-    /// Call this method manually if you want to specify a code yourself.
-    fn stop(&mut self, code: u32);
-
-    /// Poll until the stream has been closed by either side.
-    ///
-    /// This includes:
-    /// - We received a RESET_STREAM via [SendStream::reset]
-    /// - We sent a STOP_SENDING via [RecvStream::stop]
-    /// - We received a FIN via [SendStream::finish] and read all data.
-    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
-
     /// Block until the stream has been closed by either side.
+    ///
+    /// See [`PollRecvStream::poll_closed`] for what counts as closed.
     fn closed(&mut self) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         poll_fn(|cx| self.poll_closed(cx))
     }

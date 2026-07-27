@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use web_transport_trait::{RecvStream, SendStream};
+use web_transport_trait::{PollRecvStream, PollSendStream, RecvStream, SendStream};
 
 struct Noop;
 
@@ -57,7 +57,7 @@ struct DripSend {
     written: Vec<u8>,
 }
 
-impl SendStream for DripSend {
+impl PollSendStream for DripSend {
     type Error = TestError;
 
     fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, TestError>> {
@@ -83,12 +83,14 @@ impl SendStream for DripSend {
     }
 }
 
+impl SendStream for DripSend {}
+
 /// Produces at most one byte per call.
 struct DripRecv {
     remaining: Bytes,
 }
 
-impl RecvStream for DripRecv {
+impl PollRecvStream for DripRecv {
     type Error = TestError;
 
     fn poll_read(
@@ -111,6 +113,8 @@ impl RecvStream for DripRecv {
         Poll::Ready(Ok(()))
     }
 }
+
+impl RecvStream for DripRecv {}
 
 /// `write_chunk` takes ownership of the chunk and promises to write all of it, so
 /// it cannot be built on a single `write_buf` — that returns after one partial
@@ -182,4 +186,53 @@ fn read_all_buf_fills_the_buffer_then_stops() {
     let mut buf = BytesMut::with_capacity(3).limit(3);
     assert_eq!(block_on(stream.read_all_buf(&mut buf)).unwrap(), 3);
     assert_eq!(&buf.into_inner()[..], b"hel");
+}
+
+/// The reason the poll surface is its own trait: a `!Send` type can implement it.
+/// A thread-per-core runtime — `io_uring`, say — whose streams never leave the
+/// thread that owns them is then expressible, and drivable from a poll loop. It
+/// cannot implement [`SendStream`], which needs `Send` to hand out `Send` futures,
+/// and it does not need to.
+///
+/// This is a compile-time claim; there is nothing to assert at runtime.
+#[test]
+fn a_not_send_type_can_implement_the_poll_surface() {
+    struct ThreadBound {
+        _rc: std::rc::Rc<()>,
+    }
+
+    impl PollSendStream for ThreadBound {
+        type Error = TestError;
+
+        fn poll_write(
+            &mut self,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, TestError>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn set_priority(&mut self, _order: u8) {}
+
+        fn finish(&mut self) -> Result<(), TestError> {
+            Ok(())
+        }
+
+        fn reset(&mut self, _code: u32) {}
+
+        fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), TestError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let mut stream = ThreadBound {
+        _rc: Default::default(),
+    };
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+
+    let Poll::Ready(Ok(size)) = stream.poll_write(&mut cx, b"hi") else {
+        panic!("expected a completed write");
+    };
+    assert_eq!(size, 2);
 }

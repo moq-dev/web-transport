@@ -156,7 +156,7 @@ impl tokio::io::AsyncWrite for SendStream {
     }
 }
 
-impl web_transport_trait::SendStream for SendStream {
+impl web_transport_trait::PollSendStream for SendStream {
     type Error = WriteError;
 
     fn set_priority(&mut self, order: u8) {
@@ -187,12 +187,6 @@ impl web_transport_trait::SendStream for SendStream {
     // would leave the chunk gone from `buf` but only partly sent, a silent hole in
     // the stream.
 
-    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
-        // Sound to keep zero-copy here: the caller hands over ownership, so there is
-        // no buffer position to get out of sync with an incomplete write.
-        self.write_chunk(chunk).await
-    }
-
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // `stopped()` registers with the connection's notifier when it is created, so
         // the future has to be retained — rebuilding it each poll would drop the
@@ -213,5 +207,13 @@ impl web_transport_trait::SendStream for SendStream {
                 Err(noq::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
             }
         })
+    }
+}
+
+impl web_transport_trait::SendStream for SendStream {
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {
+        // Sound to keep zero-copy here: the caller hands over ownership, so there is
+        // no buffer position to get out of sync with an incomplete write.
+        self.write_chunk(chunk).await
     }
 }

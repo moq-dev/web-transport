@@ -640,7 +640,7 @@ mod writer_final_size_tests {
 
         // All three bytes are still queued, so reset drops them. They are not
         // part of the transmitted final size and must not consume flow control.
-        generic::SendStream::reset(&mut send, 0);
+        generic::PollSendStream::reset(&mut send, 0);
         assert_eq!(stream_credit.try_claim(3), 3);
         assert_eq!(conn_credit.try_claim(3), 3);
     }
@@ -2170,19 +2170,19 @@ impl SendStream {
 impl Drop for SendStream {
     fn drop(&mut self) {
         if !self.fin && self.closed.is_none() {
-            generic::SendStream::reset(self, 0);
+            generic::PollSendStream::reset(self, 0);
         }
     }
 }
 
-impl generic::SendStream for SendStream {
+impl generic::PollSendStream for SendStream {
     type Error = Error;
 
     fn poll_write(&mut self, cx: &mut Context<'_>, mut buf: &[u8]) -> Poll<Result<usize, Error>> {
         self.poll_write_buf(cx, &mut buf)
     }
 
-    fn poll_write_buf<B: Buf + generic::MaybeSend>(
+    fn poll_write_buf<B: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -2317,6 +2317,8 @@ impl generic::SendStream for SendStream {
     }
 }
 
+impl generic::SendStream for SendStream {}
+
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
@@ -2440,7 +2442,7 @@ impl RecvStream {
 impl Drop for RecvStream {
     fn drop(&mut self) {
         if !self.fin && self.closed.is_none() {
-            generic::RecvStream::stop(self, 0);
+            generic::PollRecvStream::stop(self, 0);
         }
 
         // Replenish stream count when this recv half is done
@@ -2456,7 +2458,7 @@ impl Drop for RecvStream {
     }
 }
 
-impl generic::RecvStream for RecvStream {
+impl generic::PollRecvStream for RecvStream {
     type Error = Error;
 
     fn poll_read_chunk(
@@ -2483,7 +2485,7 @@ impl generic::RecvStream for RecvStream {
         }
     }
 
-    fn poll_read_buf<B: BufMut + generic::MaybeSend>(
+    fn poll_read_buf<B: BufMut>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -2540,6 +2542,8 @@ impl generic::RecvStream for RecvStream {
         }
     }
 }
+
+impl generic::RecvStream for RecvStream {}
 
 #[cfg(test)]
 mod timer_tests {
@@ -2754,7 +2758,7 @@ mod negotiate_tests {
 mod send_offset_tests {
     use bytes::Bytes;
     use tokio::sync::mpsc;
-    use web_transport_trait::SendStream as _;
+    use web_transport_trait::{PollSendStream as _, SendStream as _};
 
     use super::SendStream;
     use crate::sched::PriorityQueue;
@@ -2818,7 +2822,7 @@ mod write_cancel_tests {
 
     use bytes::{Buf, Bytes};
     use tokio::sync::mpsc;
-    use web_transport_trait::SendStream as _;
+    use web_transport_trait::{PollSendStream as _, SendStream as _};
 
     use super::SendStream;
     use crate::credit::Credit;

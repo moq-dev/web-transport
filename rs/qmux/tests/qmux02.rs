@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use qmux::Version;
 use tokio::net::TcpListener;
-use web_transport_trait::{RecvStream, SendStream, Session as _};
+use web_transport_trait::{PollSendStream as _, RecvStream, SendStream, Session as _};
 
 /// End-to-end QMux02 over TCP: open a stream, echo it back, close.
 #[tokio::test]

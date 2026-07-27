@@ -107,10 +107,10 @@ impl AsyncWrite for SendStream {
     }
 }
 
-impl web_transport_trait::SendStream for SendStream {
+impl web_transport_trait::PollSendStream for SendStream {
     type Error = StreamError;
 
-    fn poll_write_buf<B: Buf + web_transport_trait::MaybeSend>(
+    fn poll_write_buf<B: Buf>(
         &mut self,
         cx: &mut Context<'_>,
         buf: &mut B,
@@ -145,3 +145,5 @@ impl web_transport_trait::SendStream for SendStream {
         self.inner.poll_closed(cx.waker()).map_err(Into::into)
     }
 }
+
+impl web_transport_trait::SendStream for SendStream {}
