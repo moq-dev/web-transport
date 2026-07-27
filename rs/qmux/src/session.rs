@@ -2063,6 +2063,7 @@ impl SendStream {
         }
 
         let error = Error::StreamStop(code);
+        self.abandon_write();
 
         // If we've already sent a FIN, the stream is finished; don't also emit a
         // RESET_STREAM for it (that would put two terminal frames on one stream).
@@ -2083,6 +2084,22 @@ impl SendStream {
         self.closed = Some(error.clone());
 
         error
+    }
+
+    /// Abandon a write that is still waiting for queue capacity or flow-control
+    /// credit.
+    ///
+    /// Every terminal transition must call this. A pending `reserve` is holding a
+    /// slot in the session's outbound queue that is not attached to a frame yet,
+    /// so `outbound.remove` cannot find it and nothing else will hand it back —
+    /// dropping the retained future is the only thing that releases it. Leaving it
+    /// behind costs the whole connection one of its few queue slots for as long as
+    /// this `SendStream` lives.
+    ///
+    /// A pending `reserve` holds no claimed credit (it only resolves once credit is
+    /// in hand), so there is nothing else to give back here.
+    fn abandon_write(&mut self) {
+        self.write.clear();
     }
 
     /// Release previously claimed credit (on send failure).
@@ -2182,10 +2199,7 @@ impl generic::SendStream for SendStream {
         // the waker, so a write parked below on queue capacity or flow control is
         // woken by the peer giving up on the stream.
         match self.inbound_stopped.poll_recv(cx) {
-            Poll::Ready(Some(stop)) => {
-                self.write.clear();
-                return Poll::Ready(Err(self.recv_stop(stop.code)));
-            }
+            Poll::Ready(Some(stop)) => return Poll::Ready(Err(self.recv_stop(stop.code))),
             Poll::Ready(None) | Poll::Pending => {}
         }
 
@@ -2262,6 +2276,7 @@ impl generic::SendStream for SendStream {
         // congestion window on a stream the peer has abandoned.
         let dropped = self.outbound.remove(self.id);
         self.release_credit(dropped);
+        self.abandon_write();
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
@@ -2285,6 +2300,7 @@ impl generic::SendStream for SendStream {
         self.outbound
             .push_now(self.priority, self.id, frame.into())?;
         self.fin = true;
+        self.abandon_write();
 
         Ok(())
     }
@@ -2807,7 +2823,8 @@ mod write_cancel_tests {
     use super::SendStream;
     use crate::credit::Credit;
     use crate::sched::PriorityQueue;
-    use crate::{Frame, StreamDir, StreamId};
+    use crate::{Frame, StopSending, StreamDir, StreamId};
+    use web_transport_proto::VarInt;
 
     struct Noop;
 
@@ -2824,10 +2841,19 @@ mod write_cancel_tests {
         stream_credit: Option<Credit>,
         conn_credit: Option<Credit>,
     ) -> SendStream {
+        send_stream_index(0, outbound, stream_credit, conn_credit)
+    }
+
+    fn send_stream_index(
+        index: u64,
+        outbound: PriorityQueue,
+        stream_credit: Option<Credit>,
+        conn_credit: Option<Credit>,
+    ) -> SendStream {
         let (control, _control_rx) = mpsc::unbounded_channel();
         let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
         SendStream {
-            id: StreamId::new(0, StreamDir::Uni, false),
+            id: StreamId::new(index, StreamDir::Uni, false),
             outbound,
             outbound_priority: control,
             inbound_stopped: stop_rx,
@@ -3027,6 +3053,88 @@ mod write_cancel_tests {
         // reservation goes back to the window.
         assert_eq!(stream_credit.try_claim(WINDOW), WINDOW - 8);
         assert_eq!(conn_credit.try_claim(WINDOW), WINDOW - 8);
+    }
+
+    /// A write parked on flow control is holding the queue slot it reserved, and
+    /// that slot is not attached to a frame yet — `outbound.remove` can't find it
+    /// and nothing else will ever hand it back. So whatever ends the stream has to
+    /// clear the retained reservation, or the slot stays gone for as long as the
+    /// `SendStream` lives. The session's queue has 8 of them; leaking one per
+    /// reset-mid-write starves every other stream on the connection.
+    fn parked_write(outbound: &PriorityQueue) -> SendStream {
+        // A window that starts at zero and never opens: `reserve` takes the slot,
+        // then parks on credit.
+        let mut send = send_stream(outbound.clone(), Some(Credit::new(0)), Some(Credit::new(0)));
+
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = Bytes::from(vec![0xAB_u8; 1024]);
+        assert!(send.poll_write_buf(&mut cx, &mut buf).is_pending());
+        assert!(
+            send.write.is_pending(),
+            "expected the reservation to be retained"
+        );
+
+        send
+    }
+
+    /// Whether an unrelated stream can still reserve a slot in a capacity-1 queue.
+    fn slot_available(outbound: &PriorityQueue) -> bool {
+        let mut probe = send_stream_index(1, outbound.clone(), None, None);
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        probe.poll_write(&mut cx, &[0xFF]).is_ready()
+    }
+
+    #[tokio::test]
+    async fn reset_releases_a_retained_reservation() {
+        let outbound = PriorityQueue::new(1);
+        let mut send = parked_write(&outbound);
+
+        send.reset(0);
+
+        assert!(slot_available(&outbound), "reset leaked the queue slot");
+    }
+
+    #[tokio::test]
+    async fn finish_releases_a_retained_reservation() {
+        let outbound = PriorityQueue::new(1);
+        let mut send = parked_write(&outbound);
+
+        send.finish().unwrap();
+
+        // `finish` uses `push_now`, so the FIN is queued over the capacity bound.
+        // Drain it, leaving only the reservation the parked write is holding.
+        outbound.pop().await.unwrap();
+
+        assert!(slot_available(&outbound), "finish leaked the queue slot");
+    }
+
+    /// The STOP_SENDING may be observed by `poll_closed` rather than by the write
+    /// itself, so the release can't live in `poll_write_buf` alone.
+    #[tokio::test]
+    async fn stop_observed_by_closed_releases_a_retained_reservation() {
+        let outbound = PriorityQueue::new(1);
+
+        let (stop_tx, stop_rx) = mpsc::unbounded_channel();
+        let mut send = parked_write(&outbound);
+        send.inbound_stopped = stop_rx;
+
+        stop_tx
+            .send(StopSending {
+                id: send.id,
+                code: VarInt::from(7u32),
+            })
+            .unwrap();
+
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(send.poll_closed(&mut cx).is_ready());
+
+        assert!(
+            slot_available(&outbound),
+            "a peer STOP_SENDING leaked the queue slot"
+        );
     }
 }
 
