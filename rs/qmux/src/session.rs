@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
@@ -1040,7 +1040,7 @@ impl<R: Reader> SessionState<R> {
                     inbound_data: rx,
                     inbound_reset: rx2,
                     outbound_priority: self.control.clone(),
-                    buffer: Bytes::new(),
+                    buffer: VecDeque::new(),
                     closed: None,
                     fin: false,
                     recv_credit,
@@ -1913,7 +1913,7 @@ impl generic::Session for Session {
             inbound_data: rx,
             inbound_reset: rx2,
             outbound_priority: self.outbound_priority.clone(),
-            buffer: Bytes::new(),
+            buffer: VecDeque::new(),
             closed: None,
             fin: false,
             recv_credit,
@@ -2288,7 +2288,12 @@ pub struct RecvStream {
     inbound_data: mpsc::UnboundedReceiver<Stream>,
     inbound_reset: mpsc::UnboundedReceiver<ResetStream>,
 
-    buffer: Bytes,
+    /// Received but unread chunks, in stream order. A queue rather than a single
+    /// chunk because `closed` also drains STREAM frames to observe the FIN, so
+    /// data can arrive while a partially read chunk is still outstanding.
+    /// Bounded by the receive window: chunks are only charged to flow control as
+    /// they're read out.
+    buffer: VecDeque<Bytes>,
 
     closed: Option<Error>,
     fin: bool,
@@ -2309,6 +2314,33 @@ impl RecvStream {
 
         self.closed = Some(Error::StreamReset(code));
         Error::StreamReset(code)
+    }
+
+    /// Queue a received chunk for the application to read.
+    ///
+    /// Empty chunks are dropped so the queue head is always readable; a STREAM
+    /// frame can carry no payload (an empty FIN, for example), and its `fin` flag
+    /// is tracked separately.
+    fn recv_data(&mut self, data: Bytes) {
+        if !data.is_empty() {
+            self.buffer.push_back(data);
+        }
+    }
+
+    /// Take up to `max` bytes from the head of the queue, charging them to flow
+    /// control. Returns `None` only when nothing is buffered.
+    fn take_buffered(&mut self, max: usize) -> Option<Bytes> {
+        let chunk = self.buffer.front_mut()?;
+        let to_read = max.min(chunk.len());
+        let data = chunk.split_to(to_read);
+        if chunk.is_empty() {
+            self.buffer.pop_front();
+        }
+
+        // Report consumed bytes and send window updates if needed
+        self.report_consumed(to_read as u64);
+
+        Some(data)
     }
 
     /// Report consumed bytes to flow control, sending window updates as needed.
@@ -2358,13 +2390,7 @@ impl generic::RecvStream for RecvStream {
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
         loop {
-            if !self.buffer.is_empty() {
-                let to_read = max.min(self.buffer.len());
-                let data = self.buffer.split_to(to_read);
-
-                // Report consumed bytes and send window updates if needed
-                self.report_consumed(to_read as u64);
-
+            if let Some(data) = self.take_buffered(max) {
                 return Ok(Some(data));
             }
 
@@ -2380,7 +2406,7 @@ impl generic::RecvStream for RecvStream {
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
                     self.fin = stream.fin;
-                    self.buffer = stream.data;
+                    self.recv_data(stream.data);
                 }
                 Some(reset) = self.inbound_reset.recv() => {
                     return Err(self.recv_reset(reset.code));
@@ -2394,12 +2420,9 @@ impl generic::RecvStream for RecvStream {
         &mut self,
         buf: &mut B,
     ) -> Result<Option<usize>, Self::Error> {
-        if !self.buffer.is_empty() {
-            let to_read = buf.remaining_mut().min(self.buffer.len());
-            buf.put(self.buffer.split_to(to_read));
-
-            self.report_consumed(to_read as u64);
-
+        if let Some(data) = self.take_buffered(buf.remaining_mut()) {
+            let to_read = data.len();
+            buf.put(data);
             return Ok(Some(to_read));
         }
 
@@ -2439,9 +2462,11 @@ impl generic::RecvStream for RecvStream {
                 Some(reset) = self.inbound_reset.recv() => {
                     return Err(self.recv_reset(reset.code));
                 }
+                // Observing the FIN means draining data frames, which have to
+                // queue behind anything a partial read left unread.
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
-                    self.buffer = stream.data;
+                    self.recv_data(stream.data);
                     self.fin = stream.fin;
                 }
                 else => {
@@ -3146,6 +3171,38 @@ mod recv_open_tests {
             .expect("connection credit was not replenished after reset")
             .expect("accept_uni failed");
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"12345");
+    }
+
+    /// `closed` has to drain STREAM frames to observe the FIN, so the data it
+    /// pulls off the wire must queue behind whatever a partial `read_chunk` left
+    /// unread. Overwriting the unread remainder instead doesn't just lose those
+    /// bytes: the next read silently resumes at a later stream offset, so the
+    /// application decodes a splice of two positions as contiguous.
+    #[tokio::test]
+    async fn closed_preserves_partially_read_data() {
+        let (session, tx) = scripted_session();
+
+        tx.send(uni_stream_at(0, 0, b"hello", false)).unwrap();
+        let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed");
+
+        // Read part of the first chunk, leaving "llo" buffered.
+        let head = recv.read_chunk(2).await.unwrap().expect("first chunk");
+        assert_eq!(head.as_ref(), b"he");
+
+        // More data arrives while the application is awaiting `closed`, which
+        // returns once the FIN lands.
+        tx.send(uni_stream_at(0, 5, b"world", false)).unwrap();
+        tx.send(uni_stream_at(0, 10, b"!", true)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), recv.closed())
+            .await
+            .expect("closed timed out")
+            .expect("stream finished cleanly");
+
+        // Reads resume at offset 2, in order, with nothing dropped.
+        assert_eq!(recv.read_all().await.unwrap().as_ref(), b"lloworld!");
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a
