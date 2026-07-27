@@ -140,6 +140,15 @@ mod tests {
         Waker::from(Arc::new(Noop))
     }
 
+    /// The reason `OpState` holds a `Mutex`: a boxed `Send` future is not `Sync`,
+    /// and embedding one in a public stream type would silently strip `Sync` from
+    /// it. Every backend's `SendStream` was `Send + Sync` before this existed.
+    #[test]
+    fn op_state_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OpState<()>>();
+    }
+
     #[test]
     fn pending_future_is_retained() {
         let starts = Arc::new(AtomicUsize::new(0));
