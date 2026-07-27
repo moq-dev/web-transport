@@ -236,3 +236,43 @@ fn a_not_send_type_can_implement_the_poll_surface() {
     };
     assert_eq!(size, 2);
 }
+
+/// Fills whatever destination it is handed, so the `max` bound has to come from
+/// the caller rather than from the stream being polite.
+struct FloodRecv;
+
+impl PollRecvStream for FloodRecv {
+    type Error = TestError;
+
+    fn poll_read(
+        &mut self,
+        _cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, TestError>> {
+        dst.fill(b'x');
+        Poll::Ready(Ok(Some(dst.len())))
+    }
+
+    fn stop(&mut self, _code: u32) {}
+
+    fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), TestError>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl RecvStream for FloodRecv {}
+
+/// `read_chunk(max)` documents "up to the max size", and `BytesMut::with_capacity`
+/// is free to over-allocate — so the default must bound the slice it hands out
+/// rather than trusting the allocation to be exact.
+#[test]
+fn read_chunk_never_exceeds_max() {
+    for max in [1usize, 3, 5, 7, 100, 1000, 4095] {
+        let chunk = block_on(FloodRecv.read_chunk(max)).unwrap().unwrap();
+        assert!(
+            chunk.len() <= max,
+            "read_chunk({max}) returned {} bytes",
+            chunk.len()
+        );
+    }
+}

@@ -371,9 +371,15 @@ pub trait PollRecvStream {
         // Don't allocate too much. Write your own if you want to increase this buffer.
         let mut buf = BytesMut::with_capacity(max.min(8 * 1024));
 
-        Poll::Ready(Ok(
-            ready!(self.poll_read_buf(cx, &mut buf))?.map(|_| buf.freeze())
-        ))
+        // Cap the slice we hand out rather than trusting the allocation to be exact:
+        // `with_capacity` only promises a lower bound, and an over-allocation would
+        // otherwise let a stream return more than the `max` this method documents.
+        let read = {
+            let mut limited = (&mut buf).limit(max);
+            ready!(self.poll_read_buf(cx, &mut limited))?
+        };
+
+        Poll::Ready(Ok(read.map(|_| buf.freeze())))
     }
 
     /// Send a `STOP_SENDING` QUIC code, informing the peer that no more data will be read.

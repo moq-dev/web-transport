@@ -3059,6 +3059,33 @@ mod write_cancel_tests {
         assert_eq!(conn_credit.try_claim(WINDOW), WINDOW - 8);
     }
 
+    /// A retry with a drained buffer must not put an empty non-FIN STREAM frame on
+    /// the wire. The `desired == 0` guard returns before the reservation is polled,
+    /// so the frame path is only ever reached with bytes to send.
+    #[tokio::test]
+    async fn pending_write_with_an_empty_retry_buffer_queues_nothing() {
+        let outbound = PriorityQueue::new(1);
+        let mut filler = send_stream(outbound.clone(), None, None);
+        filler.write(&[0xFF]).await.unwrap();
+
+        let mut send = send_stream(outbound.clone(), None, None);
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut long = Bytes::from(vec![0xAB_u8; 4096]);
+        assert!(send.poll_write_buf(&mut cx, &mut long).is_pending());
+
+        outbound.pop().await.unwrap();
+        let mut empty = Bytes::new();
+        let Poll::Ready(Ok(written)) = send.poll_write_buf(&mut cx, &mut empty) else {
+            panic!("an empty buffer should short-circuit");
+        };
+        assert_eq!(written, 0);
+
+        // Only the filler's byte was ever queued; no zero-length frame followed it.
+        assert_eq!(drain(&outbound).await, 0);
+    }
+
     /// A write parked on flow control is holding the queue slot it reserved, and
     /// that slot is not attached to a frame yet — `outbound.remove` can't find it
     /// and nothing else will ever hand it back. So whatever ends the stream has to

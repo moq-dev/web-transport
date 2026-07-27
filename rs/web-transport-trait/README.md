@@ -15,7 +15,7 @@ This crate provides a WebTransport trait for Send runtimes.
 -   Quiche+Tokio: [web-transport-quiche](../web-transport-quiche)
 -   Iroh: [web-transport-iroh](../web-transport-iroh)
 
-If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
+If you don't care about the underlying runtime, use the [web-transport](../web-transport) crate.
 
 ## Polling
 
