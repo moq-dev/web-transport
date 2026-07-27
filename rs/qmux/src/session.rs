@@ -2291,8 +2291,11 @@ pub struct RecvStream {
     /// Received but unread chunks, in stream order. A queue rather than a single
     /// chunk because `closed` also drains STREAM frames to observe the FIN, so
     /// data can arrive while a partially read chunk is still outstanding.
-    /// Bounded by the receive window: chunks are only charged to flow control as
-    /// they're read out.
+    ///
+    /// Under QMux the receive window bounds this: chunks are only charged to flow
+    /// control as they're read out. `Version::WebTransport` has no flow control,
+    /// so an unread stream is unbounded there — but it already is upstream in
+    /// `inbound_data`, which this queue only drains from.
     buffer: VecDeque<Bytes>,
 
     closed: Option<Error>,
