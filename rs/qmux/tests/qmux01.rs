@@ -297,6 +297,8 @@ async fn abandoned_accept_does_not_wedge_a_clone() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+
     let server_task = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
         let mut session = qmux::tcp::Config::new(Version::QMux01)
@@ -308,6 +310,7 @@ async fn abandoned_accept_does_not_wedge_a_clone() {
         let mut abandoned = session.clone();
         let parked = tokio::time::timeout(Duration::from_millis(50), abandoned.accept_uni()).await;
         assert!(parked.is_err(), "nothing to accept yet, so it should park");
+        parked_tx.send(()).unwrap();
 
         // This handle must still be able to accept.
         let mut recv = tokio::time::timeout(Duration::from_secs(2), session.accept_uni())
@@ -323,9 +326,10 @@ async fn abandoned_accept_does_not_wedge_a_clone() {
         .await
         .unwrap();
 
-    // Let the server's abandoned accept park on an empty queue first; the point of
-    // the test is what happens to the *other* handle afterwards.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait until the server's accept has actually parked on an empty queue, rather
+    // than guessing at a delay; the point of the test is what happens to the *other*
+    // handle afterwards.
+    parked_rx.await.unwrap();
 
     let mut send = session.open_uni().await.unwrap();
     send.write_all(b"through").await.unwrap();

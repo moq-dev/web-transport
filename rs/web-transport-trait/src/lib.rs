@@ -419,6 +419,14 @@ pub trait PollRecvStream {
         let dst = buf.chunk_mut();
         let len = dst.len();
 
+        // A destination with no room is not a closed stream. Backends already draw
+        // that distinction — they report `Some(0)` for an empty slice rather than
+        // `None` — and collapsing it here would turn "buffer full" into "stream
+        // ended", which reads as truncation to the caller.
+        if len == 0 {
+            return Poll::Ready(Ok(Some(0)));
+        }
+
         // `poll_read` takes an initialized slice, and `chunk_mut` hands out memory
         // that may not be. Zero it: transmuting uninitialized bytes into a
         // `&mut [u8]` is undefined behaviour whether or not the callee reads them.
@@ -473,6 +481,11 @@ pub trait PollRecvStream {
         // slice, and a buffer sized exactly to `max` also bounds the read without
         // depending on the allocation being exact — `with_capacity` promises only a
         // lower bound.
+        // As in `poll_read_buf`: asking for nothing is not end of stream.
+        if max == 0 {
+            return Poll::Ready(Ok(Some(Bytes::new())));
+        }
+
         let mut buf = BytesMut::zeroed(max.min(8 * 1024));
 
         let size = match ready!(self.poll_read(cx, &mut buf))? {

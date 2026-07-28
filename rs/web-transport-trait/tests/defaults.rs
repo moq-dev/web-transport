@@ -396,3 +396,34 @@ fn over_reported_read_panics_rather_than_advancing_past_the_buffer() {
     let mut buf = BytesMut::with_capacity(64);
     let _ = block_on(Liar.read_buf(&mut buf));
 }
+
+/// A destination with no room must not read as end of stream.
+///
+/// `None` means the peer finished; a full buffer means try again with space. The
+/// backends draw that distinction in `poll_read`, and the defaults have to keep it
+/// — collapsing the two turns "buffer full" into silent truncation.
+#[test]
+fn a_full_destination_is_not_end_of_stream() {
+    let mut stream = DripRecv {
+        remaining: Bytes::from_static(b"hello"),
+    };
+
+    let mut empty: &mut [u8] = &mut [];
+    assert_eq!(block_on(stream.read_buf(&mut empty)).unwrap(), Some(0));
+
+    // Still readable afterwards: nothing was consumed and nothing was closed.
+    assert_eq!(&block_on(stream.read_chunk(16)).unwrap().unwrap()[..], b"h");
+}
+
+/// Asking for zero bytes is likewise not end of stream.
+#[test]
+fn a_zero_max_chunk_is_not_end_of_stream() {
+    let mut stream = DripRecv {
+        remaining: Bytes::from_static(b"hello"),
+    };
+
+    let chunk = block_on(stream.read_chunk(0)).unwrap();
+    assert_eq!(chunk.as_deref(), Some(&[][..]));
+
+    assert_eq!(&block_on(stream.read_chunk(16)).unwrap().unwrap()[..], b"h");
+}

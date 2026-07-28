@@ -590,9 +590,6 @@ impl SessionAccept {
         }
     }
 
-    // This is poll-based because we accept and decode streams in parallel.
-    // In async land I would use tokio::JoinSet, but that requires a runtime.
-    // It's better to use FuturesUnordered instead because it's agnostic.
     /// Remember a caller that is parking, so it can be woken when another takes a
     /// stream and replaces its waker registration.
     fn remember(wakers: &mut Vec<Waker>, cx: &Context<'_>) {
@@ -609,6 +606,9 @@ impl SessionAccept {
         }
     }
 
+    // This is poll-based because we accept and decode streams in parallel.
+    // In async land I would use tokio::JoinSet, but that requires a runtime.
+    // It's better to use FuturesUnordered instead because it's agnostic.
     pub fn poll_accept_uni(
         &mut self,
         cx: &mut Context<'_>,
