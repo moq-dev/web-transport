@@ -9,11 +9,34 @@ import { VarInt } from "./varint.ts";
  */
 export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
 
-/** Maximum size of a single QMux frame on the wire. */
+/** Maximum size of a single QMux frame on the wire.
+ *
+ * This is draft-00's `max_frame_size`, which bounds the whole frame. The
+ * record-framed drafts supersede it with the negotiated `max_record_size`, so it
+ * only bounds draft-00 and the legacy WebTransport binding. */
 export const MAX_FRAME_SIZE = 16384;
 
-/** Maximum payload per STREAM frame, accounting for four 8-byte header varints. */
-export const MAX_FRAME_PAYLOAD = MAX_FRAME_SIZE - 32;
+/** Largest STREAM payload that keeps the encoded frame within `budget` bytes.
+ *
+ * The budget is what the peer accepts for one frame — its `max_record_size` on
+ * the record-framed drafts, {@link MAX_FRAME_SIZE} otherwise — so the frame's own
+ * header comes out of it: the type, the stream ID, and (QMux only) the offset and
+ * the length varint. Header widths are the ones this frame actually encodes, not
+ * a worst-case reservation, so a chunk fills the record the peer advertised. */
+export function maxStreamPayload(version: WireFormat, budget: number, id: Stream.Id, offset: bigint): number {
+	if (version === "webtransport") {
+		// One type byte plus the stream ID; the payload runs to the end of the
+		// message, so there is no length varint to reserve.
+		return Math.max(budget - (1 + id.value.size()), 0);
+	}
+
+	// The type is 0x0e/0x0f, always one byte.
+	const available = Math.max(budget - (1 + id.value.size() + VarInt.from(offset).size()), 0);
+	// The length varint describes the payload, so size it from `available`: that
+	// bounds every payload that can still fit, and a varint is monotonic in its
+	// value, so no larger payload could use a shorter one.
+	return Math.max(available - VarInt.from(available).size(), 0);
+}
 
 export interface Data {
 	type: "stream";

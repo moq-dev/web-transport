@@ -70,7 +70,7 @@ mod stream_transport {
     use web_transport_proto::VarInt;
 
     use super::{Reader, Transport, Writer};
-    use crate::{Error, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE};
+    use crate::{Error, Version, MAX_FRAME_SIZE};
 
     /// Bound on queued frames waiting for the session to drain them. Bytes the
     /// session hasn't picked up yet are also buffered in the OS receive window
@@ -317,7 +317,12 @@ mod stream_transport {
 
             if has_len {
                 let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
-                if len > MAX_FRAME_PAYLOAD {
+                // draft-00 bounds the whole frame by `max_frame_size`, so bound the
+                // payload by the same value rather than by our send-side header
+                // budget: a peer cannot derive that budget from anything on the
+                // wire. A byte stream cannot resynchronize past a bogus length, so
+                // this one stays fatal.
+                if len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);
                 }
                 read_bytes(reader, len, &mut buf).await?;

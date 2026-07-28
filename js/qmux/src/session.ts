@@ -8,7 +8,7 @@ import { Credit, replenishWindow } from "./credit.ts";
 import { resetCode, SessionError, StreamError, streamCode } from "./error.ts";
 import type { TransportParams, WireFormat } from "./frame.ts";
 import * as Frame from "./frame.ts";
-import { DEFAULT_TRANSPORT_PARAMS, isQmux, MAX_FRAME_PAYLOAD, usesRecords } from "./frame.ts";
+import { DEFAULT_TRANSPORT_PARAMS, isQmux, usesRecords } from "./frame.ts";
 import { RecvStream } from "./recv.ts";
 import { DEFAULT_SEND_ORDER, SendScheduler, type SendSink, WritableStreamSink } from "./scheduler.ts";
 import * as Stream from "./stream.ts";
@@ -1250,12 +1250,6 @@ export default class Session implements WebTransport {
 		// #sendDatagram/#sendPriorityFrame post-close guards.
 		if (this.#closed) return;
 
-		if (frame.data.byteLength > MAX_FRAME_PAYLOAD) {
-			this.#sendConnectionClose(1002, "frame too large");
-			this.#abort(1002, "frame too large");
-			return;
-		}
-
 		const streamId = frame.id.value.value;
 
 		if (!frame.id.canRecv(this.#isServer)) {
@@ -1271,6 +1265,7 @@ export default class Session implements WebTransport {
 		) {
 			return;
 		}
+
 		if (!recv) {
 			// We created the stream, we can skip it.
 			if (frame.id.serverInitiated === this.#isServer) {
@@ -1517,6 +1512,28 @@ export default class Session implements WebTransport {
 		this.#sendPriorityFrame({ type: "transport_parameters", params: this.#ourParams });
 	}
 
+	/** The largest STREAM frame the peer accepts, in bytes.
+	 *
+	 * Record-framed drafts negotiate it: a frame rides in one record, so the
+	 * peer's `max_record_size` is the limit (the draft-01 default until its
+	 * TRANSPORT_PARAMETERS arrive, so we never send something it would reject).
+	 * draft-00 and the legacy binding have no record layer and negotiate nothing,
+	 * so draft-00's whole-frame `max_frame_size` stands in. */
+	#sendFrameBudget(): number {
+		if (!usesRecords(this.#version)) return Frame.MAX_FRAME_SIZE;
+		return Number(this.#paramsReceived ? this.#peerParams.maxRecordSize : Frame.DEFAULT_MAX_RECORD_SIZE);
+	}
+
+	/** The largest payload one STREAM frame at `offset` can carry to the peer. */
+	#maxStreamPayload(id: Stream.Id, offset: bigint): number {
+		const max = Frame.maxStreamPayload(this.#version, this.#sendFrameBudget(), id, offset);
+		// Unreachable with a conforming peer: max_record_size is validated against
+		// the draft-01 minimum on arrival. Guard anyway — a zero budget would make
+		// the chunking loops below spin forever instead of failing.
+		if (max === 0) throw new Error("peer frame limit leaves no room for stream data");
+		return max;
+	}
+
 	/** Validate an encoded record against the peer's max_record_size (QMux01+). */
 	#validateRecordSize(bytes: Uint8Array) {
 		if (usesRecords(this.#version)) {
@@ -1544,16 +1561,9 @@ export default class Session implements WebTransport {
 
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = data.byteLength - offset;
-			// Cap by both the static frame-payload ceiling and the peer's record limit
-			// (record-framed QMux only — once params are received). Leave 32 bytes of
-			// headroom for the STREAM frame header (type, stream ID, offset, and length).
-			let chunkMax = Math.min(remaining, MAX_FRAME_PAYLOAD);
-			if (usesRecords(this.#version) && this.#paramsReceived) {
-				const peerLimit = Number(this.#peerParams.maxRecordSize) - 32;
-				if (peerLimit > 0) {
-					chunkMax = Math.min(chunkMax, peerLimit);
-				}
-			}
+			// Fill the frame the peer accepts, less this frame's own header. The
+			// offset varint grows as the stream advances, so size it per frame.
+			const chunkMax = Math.min(remaining, this.#maxStreamPayload(id, flow.sendOffset));
 
 			// Claim flow control credit (stream + connection)
 			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax));
@@ -1590,8 +1600,11 @@ export default class Session implements WebTransport {
 		if (isQmux(this.#version)) {
 			await this.#sendStreamDataWithFlowControl(id, streamId, data);
 		} else {
-			for (let offset = 0; offset < data.byteLength; offset += MAX_FRAME_PAYLOAD) {
-				const end = Math.min(offset + MAX_FRAME_PAYLOAD, data.byteLength);
+			// The legacy binding carries no offset field, so every frame's header —
+			// and therefore its payload budget — is the same size.
+			const chunkMax = this.#maxStreamPayload(id, 0n);
+			for (let offset = 0; offset < data.byteLength; offset += chunkMax) {
+				const end = Math.min(offset + chunkMax, data.byteLength);
 				const chunk = data.subarray(offset, end);
 				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
 			}
