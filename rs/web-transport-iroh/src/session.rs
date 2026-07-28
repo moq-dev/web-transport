@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -362,6 +362,14 @@ struct H3SessionAccept {
     // Keep track of work being done to read/write the WebTransport stream header.
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
+
+    // Wakers from concurrent callers of accept_bi / accept_uni.
+    // When one caller gets a stream, all others are woken so they can retry.
+    // Every clone polls this one struct, which would otherwise keep only the most
+    // recent waker, so a second accepter would register through a waker the first
+    // had already replaced and never wake.
+    bi_wakers: Vec<Waker>,
+    uni_wakers: Vec<Waker>,
 }
 
 impl H3SessionAccept {
@@ -386,6 +394,9 @@ impl H3SessionAccept {
 
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
+
+            bi_wakers: Vec::new(),
+            uni_wakers: Vec::new(),
         }
     }
 
@@ -400,7 +411,15 @@ impl H3SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let recv = res?;
+                let recv = match res {
+                    Ok(recv) => recv,
+                    Err(e) => {
+                        for waker in self.uni_wakers.drain(..) {
+                            waker.wake();
+                        }
+                        return Poll::Ready(Err(e.into()));
+                    }
+                };
                 let pending = Self::decode_uni(recv, self.session_id);
                 self.pending_uni.push(Box::pin(pending));
 
@@ -408,20 +427,28 @@ impl H3SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let (typ, recv) = match ready!(self.pending_uni.poll_next(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let (typ, recv) = match self.pending_uni.poll_next(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!("failed to decode unidirectional stream: {err:?}");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    if !self.uni_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                        self.uni_wakers.push(cx.waker().clone());
+                    }
+                    return Poll::Pending;
+                }
             };
 
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv);
+                    for waker in self.uni_wakers.drain(..) {
+                        waker.wake();
+                    }
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -471,7 +498,15 @@ impl H3SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let (send, recv) = res?;
+                let (send, recv) = match res {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        for waker in self.bi_wakers.drain(..) {
+                            waker.wake();
+                        }
+                        return Poll::Ready(Err(e.into()));
+                    }
+                };
                 let pending = Self::decode_bi(send, recv, self.session_id);
                 self.pending_bi.push(Box::pin(pending));
 
@@ -479,20 +514,28 @@ impl H3SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let res = match ready!(self.pending_bi.poll_next(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let res = match self.pending_bi.poll_next(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!("failed to decode bidirectional stream: {err:?}");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    if !self.bi_wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                        self.bi_wakers.push(cx.waker().clone());
+                    }
+                    return Poll::Pending;
+                }
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
+                for waker in self.bi_wakers.drain(..) {
+                    waker.wake();
+                }
                 return Poll::Ready(Ok((send, recv)));
             }
 
