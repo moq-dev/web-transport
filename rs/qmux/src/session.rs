@@ -20,6 +20,58 @@ use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
+/// A single-consumer channel shared by every [`Session`] clone.
+///
+/// `mpsc::Receiver::poll_recv` stores one waker, so two handles polling it would
+/// lose each other's — the second registration replaces the first, and that caller
+/// never wakes. Keep the extra wakers and wake them once someone takes a value so
+/// they retry. Same fix quinn's `SessionAccept` carries.
+///
+/// The lock is a `std::sync::Mutex` held only for the poll itself. A
+/// `tokio::sync::Mutex` would mean holding a guard across an await inside a
+/// retained future, and a caller that abandons the operation would leave the guard
+/// held — blocking every other handle until this one is polled again or dropped.
+struct SharedRecv<T> {
+    state: Mutex<SharedRecvState<T>>,
+}
+
+struct SharedRecvState<T> {
+    rx: mpsc::Receiver<T>,
+    waiters: Vec<std::task::Waker>,
+}
+
+impl<T> SharedRecv<T> {
+    fn new(rx: mpsc::Receiver<T>) -> Self {
+        Self {
+            state: Mutex::new(SharedRecvState {
+                rx,
+                waiters: Vec::new(),
+            }),
+        }
+    }
+
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let state = &mut *self.state.lock().unwrap();
+
+        match state.rx.poll_recv(cx) {
+            Poll::Ready(value) => {
+                // This poll replaced whatever waker the channel held, so anyone
+                // else waiting has to be told to re-register.
+                for waker in state.waiters.drain(..) {
+                    waker.wake();
+                }
+                Poll::Ready(value)
+            }
+            Poll::Pending => {
+                if !state.waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    state.waiters.push(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
 /// How many inbound datagrams to buffer before dropping. Datagrams are
 /// unreliable, so a slow `recv_datagram` consumer sheds load here rather than
 /// applying backpressure to the whole session.
@@ -77,8 +129,8 @@ pub struct Session {
     outbound: PriorityQueue,
     outbound_priority: mpsc::UnboundedSender<Frame>,
 
-    accept_bi: Arc<tokio::sync::Mutex<mpsc::Receiver<(SendStream, RecvStream)>>>,
-    accept_uni: Arc<tokio::sync::Mutex<mpsc::Receiver<RecvStream>>>,
+    accept_bi: Arc<SharedRecv<(SendStream, RecvStream)>>,
+    accept_uni: Arc<SharedRecv<RecvStream>>,
 
     // Shared per-stream backend state (with the reader and writer tasks). The
     // frontend registers the streams it opens directly under this lock — see
@@ -116,7 +168,7 @@ pub struct Session {
     // Inbound datagrams (RFC 9221). The backend fans DATAGRAM frames into this
     // channel; `recv_datagram` drains it. Bounded and lossy — a slow reader
     // drops datagrams rather than stalling the session.
-    recv_datagram: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
+    recv_datagram: Arc<SharedRecv<Bytes>>,
 
     // Outbound datagrams. `send_datagram` pushes payloads here; the backend loop
     // frames and writes them. Bounded and lossy so a backpressured transport
@@ -1771,8 +1823,8 @@ impl Session {
             config,
             outbound,
             outbound_priority: control_tx,
-            accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
-            accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
+            accept_bi: Arc::new(SharedRecv::new(accept_bi_rx)),
+            accept_uni: Arc::new(SharedRecv::new(accept_uni_rx)),
             streams,
             closed,
             negotiated,
@@ -1781,7 +1833,7 @@ impl Session {
             open_uni_credit,
             conn_send_credit,
             conn_recv_credit,
-            recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
+            recv_datagram: Arc::new(SharedRecv::new(recv_datagram_rx)),
             datagram_max_size,
             outbound_datagram: outbound_datagram_tx,
             _guard: guard,
@@ -1821,23 +1873,6 @@ impl Session {
     // to thread through as arguments, so `poll_*` hands each one a cloned handle.
     // That clone is refcount bumps only: every field is an `Arc`, a channel, or a
     // scalar `Config`.
-    async fn accept_uni_inner(&self) -> Result<RecvStream, Error> {
-        self.accept_uni
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
-    }
-
-    async fn accept_bi_inner(&self) -> Result<(SendStream, RecvStream), Error> {
-        self.accept_bi
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
-    }
 
     async fn open_uni_inner(&self) -> Result<SendStream, Error> {
         // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
@@ -1983,15 +2018,6 @@ impl Session {
             .map(|e| e.clone().unwrap_or(Error::Closed))
             .unwrap_or(Error::Closed)
     }
-
-    async fn recv_datagram_inner(&self) -> Result<Bytes, Error> {
-        self.recv_datagram
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
-    }
 }
 
 impl generic::Session for Session {
@@ -2003,22 +2029,18 @@ impl generic::Session for Session {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, Self::Error>> {
-        self.poll_op(
-            cx,
-            |ops| &mut ops.accept_uni,
-            |s| async move { s.accept_uni_inner().await },
-        )
+        self.accept_uni
+            .poll_recv(cx)
+            .map(|stream| stream.ok_or(Error::Closed))
     }
 
     fn poll_accept_bi(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
-        self.poll_op(
-            cx,
-            |ops| &mut ops.accept_bi,
-            |s| async move { s.accept_bi_inner().await },
-        )
+        self.accept_bi
+            .poll_recv(cx)
+            .map(|streams| streams.ok_or(Error::Closed))
     }
 
     fn poll_open_uni(
@@ -2044,11 +2066,9 @@ impl generic::Session for Session {
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
-        self.poll_op(
-            cx,
-            |ops| &mut ops.recv_datagram,
-            |s| async move { s.recv_datagram_inner().await },
-        )
+        self.recv_datagram
+            .poll_recv(cx)
+            .map(|datagram| datagram.ok_or(Error::Closed))
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {

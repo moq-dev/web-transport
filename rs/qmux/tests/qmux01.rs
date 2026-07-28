@@ -283,3 +283,51 @@ async fn qmux01_silent_peer_is_idle_closed() {
     upstream.abort();
     downstream.abort();
 }
+
+/// A handle that starts an accept and then stops polling must not wedge the others.
+///
+/// The retained-operation design makes this the hazard to watch: while accept went
+/// through a `tokio::sync::Mutex`, an abandoned accept kept its guard inside the
+/// retained future, and every clone blocked on the mutex until that handle was
+/// polled again or dropped. `SharedRecv` locks only for the poll itself.
+#[tokio::test]
+async fn abandoned_accept_does_not_wedge_a_clone() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut session = qmux::tcp::Config::new(Version::QMux01)
+            .accept(sock)
+            .await
+            .unwrap();
+
+        // A second handle starts an accept, parks, and is then abandoned mid-flight.
+        let mut abandoned = session.clone();
+        let parked = tokio::time::timeout(Duration::from_millis(50), abandoned.accept_uni()).await;
+        assert!(parked.is_err(), "nothing to accept yet, so it should park");
+
+        // This handle must still be able to accept.
+        let mut recv = tokio::time::timeout(Duration::from_secs(2), session.accept_uni())
+            .await
+            .expect("an abandoned accept on a clone must not block this one")
+            .unwrap();
+
+        assert_eq!(&recv.read_all().await.unwrap()[..], b"through");
+    });
+
+    let mut session = qmux::tcp::Config::new(Version::QMux01)
+        .connect(addr)
+        .await
+        .unwrap();
+
+    // Let the server's abandoned accept park on an empty queue first; the point of
+    // the test is what happens to the *other* handle afterwards.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut send = session.open_uni().await.unwrap();
+    send.write_all(b"through").await.unwrap();
+    send.finish().unwrap();
+
+    server_task.await.unwrap();
+}

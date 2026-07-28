@@ -387,14 +387,28 @@ pub trait PollRecvStream {
         cx: &mut Context<'_>,
         buf: &mut B,
     ) -> Poll<Result<Option<usize>, Self::Error>> {
+        let dst = buf.chunk_mut();
+        let len = dst.len();
+
+        // `poll_read` takes an initialized slice, and `chunk_mut` hands out memory
+        // that may not be. Zero it: transmuting uninitialized bytes into a
+        // `&mut [u8]` is undefined behaviour whether or not the callee reads them.
+        // Override this method to skip the memset.
+        //
+        // SAFETY: the pointer is valid for `len` bytes, and once written every one
+        // of them is initialized, so the slice refers to initialized memory.
         let dst = unsafe {
-            std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
+            let ptr = dst.as_mut_ptr();
+            std::ptr::write_bytes(ptr, 0, len);
+            std::slice::from_raw_parts_mut(ptr, len)
         };
+
         let size = match ready!(self.poll_read(cx, dst))? {
             Some(size) if size > 0 => size,
             _ => return Poll::Ready(Ok(None)),
         };
 
+        // SAFETY: `poll_read` reported writing `size` bytes into `dst`.
         unsafe { buf.advance_mut(size) };
 
         Poll::Ready(Ok(Some(size)))
@@ -409,18 +423,22 @@ pub trait PollRecvStream {
         cx: &mut Context<'_>,
         max: usize,
     ) -> Poll<Result<Option<Bytes>, Self::Error>> {
-        // Don't allocate too much. Write your own if you want to increase this buffer.
-        let mut buf = BytesMut::with_capacity(max.min(8 * 1024));
+        // Don't allocate too much. Override this to avoid the copy, or to use a
+        // larger per-poll buffer.
+        //
+        // Zeroed rather than `with_capacity`: `poll_read` needs an initialized
+        // slice, and a buffer sized exactly to `max` also bounds the read without
+        // depending on the allocation being exact — `with_capacity` promises only a
+        // lower bound.
+        let mut buf = BytesMut::zeroed(max.min(8 * 1024));
 
-        // Cap the slice we hand out rather than trusting the allocation to be exact:
-        // `with_capacity` only promises a lower bound, and an over-allocation would
-        // otherwise let a stream return more than the `max` this method documents.
-        let read = {
-            let mut limited = (&mut buf).limit(max);
-            ready!(self.poll_read_buf(cx, &mut limited))?
+        let size = match ready!(self.poll_read(cx, &mut buf))? {
+            Some(size) if size > 0 => size,
+            _ => return Poll::Ready(Ok(None)),
         };
+        buf.truncate(size);
 
-        Poll::Ready(Ok(read.map(|_| buf.freeze())))
+        Poll::Ready(Ok(Some(buf.freeze())))
     }
 
     /// Send a `STOP_SENDING` QUIC code, informing the peer that no more data will be read.
