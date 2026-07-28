@@ -178,7 +178,10 @@ pub trait SendStream: MaybeSend {
         async move {
             // Just so the arg isn't mut
             let mut c = chunk;
-            self.write_buf(&mut c).await?;
+            // `write_all_buf`, not `write_buf`: this method promises the whole chunk,
+            // and a single `write_buf` may accept only part of it. Stopping there
+            // would drop the rest silently, which the peer decodes as truncation.
+            self.write_all_buf(&mut c).await?;
             Ok(())
         }
     }
