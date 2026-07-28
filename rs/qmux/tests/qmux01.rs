@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use qmux::Version;
 use tokio::net::TcpListener;
-use web_transport_trait::{PollSendStream as _, RecvStream, SendStream, Session as _};
+use web_transport_trait::{
+    PollSendStream as _, PollSession as _, RecvStream, SendStream, Session as _,
+};
 
 /// Byte-level wire snapshot: QMux00 must NOT prepend a size varint, QMux01 must.
 ///

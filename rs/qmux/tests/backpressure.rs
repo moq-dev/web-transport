@@ -13,7 +13,9 @@ use bytes::Bytes;
 use qmux::transport::{Reader, Writer};
 use qmux::{Config, Error, Session, Transport, Version};
 use tokio::sync::{mpsc, watch};
-use web_transport_trait::{PollSendStream as _, RecvStream as _, SendStream as _, Session as _};
+use web_transport_trait::{
+    PollSendStream as _, PollSession as _, RecvStream as _, SendStream as _, Session as _,
+};
 
 /// In-memory transport whose writer blocks while a shared gate is closed,
 /// standing in for a socket that has stopped accepting writes. `gate: None`

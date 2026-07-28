@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use web_transport_trait::{PollRecvStream, PollSendStream, RecvStream, SendStream};
+use web_transport_trait::{PollRecvStream, PollSendStream, PollSession, RecvStream, SendStream};
 
 struct Noop;
 
@@ -274,5 +274,92 @@ fn read_chunk_never_exceeds_max() {
             "read_chunk({max}) returned {} bytes",
             chunk.len()
         );
+    }
+}
+
+/// The reason `PollSession` is its own trait: a `!Send` session can implement it,
+/// so a thread-per-core runtime is expressible end to end rather than only for its
+/// streams. It cannot implement [`Session`], which needs `Send` to hand out `Send`
+/// futures, and does not need to.
+///
+/// This is a compile-time claim; there is nothing to assert at runtime.
+#[test]
+fn a_not_send_session_can_implement_the_poll_surface() {
+    struct ThreadBound {
+        _rc: std::rc::Rc<()>,
+    }
+
+    impl PollSession for ThreadBound {
+        type SendStream = FloodSend;
+        type RecvStream = FloodRecv;
+        type Error = TestError;
+
+        fn poll_accept_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<FloodRecv, TestError>> {
+            Poll::Pending
+        }
+
+        fn poll_accept_bi(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(FloodSend, FloodRecv), TestError>> {
+            Poll::Pending
+        }
+
+        fn poll_open_uni(&mut self, _cx: &mut Context<'_>) -> Poll<Result<FloodSend, TestError>> {
+            Poll::Pending
+        }
+
+        fn poll_open_bi(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(FloodSend, FloodRecv), TestError>> {
+            Poll::Pending
+        }
+
+        fn send_datagram(&self, _payload: Bytes) -> Result<(), TestError> {
+            Ok(())
+        }
+
+        fn poll_recv_datagram(&mut self, _cx: &mut Context<'_>) -> Poll<Result<Bytes, TestError>> {
+            Poll::Pending
+        }
+
+        fn max_datagram_size(&self) -> usize {
+            0
+        }
+
+        fn close(&self, _code: u32, _reason: &str) {}
+
+        fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<TestError> {
+            Poll::Pending
+        }
+    }
+
+    let session = ThreadBound {
+        _rc: Default::default(),
+    };
+    assert_eq!(session.max_datagram_size(), 0);
+}
+
+/// Accepts every write, so it can stand in as a session's stream type.
+struct FloodSend;
+
+impl PollSendStream for FloodSend {
+    type Error = TestError;
+
+    fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, TestError>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn set_priority(&mut self, _order: u8) {}
+
+    fn finish(&mut self) -> Result<(), TestError> {
+        Ok(())
+    }
+
+    fn reset(&mut self, _code: u32) {}
+
+    fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), TestError>> {
+        Poll::Ready(Ok(()))
     }
 }

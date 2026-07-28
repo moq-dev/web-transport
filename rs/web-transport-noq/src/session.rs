@@ -887,7 +887,7 @@ fn map_error(error: &OnceLock<SessionError>, e: impl Into<SessionError>) -> Sess
     e
 }
 
-impl web_transport_trait::Session for Session {
+impl web_transport_trait::PollSession for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = SessionError;
@@ -1021,3 +1021,5 @@ impl web_transport_trait::Session for Session {
         Self::stats(self)
     }
 }
+
+impl web_transport_trait::Session for Session {}

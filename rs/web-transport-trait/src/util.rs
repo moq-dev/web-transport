@@ -89,7 +89,7 @@ impl<T> std::fmt::Debug for OpState<T> {
     }
 }
 
-/// The retained futures a [`Session`](crate::Session) implementation needs for the
+/// The retained futures a [`PollSession`](crate::PollSession) implementation needs for the
 /// operations that have no native poll form.
 ///
 /// Every backend today opens streams, reads datagrams and awaits close through
@@ -97,7 +97,7 @@ impl<T> std::fmt::Debug for OpState<T> {
 /// Accept is usually the exception — most backends already drive it from a poll
 /// loop — so the accept slots are there for those that don't.
 ///
-/// Because `Session` operations take `&mut self`, each of these slots has exactly
+/// Because `PollSession` operations take `&mut self`, each of these slots has exactly
 /// one owner: there is no shared-slot contention and no need to clone the session
 /// per call. Cloning this struct yields idle slots, matching [`OpState`].
 pub struct SessionOps<S, R, E> {

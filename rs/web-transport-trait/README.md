@@ -29,10 +29,14 @@ are provided helpers over them, so nothing is implemented twice.
     poll trait and opts in with an empty `impl SendStream for MyStream {}`.
     Overriding is still allowed, and is how a transport that can take ownership
     of a `Bytes` keeps `write_chunk`/`read_chunk` zero-copy.
--   **`Session` operations take `&mut self`.** That is what makes a retained
-    in-progress operation safe: each handle has exactly one owner, so a `Pending`
-    poll can resume rather than restart — which matters for `open_uni`/`open_bi`,
-    since they claim stream credit before they resolve.
+-   **Sessions split the same way.** `PollSession` holds the `poll_*` methods and
+    the synchronous ones (`send_datagram`, `close`, `protocol`,
+    `max_datagram_size`, `stats`); `Session` adds the async helpers.
+
+    Its operations take `&mut self`, which is what makes a retained in-progress
+    operation safe: each handle has exactly one owner, so a `Pending` poll can
+    resume rather than restart — which matters for `open_uni`/`open_bi`, since
+    they claim stream credit before they resolve.
 
     A `&self` poll method holding a retained future would have to either share
     one slot between concurrent callers — the second polls the first's future
@@ -59,9 +63,10 @@ ones. A transport whose streams are pinned to one thread — a thread-per-core
 loop without ever being `Send`. It just doesn't get the async conveniences, which
 have to hand out `Send` futures.
 
-`Session` still requires `Send + Sync`. Removing those is possible and would make
-a fully thread-per-core stack expressible; it is held up by consumers that share
-a session across spawned tasks, not by anything here.
+`PollSession` is colorless for the same reason, so a thread-per-core stack is
+expressible end to end and not just for its streams. `Session` adds `Send + Sync`
+because its helpers hand out `Send` futures; a transport that doesn't want them
+implements only `PollSession`.
 
 The `Send`/`Sync` bounds are conditional on WASM (see `MaybeSend`/`MaybeSync`)
 so the same traits describe browser transports.

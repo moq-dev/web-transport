@@ -583,7 +583,7 @@ impl H3SessionAccept {
     }
 }
 
-impl web_transport_trait::Session for Session {
+impl web_transport_trait::PollSession for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = SessionError;
@@ -701,6 +701,8 @@ impl web_transport_trait::Session for Session {
         }
     }
 }
+
+impl web_transport_trait::Session for Session {}
 
 pub struct SessionStats {
     stats: iroh::endpoint::ConnectionStats,

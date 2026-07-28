@@ -5,7 +5,7 @@
 use bytes::Bytes;
 use qmux::{transport::Stream, Config, Error, Session, Version};
 use tokio::net::{TcpListener, TcpStream};
-use web_transport_trait::Session as _;
+use web_transport_trait::{PollSession as _, Session as _};
 
 /// Pair a client and server over TCP loopback with the given configs, awaiting
 /// establishment on both ends.

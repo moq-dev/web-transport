@@ -415,7 +415,7 @@ impl web_transport_trait::Stats for ez::ConnectionStats {
     }
 }
 
-impl web_transport_trait::Session for Connection {
+impl web_transport_trait::PollSession for Connection {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = SessionError;
@@ -527,6 +527,8 @@ impl web_transport_trait::Session for Connection {
         self.conn.stats()
     }
 }
+
+impl web_transport_trait::Session for Connection {}
 
 // Type aliases just so clippy doesn't complain about the complexity.
 type AcceptUni = dyn Stream<Item = Result<ez::RecvStream, ez::ConnectionError>> + Send;

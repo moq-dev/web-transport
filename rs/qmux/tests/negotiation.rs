@@ -4,7 +4,7 @@
 #![cfg(any(feature = "tcp", feature = "uds"))]
 
 use qmux::Version;
-use web_transport_trait::Session as _;
+use web_transport_trait::PollSession as _;
 
 #[cfg(feature = "tcp")]
 mod tcp {

@@ -2020,7 +2020,7 @@ impl Session {
     }
 }
 
-impl generic::Session for Session {
+impl generic::PollSession for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = Error;
@@ -2128,6 +2128,8 @@ impl generic::Session for Session {
         self.negotiated.get().and_then(|p| p.as_deref())
     }
 }
+
+impl generic::Session for Session {}
 
 /// Select the agreed application protocol from two advertised lists.
 ///
