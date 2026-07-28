@@ -79,7 +79,7 @@ async fn qmux00_tcp_round_trip_unchanged() {
 
     let server = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::Config::new(Version::QMux00)
+        let mut session = qmux::tcp::Config::new(Version::QMux00)
             .accept(sock)
             .await
             .unwrap();
@@ -94,7 +94,7 @@ async fn qmux00_tcp_round_trip_unchanged() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     });
 
-    let session = qmux::tcp::Config::new(Version::QMux00)
+    let mut session = qmux::tcp::Config::new(Version::QMux00)
         .connect(addr)
         .await
         .unwrap();
@@ -121,7 +121,7 @@ async fn qmux01_tcp_stream_and_ping() {
 
     let server_task = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::Config::new(Version::QMux01)
+        let mut session = qmux::tcp::Config::new(Version::QMux01)
             .accept(sock)
             .await
             .unwrap();
@@ -140,7 +140,7 @@ async fn qmux01_tcp_stream_and_ping() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     });
 
-    let session = qmux::tcp::Config::new(Version::QMux01)
+    let mut session = qmux::tcp::Config::new(Version::QMux01)
         .connect(addr)
         .await
         .unwrap();
@@ -180,11 +180,11 @@ async fn qmux01_ping_keeps_idle_session_alive() {
         Session::connect(ta, config.clone()),
         Session::accept(tb, config),
     );
-    let client = client.unwrap();
-    let server = server.unwrap();
+    let mut client = client.unwrap();
+    let mut server = server.unwrap();
 
     // Watch both close reasons without consuming the sessions.
-    let (c, s) = (client.clone(), server.clone());
+    let (mut c, mut s) = (client.clone(), server.clone());
     let client_closed = tokio::spawn(async move { c.closed().await });
     let server_closed = tokio::spawn(async move { s.closed().await });
 
@@ -269,7 +269,7 @@ async fn qmux01_silent_peer_is_idle_closed() {
         Session::connect(ta, config.clone()),
         Session::accept(tb, config),
     );
-    let client = client.unwrap();
+    let mut client = client.unwrap();
     let _server = server.unwrap();
 
     silenced.store(true, Ordering::Relaxed);

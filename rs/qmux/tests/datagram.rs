@@ -29,7 +29,8 @@ async fn pair(client_cfg: Config, server_cfg: Config) -> (Session, Session) {
 /// Datagrams flow in both directions and arrive intact.
 #[tokio::test]
 async fn round_trip() {
-    let (client, server) = pair(Config::new(Version::QMux01), Config::new(Version::QMux01)).await;
+    let (mut client, mut server) =
+        pair(Config::new(Version::QMux01), Config::new(Version::QMux01)).await;
 
     assert!(client.max_datagram_size() > 0);
     assert!(server.max_datagram_size() > 0);
@@ -62,7 +63,7 @@ async fn disabled_by_peer_is_one_directional() {
     let mut client_cfg = Config::new(Version::QMux01);
     client_cfg.max_datagram_frame_size = 0; // client won't receive datagrams
 
-    let (client, server) = pair(client_cfg, Config::new(Version::QMux01)).await;
+    let (client, mut server) = pair(client_cfg, Config::new(Version::QMux01)).await;
 
     // The server cannot send to a client that advertised no datagram support.
     assert_eq!(server.max_datagram_size(), 0);
@@ -81,7 +82,8 @@ async fn disabled_by_peer_is_one_directional() {
 /// wire rather than silently truncated.
 #[tokio::test]
 async fn oversized_payload_rejected() {
-    let (client, _server) = pair(Config::new(Version::QMux01), Config::new(Version::QMux01)).await;
+    let (client, mut _server) =
+        pair(Config::new(Version::QMux01), Config::new(Version::QMux01)).await;
 
     let too_big = vec![0u8; client.max_datagram_size() + 1];
     assert!(matches!(

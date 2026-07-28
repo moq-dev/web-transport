@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Send HTTP/3 SETTINGS on a new unidirectional control stream.
-async fn send_settings(session: &Session) -> anyhow::Result<()> {
+async fn send_settings(session: &mut Session) -> anyhow::Result<()> {
     let mut uni = session.open_uni().await?;
 
     let mut buf = BytesMut::new();
@@ -67,7 +67,7 @@ async fn send_settings(session: &Session) -> anyhow::Result<()> {
 }
 
 /// Receive HTTP/3 SETTINGS from the peer's unidirectional control stream.
-async fn recv_settings(session: &Session) -> anyhow::Result<Settings> {
+async fn recv_settings(session: &mut Session) -> anyhow::Result<Settings> {
     let mut uni = session.accept_uni().await?;
 
     // Read all data from the control stream.
@@ -79,11 +79,15 @@ async fn recv_settings(session: &Session) -> anyhow::Result<Settings> {
     Ok(settings)
 }
 
-async fn run_client(session: Session) -> anyhow::Result<()> {
+async fn run_client(mut session: Session) -> anyhow::Result<()> {
     println!("[client] connected");
 
-    // Exchange SETTINGS (both directions concurrently).
-    let (_, settings) = tokio::try_join!(send_settings(&session), recv_settings(&session),)?;
+    // Exchange SETTINGS (both directions concurrently). Session operations take
+    // `&mut self`, so each concurrent one needs its own handle — cloning is
+    // refcount bumps, and each clone gets independent poll state.
+    let (mut sending, mut receiving) = (session.clone(), session.clone());
+    let (_, settings) =
+        tokio::try_join!(send_settings(&mut sending), recv_settings(&mut receiving))?;
 
     let wt = settings.supports_webtransport();
     assert!(wt > 0, "server does not support WebTransport");
@@ -115,11 +119,13 @@ async fn run_client(session: Session) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_server(session: Session) -> anyhow::Result<()> {
+async fn run_server(mut session: Session) -> anyhow::Result<()> {
     println!("[server] accepted connection");
 
-    // Exchange SETTINGS (both directions concurrently).
-    tokio::try_join!(send_settings(&session), recv_settings(&session),)?;
+    // Exchange SETTINGS (both directions concurrently); see `run_client` on why
+    // each direction gets its own handle.
+    let (mut sending, mut receiving) = (session.clone(), session.clone());
+    tokio::try_join!(send_settings(&mut sending), recv_settings(&mut receiving))?;
 
     // Accept the bidi request stream with the CONNECT request.
     let (mut send, mut recv) = session.accept_bi().await?;

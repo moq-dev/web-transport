@@ -22,7 +22,7 @@ async fn qmux02_tcp_stream_round_trip() {
 
     let server = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::Config::new(Version::QMux02)
+        let mut session = qmux::tcp::Config::new(Version::QMux02)
             .accept(sock)
             .await
             .unwrap();
@@ -37,7 +37,7 @@ async fn qmux02_tcp_stream_round_trip() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     });
 
-    let session = qmux::tcp::Config::new(Version::QMux02)
+    let mut session = qmux::tcp::Config::new(Version::QMux02)
         .connect(addr)
         .await
         .unwrap();
@@ -64,7 +64,7 @@ async fn default_config_uses_qmux02() {
 
     let server = tokio::spawn(async move {
         let (sock, _) = listener.accept().await.unwrap();
-        let session = qmux::tcp::Config::new(qmux::Config::default().version)
+        let mut session = qmux::tcp::Config::new(qmux::Config::default().version)
             .accept(sock)
             .await
             .unwrap();
@@ -72,7 +72,7 @@ async fn default_config_uses_qmux02() {
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"default");
     });
 
-    let session = qmux::tcp::Config::new(qmux::Config::default().version)
+    let mut session = qmux::tcp::Config::new(qmux::Config::default().version)
         .connect(addr)
         .await
         .unwrap();
@@ -104,10 +104,10 @@ async fn qmux02_ping_keeps_idle_session_alive() {
         Session::connect(ta, config.clone()),
         Session::accept(tb, config),
     );
-    let client = client.unwrap();
-    let server = server.unwrap();
+    let mut client = client.unwrap();
+    let mut server = server.unwrap();
 
-    let (c, s) = (client.clone(), server.clone());
+    let (mut c, mut s) = (client.clone(), server.clone());
     let client_closed = tokio::spawn(async move { c.closed().await });
     let server_closed = tokio::spawn(async move { s.closed().await });
 

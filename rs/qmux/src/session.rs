@@ -131,6 +131,11 @@ pub struct Session {
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
+
+    // Retained futures for the session operations, none of which have a native
+    // poll form here. Each handle owns its own, so `&mut self` is all the
+    // exclusion they need.
+    ops: generic::SessionOps<SendStream, RecvStream, Error>,
 }
 
 /// Tracks which peer-initiated recv-stream indices (in one direction) are open,
@@ -1780,16 +1785,43 @@ impl Session {
             datagram_max_size,
             outbound_datagram: outbound_datagram_tx,
             _guard: guard,
+            ops: Default::default(),
         }
     }
 }
 
-impl generic::Session for Session {
-    type SendStream = SendStream;
-    type RecvStream = RecvStream;
-    type Error = Error;
+impl Session {
+    /// Poll one of the retained session operations.
+    ///
+    /// The slot lives in `self`, so it has to come out before the closure can
+    /// borrow `self` to clone a handle for the future; taking and restoring it is
+    /// two moves of an `Option`. `SessionOps::clone` yields idle slots, so the
+    /// cloned handle carries the connection but none of this handle's poll state.
+    fn poll_op<T: 'static, F>(
+        &mut self,
+        cx: &mut Context<'_>,
+        slot: impl Fn(
+            &mut generic::SessionOps<SendStream, RecvStream, Error>,
+        ) -> &mut generic::OpState<T>,
+        make: impl FnOnce(Session) -> F,
+    ) -> Poll<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
+        let mut op = std::mem::take(slot(&mut self.ops));
+        let result = op.poll(cx, || make(self.clone()));
+        *slot(&mut self.ops) = op;
 
-    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
+        result
+    }
+
+    // The async bodies behind the `poll_*` trait methods.
+    //
+    // A retained future cannot borrow the session, and these touch too many fields
+    // to thread through as arguments, so `poll_*` hands each one a cloned handle.
+    // That clone is refcount bumps only: every field is an `Arc`, a channel, or a
+    // scalar `Config`.
+    async fn accept_uni_inner(&self) -> Result<RecvStream, Error> {
         self.accept_uni
             .lock()
             .await
@@ -1798,7 +1830,7 @@ impl generic::Session for Session {
             .ok_or(Error::Closed)
     }
 
-    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+    async fn accept_bi_inner(&self) -> Result<(SendStream, RecvStream), Error> {
         self.accept_bi
             .lock()
             .await
@@ -1807,7 +1839,7 @@ impl generic::Session for Session {
             .ok_or(Error::Closed)
     }
 
-    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
+    async fn open_uni_inner(&self) -> Result<SendStream, Error> {
         // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
         let index = self.open_uni_credit.claim_index().await?;
         let id = StreamId::new(index, StreamDir::Uni, self.is_server);
@@ -1862,7 +1894,7 @@ impl generic::Session for Session {
         Ok(send_frontend)
     }
 
-    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+    async fn open_bi_inner(&self) -> Result<(SendStream, RecvStream), Error> {
         // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
         let index = self.open_bi_credit.claim_index().await?;
         let id = StreamId::new(index, StreamDir::Bi, self.is_server);
@@ -1943,6 +1975,90 @@ impl generic::Session for Session {
         Ok((send_frontend, recv_frontend))
     }
 
+    async fn closed_inner(&self) -> Error {
+        let mut closed = self.closed.subscribe();
+        closed
+            .wait_for(|err| err.is_some())
+            .await
+            .map(|e| e.clone().unwrap_or(Error::Closed))
+            .unwrap_or(Error::Closed)
+    }
+
+    async fn recv_datagram_inner(&self) -> Result<Bytes, Error> {
+        self.recv_datagram
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(Error::Closed)
+    }
+}
+
+impl generic::Session for Session {
+    type SendStream = SendStream;
+    type RecvStream = RecvStream;
+    type Error = Error;
+
+    fn poll_accept_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::RecvStream, Self::Error>> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.accept_uni,
+            |s| async move { s.accept_uni_inner().await },
+        )
+    }
+
+    fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.accept_bi,
+            |s| async move { s.accept_bi_inner().await },
+        )
+    }
+
+    fn poll_open_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.open_uni,
+            |s| async move { s.open_uni_inner().await },
+        )
+    }
+
+    fn poll_open_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.open_bi,
+            |s| async move { s.open_bi_inner().await },
+        )
+    }
+
+    fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.recv_datagram,
+            |s| async move { s.recv_datagram_inner().await },
+        )
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+        self.poll_op(
+            cx,
+            |ops| &mut ops.closed,
+            |s| async move { s.closed_inner().await },
+        )
+    }
+
     fn close(&self, code: u32, reason: &str) {
         // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
         // session close carrying our code/reason.
@@ -1958,15 +2074,6 @@ impl generic::Session for Session {
                 reason: reason.to_string(),
             }))
             .ok();
-    }
-
-    async fn closed(&self) -> Self::Error {
-        let mut closed = self.closed.subscribe();
-        closed
-            .wait_for(|err| err.is_some())
-            .await
-            .map(|e| e.clone().unwrap_or(Error::Closed))
-            .unwrap_or(Error::Closed)
     }
 
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
@@ -1993,15 +2100,6 @@ impl generic::Session for Session {
 
     fn max_datagram_size(&self) -> usize {
         self.datagram_max_size.load(Ordering::Acquire)
-    }
-
-    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        self.recv_datagram
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
     }
 
     fn protocol(&self) -> Option<&str> {
@@ -3277,7 +3375,7 @@ mod recv_open_tests {
     /// stream.
     #[tokio::test]
     async fn retired_recv_stream_is_not_resurrected() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         // Open with data, FIN (retires the stream), then a late frame on the same id.
         tx.send(uni_stream(0, b"hello", false)).unwrap();
@@ -3301,7 +3399,7 @@ mod recv_open_tests {
 
     #[tokio::test]
     async fn recv_stream_offsets_are_not_enforced_yet() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         tx.send(uni_stream_at(0, 0, b"hello", false)).unwrap();
         tx.send(uni_stream_at(0, 99, b"world", true)).unwrap();
@@ -3320,7 +3418,7 @@ mod recv_open_tests {
     /// highest-retired-index tombstone wrongly dropping it.)
     #[tokio::test]
     async fn implicitly_opened_lower_stream_is_still_accepted() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         // Retire stream 10 first, then deliver the first frame of stream 6.
         tx.send(uni_stream(10, b"", true)).unwrap();
@@ -3346,7 +3444,7 @@ mod recv_open_tests {
     /// brand-new stream. (Guards the RESET-first resurrection path.)
     #[tokio::test]
     async fn reset_as_first_frame_prevents_resurrection() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         // RESET arrives before any STREAM frame for this id, then a STREAM does.
         tx.send(uni_reset(5, 0)).unwrap();
@@ -3365,7 +3463,7 @@ mod recv_open_tests {
     async fn empty_non_fin_stream_frames_are_not_queued() {
         const FLOOD: usize = 10_000;
 
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         // The first empty frame still opens the peer-initiated stream.
         tx.send(uni_stream(0, b"", false)).unwrap();
@@ -3400,7 +3498,7 @@ mod recv_open_tests {
         let mut config = Config::new(Version::QMux01);
         config.max_data = 4;
         config.max_stream_data_uni = 10;
-        let (session, tx) = scripted_session_with_config(config);
+        let (mut session, tx) = scripted_session_with_config(config);
 
         tx.send(uni_reset(0, 5)).unwrap();
 
@@ -3417,7 +3515,7 @@ mod recv_open_tests {
         let mut config = Config::new(Version::QMux01);
         config.max_data = 10;
         config.max_stream_data_uni = 10;
-        let (session, tx) = scripted_session_with_config(config);
+        let (mut session, tx) = scripted_session_with_config(config);
 
         tx.send(uni_reset(0, 3)).unwrap();
         tx.send(uni_stream(1, b"12345678", false)).unwrap();
@@ -3435,7 +3533,7 @@ mod recv_open_tests {
         let mut config = Config::new(Version::QMux01);
         config.max_data = 10;
         config.max_stream_data_uni = 10;
-        let (session, tx) = scripted_session_with_config(config);
+        let (mut session, tx) = scripted_session_with_config(config);
 
         tx.send(uni_reset(0, 6)).unwrap();
         tx.send(uni_stream(1, b"12345", true)).unwrap();
@@ -3454,7 +3552,7 @@ mod recv_open_tests {
     /// application decodes a splice of two positions as contiguous.
     #[tokio::test]
     async fn closed_preserves_partially_read_data() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         tx.send(uni_stream_at(0, 0, b"hello", false)).unwrap();
         let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
@@ -3484,7 +3582,7 @@ mod recv_open_tests {
     /// retaining the stream's terminal state.
     #[tokio::test]
     async fn legacy_zero_final_size_after_data_is_tolerated() {
-        let (session, tx) = scripted_session();
+        let (mut session, tx) = scripted_session();
 
         tx.send(uni_stream(0, b"hello", false)).unwrap();
         let mut recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
@@ -3554,7 +3652,7 @@ mod datagram_recv_tests {
     async fn oversized_frame_closes_session() {
         let mut cfg = Config::new(Version::QMux01);
         cfg.max_datagram_frame_size = 100;
-        let (server, mut raw) = raw_peer(cfg).await;
+        let (mut server, mut raw) = raw_peer(cfg).await;
 
         // Usable payload is 97 (100 - 1 type byte - 2 length-varint bytes); a
         // 98-byte payload tips the encoded frame to 101 > 100.
@@ -3573,7 +3671,7 @@ mod datagram_recv_tests {
     async fn unnegotiated_datagram_closes_session() {
         let mut cfg = Config::new(Version::QMux01);
         cfg.max_datagram_frame_size = 0;
-        let (server, mut raw) = raw_peer(cfg).await;
+        let (mut server, mut raw) = raw_peer(cfg).await;
 
         let datagram = Frame::Datagram(Bytes::from_static(b"hi").into())
             .encode(Version::QMux01)
@@ -3613,7 +3711,7 @@ mod datagram_recv_tests {
 
         let mut cfg = Config::new(Version::QMux01);
         cfg.max_datagram_frame_size = 100;
-        let (server, mut raw) = raw_peer(cfg).await;
+        let (mut server, mut raw) = raw_peer(cfg).await;
 
         // Oversized DATAGRAM frame → the server tears down with FrameTooLarge.
         let datagram = Frame::Datagram(Bytes::from(vec![0u8; 98]).into())
@@ -3642,7 +3740,7 @@ mod datagram_recv_tests {
     /// the peer's code/reason.
     #[tokio::test]
     async fn peer_application_close_is_graceful() {
-        let (server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
+        let (mut server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
 
         let close = Frame::ApplicationClose(ApplicationClose {
             code: VarInt::from_u32(42),
@@ -3669,7 +3767,7 @@ mod datagram_recv_tests {
     async fn peer_connection_close_is_abnormal() {
         use web_transport_trait::Error as _;
 
-        let (server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
+        let (mut server, mut raw) = raw_peer(Config::new(Version::QMux01)).await;
 
         let close = Frame::ConnectionClose(ConnectionClose {
             code: VarInt::from_u32(1002),
@@ -3694,7 +3792,7 @@ mod datagram_recv_tests {
     async fn frame_at_limit_delivered() {
         let mut cfg = Config::new(Version::QMux01);
         cfg.max_datagram_frame_size = 100;
-        let (server, mut raw) = raw_peer(cfg).await;
+        let (mut server, mut raw) = raw_peer(cfg).await;
 
         // 97-byte payload → 1 + 2 + 97 == 100 == the limit.
         let payload = vec![7u8; 97];
@@ -3715,7 +3813,7 @@ mod datagram_recv_tests {
     async fn no_length_datagram_uses_exact_frame_size() {
         let mut cfg = Config::new(Version::QMux01);
         cfg.max_datagram_frame_size = 100;
-        let (server, mut raw) = raw_peer(cfg).await;
+        let (mut server, mut raw) = raw_peer(cfg).await;
 
         // A 99-byte 0x30 payload is a 1 + 99 = 100-byte frame — exactly the limit
         // — even though the length-prefixed reconstruction (1 + 2 + 99 = 102)
@@ -3806,7 +3904,7 @@ mod qmux02_recv_tests {
     /// PROTOCOL_VIOLATION (the "exactly once" half of the first-frame rule).
     #[tokio::test]
     async fn duplicate_transport_parameters_rejected() {
-        let (server, mut raw) = established_peer().await;
+        let (mut server, mut raw) = established_peer().await;
 
         raw.write_all(&record(&qmux02_params())).await.unwrap();
         raw.flush().await.unwrap();
@@ -3837,7 +3935,7 @@ mod qmux02_recv_tests {
     /// A QX_PING response echoing a sequence we never sent is a PROTOCOL_VIOLATION.
     #[tokio::test]
     async fn ping_response_for_unsent_sequence_closes() {
-        let (server, mut raw) = established_peer().await;
+        let (mut server, mut raw) = established_peer().await;
 
         let ping = Frame::Ping(crate::Ping {
             sequence: 5,
@@ -3854,7 +3952,7 @@ mod qmux02_recv_tests {
     /// QX_PING request sequence numbers must strictly increase.
     #[tokio::test]
     async fn ping_request_not_increasing_closes() {
-        let (server, mut raw) = established_peer().await;
+        let (mut server, mut raw) = established_peer().await;
 
         for _ in 0..2 {
             let ping = Frame::Ping(crate::Ping {
@@ -3876,7 +3974,7 @@ mod qmux02_recv_tests {
     async fn reset_stream_at_resets_accepted_stream() {
         use web_transport_trait::RecvStream as _;
 
-        let (server, mut raw) = established_peer().await;
+        let (mut server, mut raw) = established_peer().await;
 
         let id = StreamId::new(0, StreamDir::Uni, false);
         let stream = Frame::Stream(Stream {
@@ -3931,7 +4029,7 @@ mod qmux02_recv_tests {
             .unwrap();
         raw.write_all(&record(&params)).await.unwrap();
         raw.flush().await.unwrap();
-        let server = accept.await.unwrap().unwrap();
+        let mut server = accept.await.unwrap().unwrap();
 
         // Hand-built RESET_STREAM_AT (0x24) on a client uni stream.
         let id = StreamId::new(0, StreamDir::Uni, false);

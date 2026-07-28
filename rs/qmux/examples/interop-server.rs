@@ -35,7 +35,7 @@ fn payload(seed: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn run(session: Session, version: Version) -> anyhow::Result<()> {
+async fn run(mut session: Session, version: Version) -> anyhow::Result<()> {
     if session.protocol() != Some(PROTOCOL) {
         bail!("unexpected negotiated protocol: {:?}", session.protocol());
     }

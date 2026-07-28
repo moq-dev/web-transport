@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context, Poll, Waker},
+    task::{ready, Context, Poll, Waker},
     time::Duration,
 };
 
@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 
 use crate::{
-    proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
+    proto::{ConnectRequest, ConnectResponse, Frame, Header, StreamUni, VarInt},
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
 
@@ -37,9 +37,9 @@ pub struct Session {
     accept: Option<Arc<Mutex<SessionAccept>>>,
 
     // Cache the headers in front of each stream we open.
-    header_uni: Vec<u8>,
-    header_bi: Vec<u8>,
-    header_datagram: Vec<u8>,
+    header_uni: Header,
+    header_bi: Header,
+    header_datagram: Header,
 
     // Keep a reference to the settings and connect stream to avoid closing them until dropped.
     #[allow(dead_code)]
@@ -59,6 +59,10 @@ pub struct Session {
 
     // The response sent by the server.
     response: ConnectResponse,
+
+    // Retained futures for the operations with no native poll form. Each handle
+    // owns its own, so `&mut self` is all the exclusion they need.
+    ops: web_transport_trait::SessionOps<SendStream, RecvStream, SessionError>,
 }
 
 impl Session {
@@ -67,16 +71,17 @@ impl Session {
         let session_id = connect.session_id();
 
         // Cache the tiny header we write in front of each stream we open.
-        let mut header_uni = Vec::new();
-        StreamUni::WEBTRANSPORT.encode(&mut header_uni);
-        session_id.encode(&mut header_uni);
+        let header_uni = Header::encode(|w| {
+            StreamUni::WEBTRANSPORT.encode(w);
+            session_id.encode(w);
+        });
 
-        let mut header_bi = Vec::new();
-        Frame::WEBTRANSPORT.encode(&mut header_bi);
-        session_id.encode(&mut header_bi);
+        let header_bi = Header::encode(|w| {
+            Frame::WEBTRANSPORT.encode(w);
+            session_id.encode(w);
+        });
 
-        let mut header_datagram = Vec::new();
-        session_id.encode(&mut header_datagram);
+        let header_datagram = Header::encode(|w| session_id.encode(w));
 
         let error: Arc<OnceLock<SessionError>> = Arc::new(OnceLock::new());
 
@@ -84,6 +89,7 @@ impl Session {
         let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
 
         let this = Self {
+            ops: Default::default(),
             conn,
             accept: Some(Arc::new(Mutex::new(accept))),
             session_id: Some(session_id),
@@ -216,38 +222,61 @@ impl Session {
 
     /// Open a new unidirectional stream. See [`quinn::Connection::open_uni`].
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self.conn.open_uni().await.map_err(|e| self.map_error(e))?;
+        Self::open_uni_owned(self.conn.clone(), self.header_uni, self.error.clone()).await
+    }
+
+    /// The body of [`open_uni`](Self::open_uni), over owned handles.
+    ///
+    /// `poll_open_uni` has to retain this future between polls, which means it
+    /// cannot borrow the session. Taking cheap clones keeps one implementation
+    /// rather than two.
+    async fn open_uni_owned(
+        conn: quinn::Connection,
+        header: Header,
+        error: Arc<OnceLock<SessionError>>,
+    ) -> Result<SendStream, SessionError> {
+        let mut send = conn.open_uni().await.map_err(|e| map_error(&error, e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
         // Also the header is very important for determining the session ID without reliable reset.
         send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_uni)
+        Self::write_full(&mut send, &header)
             .await
-            .map_err(|e| self.map_error(e))?;
+            .map_err(|e| map_error(&error, e))?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
-        Ok(SendStream::new(send, self.error.clone()))
+        Ok(SendStream::new(send, error))
     }
 
     /// Open a new bidirectional stream. See [`quinn::Connection::open_bi`].
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self.conn.open_bi().await.map_err(|e| self.map_error(e))?;
+        Self::open_bi_owned(self.conn.clone(), self.header_bi, self.error.clone()).await
+    }
+
+    /// The body of [`open_bi`](Self::open_bi), over owned handles. See
+    /// [`open_uni_owned`](Self::open_uni_owned).
+    async fn open_bi_owned(
+        conn: quinn::Connection,
+        header: Header,
+        error: Arc<OnceLock<SessionError>>,
+    ) -> Result<(SendStream, RecvStream), SessionError> {
+        let (mut send, recv) = conn.open_bi().await.map_err(|e| map_error(&error, e))?;
 
         // Set the stream priority to max and then write the stream header.
         // Otherwise the application could write data with lower priority than the header, resulting in queuing.
         // Also the header is very important for determining the session ID without reliable reset.
         send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_bi)
+        Self::write_full(&mut send, &header)
             .await
-            .map_err(|e| self.map_error(e))?;
+            .map_err(|e| map_error(&error, e))?;
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
         Ok((
-            SendStream::new(send, self.error.clone()),
-            RecvStream::new(recv, self.error.clone()),
+            SendStream::new(send, error.clone()),
+            RecvStream::new(recv, error),
         ))
     }
 
@@ -257,15 +286,24 @@ impl Session {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received bytes.
     pub async fn read_datagram(&self) -> Result<Bytes, SessionError> {
-        let mut datagram = self
-            .conn
+        Self::read_datagram_owned(self.conn.clone(), self.error.clone(), self.session_id).await
+    }
+
+    /// The body of [`read_datagram`](Self::read_datagram), over owned handles. See
+    /// [`open_uni_owned`](Self::open_uni_owned).
+    async fn read_datagram_owned(
+        conn: quinn::Connection,
+        error: Arc<OnceLock<SessionError>>,
+        session_id: Option<VarInt>,
+    ) -> Result<Bytes, SessionError> {
+        let mut datagram = conn
             .read_datagram()
             .await
-            .map_err(|e| self.map_error(e))?;
+            .map_err(|e| map_error(&error, e))?;
 
         let mut cursor = Cursor::new(&datagram);
 
-        if let Some(session_id) = self.session_id {
+        if let Some(session_id) = session_id {
             // We have to check and strip the session ID from the datagram.
             let actual_id =
                 VarInt::decode(&mut cursor).map_err(|_| WebTransportError::UnknownSession)?;
@@ -456,7 +494,16 @@ impl Session {
     /// connection to shut down, ensuring the `CloseWebTransportSession` capsule has
     /// been delivered. Use [`close_reason()`](Self::close_reason) for a non-blocking check.
     pub async fn closed(&self) -> SessionError {
-        self.map_error(self.conn.closed().await)
+        Self::closed_owned(self.conn.clone(), self.error.clone()).await
+    }
+
+    /// The body of [`closed`](Self::closed), over owned handles. See
+    /// [`open_uni_owned`](Self::open_uni_owned).
+    async fn closed_owned(
+        conn: quinn::Connection,
+        error: Arc<OnceLock<SessionError>>,
+    ) -> SessionError {
+        map_error(&error, conn.closed().await)
     }
 
     /// Return why the session was closed, or None if it's not closed. See [`quinn::Connection::close_reason`].
@@ -466,18 +513,7 @@ impl Session {
 
     /// Replace connection-level errors with the stored session error if available.
     fn map_error(&self, e: impl Into<SessionError>) -> SessionError {
-        let e = e.into();
-        if let Some(err) = self.error.get() {
-            if matches!(
-                &e,
-                SessionError::ConnectionError(_)
-                    | SessionError::WebTransportError(WebTransportError::Closed(..))
-                    | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(_))
-            ) {
-                return err.clone();
-            }
-        }
-        e
+        map_error(&self.error, e)
     }
 
     async fn write_full(send: &mut quinn::SendStream, buf: &[u8]) -> Result<(), SessionError> {
@@ -498,6 +534,7 @@ impl Session {
         response: impl Into<ConnectResponse>,
     ) -> Self {
         Self {
+            ops: Default::default(),
             conn,
             session_id: None,
             header_uni: Default::default(),
@@ -831,41 +868,149 @@ impl web_transport_trait::Stats for SessionStats {
     }
 }
 
+/// Replace connection-level errors with the stored session error if available.
+///
+/// Free-standing so the retained `poll_*` futures, which hold an owned `error`
+/// rather than the session, share one implementation with the `&self` methods.
+fn map_error(error: &OnceLock<SessionError>, e: impl Into<SessionError>) -> SessionError {
+    let e = e.into();
+    if let Some(err) = error.get() {
+        if matches!(
+            &e,
+            SessionError::ConnectionError(_)
+                | SessionError::WebTransportError(WebTransportError::Closed(..))
+                | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(_))
+        ) {
+            return err.clone();
+        }
+    }
+    e
+}
+
 impl web_transport_trait::Session for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = SessionError;
 
-    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        Self::accept_uni(self).await
+    fn poll_accept_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::RecvStream, Self::Error>> {
+        // The WebTransport path is already poll-driven: `SessionAccept` decodes
+        // stream headers through a `FuturesUnordered` and tracks a waker per
+        // concurrent caller, so forward straight to it.
+        if let Some(accept) = &self.accept {
+            let result = ready!(accept.lock().unwrap().poll_accept_uni(cx));
+            return Poll::Ready(result.map_err(|e| self.map_error(e)));
+        }
+
+        // Raw QUIC has no header to decode, but `quinn::Connection::accept_uni`
+        // registers its `Notified` when the future is built, so the future has to be
+        // retained rather than rebuilt each poll.
+        let Self {
+            conn, error, ops, ..
+        } = self;
+        ops.accept_uni.poll(cx, || {
+            let (conn, error) = (conn.clone(), error.clone());
+            async move {
+                let recv = conn.accept_uni().await.map_err(|e| map_error(&error, e))?;
+                Ok(RecvStream::new(recv, error))
+            }
+        })
     }
 
-    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::accept_bi(self).await
+    fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        if let Some(accept) = &self.accept {
+            let result = ready!(accept.lock().unwrap().poll_accept_bi(cx));
+            return Poll::Ready(result.map_err(|e| self.map_error(e)));
+        }
+
+        let Self {
+            conn, error, ops, ..
+        } = self;
+        ops.accept_bi.poll(cx, || {
+            let (conn, error) = (conn.clone(), error.clone());
+            async move {
+                let (send, recv) = conn.accept_bi().await.map_err(|e| map_error(&error, e))?;
+                Ok((
+                    SendStream::new(send, error.clone()),
+                    RecvStream::new(recv, error),
+                ))
+            }
+        })
     }
 
-    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        Self::open_bi(self).await
+    fn poll_open_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>> {
+        // Opening claims stream credit and then writes the WebTransport header, so
+        // it is a multi-step routine with no poll form. Retaining it is what stops a
+        // `Pending` from abandoning the claim.
+        let Self {
+            conn,
+            header_uni,
+            error,
+            ops,
+            ..
+        } = self;
+        ops.open_uni.poll(cx, || {
+            let (conn, header, error) = (conn.clone(), *header_uni, error.clone());
+            Self::open_uni_owned(conn, header, error)
+        })
     }
 
-    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-        Self::open_uni(self).await
+    fn poll_open_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(Self::SendStream, Self::RecvStream), Self::Error>> {
+        let Self {
+            conn,
+            header_bi,
+            error,
+            ops,
+            ..
+        } = self;
+        ops.open_bi.poll(cx, || {
+            let (conn, header, error) = (conn.clone(), *header_bi, error.clone());
+            Self::open_bi_owned(conn, header, error)
+        })
     }
 
     fn close(&self, code: u32, reason: &str) {
         Self::close(self, code, reason.as_bytes());
     }
 
-    async fn closed(&self) -> Self::Error {
-        Self::closed(self).await
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+        let Self {
+            conn, error, ops, ..
+        } = self;
+        ops.closed.poll(cx, || {
+            let (conn, error) = (conn.clone(), error.clone());
+            Self::closed_owned(conn, error)
+        })
     }
 
     fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
         Self::send_datagram(self, data)
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        Self::read_datagram(self).await
+    fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+        let Self {
+            conn,
+            error,
+            session_id,
+            ops,
+            ..
+        } = self;
+        let session_id = *session_id;
+        ops.recv_datagram.poll(cx, || {
+            let (conn, error) = (conn.clone(), error.clone());
+            Self::read_datagram_owned(conn, error, session_id)
+        })
     }
 
     fn max_datagram_size(&self) -> usize {

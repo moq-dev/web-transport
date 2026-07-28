@@ -102,14 +102,14 @@ async fn pair(gate: watch::Receiver<bool>) -> (Session, Session) {
 #[tokio::test]
 async fn reads_are_not_blocked_by_a_stalled_writer() {
     let (gate_tx, gate_rx) = watch::channel(true); // open: handshake flows
-    let (client, server) = pair(gate_rx).await;
+    let (mut client, mut server) = pair(gate_rx).await;
 
     // Close the gate: the client's writer now blocks on its next send.
     gate_tx.send(false).unwrap();
 
     // The client fills its outbound pipeline with a large payload; the writer
     // task wedges on the gate with the queue full.
-    let client_writer = client.clone();
+    let mut client_writer = client.clone();
     let writer = tokio::spawn(async move {
         let mut s = client_writer.open_uni().await.unwrap();
         let _ = s.write_all(&vec![b'C'; 512 * 1024]).await; // blocks; may error on teardown
@@ -149,7 +149,7 @@ async fn reads_are_not_blocked_by_a_stalled_writer() {
 #[tokio::test]
 async fn datagrams_are_shed_under_backpressure() {
     let (gate_tx, gate_rx) = watch::channel(true);
-    let (client, server) = pair(gate_rx).await;
+    let (client, mut server) = pair(gate_rx).await;
 
     assert!(
         client.max_datagram_size() > 0,
@@ -159,7 +159,7 @@ async fn datagrams_are_shed_under_backpressure() {
     // Wedge the client writer, then fill the pipeline with stream data so the
     // writer channel is provably at zero free capacity.
     gate_tx.send(false).unwrap();
-    let client_filler = client.clone();
+    let mut client_filler = client.clone();
     let filler = tokio::spawn(async move {
         let mut s = client_filler.open_uni().await.unwrap();
         let _ = s.write_all(&vec![b'F'; 512 * 1024]).await;
@@ -238,7 +238,7 @@ async fn idle_timeout_deferred_but_bounded_under_backpressure() {
 
     // Wedge the client writer: close the gate, then push a write it can't drain.
     gate_tx.send(false).unwrap();
-    let client_writer = client.clone();
+    let mut client_writer = client.clone();
     let writer = tokio::spawn(async move {
         let mut s = client_writer.open_uni().await.unwrap();
         let _ = s.write_all(&vec![b'X'; 256 * 1024]).await;
@@ -246,7 +246,7 @@ async fn idle_timeout_deferred_but_bounded_under_backpressure() {
     });
 
     // Observe the client's close reason (resolves only once it actually closes).
-    let client_closed = client.clone();
+    let mut client_closed = client.clone();
     let closed = tokio::spawn(async move { client_closed.closed().await });
 
     // Past the raw 150ms idle window but within the bounded grace: still open.

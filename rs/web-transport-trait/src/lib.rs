@@ -1,4 +1,3 @@
-mod poll;
 mod util;
 
 use std::{
@@ -7,8 +6,7 @@ use std::{
     time::Duration,
 };
 
-pub use crate::poll::SessionPoll;
-pub use crate::util::{MaybeSend, MaybeSync, OpState};
+pub use crate::util::{MaybeSend, MaybeSync, OpState, SessionOps};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Connection-level statistics.
@@ -76,40 +74,73 @@ pub trait Error: std::error::Error + MaybeSend + MaybeSync + 'static {
     }
 }
 
+/// The stream pair produced by opening or accepting a bidirectional stream.
+pub type BiStreams<S> = (<S as Session>::SendStream, <S as Session>::RecvStream);
+
 /// A WebTransport Session, able to accept/create streams and send/recv datagrams.
 ///
 /// The session can be cloned to create multiple handles.
 /// The session will be closed on drop.
 ///
-/// Session operations are async because every backend implements them that way.
-/// To drive them from a `poll` loop instead, wrap the session in
-/// [`SessionPoll`], which retains each in-progress operation across polls.
-/// Streams are poll-native and keep their poll surface in separate traits:
-/// [`PollSendStream`] and [`PollRecvStream`].
-///
-/// Unlike those, this trait requires `Send + Sync`, so a thread-pinned session is
-/// not expressible today — see the crate README.
-pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
+/// Operations take `&mut self`, so each handle has one unambiguous owner and can
+/// retain an in-progress operation safely. Clone the concrete session type to run
+/// operations concurrently — the trait does not require `Clone`, so a session that
+/// cannot be duplicated is still expressible.
+pub trait Session: MaybeSend + MaybeSync + 'static {
     type SendStream: SendStream + 'static;
     type RecvStream: RecvStream + 'static;
     type Error: Error;
 
+    /// Poll for a unidirectional stream created by the peer.
+    fn poll_accept_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::RecvStream, Self::Error>>;
+
     /// Block until the peer creates a new unidirectional stream.
-    fn accept_uni(&self)
-        -> impl Future<Output = Result<Self::RecvStream, Self::Error>> + MaybeSend;
+    fn accept_uni(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::RecvStream, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_accept_uni(cx))
+    }
+
+    /// Poll for a bidirectional stream created by the peer.
+    fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<BiStreams<Self>, Self::Error>>;
 
     /// Block until the peer creates a new bidirectional stream.
     fn accept_bi(
-        &self,
-    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend;
+        &mut self,
+    ) -> impl Future<Output = Result<BiStreams<Self>, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_accept_bi(cx))
+    }
+
+    /// Poll to open a unidirectional stream, which blocks while there are too many
+    /// concurrent streams.
+    fn poll_open_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>>;
+
+    /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
+    fn open_uni(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::SendStream, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_open_uni(cx))
+    }
+
+    /// Poll to open a bidirectional stream, which blocks while there are too many
+    /// concurrent streams.
+    fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<BiStreams<Self>, Self::Error>>;
 
     /// Open a new bidirectional stream, which may block when there are too many concurrent streams.
     fn open_bi(
-        &self,
-    ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend;
-
-    /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
-    fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, Self::Error>> + MaybeSend;
+        &mut self,
+    ) -> impl Future<Output = Result<BiStreams<Self>, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_open_bi(cx))
+    }
 
     /// Send a datagram over the network.
     ///
@@ -122,8 +153,13 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// - ???
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error>;
 
+    /// Poll for a datagram from the network.
+    fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>>;
+
     /// Receive a datagram over the network.
-    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend;
+    fn recv_datagram(&mut self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend {
+        poll_fn(|cx| self.poll_recv_datagram(cx))
+    }
 
     /// The maximum size of a datagram that can be sent.
     fn max_datagram_size(&self) -> usize;
@@ -136,8 +172,13 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// Close the connection immediately with a code and reason.
     fn close(&self, code: u32, reason: &str);
 
+    /// Poll until the connection is closed by either side.
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error>;
+
     /// Block until the connection is closed by either side.
-    fn closed(&self) -> impl Future<Output = Self::Error> + MaybeSend;
+    fn closed(&mut self) -> impl Future<Output = Self::Error> + MaybeSend {
+        poll_fn(|cx| self.poll_closed(cx))
+    }
 
     /// Return connection-level statistics, if supported.
     fn stats(&self) -> impl Stats {

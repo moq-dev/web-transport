@@ -89,6 +89,59 @@ impl<T> std::fmt::Debug for OpState<T> {
     }
 }
 
+/// The retained futures a [`Session`](crate::Session) implementation needs for the
+/// operations that have no native poll form.
+///
+/// Every backend today opens streams, reads datagrams and awaits close through
+/// multi-step async routines, so each of those needs an [`OpState`] to be pollable.
+/// Accept is usually the exception — most backends already drive it from a poll
+/// loop — so the accept slots are there for those that don't.
+///
+/// Because `Session` operations take `&mut self`, each of these slots has exactly
+/// one owner: there is no shared-slot contention and no need to clone the session
+/// per call. Cloning this struct yields idle slots, matching [`OpState`].
+pub struct SessionOps<S, R, E> {
+    /// Retains `accept_uni` for backends without a native poll form.
+    pub accept_uni: OpState<Result<R, E>>,
+    /// Retains `accept_bi` for backends without a native poll form.
+    pub accept_bi: OpState<Result<(S, R), E>>,
+    /// Retains the in-progress `open_uni`, which claims stream credit before it
+    /// resolves — restarting it would leak the claim.
+    pub open_uni: OpState<Result<S, E>>,
+    /// Retains the in-progress `open_bi`, which claims stream credit before it
+    /// resolves — restarting it would leak the claim.
+    pub open_bi: OpState<Result<(S, R), E>>,
+    /// Retains `recv_datagram`.
+    pub recv_datagram: OpState<Result<bytes::Bytes, E>>,
+    /// Retains `closed`.
+    pub closed: OpState<E>,
+}
+
+impl<S, R, E> Default for SessionOps<S, R, E> {
+    fn default() -> Self {
+        Self {
+            accept_uni: Default::default(),
+            accept_bi: Default::default(),
+            open_uni: Default::default(),
+            open_bi: Default::default(),
+            recv_datagram: Default::default(),
+            closed: Default::default(),
+        }
+    }
+}
+
+impl<S, R, E> Clone for SessionOps<S, R, E> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<S, R, E> std::fmt::Debug for SessionOps<S, R, E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("SessionOps").finish_non_exhaustive()
+    }
+}
+
 /// A trait that is Send on native targets and empty on WASM.
 #[cfg(not(target_family = "wasm"))]
 pub trait MaybeSend: Send {}
