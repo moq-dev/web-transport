@@ -437,7 +437,21 @@ pub trait PollRecvStream {
             _ => return Poll::Ready(Ok(None)),
         };
 
-        // SAFETY: `poll_read` reported writing `size` bytes into `dst`.
+        // `advance_mut` is unsafe and `PollRecvStream` is not, so a wrong count
+        // here must not become unsoundness. Panic rather than clamp: an
+        // implementation that reports more than the buffer it was handed is
+        // broken, and quietly trusting a smaller number would hide it.
+        //
+        // A count that is wrong but in range stays a plain logic bug — the caller
+        // sees the zeroed bytes, which is the usual outcome for a `read` that
+        // misreports.
+        assert!(
+            size <= len,
+            "poll_read reported {size} bytes for a {len}-byte buffer"
+        );
+
+        // SAFETY: `size` is within `dst`, and every byte of `dst` was initialized
+        // above, so `size` bytes of the chunk are initialized.
         unsafe { buf.advance_mut(size) };
 
         Poll::Ready(Ok(Some(size)))

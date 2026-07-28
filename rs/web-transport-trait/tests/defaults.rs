@@ -363,3 +363,36 @@ impl PollSendStream for FloodSend {
         Poll::Ready(Ok(()))
     }
 }
+
+/// A safe `PollRecvStream` must not be able to cause unsoundness by over-reporting
+/// its read. `poll_read_buf` feeds the count to `BufMut::advance_mut`, which is
+/// unsafe, so the count is checked rather than trusted.
+#[test]
+#[should_panic(expected = "poll_read reported")]
+fn over_reported_read_panics_rather_than_advancing_past_the_buffer() {
+    struct Liar;
+
+    impl PollRecvStream for Liar {
+        type Error = TestError;
+
+        fn poll_read(
+            &mut self,
+            _cx: &mut Context<'_>,
+            dst: &mut [u8],
+        ) -> Poll<Result<Option<usize>, TestError>> {
+            // Claims to have written far more than it was given room for.
+            Poll::Ready(Ok(Some(dst.len() + 4096)))
+        }
+
+        fn stop(&mut self, _code: u32) {}
+
+        fn poll_closed(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), TestError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl RecvStream for Liar {}
+
+    let mut buf = BytesMut::with_capacity(64);
+    let _ = block_on(Liar.read_buf(&mut buf));
+}

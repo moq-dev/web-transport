@@ -11,7 +11,7 @@ use crate::{Error, Protocol, Session, Version};
 /// ```no_run
 /// # async fn f(addr: std::net::SocketAddr) -> Result<(), qmux::Error> {
 /// use qmux::{tcp, Version};
-/// use web_transport_trait::Session as _;
+/// use web_transport_trait::PollSession as _;
 ///
 /// // Negotiate one of these protocols (server preference wins):
 /// let session = tcp::Config::new(Version::QMux01)

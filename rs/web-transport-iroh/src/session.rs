@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -419,6 +419,14 @@ struct H3SessionAccept {
     // Keep track of work being done to read/write the WebTransport stream header.
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
+
+    // Wakers from concurrent callers of accept_bi / accept_uni.
+    // Every clone of the session polls this one struct, and the streams beneath it
+    // store only the most recent waker — so a second caller's registration replaces
+    // the first's and that caller never wakes. Keep them all and wake them when one
+    // caller takes a stream, so the rest retry.
+    bi_wakers: Vec<Waker>,
+    uni_wakers: Vec<Waker>,
 }
 
 impl H3SessionAccept {
@@ -443,12 +451,30 @@ impl H3SessionAccept {
 
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
+            bi_wakers: Vec::new(),
+            uni_wakers: Vec::new(),
         }
     }
 
     // This is poll-based because we accept and decode streams in parallel.
     // In async land I would use tokio::JoinSet, but that requires a runtime.
     // It's better to use FuturesUnordered instead because it's agnostic.
+    /// Remember a caller that is parking, so it can be woken when another takes a
+    /// stream and replaces its waker registration.
+    fn remember(wakers: &mut Vec<Waker>, cx: &Context<'_>) {
+        if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            wakers.push(cx.waker().clone());
+        }
+    }
+
+    /// Wake everyone else so they re-register; whoever polled last owns the
+    /// underlying registration.
+    fn wake_all(wakers: &mut Vec<Waker>) {
+        for waker in wakers.drain(..) {
+            waker.wake();
+        }
+    }
+
     pub fn poll_accept_uni(
         &mut self,
         cx: &mut Context<'_>,
@@ -457,7 +483,13 @@ impl H3SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let recv = res?;
+                let recv = match res {
+                    Ok(recv) => recv,
+                    Err(err) => {
+                        Self::wake_all(&mut self.uni_wakers);
+                        return Poll::Ready(Err(err.into()));
+                    }
+                };
                 let pending = Self::decode_uni(recv, self.session_id);
                 self.pending_uni.push(Box::pin(pending));
 
@@ -465,20 +497,24 @@ impl H3SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let (typ, recv) = match ready!(self.pending_uni.poll_next(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let (typ, recv) = match self.pending_uni.poll_next(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!("failed to decode unidirectional stream: {err:?}");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    Self::remember(&mut self.uni_wakers, cx);
+                    return Poll::Pending;
+                }
             };
 
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv);
+                    Self::wake_all(&mut self.uni_wakers);
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -528,7 +564,13 @@ impl H3SessionAccept {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next(cx) {
                 // Start decoding the header and add the future to the list of pending streams.
-                let (send, recv) = res?;
+                let (send, recv) = match res {
+                    Ok(streams) => streams,
+                    Err(err) => {
+                        Self::wake_all(&mut self.bi_wakers);
+                        return Poll::Ready(Err(err.into()));
+                    }
+                };
                 let pending = Self::decode_bi(send, recv, self.session_id);
                 self.pending_bi.push(Box::pin(pending));
 
@@ -536,20 +578,24 @@ impl H3SessionAccept {
             }
 
             // Poll the list of pending streams.
-            let res = match ready!(self.pending_bi.poll_next(cx)) {
-                Some(Ok(res)) => res,
-                Some(Err(err)) => {
+            let res = match self.pending_bi.poll_next(cx) {
+                Poll::Ready(Some(Ok(res))) => res,
+                Poll::Ready(Some(Err(err))) => {
                     // Ignore the error, the stream was probably reset early.
                     tracing::warn!("failed to decode bidirectional stream: {err:?}");
                     continue;
                 }
-                None => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {
+                    Self::remember(&mut self.bi_wakers, cx);
+                    return Poll::Pending;
+                }
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
+                Self::wake_all(&mut self.bi_wakers);
                 return Poll::Ready(Ok((send, recv)));
             }
 
@@ -593,7 +639,7 @@ impl web_transport_trait::PollSession for Session {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::RecvStream, Self::Error>> {
         // The WebTransport path is already poll-driven: `H3SessionAccept` decodes
-        // stream headers through a `FuturesUnordered` and tracks a waker per
+        // stream headers through a `FuturesUnordered` and keeps a waker per
         // concurrent caller, so forward straight to it.
         if let Some(h3) = &self.h3 {
             return h3.accept.lock().unwrap().poll_accept_uni(cx);

@@ -2235,55 +2235,81 @@ impl SendStream {
     /// Reserve a queue slot and claim flow control credit for sending up to
     /// `desired` bytes, resolving to the permit and the amount allowed.
     ///
-    /// This resolves only once both are in hand, so it holds no claimed credit
-    /// while pending: dropping it returns the permit and claims nothing. That is
-    /// what lets `poll_write_buf` retain it across polls without leaking credit,
-    /// and what lets it commit the caller's bytes with nothing to await in
-    /// between.
+    /// This holds nothing while pending. That is the whole shape of it: the future
+    /// is retained across polls, so anything it owns between polls it also owns
+    /// across an abandoned write — and a caller that cancels a write and never
+    /// returns to the stream would keep it for the life of that stream. A queue
+    /// slot is the scarce one; the session has only a handful, so a few abandoned
+    /// writes on live streams would block every other stream on the connection.
     ///
-    /// It deliberately does not watch `inbound_stopped`. It borrows nothing from
-    /// the stream, so it cannot; instead `poll_write_buf` checks for a
-    /// STOP_SENDING before every poll, which registers the waker that wakes a
-    /// write blocked here.
+    /// So the slot is taken only across a synchronous credit claim, and given back
+    /// before waiting on the peer's window. Both are still acquired before any
+    /// bytes leave the caller's buffer, which is what `poll_write_buf` needs.
     async fn reserve(
         outbound: PriorityQueue,
         stream_credit: Option<Credit>,
         conn_credit: Option<Credit>,
         desired: u64,
     ) -> Result<(Permit, u64), Error> {
-        let permit = outbound.reserve().await?;
-
         let (stream_credit, conn_credit) = match (stream_credit, conn_credit) {
-            (Some(s), Some(c)) => (s, c),
-            _ => return Ok((permit, desired)), // No flow control
+            (Some(stream), Some(conn)) => (stream, conn),
+            // No flow control, so a slot is all this needs.
+            _ => return Ok((outbound.reserve().await?, desired)),
         };
 
         loop {
-            // 1. Try to claim stream credit
-            let stream_claimed = stream_credit.try_claim(desired);
-            if stream_claimed == 0 {
-                // Release and retry the full loop to coordinate with conn credit
-                let claimed = stream_credit.claim(desired).await?;
-                stream_credit.release(claimed);
-                continue;
+            let permit = outbound.reserve().await?;
+
+            // Never await while holding the permit.
+            if let Some(allowed) = Self::try_claim_credit(&stream_credit, &conn_credit, desired) {
+                return Ok((permit, allowed));
             }
 
-            // 2. Try to claim connection credit (may get less than stream_claimed)
-            let conn_claimed = conn_credit.try_claim(stream_claimed);
-            if conn_claimed == 0 {
-                stream_credit.release(stream_claimed);
-                let claimed = conn_credit.claim(1).await?;
-                conn_credit.release(claimed); // Release, retry full loop
-                continue;
-            }
-
-            // Return excess stream credit if connection had less
-            if conn_claimed < stream_claimed {
-                stream_credit.release(stream_claimed - conn_claimed);
-            }
-
-            return Ok((permit, conn_claimed));
+            drop(permit);
+            Self::wait_for_credit(&stream_credit, &conn_credit, desired).await?;
         }
+    }
+
+    /// Claim credit for up to `desired` bytes, or nothing at all.
+    ///
+    /// Coordinates the two windows: the connection may allow less than the stream,
+    /// in which case the excess stream credit goes back.
+    fn try_claim_credit(stream: &Credit, conn: &Credit, desired: u64) -> Option<u64> {
+        let stream_claimed = stream.try_claim(desired);
+        if stream_claimed == 0 {
+            return None;
+        }
+
+        let conn_claimed = conn.try_claim(stream_claimed);
+        if conn_claimed == 0 {
+            stream.release(stream_claimed);
+            return None;
+        }
+
+        if conn_claimed < stream_claimed {
+            stream.release(stream_claimed - conn_claimed);
+        }
+
+        Some(conn_claimed)
+    }
+
+    /// Wait until credit may be available, claiming none of it.
+    ///
+    /// Waits on whichever window is actually short — waiting on the stream when the
+    /// connection is the constraint would return immediately and spin.
+    async fn wait_for_credit(stream: &Credit, conn: &Credit, desired: u64) -> Result<(), Error> {
+        let stream_claimed = stream.try_claim(desired);
+        if stream_claimed == 0 {
+            let claimed = stream.claim(desired).await?;
+            stream.release(claimed);
+            return Ok(());
+        }
+
+        stream.release(stream_claimed);
+        let claimed = conn.claim(1).await?;
+        conn.release(claimed);
+
+        Ok(())
     }
 }
 
@@ -3109,14 +3135,18 @@ mod write_cancel_tests {
         );
     }
 
-    /// A `Pending` poll keeps its reservation instead of starting over.
+    /// A `Pending` poll keeps its place in line instead of starting over.
     ///
     /// This is the difference between a `poll_*` method and a `poll_fn` around a
-    /// fresh future: rebuilding the reservation each poll would hand the queue
-    /// slot back and re-queue behind every other stream, so a write could be
+    /// fresh future: rebuilding the operation each poll would drop the queue's
+    /// wakeup registration and go to the back of the line, so a write could be
     /// starved indefinitely by a busy connection.
+    ///
+    /// What it retains is the *waiting*, not a resource — see
+    /// `abandoned_writes_do_not_consume_the_queue`, which is why it must not hold
+    /// a slot while parked.
     #[tokio::test]
-    async fn pending_write_retains_its_reservation() {
+    async fn pending_write_keeps_its_place_in_line() {
         // Capacity 1, already occupied: the write parks in `reserve`.
         let outbound = PriorityQueue::new(1);
         let mut filler = send_stream(outbound.clone(), None, None);
@@ -3128,7 +3158,7 @@ mod write_cancel_tests {
         let waker = waker();
         let mut cx = Context::from_waker(&waker);
         assert!(send.poll_write_buf(&mut cx, &mut buf).is_pending());
-        assert!(send.write.is_pending(), "the reservation was abandoned");
+        assert!(send.write.is_pending(), "the operation was restarted");
     }
 
     /// A retried write may arrive with a shorter buffer than the one that started
@@ -3204,6 +3234,58 @@ mod write_cancel_tests {
 
         // Only the filler's byte was ever queued; no zero-length frame followed it.
         assert_eq!(drain(&outbound).await, 0);
+    }
+
+    /// A write cancelled on a stream that stays open must not keep a queue slot.
+    ///
+    /// This is the case the terminal-transition release does not cover: nothing
+    /// ends the stream, so nothing runs the cleanup. The session queue has only a
+    /// handful of slots, so a few streams that each cancel one credit-starved write
+    /// and then go quiet would block every other stream on the connection.
+    #[tokio::test]
+    async fn abandoned_writes_do_not_consume_the_queue() {
+        const STREAMS: usize = 8;
+
+        // Exactly as many slots as streams that will abandon a write, so a single
+        // leaked slot is enough to starve the probe below.
+        let outbound = PriorityQueue::new(STREAMS);
+
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Each stream parks on a window that never opens, then is left alone —
+        // still alive, never reset, never finished, never polled again.
+        let _abandoned: Vec<SendStream> = (0..STREAMS)
+            .map(|index| {
+                let mut send = send_stream_index(
+                    index as u64,
+                    outbound.clone(),
+                    Some(Credit::new(0)),
+                    Some(Credit::new(0)),
+                );
+                let mut buf = Bytes::from(vec![0xAB_u8; 1024]);
+                assert!(send.poll_write_buf(&mut cx, &mut buf).is_pending());
+                send
+            })
+            .collect();
+
+        // An unrelated stream with credit must still be able to enqueue.
+        let mut probe = send_stream_index(
+            STREAMS as u64,
+            outbound.clone(),
+            Some(Credit::new(1024)),
+            Some(Credit::new(1024)),
+        );
+        let mut buf = Bytes::from(vec![0xCD_u8; 8]);
+
+        let written = loop {
+            match probe.poll_write_buf(&mut cx, &mut buf) {
+                Poll::Ready(result) => break result.expect("write_buf"),
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        };
+
+        assert_eq!(written, 8, "abandoned writes starved the queue");
     }
 
     /// A write parked on flow control is holding the queue slot it reserved, and
