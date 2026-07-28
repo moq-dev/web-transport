@@ -890,8 +890,18 @@ impl<R: Reader> SessionState<R> {
                         for frame in Frame::decode_record(data)? {
                             self.recv_frame(frame).await?;
                         }
-                    } else if let Some(frame) = Frame::decode(data, self.config.version)? {
-                        self.recv_frame(frame).await?;
+                    } else {
+                        // draft-00 §5.2: `max_frame_size` bounds the whole frame,
+                        // header included, and may only be raised from its initial
+                        // value — which we never do, so the initial value is what a
+                        // peer may send. Each message is one frame here. The legacy
+                        // binding predates the parameter and bounds nothing.
+                        if self.config.version == Version::QMux00 && data.len() > MAX_FRAME_SIZE {
+                            return Err(Error::FrameTooLarge);
+                        }
+                        if let Some(frame) = Frame::decode(data, self.config.version)? {
+                            self.recv_frame(frame).await?;
+                        }
                     }
                 }
                 _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
@@ -3463,18 +3473,39 @@ mod stream_payload_tests {
         assert_eq!(read_uni(&session).await, payload);
     }
 
-    /// draft-00 has no record layer, so the whole frame is bounded by
-    /// `max_frame_size` — nothing narrower is derivable from the wire.
+    /// draft-00 §5.2 bounds the whole frame at `max_frame_size`, so a frame of
+    /// exactly that size — header included — is legal and must be delivered.
     #[tokio::test]
-    async fn qmux00_full_size_frame_is_delivered() {
+    async fn qmux00_max_size_frame_is_delivered() {
         let (session, peer) = scripted_session(Version::QMux00);
 
         let payload = vec![0x5a; crate::MAX_FRAME_SIZE - 5];
-        peer.inbound
-            .send(uni_stream(Version::QMux00, 0, payload.clone(), true))
-            .unwrap();
+        let frame = uni_stream(Version::QMux00, 0, payload.clone(), true);
+        assert_eq!(frame.len(), crate::MAX_FRAME_SIZE);
+        peer.inbound.send(frame).unwrap();
 
         assert_eq!(read_uni(&session).await, payload);
+    }
+
+    /// One byte past it is a frame-size violation, which draft-00 §5.2 requires
+    /// closing the connection over.
+    #[tokio::test]
+    async fn qmux00_oversized_frame_closes_the_session() {
+        let (session, peer) = scripted_session(Version::QMux00);
+
+        let frame = uni_stream(
+            Version::QMux00,
+            0,
+            vec![0x5a; crate::MAX_FRAME_SIZE - 4],
+            true,
+        );
+        assert_eq!(frame.len(), crate::MAX_FRAME_SIZE + 1);
+        peer.inbound.send(frame).unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .expect("the session stayed open on an oversized frame");
+        assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
     }
 
     /// The frames we emit have to reach the peer's limit: a fixed header
@@ -3494,6 +3525,28 @@ mod stream_payload_tests {
 
         let records = wait_for_stream_records(&peer, 1).await;
         assert_eq!(records[0].len(), DEFAULT_MAX_RECORD_SIZE as usize);
+    }
+
+    /// A budget that straddles a varint boundary still has to be filled exactly:
+    /// the length field describing the payload is narrower than one describing the
+    /// space left for it, and those two bytes are usable.
+    #[tokio::test]
+    async fn we_fill_a_record_across_a_varint_boundary() {
+        const MAX_RECORD_SIZE: u64 = 16_387;
+
+        let (session, peer) = scripted_session(Version::QMux01);
+        peer.params(MAX_RECORD_SIZE);
+
+        let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
+            .await
+            .expect("open_uni timed out")
+            .expect("open_uni failed");
+        send.write(&vec![0x5a; MAX_RECORD_SIZE as usize * 2])
+            .await
+            .unwrap();
+
+        let records = wait_for_stream_records(&peer, 1).await;
+        assert_eq!(records[0].len(), MAX_RECORD_SIZE as usize);
     }
 
     /// The budget is the peer's, not a constant of ours, so a peer that accepts

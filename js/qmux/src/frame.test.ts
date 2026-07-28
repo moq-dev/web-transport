@@ -339,3 +339,49 @@ describe("QMux02 (draft-02)", () => {
 		expect(decoded[1].type).toBe("stream");
 	});
 });
+
+describe("maxStreamPayload", () => {
+	const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+
+	/** The encoded frame fills `budget` as tightly as the varint widths allow:
+	 *  one byte more would overrun it. */
+	function assertTight(budget: bigint, streamId: Stream.Id, offset: bigint) {
+		const payload = Frame.maxStreamPayload("qmux-01", budget, streamId, offset);
+		const framed = (n: bigint) =>
+			BigInt(1 + streamId.value.size() + VarInt.from(offset).size() + VarInt.from(n).size()) + n;
+
+		expect(framed(payload) <= budget).toBe(true);
+		expect(framed(payload + 1n) > budget).toBe(true);
+	}
+
+	test("fills the budget at varint boundaries", () => {
+		// Where the length field changes width, subtracting the width of the space
+		// left (rather than of the payload) leaves bytes unused: at 16387 that is
+		// 16380, but 16382 fits — its own length still encodes in two bytes.
+		for (let budget = 60n; budget <= 70n; budget++) assertTight(budget, id, 0n);
+		for (let budget = 16380n; budget <= 16392n; budget++) assertTight(budget, id, 0n);
+		expect(Frame.maxStreamPayload("qmux-01", 16387n, id, 0n)).toBe(16382n);
+	});
+
+	test("accounts for wider header fields", () => {
+		const wide = Stream.Id.create(1n << 20n, Stream.Dir.Uni, true);
+		assertTight(Frame.DEFAULT_MAX_RECORD_SIZE, wide, 1n << 20n);
+		expect(Frame.maxStreamPayload("qmux-01", Frame.DEFAULT_MAX_RECORD_SIZE, wide, 1n << 20n)).toBeLessThan(
+			Frame.maxStreamPayload("qmux-01", Frame.DEFAULT_MAX_RECORD_SIZE, id, 0n),
+		);
+	});
+
+	test("handles the largest advertised max_record_size", () => {
+		// max_record_size is a varint, so a peer may advertise 2^62-1 — a value
+		// `number` cannot hold exactly.
+		assertTight(VarInt.MAX, id, 0n);
+	});
+
+	test("the legacy binding reserves no length field", () => {
+		// The payload runs to the end of the message, so only the type byte and the
+		// stream ID come out of the budget.
+		expect(Frame.maxStreamPayload("webtransport", BigInt(Frame.MAX_FRAME_SIZE), id, 0n)).toBe(
+			BigInt(Frame.MAX_FRAME_SIZE) - 2n,
+		);
+	});
+});

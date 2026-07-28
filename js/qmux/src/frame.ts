@@ -16,26 +16,51 @@ export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
  * only bounds draft-00 and the legacy WebTransport binding. */
 export const MAX_FRAME_SIZE = 16384;
 
+/** Largest value each varint width encodes (RFC 9000 §16). */
+const VARINT_MAX = [63n, 16383n, 1073741823n, 4611686018427387903n];
+
+/** Largest `n` with `n + varint(n).size() <= available`.
+ *
+ * The length varint's width depends on the payload it describes, so this is a
+ * fixed point rather than a subtraction: at `available = 16384`, reserving four
+ * bytes (the width of 16384 itself) yields 16380, but 16382 fits — its length
+ * still encodes in two. Solve it by asking, for each width, what the largest
+ * payload that width can describe *and* leave room for is, then take the best. */
+function maxLengthPrefixedPayload(available: bigint): bigint {
+	let best = 0n;
+	for (const max of VARINT_MAX) {
+		const width = BigInt(VarInt.from(max).size());
+		if (available < width) break;
+		const candidate = available - width < max ? available - width : max;
+		// Skip a candidate this width cannot describe: a narrower varint means a
+		// smaller width already covered it, exactly.
+		if (VarInt.from(candidate).size() === Number(width) && candidate > best) best = candidate;
+	}
+	return best;
+}
+
 /** Largest STREAM payload that keeps the encoded frame within `budget` bytes.
  *
  * The budget is what the peer accepts for one frame — its `max_record_size` on
  * the record-framed drafts, {@link MAX_FRAME_SIZE} otherwise — so the frame's own
  * header comes out of it: the type, the stream ID, and (QMux only) the offset and
  * the length varint. Header widths are the ones this frame actually encodes, not
- * a worst-case reservation, so a chunk fills the record the peer advertised. */
-export function maxStreamPayload(version: WireFormat, budget: number, id: Stream.Id, offset: bigint): number {
+ * a worst-case reservation, so a chunk fills the record the peer advertised.
+ *
+ * `budget` and the result are `bigint`: `max_record_size` is a varint, so a peer
+ * may advertise up to 2^62-1, which `number` cannot hold exactly. */
+export function maxStreamPayload(version: WireFormat, budget: bigint, id: Stream.Id, offset: bigint): bigint {
+	// The type is 0x0e/0x0f on QMux and 0x08/0x09 on the legacy binding: one byte
+	// either way.
+	const header = BigInt(1 + id.value.size());
 	if (version === "webtransport") {
-		// One type byte plus the stream ID; the payload runs to the end of the
-		// message, so there is no length varint to reserve.
-		return Math.max(budget - (1 + id.value.size()), 0);
+		// The payload runs to the end of the message, so there is no length varint
+		// to reserve.
+		return budget > header ? budget - header : 0n;
 	}
 
-	// The type is 0x0e/0x0f, always one byte.
-	const available = Math.max(budget - (1 + id.value.size() + VarInt.from(offset).size()), 0);
-	// The length varint describes the payload, so size it from `available`: that
-	// bounds every payload that can still fit, and a varint is monotonic in its
-	// value, so no larger payload could use a shorter one.
-	return Math.max(available - VarInt.from(available).size(), 0);
+	const fixed = header + BigInt(VarInt.from(offset).size());
+	return maxLengthPrefixedPayload(budget > fixed ? budget - fixed : 0n);
 }
 
 export interface Data {

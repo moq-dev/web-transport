@@ -317,12 +317,11 @@ mod stream_transport {
 
             if has_len {
                 let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
-                // draft-00 bounds the whole frame by `max_frame_size`, so bound the
-                // payload by the same value rather than by our send-side header
-                // budget: a peer cannot derive that budget from anything on the
-                // wire. A byte stream cannot resynchronize past a bogus length, so
-                // this one stays fatal.
-                if len > MAX_FRAME_SIZE {
+                // draft-00 §5.2: `max_frame_size` bounds the whole frame, so the
+                // header bytes read so far count against it. A byte stream cannot
+                // resynchronize past an oversized frame, so this stays fatal — as
+                // the draft requires (FRAME_ENCODING_ERROR).
+                if buf.len() + len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);
                 }
                 read_bytes(reader, len, &mut buf).await?;
@@ -355,7 +354,7 @@ mod stream_transport {
                     read_varint_into(reader, &mut buf).await?; // frame_type
                 }
                 let reason_len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
-                if reason_len > MAX_FRAME_SIZE {
+                if buf.len() + reason_len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);
                 }
                 read_bytes(reader, reason_len, &mut buf).await?;
@@ -391,7 +390,7 @@ mod stream_transport {
             // DATAGRAM with length
             0x31 => {
                 let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
-                if len > MAX_FRAME_SIZE {
+                if buf.len() + len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);
                 }
                 read_bytes(reader, len, &mut buf).await?;
@@ -399,7 +398,7 @@ mod stream_transport {
             // QX_TRANSPORT_PARAMETERS
             0x3f5153300d0a0d0a => {
                 let len = read_varint_into(reader, &mut buf).await?.into_inner() as usize;
-                if len > MAX_FRAME_SIZE {
+                if buf.len() + len > MAX_FRAME_SIZE {
                     return Err(Error::FrameTooLarge);
                 }
                 read_bytes(reader, len, &mut buf).await?;
@@ -534,6 +533,43 @@ mod stream_transport {
             let err = transport.recv().await.expect_err("FrameTooLarge expected");
             assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
         }
+
+        /// draft-00 §5.2 bounds the whole frame at `max_frame_size`, header
+        /// included: a frame of exactly that size parses, and one byte more is a
+        /// frame-size violation rather than something to read into memory.
+        #[tokio::test]
+        async fn recv_qmux00_bounds_the_whole_frame() {
+            use crate::proto::{Frame, Stream as StreamFrame};
+            use crate::{StreamDir, StreamId};
+
+            let frame = |payload: usize| {
+                Frame::Stream(StreamFrame {
+                    id: StreamId::new(0, StreamDir::Uni, true),
+                    offset: 0,
+                    data: vec![0x5a; payload].into(),
+                    fin: false,
+                })
+                .encode(Version::QMux00)
+                .unwrap()
+            };
+
+            let at_limit = frame(MAX_FRAME_SIZE - 5);
+            assert_eq!(at_limit.len(), MAX_FRAME_SIZE);
+            let over_limit = frame(MAX_FRAME_SIZE - 4);
+            assert_eq!(over_limit.len(), MAX_FRAME_SIZE + 1);
+
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let (_writer, mut transport) = Stream::new(client, Version::QMux00, 0).split();
+
+            server.write_all(&at_limit).await.unwrap();
+            server.flush().await.unwrap();
+            assert_eq!(transport.recv().await.unwrap(), at_limit);
+
+            server.write_all(&over_limit).await.unwrap();
+            server.flush().await.unwrap();
+            let err = transport.recv().await.expect_err("FrameTooLarge expected");
+            assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
+        }
     }
 }
 
@@ -588,7 +624,7 @@ mod ws_transport {
 
     use super::{Reader, Transport, Writer};
     use crate::ws::KeepAlive;
-    use crate::{Error, Version};
+    use crate::{Error, Version, MAX_FRAME_SIZE};
 
     type Message = tungstenite::Message;
 
@@ -619,17 +655,27 @@ mod ws_transport {
     pub(crate) struct WsTransport<T> {
         ws: T,
         keep_alive: Option<KeepAlive>,
-        record_limit: Option<usize>,
+        /// Largest inbound message we accept, or `None` when nothing bounds it.
+        recv_limit: Option<usize>,
     }
 
     impl<T> WsTransport<T> {
         pub fn new(ws: T, version: Version, max_record_size: u64) -> Self {
+            // A message is a record on the record-framed drafts, bounded by the
+            // `max_record_size` we advertised; on draft-00 it is a single frame,
+            // bounded by `max_frame_size` (§5.2), which we never advertise above
+            // its initial value. The legacy binding negotiates neither.
+            let recv_limit = if version.uses_records() {
+                Some(usize::try_from(max_record_size).unwrap_or(usize::MAX))
+            } else if version.is_qmux() {
+                Some(MAX_FRAME_SIZE)
+            } else {
+                None
+            };
             Self {
                 ws,
                 keep_alive: None,
-                record_limit: version
-                    .uses_records()
-                    .then(|| usize::try_from(max_record_size).unwrap_or(usize::MAX)),
+                recv_limit,
             }
         }
 
@@ -722,7 +768,7 @@ mod ws_transport {
                 None => (None, None),
             };
             let (tx, rx) = mpsc::channel(WS_RECV_CHANNEL_CAPACITY);
-            let pump = tokio::spawn(ws_pump(stream, deadline, self.record_limit, tx));
+            let pump = tokio::spawn(ws_pump(stream, deadline, self.recv_limit, tx));
             (WsWriter { sink, ping }, WsReader { rx, pump })
         }
     }
@@ -788,7 +834,7 @@ mod ws_transport {
     async fn ws_pump<S>(
         mut stream: S,
         mut deadline: Option<DeadlineState>,
-        record_limit: Option<usize>,
+        recv_limit: Option<usize>,
         tx: mpsc::Sender<Result<Bytes, Error>>,
     ) where
         S: futures::Stream<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
@@ -835,7 +881,7 @@ mod ws_transport {
 
             match message {
                 Message::Binary(data) => {
-                    if record_limit.is_some_and(|limit| data.len() > limit) {
+                    if recv_limit.is_some_and(|limit| data.len() > limit) {
                         // Release the oversized allocation before waiting for room to
                         // report the terminal error. In particular, never let it enter
                         // the bounded record queue while the session is backpressured.
