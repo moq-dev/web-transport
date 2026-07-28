@@ -11,8 +11,8 @@ use std::{
     task::{Context, Poll, Wake, Waker},
 };
 
-use bytes::Bytes;
-use web_transport_trait::SendStream;
+use bytes::{Bytes, BytesMut};
+use web_transport_trait::{RecvStream, SendStream};
 
 struct Noop;
 
@@ -116,4 +116,63 @@ fn write_buf_advances_only_by_what_was_accepted() {
     let size = block_on(send.write_buf(&mut buf)).unwrap();
     assert_eq!(size, 1);
     assert_eq!(&buf[..], b"ello");
+}
+
+/// Produces at most one byte per call.
+struct DripRecv {
+    remaining: Bytes,
+}
+
+impl DripRecv {
+    fn new(data: &'static [u8]) -> Self {
+        Self {
+            remaining: Bytes::from_static(data),
+        }
+    }
+}
+
+impl RecvStream for DripRecv {
+    type Error = TestError;
+
+    async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, TestError> {
+        if self.remaining.is_empty() {
+            return Ok(None);
+        }
+        if dst.is_empty() {
+            return Ok(Some(0));
+        }
+
+        dst[0] = self.remaining[0];
+        self.remaining = self.remaining.slice(1..);
+        Ok(Some(1))
+    }
+
+    fn stop(&mut self, _code: u32) {}
+
+    async fn closed(&mut self) -> Result<(), TestError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn read_all_collects_every_byte() {
+    let mut recv = DripRecv::new(b"hello");
+    let data = block_on(recv.read_all()).unwrap();
+    assert_eq!(&data[..], b"hello");
+}
+
+#[test]
+fn read_all_buf_collects_every_byte() {
+    let mut recv = DripRecv::new(b"hello");
+    let mut buf = BytesMut::with_capacity(32);
+    let size = block_on(recv.read_all_buf(&mut buf)).unwrap();
+    assert_eq!(size, 5);
+    assert_eq!(&buf[..], b"hello");
+}
+
+#[test]
+fn read_buf_reports_end_of_stream() {
+    let mut recv = DripRecv::new(b"");
+    let mut buf = BytesMut::with_capacity(8);
+    assert_eq!(block_on(recv.read_buf(&mut buf)).unwrap(), None);
 }
