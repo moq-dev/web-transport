@@ -1,8 +1,10 @@
+mod poll;
 mod util;
 
 use std::future::Future;
 use std::time::Duration;
 
+pub use crate::poll::{BiStreams, PollRecvStream, PollSendStream, PollSession};
 pub use crate::util::{MaybeSend, MaybeSync};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
