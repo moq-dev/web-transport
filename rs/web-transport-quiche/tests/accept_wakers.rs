@@ -138,3 +138,68 @@ async fn concurrent_accept_wakes_every_accepter() -> Result<()> {
     server_task.abort();
     Ok(())
 }
+
+/// The user-visible form of the same bug, matching the original reproducer that
+/// diagnosed it for quinn: two independent tasks each awaiting `accept_uni`, and two
+/// streams to serve them. Without the waker list, whichever task registered first is
+/// never woken again and hangs forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_tasks_can_accept_concurrently() -> Result<()> {
+    let (chain, key) = make_self_signed()?;
+
+    let mut server = ServerBuilder::default()
+        .with_bind::<SocketAddr>((Ipv4Addr::LOCALHOST, 0).into())?
+        .with_single_cert(chain, key)?;
+
+    let addr = *server
+        .local_addrs()
+        .first()
+        .context("server has no local address")?;
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_task = tokio::spawn(async move {
+        let request = server.accept().await.expect("a connection");
+        let session = request.ok().await.expect("an established session");
+
+        // Two accepters on two clones, exactly as an application would fan out.
+        let mut accepters = Vec::new();
+        for _ in 0..2 {
+            let session = session.clone();
+            accepters.push(tokio::spawn(async move {
+                let mut recv = session.accept_uni().await.expect("a stream");
+                let mut data = Vec::new();
+                recv.read_to_end(&mut data).await.expect("the payload");
+                data
+            }));
+        }
+
+        for accepter in accepters {
+            assert_eq!(accepter.await.expect("accepter task"), b"hi");
+        }
+
+        done_tx.send(()).expect("client is listening");
+    });
+
+    let url = Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))?;
+    let session = client()
+        .with_bind((Ipv4Addr::LOCALHOST, 0))?
+        .connect(url)
+        .await?
+        .established()
+        .await?;
+
+    for _ in 0..2 {
+        let mut send = session.open_uni().await?;
+        send.write_all(b"hi").await?;
+        send.finish()?;
+    }
+
+    timeout(Duration::from_secs(10), done_rx)
+        .await
+        .context("an accepter was never woken")??;
+
+    session.close(0, "bye");
+    server_task.abort();
+    Ok(())
+}

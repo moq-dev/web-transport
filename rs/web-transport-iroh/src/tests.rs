@@ -262,3 +262,71 @@ async fn quic_smoke() -> n0_error::Result<()> {
 
     Ok(())
 }
+
+/// The user-visible form of the same bug, matching the original reproducer that
+/// diagnosed it for quinn: two independent tasks each awaiting `accept_uni`, and two
+/// streams to serve them. Without the waker list, whichever task registered first is
+/// never woken again and hangs forever.
+#[tokio::test]
+#[traced_test]
+async fn two_tasks_can_accept_concurrently() -> n0_error::Result<()> {
+    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Client::new(client);
+
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_id = server.id();
+    let server_addr = server.addr();
+
+    let url: Url = format!("https://{}/foo", server_id).parse().unwrap();
+
+    let client_task = tokio::task::spawn({
+        let url = url.clone();
+        async move {
+            let session = client.connect_h3(server_addr, url).await.unwrap();
+            for _ in 0..2 {
+                let mut stream = session.open_uni().await.unwrap();
+                stream.write_all(b"hi").await.unwrap();
+                stream.finish().unwrap();
+            }
+            session.closed().await;
+            client.close().await;
+        }
+    });
+
+    let server_task = tokio::task::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let session = H3Request::accept(conn).await.unwrap().ok().await.unwrap();
+
+        // Two accepters on two clones, exactly as an application would fan out.
+        let mut accepters = Vec::new();
+        for _ in 0..2 {
+            let session = session.clone();
+            accepters.push(tokio::task::spawn(async move {
+                let mut recv = session.accept_uni().await.unwrap();
+                recv.read_to_end(2).await.unwrap()
+            }));
+        }
+
+        for accepter in accepters {
+            assert_eq!(accepter.await.unwrap(), b"hi");
+        }
+
+        session.close(0, b"bye");
+        server.close().await;
+    });
+
+    timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client task timed out")
+        .unwrap();
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out: an accepter was never woken")
+        .unwrap();
+
+    Ok(())
+}
