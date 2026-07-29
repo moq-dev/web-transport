@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use rustls_pki_types::CertificateDer;
 use std::{
-    collections::{hash_map, HashMap, HashSet},
+    collections::{hash_map, HashMap, HashSet, VecDeque},
     future::poll_fn,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -19,12 +19,25 @@ use tokio_quiche::{
 use crate::ez::Lock;
 
 use super::{
-    ConnectionClosed, ConnectionError, ConnectionStats, Metrics, RecvState, RecvStream, SendState,
-    SendStream, StreamId,
+    ConnectionClosed, ConnectionError, ConnectionStats, Metrics, RecvState, SendState, StreamId,
 };
 
 // "drop" in ascii; if you see this then close(code)
 const DROP_CODE: u64 = 0x64726F70;
+
+/// How many datagrams to hold for the application before dropping the oldest.
+const DGRAM_QUEUE_CAPACITY: usize = 32;
+
+/// Register `waker` unless an equivalent one is already parked.
+fn park(wakers: &mut Vec<Waker>, waker: &Waker) {
+    if !wakers.iter().any(|w| w.will_wake(waker)) {
+        wakers.push(waker.clone());
+    }
+}
+
+type AcceptBiResult = Poll<Result<(StreamId, Lock<SendState>, Lock<RecvState>), ConnectionError>>;
+
+type AcceptUniResult = Poll<Result<(StreamId, Lock<RecvState>), ConnectionError>>;
 
 type OpenBiResult =
     Poll<Result<(Option<Waker>, StreamId, Lock<SendState>, Lock<RecvState>), ConnectionError>>;
@@ -62,6 +75,27 @@ pub(super) struct DriverState {
 
     /// Latest connection statistics, refreshed by the driver each poll.
     stats: ConnectionStats,
+
+    /// Streams the peer opened, waiting to be handed out, and whoever is parked on
+    /// them.
+    ///
+    /// These hold the stream *parts* rather than built `SendStream`/`RecvStream`:
+    /// those keep a `Lock<DriverState>`, so parking one here would be a reference
+    /// cycle. `Connection` assembles them, exactly as it does for `open_uni`.
+    ///
+    /// A channel would be the obvious home, but its receive future owns the waker
+    /// registration and drops it with the future — so an abandoned poll would never
+    /// be woken again. Parking the waker here is what makes `poll_accept_*` honest.
+    accept_bi: VecDeque<(StreamId, Lock<SendState>, Lock<RecvState>)>,
+    accept_uni: VecDeque<(StreamId, Lock<RecvState>)>,
+    accept_bi_wakers: Vec<Waker>,
+    accept_uni_wakers: Vec<Waker>,
+
+    /// Datagrams received from the peer. Bounded: when the application cannot keep
+    /// up the *oldest* is dropped, which is the unreliable-datagram contract and
+    /// keeps the freshest data, unlike a channel that rejects the newest.
+    dgram_in: VecDeque<Bytes>,
+    dgram_in_wakers: Vec<Waker>,
 }
 
 impl DriverState {
@@ -88,6 +122,12 @@ impl DriverState {
             server_name: None,
             peer_certs: None,
             handshake_wakers: Vec::new(),
+            accept_bi: VecDeque::new(),
+            accept_uni: VecDeque::new(),
+            accept_bi_wakers: Vec::new(),
+            accept_uni_wakers: Vec::new(),
+            dgram_in: VecDeque::new(),
+            dgram_in_wakers: Vec::new(),
             stats: ConnectionStats::default(),
         }
     }
@@ -214,6 +254,80 @@ impl DriverState {
         Poll::Ready(Ok((wakeup, id, send, recv)))
     }
 
+    /// Queue a stream the peer opened, returning the wakers to notify.
+    ///
+    /// The caller wakes them after releasing the lock, matching the rest of this
+    /// type.
+    pub fn push_accept_bi(
+        &mut self,
+        id: StreamId,
+        send: Lock<SendState>,
+        recv: Lock<RecvState>,
+    ) -> Vec<Waker> {
+        self.accept_bi.push_back((id, send, recv));
+        std::mem::take(&mut self.accept_bi_wakers)
+    }
+
+    pub fn push_accept_uni(&mut self, id: StreamId, recv: Lock<RecvState>) -> Vec<Waker> {
+        self.accept_uni.push_back((id, recv));
+        std::mem::take(&mut self.accept_uni_wakers)
+    }
+
+    pub fn poll_accept_bi(&mut self, waker: &Waker) -> AcceptBiResult {
+        // Drain what already arrived before reporting a close: streams the peer
+        // opened are finite and the application is entitled to them.
+        if let Some(parts) = self.accept_bi.pop_front() {
+            return Poll::Ready(Ok(parts));
+        }
+
+        if let Poll::Ready(err) = self.error(waker) {
+            return Poll::Ready(Err(err));
+        }
+
+        park(&mut self.accept_bi_wakers, waker);
+        Poll::Pending
+    }
+
+    pub fn poll_accept_uni(&mut self, waker: &Waker) -> AcceptUniResult {
+        if let Some(parts) = self.accept_uni.pop_front() {
+            return Poll::Ready(Ok(parts));
+        }
+
+        if let Poll::Ready(err) = self.error(waker) {
+            return Poll::Ready(Err(err));
+        }
+
+        park(&mut self.accept_uni_wakers, waker);
+        Poll::Pending
+    }
+
+    /// Queue a datagram from the peer, returning the wakers to notify.
+    ///
+    /// Drops the oldest when full rather than the new arrival: for unreliable
+    /// datagrams the freshest data is the useful data.
+    pub fn push_dgram_in(&mut self, datagram: Bytes) -> Vec<Waker> {
+        while self.dgram_in.len() >= DGRAM_QUEUE_CAPACITY {
+            tracing::trace!("dropping oldest incoming datagram: queue full");
+            self.dgram_in.pop_front();
+        }
+
+        self.dgram_in.push_back(datagram);
+        std::mem::take(&mut self.dgram_in_wakers)
+    }
+
+    pub fn poll_dgram_in(&mut self, waker: &Waker) -> Poll<Result<Bytes, ConnectionError>> {
+        if let Some(datagram) = self.dgram_in.pop_front() {
+            return Poll::Ready(Ok(datagram));
+        }
+
+        if let Poll::Ready(err) = self.error(waker) {
+            return Poll::Ready(Err(err));
+        }
+
+        park(&mut self.dgram_in_wakers, waker);
+        Poll::Pending
+    }
+
     pub fn open_uni(&mut self, waker: &Waker) -> OpenUniResult {
         if let Poll::Ready(err) = self.error(waker) {
             return Poll::Ready(Err(err));
@@ -281,11 +395,8 @@ pub(super) struct Driver {
 
     buf: Vec<u8>,
 
-    accept_bi: flume::Sender<(SendStream, RecvStream)>,
-    accept_uni: flume::Sender<RecvStream>,
-
-    // Datagrams.
-    dgram_in: flume::Sender<Bytes>,
+    // Datagrams. Only the outbound half is a channel now; inbound datagrams and
+    // accepted streams are queued in `DriverState` so they can be polled.
     dgram_out: flume::Receiver<Bytes>,
     // Writable datagram size in bytes, published once at handshake. 0 means the
     // peer didn't negotiate the datagram extension.
@@ -297,9 +408,6 @@ pub(super) struct Driver {
 impl Driver {
     pub fn new(
         state: Lock<DriverState>,
-        accept_bi: flume::Sender<(SendStream, RecvStream)>,
-        accept_uni: flume::Sender<RecvStream>,
-        dgram_in: flume::Sender<Bytes>,
         dgram_out: flume::Receiver<Bytes>,
         dgram_max: Arc<AtomicUsize>,
         keep_alive: Option<Duration>,
@@ -309,9 +417,6 @@ impl Driver {
             send: HashMap::new(),
             recv: HashMap::new(),
             buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
-            accept_bi,
-            accept_uni,
-            dgram_in,
             dgram_out,
             dgram_max,
             keep_alive: keep_alive.map(KeepAlive::new),
@@ -420,7 +525,7 @@ impl Driver {
         let state = Lock::new(state);
 
         self.recv.insert(stream_id, state.clone());
-        let recv = RecvStream::new(stream_id, state.clone(), self.state.clone());
+        let recv_state = state.clone();
 
         let mut state = SendState::new(stream_id);
         state.flush(qconn)?;
@@ -428,10 +533,14 @@ impl Driver {
         let state = Lock::new(state);
         self.send.insert(stream_id, state.clone());
 
-        let send = SendStream::new(stream_id, state.clone(), self.state.clone());
-        self.accept_bi
-            .send((send, recv))
-            .map_err(|_| ConnectionError::Dropped)?;
+        let wakers = self
+            .state
+            .lock()
+            .push_accept_bi(stream_id, state.clone(), recv_state);
+
+        for waker in wakers {
+            waker.wake();
+        }
 
         Ok(())
     }
@@ -449,10 +558,11 @@ impl Driver {
         let state = Lock::new(state);
         self.recv.insert(stream_id, state.clone());
 
-        let recv = RecvStream::new(stream_id, state.clone(), self.state.clone());
-        self.accept_uni
-            .send(recv)
-            .map_err(|_| ConnectionError::Dropped)?;
+        let wakers = self.state.lock().push_accept_uni(stream_id, state);
+
+        for waker in wakers {
+            waker.wake();
+        }
 
         Ok(())
     }
@@ -717,15 +827,10 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
             match qconn.dgram_recv(&mut self.buf) {
                 Ok(len) => {
                     let buf = Bytes::copy_from_slice(&self.buf[..len]);
-                    match self.dgram_in.try_send(buf) {
-                        Ok(()) => {}
-                        Err(flume::TrySendError::Full(_)) => {
-                            tracing::trace!("dropping incoming datagram: channel full");
-                        }
-                        Err(flume::TrySendError::Disconnected(_)) => {
-                            // Receiver dropped — connection gone or not interested.
-                            break;
-                        }
+                    let wakers = self.state.lock().push_dgram_in(buf);
+
+                    for waker in wakers {
+                        waker.wake();
                     }
                 }
                 Err(quiche::Error::Done) => break,

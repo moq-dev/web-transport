@@ -9,7 +9,7 @@ use std::{
     io::Cursor,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
+    task::{ready, Context, Poll, Waker},
 };
 
 // "conn" in ascii; if you see this then close(code)
@@ -63,6 +63,50 @@ pub struct Connection {
     // The request and response that were sent and received.
     request: ConnectRequest,
     response: ConnectResponse,
+
+    // Opening a stream is two steps — take the stream, then write the WebTransport
+    // header — so a `Pending` in the middle has to resume rather than start over.
+    //
+    // A plain state machine, not a retained future: `ez` exposes every step as a
+    // `poll_*`, so there is nothing to box. Per-clone, matching the poll trait's
+    // "clone the session for concurrency".
+    open_uni: OpenUni,
+    open_bi: OpenBi,
+}
+
+/// Where an in-progress `poll_open_uni` got to.
+#[derive(Default)]
+enum OpenUni {
+    #[default]
+    Idle,
+    /// Stream taken, header partially written.
+    Header { send: ez::SendStream, offset: usize },
+}
+
+/// Where an in-progress `poll_open_bi` got to.
+#[derive(Default)]
+enum OpenBi {
+    #[default]
+    Idle,
+    Header {
+        send: ez::SendStream,
+        recv: ez::RecvStream,
+        offset: usize,
+    },
+}
+
+impl Clone for OpenUni {
+    /// A clone starts idle; the operation in flight stays with the handle that
+    /// started it.
+    fn clone(&self) -> Self {
+        Self::Idle
+    }
+}
+
+impl Clone for OpenBi {
+    fn clone(&self) -> Self {
+        Self::Idle
+    }
 }
 
 impl Connection {
@@ -102,6 +146,8 @@ impl Connection {
             request: connect.request.clone(),
             response: connect.response.clone(),
             settings: Some(Arc::new(settings)),
+            open_uni: OpenUni::Idle,
+            open_bi: OpenBi::Idle,
         };
 
         // Run a background task to check if the connect stream is closed.
@@ -227,12 +273,17 @@ impl Connection {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received bytes.
     pub async fn read_datagram(&self) -> Result<Bytes, SessionError> {
-        let mut datagram = self
+        let datagram = self
             .conn
             .read_datagram()
             .await
             .map_err(SessionError::from)?;
 
+        self.strip_datagram_header(datagram)
+    }
+
+    /// Validate and remove the session ID a WebTransport datagram carries.
+    fn strip_datagram_header(&self, mut datagram: Bytes) -> Result<Bytes, SessionError> {
         let mut cursor = Cursor::new(&datagram);
 
         if let Some(session_id) = self.session_id {
@@ -244,9 +295,7 @@ impl Connection {
         }
 
         // Return the datagram without the session ID.
-        let datagram = datagram.split_off(cursor.position() as usize);
-
-        Ok(datagram)
+        Ok(datagram.split_off(cursor.position() as usize))
     }
 
     /// Sends an application datagram to the remote peer.
@@ -325,6 +374,8 @@ impl Connection {
             settings: None,
             request: request.into(),
             response: response.into(),
+            open_uni: OpenUni::Idle,
+            open_bi: OpenBi::Idle,
         }
     }
 
@@ -653,5 +704,137 @@ impl SessionAccept {
         }
 
         Ok(Some((send, recv)))
+    }
+}
+
+impl web_transport_trait::poll::Session for Connection {
+    type SendStream = SendStream;
+    type RecvStream = RecvStream;
+    type Error = SessionError;
+
+    fn poll_accept_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, SessionError>> {
+        match self.accept.clone() {
+            // `SessionAccept` decodes stream headers, so it keeps its own state and
+            // waker list; forward to it.
+            Some(accept) => accept.lock().unwrap().poll_accept_uni(cx),
+            None => {
+                let recv = ready!(self.conn.poll_accept_uni(cx.waker()))?;
+                Poll::Ready(Ok(RecvStream::new(recv)))
+            }
+        }
+    }
+
+    fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        match self.accept.clone() {
+            Some(accept) => accept.lock().unwrap().poll_accept_bi(cx),
+            None => {
+                let (send, recv) = ready!(self.conn.poll_accept_bi(cx.waker()))?;
+                Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))))
+            }
+        }
+    }
+
+    fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<SendStream, SessionError>> {
+        loop {
+            match &mut self.open_uni {
+                OpenUni::Idle => {
+                    let send = ready!(self.conn.poll_open_uni(cx.waker()))?;
+                    self.open_uni = OpenUni::Header { send, offset: 0 };
+                }
+                OpenUni::Header { send, offset } => {
+                    while *offset < self.header_uni.len() {
+                        let size = ready!(send.poll_write(cx, &self.header_uni[*offset..]))
+                            .map_err(SessionError::Header)?;
+                        *offset += size;
+                    }
+
+                    // Header written: hand the stream over and go idle.
+                    let OpenUni::Header { send, .. } =
+                        std::mem::replace(&mut self.open_uni, OpenUni::Idle)
+                    else {
+                        unreachable!("checked above");
+                    };
+
+                    return Poll::Ready(Ok(SendStream::new(send)));
+                }
+            }
+        }
+    }
+
+    fn poll_open_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        loop {
+            match &mut self.open_bi {
+                OpenBi::Idle => {
+                    let (send, recv) = ready!(self.conn.poll_open_bi(cx.waker()))?;
+                    self.open_bi = OpenBi::Header {
+                        send,
+                        recv,
+                        offset: 0,
+                    };
+                }
+                OpenBi::Header { send, offset, .. } => {
+                    while *offset < self.header_bi.len() {
+                        let size = ready!(send.poll_write(cx, &self.header_bi[*offset..]))
+                            .map_err(SessionError::Header)?;
+                        *offset += size;
+                    }
+
+                    let OpenBi::Header { send, recv, .. } =
+                        std::mem::replace(&mut self.open_bi, OpenBi::Idle)
+                    else {
+                        unreachable!("checked above");
+                    };
+
+                    return Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))));
+                }
+            }
+        }
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        _cx: &mut Context<'_>,
+        payload: &[u8],
+    ) -> Poll<Result<(), SessionError>> {
+        // `ez` queues outbound datagrams into a bounded channel and drops on full,
+        // which is the unreliable contract — there is no capacity to wait for, so
+        // this never parks.
+        let mut buf = BytesMut::with_capacity(self.header_datagram.len() + payload.len());
+        buf.extend_from_slice(&self.header_datagram);
+        buf.extend_from_slice(payload);
+
+        Poll::Ready(self.conn.send_datagram(buf.into()).map_err(Into::into))
+    }
+
+    fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {
+        let datagram = ready!(self.conn.poll_read_datagram(cx.waker()))?;
+        Poll::Ready(self.strip_datagram_header(datagram))
+    }
+
+    fn max_datagram_size(&self) -> usize {
+        Self::max_datagram_size(self)
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        self.response.protocol.as_deref()
+    }
+
+    fn close(&mut self, code: u32, reason: &str) {
+        Self::close(self, code, reason);
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<SessionError> {
+        self.conn.poll_closed(cx.waker()).map(Into::into)
+    }
+
+    #[allow(refining_impl_trait)]
+    fn stats(&self) -> ez::ConnectionStats {
+        Self::stats(self)
     }
 }

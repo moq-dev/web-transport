@@ -130,3 +130,37 @@ impl web_transport_trait::SendStream for SendStream {
         self.closed().await
     }
 }
+
+impl web_transport_trait::poll::SendStream for SendStream {
+    type Error = StreamError;
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        self.inner.poll_write(cx, buf).map_err(Into::into)
+    }
+
+    fn poll_write_buf<B: Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<Result<usize, Self::Error>> {
+        // ez advances `buf` by exactly what it accepted, so this keeps the
+        // partial-write contract while skipping the default's extra copy.
+        self.inner.poll_write_buf(cx, buf).map_err(Into::into)
+    }
+
+    fn set_priority(&mut self, order: u8) {
+        self.set_priority(order)
+    }
+
+    fn reset(&mut self, code: u32) {
+        self.reset(code)
+    }
+
+    fn finish(&mut self) -> Result<(), Self::Error> {
+        self.finish()
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_closed(cx.waker()).map_err(Into::into)
+    }
+}

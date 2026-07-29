@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
     },
-    task::{Poll, Waker},
+    task::{ready, Poll, Waker},
 };
 use thiserror::Error;
 use tokio_quiche::quiche;
@@ -141,12 +141,15 @@ impl ConnectionClose {
         }
     }
 
-    pub async fn wait(&self) -> ConnectionError {
-        poll_fn(|cx| self.driver.lock().closed(cx.waker())).await
-    }
-
+    /// Only the test below still needs this: accept and datagram reads used to race
+    /// it in a `select!`, and now poll the driver's own error state directly.
+    #[cfg(test)]
     pub async fn error(&self) -> ConnectionError {
         poll_fn(|cx| self.driver.lock().error(cx.waker())).await
+    }
+
+    pub async fn wait(&self) -> ConnectionError {
+        poll_fn(|cx| self.driver.lock().closed(cx.waker())).await
     }
 
     pub fn is_closed(&self) -> bool {
@@ -176,13 +179,12 @@ impl Drop for ConnectionClose {
 pub struct Connection {
     inner: Arc<tokio_quiche::QuicConnection>,
 
-    // Unbounded
-    accept_bi: flume::Receiver<(SendStream, RecvStream)>,
-    accept_uni: flume::Receiver<RecvStream>,
-
-    // Datagram plumbing. Both channels are bounded; drops on full are silent
-    // and consistent with the unreliable QUIC datagram contract.
-    dgram_in: flume::Receiver<Bytes>,
+    // Accepted streams and inbound datagrams are queued in `DriverState`, not in a
+    // channel, so they can be polled: a channel's receive future owns its waker
+    // registration and drops it with the future.
+    //
+    // Outbound datagrams stay a channel — bounded, and dropping on full is
+    // consistent with the unreliable QUIC datagram contract.
     dgram_out: flume::Sender<Bytes>,
     dgram_max: Arc<AtomicUsize>,
 
@@ -196,9 +198,6 @@ impl Connection {
     pub(super) fn new(
         conn: tokio_quiche::QuicConnection,
         driver: Lock<DriverState>,
-        accept_bi: flume::Receiver<(SendStream, RecvStream)>,
-        accept_uni: flume::Receiver<RecvStream>,
-        dgram_in: flume::Receiver<Bytes>,
         dgram_out: flume::Sender<Bytes>,
         dgram_max: Arc<AtomicUsize>,
     ) -> Self {
@@ -206,9 +205,6 @@ impl Connection {
 
         Self {
             inner: Arc::new(conn),
-            accept_bi,
-            accept_uni,
-            dgram_in,
             dgram_out,
             dgram_max,
             driver,
@@ -218,18 +214,31 @@ impl Connection {
 
     /// Accept a bidirectional stream created by the remote peer.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        tokio::select! {
-            Ok(res) = self.accept_bi.recv_async() => Ok(res),
-            err = self.close.error() => Err(err),
-        }
+        poll_fn(|cx| self.poll_accept_bi(cx.waker())).await
+    }
+
+    /// Poll for a bidirectional stream created by the remote peer.
+    pub fn poll_accept_bi(
+        &self,
+        waker: &Waker,
+    ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
+        let (id, send, recv) = ready!(self.driver.lock().poll_accept_bi(waker))?;
+
+        Poll::Ready(Ok((
+            SendStream::new(id, send, self.driver.clone()),
+            RecvStream::new(id, recv, self.driver.clone()),
+        )))
     }
 
     /// Accept a unidirectional stream created by the remote peer.
     pub async fn accept_uni(&self) -> Result<RecvStream, ConnectionError> {
-        tokio::select! {
-            Ok(res) = self.accept_uni.recv_async() => Ok(res),
-            err = self.close.error() => Err(err),
-        }
+        poll_fn(|cx| self.poll_accept_uni(cx.waker())).await
+    }
+
+    /// Poll for a unidirectional stream created by the remote peer.
+    pub fn poll_accept_uni(&self, waker: &Waker) -> Poll<Result<RecvStream, ConnectionError>> {
+        let (id, recv) = ready!(self.driver.lock().poll_accept_uni(waker))?;
+        Poll::Ready(Ok(RecvStream::new(id, recv, self.driver.clone())))
     }
 
     /// Open a new bidirectional stream.
@@ -260,18 +269,47 @@ impl Connection {
         Ok(send)
     }
 
+    /// Poll to open a new unidirectional stream.
+    pub fn poll_open_uni(&self, waker: &Waker) -> Poll<Result<SendStream, ConnectionError>> {
+        let (wakeup, id, send) = ready!(self.driver.lock().open_uni(waker))?;
+        if let Some(wakeup) = wakeup {
+            wakeup.wake();
+        }
+
+        Poll::Ready(Ok(SendStream::new(id, send, self.driver.clone())))
+    }
+
+    /// Poll to open a new bidirectional stream.
+    pub fn poll_open_bi(
+        &self,
+        waker: &Waker,
+    ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
+        let (wakeup, id, send, recv) = ready!(self.driver.lock().open_bi(waker))?;
+        if let Some(wakeup) = wakeup {
+            wakeup.wake();
+        }
+
+        Poll::Ready(Ok((
+            SendStream::new(id, send, self.driver.clone()),
+            RecvStream::new(id, recv, self.driver.clone()),
+        )))
+    }
+
+    /// Poll until the connection is closed and drained.
+    pub fn poll_closed(&self, waker: &Waker) -> Poll<ConnectionError> {
+        self.driver.lock().closed(waker)
+    }
+
     /// Receive the next application datagram from the remote peer.
     ///
     /// Waits until a datagram arrives or the connection is closed.
     pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
-        tokio::select! {
-            res = self.dgram_in.recv_async() => match res {
-                Ok(bytes) => Ok(bytes),
-                // Sender dropped — the driver closed; surface the close reason.
-                Err(_) => Err(self.close.error().await),
-            },
-            err = self.close.error() => Err(err),
-        }
+        poll_fn(|cx| self.poll_read_datagram(cx.waker())).await
+    }
+
+    /// Poll for the next application datagram from the remote peer.
+    pub fn poll_read_datagram(&self, waker: &Waker) -> Poll<Result<Bytes, ConnectionError>> {
+        self.driver.lock().poll_dgram_in(waker)
     }
 
     /// Queue an application datagram for the driver to send.

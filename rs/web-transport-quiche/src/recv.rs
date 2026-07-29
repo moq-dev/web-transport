@@ -102,3 +102,34 @@ impl web_transport_trait::RecvStream for RecvStream {
         self.closed().await
     }
 }
+
+impl web_transport_trait::poll::RecvStream for RecvStream {
+    type Error = StreamError;
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        self.inner.poll_read(cx.waker(), dst).map_err(Into::into)
+    }
+
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        // ez already owns the bytes, so this hands them over instead of copying.
+        self.inner
+            .poll_read_chunk(cx.waker(), max)
+            .map_err(Into::into)
+    }
+
+    fn stop(&mut self, code: u32) {
+        self.stop(code);
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_closed(cx.waker()).map_err(Into::into)
+    }
+}

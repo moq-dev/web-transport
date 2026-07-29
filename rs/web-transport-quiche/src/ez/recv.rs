@@ -251,7 +251,26 @@ impl RecvStream {
         poll_fn(|cx| self.poll_read_chunk(cx.waker(), max)).await
     }
 
-    fn poll_read_chunk(
+    /// Poll to read some data into the buffer, returning the amount read.
+    ///
+    /// Returns `None` if the stream has been finished by the remote.
+    pub fn poll_read(
+        &mut self,
+        waker: &Waker,
+        buf: &mut [u8],
+    ) -> Poll<Result<Option<usize>, StreamError>> {
+        let chunk = ready!(self.poll_read_chunk(waker, buf.len()))?;
+
+        Poll::Ready(Ok(chunk.map(|chunk| {
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            chunk.len()
+        })))
+    }
+
+    /// Poll to read a chunk of data from the stream, avoiding a copy.
+    ///
+    /// Returns `None` if the stream has been finished by the remote.
+    pub fn poll_read_chunk(
         &mut self,
         waker: &Waker,
         max: usize,
@@ -325,7 +344,8 @@ impl RecvStream {
         self.state.lock().is_closed()
     }
 
-    fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    /// Poll until the stream is closed by either side.
+    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
         if let Poll::Ready(res) = self.state.lock().poll_closed(waker) {
             return Poll::Ready(res);
         }
