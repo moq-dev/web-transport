@@ -2,7 +2,7 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -17,11 +17,18 @@ use crate::{ClosedStream, SessionError, WriteError};
 pub struct SendStream {
     stream: quinn::SendStream,
     error: Arc<OnceLock<SessionError>>,
+
+    // Retains the `stopped()` future across `poll_closed` calls.
+    closed: crate::op::Op<Result<(), WriteError>>,
 }
 
 impl SendStream {
     pub(crate) fn new(stream: quinn::SendStream, error: Arc<OnceLock<SessionError>>) -> Self {
-        Self { stream, error }
+        Self {
+            stream,
+            error,
+            closed: Default::default(),
+        }
     }
 
     /// Replace connection-level errors with the stored session error if available.
@@ -185,5 +192,61 @@ impl web_transport_trait::SendStream for SendStream {
             Some(code) => Err(WriteError::Stopped(code)),
             None => Ok(()),
         }
+    }
+}
+
+impl web_transport_trait::poll::SendStream for SendStream {
+    type Error = WriteError;
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let size = ready!(quinn::SendStream::poll_write(
+            Pin::new(&mut self.stream),
+            cx,
+            buf
+        ))
+        .map_err(|e| self.map_error(e))?;
+        Poll::Ready(Ok(size))
+    }
+
+    // `poll_write_buf` is deliberately left to the trait's default, which writes out
+    // of `buf.chunk()` and advances only by what Quinn accepted. Overriding it to
+    // `copy_to_bytes` up front and then write the zero-copy `write_chunk` would be
+    // faster but loses data: the chunk would be gone from `buf` before Quinn
+    // accepted it, a silent hole in the stream if the write does not complete.
+
+    fn set_priority(&mut self, order: u8) {
+        Self::set_priority(self, order.into()).ok();
+    }
+
+    fn reset(&mut self, code: u32) {
+        Self::reset(self, code).ok();
+    }
+
+    fn finish(&mut self) -> Result<(), Self::Error> {
+        Self::finish(self).map_err(|_| WriteError::ClosedStream)
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // `stopped()` registers with the connection's notifier on its first poll, so
+        // the future has to be retained — rebuilding it every poll would drop that
+        // registration and we would never be woken.
+        let stopped = self.stream.stopped();
+        let error = self.error.clone();
+
+        self.closed.poll(cx, move || async move {
+            match stopped.await {
+                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                    Some(code) => Err(WriteError::Stopped(code)),
+                    None => Err(WriteError::InvalidStopped(code)),
+                },
+                Ok(None) => Ok(()),
+                Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
+                    Err(WriteError::SessionError(
+                        error.get().cloned().unwrap_or_else(|| conn_err.into()),
+                    ))
+                }
+                Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
+            }
+        })
     }
 }

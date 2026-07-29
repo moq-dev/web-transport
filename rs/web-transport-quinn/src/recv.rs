@@ -1,8 +1,9 @@
 use std::{
+    future::Future,
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use bytes::Bytes;
@@ -147,5 +148,39 @@ impl web_transport_trait::RecvStream for RecvStream {
     async fn closed(&mut self) -> Result<(), Self::Error> {
         self.received_reset().await?;
         Ok(())
+    }
+}
+
+impl web_transport_trait::poll::RecvStream for RecvStream {
+    type Error = ReadError;
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        if dst.is_empty() {
+            // Asking for no bytes is not end of stream.
+            return Poll::Ready(Ok(Some(0)));
+        }
+
+        let size = ready!(quinn::RecvStream::poll_read(&mut self.inner, cx, dst))
+            .map_err(|e| self.map_error(e))?;
+
+        // Quinn reports a finished stream as zero bytes into a non-empty buffer.
+        Poll::Ready(Ok((size != 0).then_some(size)))
+    }
+
+    fn stop(&mut self, code: u32) {
+        Self::stop(self, code).ok();
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Nothing to retain: Quinn parks this waker in the connection's
+        // `blocked_readers` map keyed by stream ID, not inside the future, so the
+        // registration outlives the future we build here and drop again.
+        let mut reset = std::pin::pin!(self.received_reset());
+        ready!(reset.as_mut().poll(cx))?;
+        Poll::Ready(Ok(()))
     }
 }

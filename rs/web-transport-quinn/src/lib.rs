@@ -26,6 +26,7 @@
 // External
 mod client;
 mod error;
+mod op;
 mod recv;
 mod send;
 mod server;

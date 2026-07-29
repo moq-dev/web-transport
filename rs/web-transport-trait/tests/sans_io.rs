@@ -5,7 +5,7 @@
 //! properties that are easy to lose in a refactor.
 //!
 //! 1. **It is `!Send`.** Every type here holds an [`Rc`]. A `Send` bound anywhere on
-//!    [`PollSession`], [`PollSendStream`], [`PollRecvStream`] — or on the associated
+//!    [`Session`], [`SendStream`], [`RecvStream`] — or on the associated
 //!    stream types, which is the subtle way it creeps back in — would reject this
 //!    file at compile time. `requires_*` below force the bounds to be checked.
 //!
@@ -26,7 +26,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use web_transport_trait::{PollRecvStream, PollSendStream, PollSession};
+use web_transport_trait::poll::{RecvStream, SendStream, Session};
 
 // --- error --------------------------------------------------------------------
 
@@ -106,7 +106,7 @@ struct LocalSend {
     priority: u8,
 }
 
-impl PollSendStream for LocalSend {
+impl SendStream for LocalSend {
     type Error = LocalError;
 
     fn poll_write(&mut self, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, LocalError>> {
@@ -151,7 +151,7 @@ struct LocalRecv {
     buf: Shared,
 }
 
-impl PollRecvStream for LocalRecv {
+impl RecvStream for LocalRecv {
     type Error = LocalError;
 
     fn poll_read(
@@ -225,7 +225,7 @@ impl LocalSession {
     }
 }
 
-impl PollSession for LocalSession {
+impl Session for LocalSession {
     type SendStream = LocalSend;
     type RecvStream = LocalRecv;
     type Error = LocalError;
@@ -298,14 +298,28 @@ impl PollSession for LocalSession {
         )))
     }
 
-    fn send_datagram(&mut self, payload: Bytes) -> Result<(), LocalError> {
+    fn poll_send_datagram(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: &Bytes,
+    ) -> Poll<Result<(), LocalError>> {
         let mut inbox = self.tx.borrow_mut();
         if inbox.closed {
-            return Err(LocalError);
+            return Poll::Ready(Err(LocalError));
         }
-        inbox.datagrams.push_back(payload);
+        // A tiny queue, so the backpressure path is exercised rather than
+        // theoretical.
+        if inbox.datagrams.len() >= 2 {
+            inbox.park(cx);
+            return Poll::Pending;
+        }
+        inbox.datagrams.push_back(payload.clone());
         inbox.wake();
-        Ok(())
+        Poll::Ready(Ok(()))
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        None
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, LocalError>> {
@@ -322,6 +336,10 @@ impl PollSession for LocalSession {
 
     fn max_datagram_size(&self) -> usize {
         1200
+    }
+
+    fn stats(&self) -> impl web_transport_trait::Stats {
+        web_transport_trait::StatsUnavailable
     }
 
     fn close(&mut self, _code: u32, _reason: &str) {
@@ -345,10 +363,10 @@ impl PollSession for LocalSession {
 // --- the bounds themselves ----------------------------------------------------
 
 /// These would not compile if the poll traits carried a `Send` bound, or if
-/// `PollSession` required `Send` of its associated stream types.
-fn requires_poll_session<S: PollSession>() {}
-fn requires_poll_send_stream<S: PollSendStream>() {}
-fn requires_poll_recv_stream<S: PollRecvStream>() {}
+/// `Session` required `Send` of its associated stream types.
+fn requires_poll_session<S: Session>() {}
+fn requires_poll_send_stream<S: SendStream>() {}
+fn requires_poll_recv_stream<S: RecvStream>() {}
 
 #[test]
 fn a_not_send_transport_implements_the_poll_surface() {
@@ -432,7 +450,8 @@ fn datagrams_round_trip() {
 
     assert!(server.poll_recv_datagram(&mut cx).is_pending());
 
-    client.send_datagram(Bytes::from_static(b"dgram")).unwrap();
+    let payload = Bytes::from_static(b"dgram");
+    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
     let datagram = ready(server.poll_recv_datagram(&mut cx)).unwrap();
     assert_eq!(&datagram[..], b"dgram");
 }
@@ -491,4 +510,28 @@ fn a_full_destination_is_not_end_of_stream() {
         Some(Bytes::new()),
         "asking for zero bytes must not look like a finished stream"
     );
+}
+
+/// The reason `poll_send_datagram` is pollable rather than infallible: a caller can
+/// wait for room instead of having the payload silently dropped. The loopback queues
+/// two, so the third parks until the peer drains one.
+#[test]
+fn send_datagram_reports_backpressure() {
+    let waker = Waker::from(Arc::new(Noop));
+    let mut cx = Context::from_waker(&waker);
+
+    let (mut client, mut server) = LocalSession::pair();
+    let payload = Bytes::from_static(b"dgram");
+
+    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
+    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
+
+    assert!(
+        client.poll_send_datagram(&mut cx, &payload).is_pending(),
+        "a full transport must park rather than drop the datagram"
+    );
+
+    // The peer drains one, so there is room again.
+    ready(server.poll_recv_datagram(&mut cx)).unwrap();
+    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
 }

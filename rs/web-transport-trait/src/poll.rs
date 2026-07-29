@@ -11,7 +11,7 @@
 //!   thread-per-core `io_uring` runtime, say — can implement these. The async traits
 //!   in the crate root add `MaybeSend` on top, because their futures need it; the
 //!   poll traits do not, so a `!Send` stack stays expressible all the way down.
-//!   [`PollSession`]'s associated stream types only require the poll halves, so the
+//!   [`Session`]'s associated stream types only require the poll halves, so the
 //!   bound cannot leak back in through them.
 //!
 //! - **`&mut self` throughout, and no `Clone`.** A sans-I/O state machine owns its
@@ -30,7 +30,7 @@
 //! # Retaining state between calls
 //!
 //! A `poll_*` method may keep its own progress across calls, and often should —
-//! [`PollSendStream::poll_write_buf`] will typically have reserved send capacity by
+//! [`SendStream::poll_write_buf`] will typically have reserved send capacity by
 //! the time it returns [`Poll::Pending`], and starting over would give that back.
 //! What it must not keep is anything belonging to the *caller*:
 //!
@@ -38,9 +38,9 @@
 //!   fresh one, and a caller is free to retry a pending write with a shorter buffer.
 //!   Retained progress must be reconciled against the buffer actually presented, not
 //!   the one that started the operation.
-//! - Whatever ends the stream — [`PollSendStream::reset`],
-//!   [`PollSendStream::finish`], a peer STOP_SENDING seen by
-//!   [`PollSendStream::poll_closed`] — must release retained progress. Nothing else
+//! - Whatever ends the stream — [`SendStream::reset`],
+//!   [`SendStream::finish`], a peer STOP_SENDING seen by
+//!   [`SendStream::poll_closed`] — must release retained progress. Nothing else
 //!   will: the guards at the top of a write return early once the stream is closed,
 //!   so no later call reaches the cleanup, and a reservation held past that point is
 //!   leaked for the life of the stream.
@@ -53,26 +53,23 @@ use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{Error, Stats, StatsUnavailable};
+use crate::{Error, Stats};
 
 /// The stream pair produced by opening or accepting a bidirectional stream.
-pub type BiStreams<S> = (
-    <S as PollSession>::SendStream,
-    <S as PollSession>::RecvStream,
-);
+pub type BiStreams<S> = (<S as Session>::SendStream, <S as Session>::RecvStream);
 
 /// The `poll`-based surface of a WebTransport session.
 ///
 /// See the [module docs](self) for why this takes `&mut self` and carries no `Send`
 /// bound.
-pub trait PollSession {
+pub trait Session {
     /// The outgoing stream type. Only the poll half is required, so a `!Send`
     /// session can hang `!Send` streams off it.
-    type SendStream: PollSendStream;
+    type SendStream: SendStream;
 
     /// The incoming stream type. Only the poll half is required, so a `!Send`
     /// session can hang `!Send` streams off it.
-    type RecvStream: PollRecvStream;
+    type RecvStream: RecvStream;
 
     /// The error type for every operation on this session.
     type Error: Error;
@@ -100,16 +97,26 @@ pub trait PollSession {
     /// concurrent streams.
     fn poll_open_bi(&mut self, cx: &mut Context<'_>) -> Poll<Result<BiStreams<Self>, Self::Error>>;
 
-    /// Send a datagram over the network.
+    /// Poll to send a datagram over the network.
     ///
-    /// QUIC datagrams may be dropped for any reason:
+    /// Returns [`Poll::Pending`] while the transport has no room for it, so a caller
+    /// can wait for capacity rather than having the payload dropped underneath it.
+    ///
+    /// `payload` is taken by reference because a [`Poll::Pending`] return means the
+    /// caller retries with the same datagram; an implementation clones it — a
+    /// refcount bump — only once it has accepted it.
+    ///
+    /// Accepting a datagram is not delivery. QUIC datagrams may still be dropped:
     /// - Network congestion.
     /// - Random packet loss.
     /// - Payload is larger than `max_datagram_size()`
     /// - Peer is not receiving datagrams.
-    /// - Peer has too many outstanding datagrams.
     /// - ???
-    fn send_datagram(&mut self, payload: Bytes) -> Result<(), Self::Error>;
+    fn poll_send_datagram(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: &Bytes,
+    ) -> Poll<Result<(), Self::Error>>;
 
     /// Poll for a datagram from the network.
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>>;
@@ -118,26 +125,33 @@ pub trait PollSession {
     fn max_datagram_size(&self) -> usize;
 
     /// Return the negotiated WebTransport subprotocol, if any.
-    fn protocol(&self) -> Option<&str> {
-        None
-    }
+    ///
+    /// Return `None` if the transport does not negotiate one. This is required
+    /// rather than defaulted: a transport that negotiates a subprotocol and forgets
+    /// to report it is a silent bug, and the default hid that.
+    fn protocol(&self) -> Option<&str>;
 
     /// Close the connection immediately with a code and reason.
+    ///
+    /// Idempotent, and deliberately infallible: closing an already-closed connection
+    /// achieved what the caller asked for, and there is nothing they could do with an
+    /// error.
     fn close(&mut self, code: u32, reason: &str);
 
     /// Poll until the connection is closed by either side.
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error>;
 
-    /// Return connection-level statistics, if supported.
-    fn stats(&self) -> impl Stats {
-        StatsUnavailable
-    }
+    /// Return connection-level statistics.
+    ///
+    /// Return [`crate::StatsUnavailable`] if the transport does not track them. Required
+    /// rather than defaulted for the same reason as [`protocol`](Self::protocol).
+    fn stats(&self) -> impl Stats;
 }
 
 /// The `poll`-based surface of an outgoing stream.
 ///
 /// See the [module docs](self) for what a `poll_*` method may retain between calls.
-pub trait PollSendStream {
+pub trait SendStream {
     /// The error type for every operation on this stream.
     type Error: Error;
 
@@ -195,13 +209,18 @@ pub trait PollSendStream {
     ///
     /// This translates into a RESET_STREAM QUIC code.
     /// The peer may not receive the reset code if the stream is already closed.
+    ///
+    /// Takes `&mut self` rather than `self` even though it is terminal, so a caller
+    /// can still [`poll_closed`](Self::poll_closed) afterwards to await the peer —
+    /// and so it matches [`finish`](Self::finish), which must not consume the stream
+    /// for exactly that reason.
     fn reset(&mut self, code: u32);
 
     /// Poll until the stream is closed by either side.
     ///
     /// This includes:
     /// - We sent a RESET_STREAM via [`reset`](Self::reset)
-    /// - We received a STOP_SENDING via [`PollRecvStream::stop`]
+    /// - We received a STOP_SENDING via [`RecvStream::stop`]
     /// - A FIN is acknowledged by the peer via [`finish`](Self::finish)
     ///
     /// Some implementations do not support FIN acknowledgement, in which case this
@@ -212,7 +231,7 @@ pub trait PollSendStream {
 /// The `poll`-based surface of an incoming stream.
 ///
 /// See the [module docs](self) for what a `poll_*` method may retain between calls.
-pub trait PollRecvStream {
+pub trait RecvStream {
     /// The error type for every operation on this stream.
     type Error: Error;
 
@@ -309,8 +328,8 @@ pub trait PollRecvStream {
     /// Poll until the stream has been closed by either side.
     ///
     /// This includes:
-    /// - We received a RESET_STREAM via [`PollSendStream::reset`]
+    /// - We received a RESET_STREAM via [`SendStream::reset`]
     /// - We sent a STOP_SENDING via [`stop`](Self::stop)
-    /// - We received a FIN via [`PollSendStream::finish`] and read all data.
+    /// - We received a FIN via [`SendStream::finish`] and read all data.
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
 }
