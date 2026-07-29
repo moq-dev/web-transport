@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, watch};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
+use crate::shared::SharedRecv;
+
 /// How many inbound datagrams to buffer before dropping. Datagrams are
 /// unreliable, so a slow `recv_datagram` consumer sheds load here rather than
 /// applying backpressure to the whole session.
@@ -76,8 +78,10 @@ pub struct Session {
     outbound: PriorityQueue,
     outbound_priority: mpsc::UnboundedSender<Frame>,
 
-    accept_bi: Arc<tokio::sync::Mutex<mpsc::Receiver<(SendStream, RecvStream)>>>,
-    accept_uni: Arc<tokio::sync::Mutex<mpsc::Receiver<RecvStream>>>,
+    // Shared by every clone. See `SharedRecv` for why this is not a
+    // `tokio::sync::Mutex` around the receiver.
+    accept_bi: Arc<SharedRecv<(SendStream, RecvStream)>>,
+    accept_uni: Arc<SharedRecv<RecvStream>>,
 
     // Shared per-stream backend state (with the reader and writer tasks). The
     // frontend registers the streams it opens directly under this lock — see
@@ -115,7 +119,7 @@ pub struct Session {
     // Inbound datagrams (RFC 9221). The backend fans DATAGRAM frames into this
     // channel; `recv_datagram` drains it. Bounded and lossy — a slow reader
     // drops datagrams rather than stalling the session.
-    recv_datagram: Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>,
+    recv_datagram: Arc<SharedRecv<Bytes>>,
 
     // Outbound datagrams. `send_datagram` pushes payloads here; the backend loop
     // frames and writes them. Bounded and lossy so a backpressured transport
@@ -1763,8 +1767,8 @@ impl Session {
             config,
             outbound,
             outbound_priority: control_tx,
-            accept_bi: Arc::new(tokio::sync::Mutex::new(accept_bi_rx)),
-            accept_uni: Arc::new(tokio::sync::Mutex::new(accept_uni_rx)),
+            accept_bi: Arc::new(SharedRecv::new(accept_bi_rx)),
+            accept_uni: Arc::new(SharedRecv::new(accept_uni_rx)),
             streams,
             closed,
             negotiated,
@@ -1773,7 +1777,7 @@ impl Session {
             open_uni_credit,
             conn_send_credit,
             conn_recv_credit,
-            recv_datagram: Arc::new(tokio::sync::Mutex::new(recv_datagram_rx)),
+            recv_datagram: Arc::new(SharedRecv::new(recv_datagram_rx)),
             datagram_max_size,
             outbound_datagram: outbound_datagram_tx,
             _guard: guard,
@@ -1787,21 +1791,11 @@ impl generic::Session for Session {
     type Error = Error;
 
     async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        self.accept_uni
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
+        self.accept_uni.recv().await.ok_or(Error::Closed)
     }
 
     async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        self.accept_bi
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
+        self.accept_bi.recv().await.ok_or(Error::Closed)
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
@@ -1991,12 +1985,7 @@ impl generic::Session for Session {
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        self.recv_datagram
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(Error::Closed)
+        self.recv_datagram.recv().await.ok_or(Error::Closed)
     }
 
     fn protocol(&self) -> Option<&str> {
