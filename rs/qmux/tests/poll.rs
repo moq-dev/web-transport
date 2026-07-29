@@ -43,7 +43,9 @@ async fn bounded<F: Future>(future: F) -> F::Output {
 async fn a_uni_stream_round_trips_through_the_poll_surface() {
     let (mut client, mut server) = pair(|_| {}).await;
 
-    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx))).await.unwrap();
+    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx)))
+        .await
+        .unwrap();
     let size = bounded(poll_fn(|cx| send.poll_write(cx, b"hello")))
         .await
         .unwrap();
@@ -75,14 +77,16 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() {
 async fn a_bi_stream_round_trips_through_the_poll_surface() {
     let (mut client, mut server) = pair(|_| {}).await;
 
-    let (mut client_send, mut client_recv) =
-        bounded(poll_fn(|cx| client.poll_open_bi(cx))).await.unwrap();
+    let (mut client_send, mut client_recv) = bounded(poll_fn(|cx| client.poll_open_bi(cx)))
+        .await
+        .unwrap();
     bounded(poll_fn(|cx| client_send.poll_write(cx, b"ping")))
         .await
         .unwrap();
 
-    let (mut server_send, mut server_recv) =
-        bounded(poll_fn(|cx| server.poll_accept_bi(cx))).await.unwrap();
+    let (mut server_send, mut server_recv) = bounded(poll_fn(|cx| server.poll_accept_bi(cx)))
+        .await
+        .unwrap();
 
     let chunk = bounded(poll_fn(|cx| server_recv.poll_read_chunk(cx, 16)))
         .await
@@ -163,7 +167,9 @@ async fn racing_accepts_on_clones_are_both_woken() {
 
     let mut client = client;
     for payload in [b"one".as_slice(), b"two".as_slice()] {
-        let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx))).await.unwrap();
+        let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx)))
+            .await
+            .unwrap();
         bounded(poll_fn(|cx| send.poll_write(cx, payload)))
             .await
             .unwrap();
@@ -192,7 +198,9 @@ async fn a_stop_wakes_a_write_parked_on_flow_control() {
     })
     .await;
 
-    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx))).await.unwrap();
+    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx)))
+        .await
+        .unwrap();
     let size = bounded(poll_fn(|cx| send.poll_write(cx, b"full")))
         .await
         .unwrap();
@@ -206,7 +214,10 @@ async fn a_stop_wakes_a_write_parked_on_flow_control() {
         (send, err)
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!write.is_finished(), "the write should park on flow control");
+    assert!(
+        !write.is_finished(),
+        "the write should park on flow control"
+    );
 
     let mut recv = bounded(poll_fn(|cx| server.poll_accept_uni(cx)))
         .await

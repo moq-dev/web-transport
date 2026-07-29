@@ -1,17 +1,16 @@
 //! Per-stream priority scheduling for outbound STREAM data.
 //!
-//! Replaces the bounded `mpsc` data channel the session used to interleave
-//! STREAM frames purely by arrival order. Frames are bucketed by stream
-//! priority (a `u8`, higher = sent first, matching the W3C `sendOrder`
-//! convention) so a high-priority stream can jump ahead of a low-priority
-//! backlog. Re-prioritization is retroactive and cheap: only the stream's
-//! scheduling pointer moves between bands, never its queued frames, so the
-//! per-stream FIFO order the receiver relies on (it appends STREAM data by
+//! A bounded queue that interleaves STREAM frames by stream priority rather
+//! than pure arrival order (a `u8`, higher = sent first, matching the W3C
+//! `sendOrder` convention), so a high-priority stream can jump ahead of a
+//! low-priority backlog. Re-prioritization is retroactive and cheap: only the
+//! stream's scheduling pointer moves between bands, never its queued frames, so
+//! the per-stream FIFO order the receiver relies on (it appends STREAM data by
 //! arrival, ignoring the wire offset) is always preserved.
 //!
 //! Control frames are *not* routed here — the session keeps its separate
-//! unbounded `outbound_priority` channel and a `biased` select so control
-//! always precedes any data this queue yields.
+//! unbounded control lane, which the writer polls first so control always
+//! precedes any data this queue yields.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},

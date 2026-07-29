@@ -6,6 +6,8 @@ QMux brings QUIC's multiplexed streams and flow control to reliable, ordered byt
 
 The protocol reuses QUIC frame types and semantics while adapting them for stream-based transports, providing multiplexed streams with flow control and optional unreliable datagrams.
 
+The session implements both `web-transport-trait` surfaces: the async traits and the sans-I/O `poll` traits. Internally the frontends are poll-first state machines built on [kio](https://docs.rs/kio) shared state (the async methods are thin wrappers), while two background tasks drive the transport's read and write halves and a timer task owns the idle timeout and keep-alive ping.
+
 ## Install
 
 ```toml

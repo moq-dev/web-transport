@@ -150,10 +150,7 @@ pub struct Session {
 }
 
 /// Poll for the session's terminal error, registering `waiter` until one is set.
-fn poll_closed_state(
-    closed: &kio::Shared<Option<Error>>,
-    waiter: &kio::Waiter,
-) -> Poll<Error> {
+fn poll_closed_state(closed: &kio::Shared<Option<Error>>, waiter: &kio::Waiter) -> Poll<Error> {
     match closed.poll(waiter, |slot| {
         if slot.is_some() {
             Poll::Ready(())
@@ -1162,7 +1159,11 @@ impl<R: Reader> SessionState<R> {
                 // a FIN-bearing first frame is terminal, so only a live stream
                 // registers a backend for later frames.
                 if !fin {
-                    self.streams.lock().unwrap().recv.insert(stream.id, recv_backend);
+                    self.streams
+                        .lock()
+                        .unwrap()
+                        .recv
+                        .insert(stream.id, recv_backend);
                 }
             }
             Frame::ResetStream(reset) => {
@@ -2224,7 +2225,7 @@ struct SendState {
 pub struct SendStream {
     id: StreamId,
 
-    outbound: PriorityQueue,                         // STREAM
+    outbound: PriorityQueue,         // STREAM
     outbound_priority: Deque<Frame>, // RESET_STREAM
     shared: kio::Shared<SendShared>,
 
