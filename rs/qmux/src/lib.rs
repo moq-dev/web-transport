@@ -14,7 +14,6 @@ mod proto;
 mod protocol;
 mod sched;
 mod session;
-mod shared;
 mod stream;
 
 /// Transport abstraction and the byte-stream [`transport::Stream`] implementation.

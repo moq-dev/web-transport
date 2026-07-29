@@ -23,7 +23,7 @@ impl CreditState {
 /// Tracks used/max credit for flow control.
 ///
 /// Works for both send and recv flow control:
-/// - **Send**: `try_claim`/`claim` to reserve credit, `release` for rollback, `increase_max` on peer's MAX_DATA.
+/// - **Send**: `poll_claim`/`poll_claim_index` to reserve credit, `release` for rollback, `increase_max` on peer's MAX_DATA.
 /// - **Recv**: `receive` to validate incoming data, `consume` to track app consumption and trigger window updates.
 ///
 /// Clone is cheap and shares the same state.
@@ -55,6 +55,7 @@ impl Credit {
     // --- Send-side methods ---
 
     /// Try to claim up to `limit` units. Returns amount claimed (0 if none available).
+    #[cfg(test)]
     pub fn try_claim(&self, limit: u64) -> u64 {
         let mut state = self.state.lock();
         let claimed = limit.min(state.available());
@@ -62,11 +63,6 @@ impl Credit {
             state.used += claimed;
         }
         claimed
-    }
-
-    /// Claim up to `limit` units, waiting until credit is available.
-    pub async fn claim(&self, limit: u64) -> Result<u64, Error> {
-        kio::wait(|waiter| self.poll_claim(waiter, limit)).await
     }
 
     /// Poll to claim up to `limit` units.

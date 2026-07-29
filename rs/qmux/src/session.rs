@@ -16,11 +16,9 @@ use crate::{
     Stream, StreamDir, StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD,
 };
 use bytes::{Buf, BufMut, Bytes};
-use tokio::sync::{mpsc, watch};
+use kio::Deque;
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
-
-use crate::shared::SharedRecv;
 
 /// How many inbound datagrams to buffer before dropping. Datagrams are
 /// unreliable, so a slow `recv_datagram` consumer sheds load here rather than
@@ -61,7 +59,7 @@ struct Streams {
 /// promptly rather than waiting for the transport to notice. Mirrors how a QUIC
 /// endpoint's connection handle owns the connection's lifetime.
 struct SessionGuard {
-    closed: watch::Sender<Option<Error>>,
+    closed: kio::Shared<Option<Error>>,
 }
 
 impl Drop for SessionGuard {
@@ -77,12 +75,13 @@ pub struct Session {
     config: Config,
 
     outbound: PriorityQueue,
-    outbound_priority: mpsc::UnboundedSender<Frame>,
+    outbound_priority: Deque<Frame>,
 
-    // Shared by every clone. See `SharedRecv` for why this is not a
-    // `tokio::sync::Mutex` around the receiver.
-    accept_bi: Arc<SharedRecv<(SendStream, RecvStream)>>,
-    accept_uni: Arc<SharedRecv<RecvStream>>,
+    // Shared by every clone: any handle can poll an accept directly, and a
+    // handle that starts one and stops polling blocks nobody (kio registrations
+    // are per-waiter, and losers of a pop race are re-woken).
+    accept_bi: Deque<(SendStream, RecvStream)>,
+    accept_uni: Deque<RecvStream>,
 
     // Shared per-stream backend state (with the reader and writer tasks). The
     // frontend registers the streams it opens directly under this lock — see
@@ -91,7 +90,7 @@ pub struct Session {
     // frame (no open-vs-writer race) and there's no message-passing hop.
     streams: Arc<Mutex<Streams>>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: kio::Shared<Option<Error>>,
 
     // Negotiated application protocol (via the application_protocols transport
     // parameter). Resolved exactly once, before the session is handed to the
@@ -104,8 +103,8 @@ pub struct Session {
 
     // Flips to `true` once the peer's transport parameters have been received and
     // applied (or eagerly for the param-less `webtransport` format). `established()`
-    // awaits this; if the sender drops first, the connection closed mid-handshake.
-    established: watch::Receiver<bool>,
+    // awaits this, or `closed` if the connection dies mid-handshake.
+    established: kio::Shared<bool>,
 
     // Flow control: stream count credits (claim_index returns stream sequence number)
     open_bi_credit: Credit,
@@ -118,23 +117,58 @@ pub struct Session {
     conn_recv_credit: Credit,
 
     // Inbound datagrams (RFC 9221). The backend fans DATAGRAM frames into this
-    // channel; `recv_datagram` drains it. Bounded and lossy — a slow reader
+    // lane; `recv_datagram` drains it. Bounded and lossy — a slow reader
     // drops datagrams rather than stalling the session.
-    recv_datagram: Arc<SharedRecv<Bytes>>,
+    recv_datagram: Deque<Bytes>,
 
     // Outbound datagrams. `send_datagram` pushes payloads here; the backend loop
     // frames and writes them. Bounded and lossy so a backpressured transport
     // drops datagrams instead of queueing them unboundedly. Kept off the
     // (lossless) control lane, which must never drop RESET/STOP/CLOSE frames.
-    outbound_datagram: mpsc::Sender<Bytes>,
+    // (`poll_send_datagram` waits for room instead of shedding, per its trait
+    // contract.)
+    outbound_datagram: Deque<Bytes>,
 
     // The largest datagram payload we may send, i.e. `max_datagram_size()`.
     // Resolved from the peer's transport parameters before the session is handed
     // to the caller (0 = the peer doesn't accept datagrams).
     datagram_max_size: Arc<AtomicUsize>,
 
+    // Retained waiters for the `Context`-based poll trait methods, one per
+    // logical operation. Cloning a session hands the clone idle cells, so an
+    // operation in flight stays with the handle that started it.
+    waiter_accept_uni: kio::WaiterCell,
+    waiter_accept_bi: kio::WaiterCell,
+    waiter_open_uni: kio::WaiterCell,
+    waiter_open_bi: kio::WaiterCell,
+    waiter_send_datagram: kio::WaiterCell,
+    waiter_recv_datagram: kio::WaiterCell,
+    waiter_closed: kio::WaiterCell,
+
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
+}
+
+/// Poll for the session's terminal error, registering `waiter` until one is set.
+fn poll_closed_state(
+    closed: &kio::Shared<Option<Error>>,
+    waiter: &kio::Waiter,
+) -> Poll<Error> {
+    match closed.poll(waiter, |slot| {
+        if slot.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }) {
+        Poll::Ready(slot) => Poll::Ready(slot.clone().unwrap_or(Error::Closed)),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Wait until the session records a terminal error, returning it.
+async fn closed_reason(closed: &kio::Shared<Option<Error>>) -> Error {
+    kio::wait(|waiter| poll_closed_state(closed, waiter)).await
 }
 
 /// Tracks which peer-initiated recv-stream indices (in one direction) are open,
@@ -200,21 +234,21 @@ struct SessionState<R: Reader> {
     // enqueue their own data (`outbound`) and control frames (`control`). The
     // reader never pulls from these — the writer does.
     outbound: PriorityQueue,
-    control: mpsc::UnboundedSender<Frame>,
+    control: Deque<Frame>,
 
-    accept_bi: mpsc::Sender<(SendStream, RecvStream)>,
-    accept_uni: mpsc::Sender<RecvStream>,
+    accept_bi: Deque<(SendStream, RecvStream)>,
+    accept_uni: Deque<RecvStream>,
 
     // Shared per-stream backend state (with the frontend and writer). The
     // frontend inserts streams it opens; the reader inserts peer-initiated ones.
     streams: Arc<Mutex<Streams>>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: kio::Shared<Option<Error>>,
 
     // Negotiated protocol and handshake-complete signal — see the matching
     // fields on `Session`.
     negotiated: Arc<OnceLock<Option<String>>>,
-    established: watch::Sender<bool>,
+    established: kio::Shared<bool>,
 
     // Flow control state
     conn_send_credit: Credit,
@@ -255,7 +289,7 @@ struct SessionState<R: Reader> {
 
     // Inbound datagram sink (see the matching field on `Session`) plus the
     // shared send-limit cell resolved from the peer's params.
-    recv_datagram: mpsc::Sender<Bytes>,
+    recv_datagram: Deque<Bytes>,
     datagram_max_size: Arc<AtomicUsize>,
 
     // Effective outbound record-size limit and idle-timeout (ms), shared with the
@@ -272,26 +306,29 @@ struct SessionState<R: Reader> {
     pings_sent: Arc<AtomicU64>,
 }
 
-/// Pick the next outbound frame in strict priority order: control (lossless,
+/// Poll for the next outbound frame in strict priority order: control (lossless,
 /// e.g. RESET/STOP/CLOSE/window updates) first, then datagrams (low-latency but
 /// droppable), then bulk stream data scheduled by [`PriorityQueue`]. Returns
 /// `None` only once the stream queue is closed, which drives session teardown.
 ///
-/// Each source's future is cancel-safe (`mpsc::recv` and `PriorityQueue::pop`
-/// remove nothing until they resolve), so losing this race in the caller's
-/// `select!` never drops a frame.
-async fn next_outbound(
-    control: &mut mpsc::UnboundedReceiver<Frame>,
-    datagram: &mut mpsc::Receiver<Bytes>,
+/// One poll registers `waiter` with every source that came up empty, so a frame
+/// landing on any lane re-polls the caller — no `select!` over per-lane futures,
+/// and nothing is consumed on a `Pending`.
+fn poll_next_outbound(
+    control: &Deque<Frame>,
+    datagram: &Deque<Bytes>,
     stream: &PriorityQueue,
-) -> Option<Frame> {
-    tokio::select! {
-        biased;
-        Some(frame) = control.recv() => Some(frame),
-        // `.into()` builds the length-prefixed (0x31) form we always emit.
-        Some(payload) = datagram.recv() => Some(Frame::Datagram(payload.into())),
-        frame = stream.pop() => frame,
+    waiter: &kio::Waiter,
+) -> Poll<Option<Frame>> {
+    // A closed lane simply stops producing; teardown is the stream queue's `None`.
+    if let Poll::Ready(Ok(frame)) = control.poll_pop(waiter) {
+        return Poll::Ready(Some(frame));
     }
+    if let Poll::Ready(Ok(payload)) = datagram.poll_pop(waiter) {
+        // `.into()` builds the length-prefixed (0x31) form we always emit.
+        return Poll::Ready(Some(Frame::Datagram(payload.into())));
+    }
+    stream.poll_pop(waiter)
 }
 
 /// RFC 9000 §10.1 effective idle timeout in ms: the smaller of the two advertised
@@ -323,15 +360,11 @@ fn instant_at(base: tokio::time::Instant, ms: u64) -> tokio::time::Instant {
 /// Record `err` as the session's terminal close reason, but only if none is set
 /// yet — the first reason wins. The reader, writer, timer, and [`SessionGuard`] all
 /// funnel through this so teardown reports a single, stable cause.
-fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
-    closed.send_if_modified(|slot| {
-        if slot.is_none() {
-            *slot = Some(err);
-            true
-        } else {
-            false
-        }
-    });
+fn note_closed(closed: &kio::Shared<Option<Error>>, err: Error) {
+    let mut slot = closed.lock();
+    if slot.is_none() {
+        *slot = Some(err);
+    }
 }
 
 /// Writer-side task state: owns the transport send half and is the sole producer
@@ -349,8 +382,8 @@ struct WriterState<W: Writer> {
     writer: W,
     version: Version,
 
-    control: mpsc::UnboundedReceiver<Frame>,
-    datagrams: mpsc::Receiver<Bytes>,
+    control: Deque<Frame>,
+    datagrams: Deque<Bytes>,
     outbound: PriorityQueue,
 
     // Shared with the reader task.
@@ -362,7 +395,7 @@ struct WriterState<W: Writer> {
     // genuinely dead one, and not idle-close the former. See `transmit`.
     writer_backpressured: Arc<AtomicBool>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: kio::Shared<Option<Error>>,
 
     // Origin shared with the reader and timer, plus the millis (since `base`) at
     // which our last send landed — published for keep-alive and idle scheduling.
@@ -388,16 +421,18 @@ impl<W: Writer> WriterState<W> {
     }
 
     async fn run(&mut self) {
-        let mut closed_rx = self.closed.subscribe();
+        let closed = self.closed.clone();
         // Set if a write was abandoned mid-flight because the session tore down.
         // The transport may be parked mid-frame, so we must not touch it again.
         let mut interrupted = false;
         loop {
             tokio::select! {
                 biased;
-                frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
+                frame = kio::wait(|waiter| {
+                    poll_next_outbound(&self.control, &self.datagrams, &self.outbound, waiter)
+                }) => {
                     match frame {
-                        Some(frame) => match self.transmit_or_teardown(frame, &mut closed_rx).await {
+                        Some(frame) => match self.transmit_or_teardown(frame, &closed).await {
                             Transmitted::Ok => {}
                             Transmitted::Failed(err) => {
                                 self.note_closed(err);
@@ -420,15 +455,12 @@ impl<W: Writer> WriterState<W> {
                         break;
                     }
                 }
-                // Wrapped so the `watch::Ref` guard is dropped before the branch
-                // resolves — otherwise it (non-`Send`), held across a `send` await,
-                // would make the task non-`Send`.
-                _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
+                _ = closed_reason(&closed) => {
                     // Session tearing down while we were parked between writes (not
                     // mid-frame), so the transport is at a frame boundary: best-effort
                     // flush of any queued control frames (e.g. a ConnectionClose)
                     // before we stop.
-                    while let Ok(frame) = self.control.try_recv() {
+                    while let Some(frame) = self.control.try_pop().ok().flatten() {
                         if self.transmit(frame).await.is_err() {
                             break;
                         }
@@ -456,7 +488,7 @@ impl<W: Writer> WriterState<W> {
     async fn transmit_or_teardown(
         &mut self,
         frame: Frame,
-        closed_rx: &mut watch::Receiver<Option<Error>>,
+        closed: &kio::Shared<Option<Error>>,
     ) -> Transmitted {
         tokio::select! {
             biased;
@@ -464,11 +496,7 @@ impl<W: Writer> WriterState<W> {
                 Ok(()) => Transmitted::Ok,
                 Err(err) => Transmitted::Failed(err),
             },
-            // Wrapped so the non-`Send` `watch::Ref` is dropped before the branch
-            // resolves (same reason as the `closed` branch in `run`).
-            _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
-                Transmitted::Interrupted
-            }
+            _ = closed_reason(closed) => Transmitted::Interrupted,
         }
     }
 
@@ -569,8 +597,8 @@ mod writer_final_size_tests {
             },
         );
 
-        let (_control_tx, control) = mpsc::unbounded_channel();
-        let (_datagram_tx, datagrams) = mpsc::channel(1);
+        let control = Deque::new();
+        let datagrams = Deque::bounded(1);
         let mut writer = WriterState {
             writer: CaptureWriter(sent.clone()),
             version: Version::QMux01,
@@ -580,7 +608,7 @@ mod writer_final_size_tests {
             streams,
             record_limit: Arc::new(AtomicU64::new(u64::MAX)),
             writer_backpressured: Arc::new(AtomicBool::new(false)),
-            closed: watch::Sender::new(None),
+            closed: kio::Shared::new(None),
             base: tokio::time::Instant::now(),
             last_send_at: Arc::new(AtomicU64::new(0)),
         };
@@ -623,7 +651,7 @@ mod writer_final_size_tests {
     async fn reset_returns_credit_reserved_for_dropped_frames() {
         let id = StreamId::new(0, StreamDir::Uni, false);
         let outbound = PriorityQueue::new(4);
-        let (priority, _priority_rx) = mpsc::unbounded_channel();
+        let priority = Deque::new();
         let stream_credit = Credit::new(3);
         let conn_credit = Credit::new(3);
         let mut send = SendStream {
@@ -684,10 +712,10 @@ struct TimerState {
     idle_timeout_ms: Arc<AtomicU64>,
 
     // Enqueues keep-alive pings; the writer transmits them like any control frame.
-    control: mpsc::UnboundedSender<Frame>,
-    closed: watch::Sender<Option<Error>>,
+    control: Deque<Frame>,
+    closed: kio::Shared<Option<Error>>,
     // Gates arming: the idle timeout only applies once params are exchanged.
-    established: watch::Receiver<bool>,
+    established: kio::Shared<bool>,
 
     // Count of QX_PING requests we've enqueued (i.e. sequences 0..pings_sent).
     // Published for the reader task, which rejects (draft-02) a QX_PING response
@@ -754,19 +782,17 @@ impl TimerState {
         )
     }
 
-    async fn run(mut self) {
-        let mut closed_rx = self.closed.subscribe();
+    async fn run(self) {
+        let closed = self.closed.clone();
 
         // The idle timeout only applies once the peer's params have been exchanged.
         // Wait for establishment — or teardown — before arming anything.
         tokio::select! {
             biased;
-            _ = closed_rx.wait_for(|s| s.is_some()) => return,
-            res = self.established.wait_for(|&e| e) => {
-                if res.is_err() {
-                    return; // session dropped before establishing
-                }
-            }
+            _ = closed_reason(&closed) => return,
+            _ = self.established.wait(|flag| {
+                if **flag { Poll::Ready(()) } else { Poll::Pending }
+            }) => {}
         }
 
         // Negotiated idle timeout, published by `recv_transport_parameters` before
@@ -807,7 +833,7 @@ impl TimerState {
 
             tokio::select! {
                 biased;
-                _ = closed_rx.wait_for(|s| s.is_some()) => return,
+                _ = closed_reason(&closed) => return,
                 _ = tokio::time::sleep_until(wake) => {}
             }
 
@@ -827,8 +853,8 @@ impl TimerState {
                     // Publish before the enqueue is observable so the reader never
                     // sees a response to a ping it hasn't been told about.
                     self.pings_sent.store(next_ping_seq, Ordering::Release);
-                    if self.control.send(ping).is_err() {
-                        return; // writer gone
+                    if self.control.try_push(ping).is_err() {
+                        return; // session torn down
                     }
                 }
                 last_ping_ms = millis_since(self.base, now);
@@ -870,13 +896,13 @@ impl TimerState {
 
 impl<R: Reader> SessionState<R> {
     async fn run(&mut self) -> Result<(), Error> {
-        let mut closed = self.closed.subscribe();
+        let closed = self.closed.clone();
 
         loop {
             // The idle timeout and keep-alive ping are owned by the timer task,
             // which reads the `last_recv_at` we publish below. Keeping the deadline
             // off this select is what stops application backpressure — parking in
-            // `recv_frame`'s `accept_*.send().await` — from starving the deadline
+            // `recv_frame`'s `accept_*.push().await` — from starving the deadline
             // and firing a spurious idle close on re-entry.
             tokio::select! {
                 biased;
@@ -896,9 +922,7 @@ impl<R: Reader> SessionState<R> {
                         self.recv_frame(frame).await?;
                     }
                 }
-                _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
-                    return Err(closed.borrow().clone().unwrap_or(Error::Closed))
-                }
+                err = closed_reason(&closed) => return Err(err),
             }
         }
     }
@@ -1081,7 +1105,7 @@ impl<R: Reader> SessionState<R> {
                         // channel is full, so the timer defers the idle close rather
                         // than mistaking a slow `accept_uni` consumer for a dead peer.
                         self.reader_backpressured.store(true, Ordering::Release);
-                        let result = self.accept_uni.send(recv_frontend).await;
+                        let result = self.accept_uni.push(recv_frontend).await;
                         self.reader_backpressured.store(false, Ordering::Release);
                         result.map_err(|_| Error::Closed)?;
                     }
@@ -1128,7 +1152,7 @@ impl<R: Reader> SessionState<R> {
                         // See the uni arm: defer the idle close while a slow
                         // `accept_bi` consumer keeps the bounded channel full.
                         self.reader_backpressured.store(true, Ordering::Release);
-                        let result = self.accept_bi.send((send_frontend, recv_frontend)).await;
+                        let result = self.accept_bi.push((send_frontend, recv_frontend)).await;
                         self.reader_backpressured.store(false, Ordering::Release);
                         result.map_err(|_| Error::Closed)?;
                     }
@@ -1228,7 +1252,7 @@ impl<R: Reader> SessionState<R> {
                     // it can ever occupy receive memory. Make it immediately
                     // eligible to replenish the connection window.
                     if let Some(new_max) = self.conn_recv_credit.consume(gap) {
-                        self.control.send(Frame::MaxData(new_max)).ok();
+                        self.control.try_push(Frame::MaxData(new_max)).ok();
                     }
                 }
 
@@ -1260,7 +1284,7 @@ impl<R: Reader> SessionState<R> {
                             StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
                             StreamDir::Uni => Frame::MaxStreamsUni(new_max),
                         };
-                        self.control.send(frame).ok();
+                        self.control.try_push(frame).ok();
                     }
                 }
             }
@@ -1281,22 +1305,24 @@ impl<R: Reader> SessionState<R> {
             // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
             // as a clean session close carrying the peer's code/reason.
             Frame::ApplicationClose(close) => {
-                self.closed
-                    .send(Some(Error::ConnectionClosed {
+                note_closed(
+                    &self.closed,
+                    Error::ConnectionClosed {
                         code: close.code,
                         reason: close.reason,
-                    }))
-                    .ok();
+                    },
+                );
             }
             // CONNECTION_CLOSE (0x1c): the peer hit a protocol/transport error —
             // surfaces as an abnormal close, not a clean one.
             Frame::ConnectionClose(close) => {
-                self.closed
-                    .send(Some(Error::ConnectionReset {
+                note_closed(
+                    &self.closed,
+                    Error::ConnectionReset {
                         code: close.code,
                         reason: close.reason,
-                    }))
-                    .ok();
+                    },
+                );
             }
             // Flow control frames
             Frame::MaxData(max) => {
@@ -1347,7 +1373,7 @@ impl<R: Reader> SessionState<R> {
                         sequence: ping.sequence,
                         response: true,
                     });
-                    self.control.send(response).ok();
+                    self.control.try_push(response).ok();
                 }
             }
             // DATAGRAM: fan out to the receive channel. `max_datagram_frame_size`
@@ -1367,7 +1393,7 @@ impl<R: Reader> SessionState<R> {
                 if datagram.frame_size() > self.our_params.max_datagram_frame_size {
                     return Err(Error::FrameTooLarge);
                 }
-                let _ = self.recv_datagram.try_send(datagram.data);
+                let _ = self.recv_datagram.try_push(datagram.data);
             }
         }
 
@@ -1493,7 +1519,7 @@ impl<R: Reader> SessionState<R> {
 
         // Handshake complete: `negotiated` is now set, so unblock `established()`
         // and let the synchronous getter return its final value.
-        self.established.send_replace(true);
+        *self.established.lock() = true;
 
         Ok(())
     }
@@ -1530,12 +1556,22 @@ impl Session {
     /// Folded into [`connect`](Session::connect) / [`accept`](Session::accept);
     /// see those for the timeout and error semantics.
     async fn established(&self) -> Result<(), Error> {
-        let mut established = self.established.clone();
-        if *established.borrow() {
-            return Ok(());
-        }
+        // One poll watches both cells: establishment resolves it, and a session
+        // that dies mid-handshake surfaces its close reason instead of hanging.
+        let wait = kio::wait(|waiter| {
+            let flag = self.established.poll(waiter, |flag| {
+                if **flag {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+            if flag.is_ready() {
+                return Poll::Ready(Ok(()));
+            }
+            poll_closed_state(&self.closed, waiter).map(Err)
+        });
 
-        let wait = established.wait_for(|&done| done);
         let timeout = self.config.handshake_timeout;
         // A zero timeout disables the bound (wait indefinitely).
         let outcome = if timeout.is_zero() {
@@ -1546,22 +1582,22 @@ impl Session {
 
         match outcome {
             // Established.
-            Some(Ok(_)) => Ok(()),
+            Some(Ok(())) => Ok(()),
             // The backend task ended before establishing — surface the close reason.
-            Some(Err(_)) => Err(self.closed.borrow().clone().unwrap_or(Error::Closed)),
+            Some(Err(err)) => Err(err),
             // Timed out waiting for the peer's parameters: abort the half-open
             // handshake, notifying the peer, and fail rather than hang.
             None => {
                 // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
                 // rather than seeing a graceful close.
-                let _ = self.outbound_priority.send(
+                let _ = self.outbound_priority.try_push(
                     ConnectionClose {
                         code: VarInt::from(0u32),
                         reason: "handshake timeout".to_string(),
                     }
                     .into(),
                 );
-                self.closed.send_replace(Some(Error::HandshakeTimeout));
+                note_closed(&self.closed, Error::HandshakeTimeout);
                 Err(Error::HandshakeTimeout)
             }
         }
@@ -1576,21 +1612,21 @@ impl Session {
         let version = config.version;
         let our_params = config.to_transport_params();
 
-        let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
-        let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
+        let accept_bi = Deque::bounded(1024);
+        let accept_uni = Deque::bounded(1024);
 
         let outbound = PriorityQueue::new(8);
         // Control lane (lossless): RESET/STOP/CLOSE, window updates, pings, and the
         // initial TRANSPORT_PARAMETERS. The reader and stream frontends produce;
         // the writer consumes.
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let control = Deque::new();
 
-        // Bounded, lossy datagram channels — drop on a full buffer rather than
-        // stalling, matching QUIC's unreliable semantics. When the writer stalls on
-        // backpressure it stops draining `outbound_datagram`, which fills and makes
-        // `send_datagram` shed.
-        let (recv_datagram_tx, recv_datagram_rx) = mpsc::channel(DATAGRAM_RECV_BUFFER);
-        let (outbound_datagram_tx, outbound_datagram_rx) = mpsc::channel(DATAGRAM_SEND_BUFFER);
+        // Bounded, lossy datagram lanes — `try_push` drops on a full buffer rather
+        // than stalling, matching QUIC's unreliable semantics. When the writer
+        // stalls on backpressure it stops draining `outbound_datagram`, which fills
+        // and makes `send_datagram` shed.
+        let recv_datagram = Deque::bounded(DATAGRAM_RECV_BUFFER);
+        let outbound_datagram = Deque::bounded(DATAGRAM_SEND_BUFFER);
         let datagram_max_size = Arc::new(AtomicUsize::new(0));
 
         // Shared with the writer task: per-stream backend state, plus the two
@@ -1615,13 +1651,13 @@ impl Session {
         let reader_backpressured = Arc::new(AtomicBool::new(false));
         let writer_backpressured = Arc::new(AtomicBool::new(false));
 
-        let closed = watch::Sender::new(None);
+        let closed = kio::Shared::new(None);
 
         // The QMux handshake requires TRANSPORT_PARAMETERS as the first frame. It
         // leads the FIFO control lane, so the writer emits it before anything else.
         if version.is_qmux() {
-            control_tx
-                .send(Frame::TransportParameters(our_params.clone()))
+            control
+                .try_push(Frame::TransportParameters(our_params.clone()))
                 .ok();
         }
 
@@ -1633,8 +1669,8 @@ impl Session {
         let mut writer = WriterState {
             writer: writer_half,
             version,
-            control: control_rx,
-            datagrams: outbound_datagram_rx,
+            control: control.clone(),
+            datagrams: outbound_datagram.clone(),
             outbound: outbound.clone(),
             streams: streams.clone(),
             record_limit: record_limit.clone(),
@@ -1661,7 +1697,7 @@ impl Session {
         // Handshake-complete signal. QMux versions flip it once the peer's params
         // arrive; the legacy `webtransport` format exchanges none, so it (and the
         // resolved getter) are established eagerly.
-        let (established_tx, established_rx) = watch::channel(!version.is_qmux());
+        let established = kio::Shared::new(!version.is_qmux());
 
         let open_bi_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
         let open_uni_credit = Credit::new(if version.is_qmux() { 0 } else { u64::MAX });
@@ -1691,13 +1727,13 @@ impl Session {
             config: config.clone(),
             is_server,
             outbound: outbound.clone(),
-            control: control_tx.clone(),
-            accept_bi: accept_bi_tx,
-            accept_uni: accept_uni_tx,
+            control: control.clone(),
+            accept_bi: accept_bi.clone(),
+            accept_uni: accept_uni.clone(),
             streams: streams.clone(),
             closed: closed.clone(),
             negotiated: negotiated.clone(),
-            established: established_tx,
+            established: established.clone(),
             conn_send_credit: conn_send_credit.clone(),
             conn_recv_credit: conn_recv_credit.clone(),
             our_params: our_params.clone(),
@@ -1712,7 +1748,7 @@ impl Session {
             base,
             last_recv_at: last_recv_at.clone(),
             reader_backpressured: reader_backpressured.clone(),
-            recv_datagram: recv_datagram_tx,
+            recv_datagram: recv_datagram.clone(),
             datagram_max_size: datagram_max_size.clone(),
             record_limit: record_limit.clone(),
             idle_timeout_ms: idle_timeout_ms.clone(),
@@ -1732,14 +1768,15 @@ impl Session {
                 reader_backpressured: reader_backpressured.clone(),
                 writer_backpressured: writer_backpressured.clone(),
                 idle_timeout_ms: idle_timeout_ms.clone(),
-                control: control_tx.clone(),
+                control: control.clone(),
                 closed: closed.clone(),
-                established: established_rx.clone(),
+                established: established.clone(),
                 pings_sent: pings_sent.clone(),
             };
             tokio::spawn(timer.run());
         }
 
+        let outbound_datagram_teardown = outbound_datagram.clone();
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // If we tore down because of a protocol/transport violation *we*
@@ -1750,7 +1787,7 @@ impl Session {
             // close, a close the peer already sent us, an idle timeout, or a dead
             // transport — none of which should (or can) emit a frame here.
             if let Some(code) = err.transport_close() {
-                let _ = backend.control.send(
+                let _ = backend.control.try_push(
                     ConnectionClose {
                         code: VarInt::from(code),
                         reason: err.to_string(),
@@ -1758,19 +1795,21 @@ impl Session {
                     .into(),
                 );
             }
-            // Dropping `backend` drops the `established` sender; an `established()`
-            // waiter that was still pending then observes the channel close and
-            // reports this terminal error. The OnceLock stays unset, so the
-            // synchronous getter reports `None` on a never-established session.
-            // Close all credits so blocked claim()/claim_index() calls unblock
+            // Explicit teardown: kio state has no liveness of its own, so every
+            // lane and per-stream cell is closed by hand. A frontend parked on an
+            // accept, read, write, or `closed()` learns of the teardown from these
+            // flags, not from a dropped channel. (The queues drain before they
+            // report closure, so anything already delivered is still readable.)
             backend.open_bi_credit.close();
             backend.open_uni_credit.close();
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
             backend.outbound.close();
-            // Explicitly close every live stream's shared state: kio state has no
-            // liveness of its own, so a frontend parked on a read or `closed()`
-            // learns of the teardown from this flag, not from a dropped channel.
+            backend.accept_uni.close();
+            backend.accept_bi.close();
+            backend.recv_datagram.close();
+            outbound_datagram_teardown.close();
+            backend.control.close();
             {
                 let streams = backend.streams.lock().unwrap();
                 for send in streams.send.values() {
@@ -1783,12 +1822,13 @@ impl Session {
                     recv.shared.lock().closed = true;
                 }
             }
-            // `send_replace`, not `send`: the latter drops the value when there
-            // are no receivers, which loses the close reason for any `closed()`
-            // call made after the session has already finished closing (e.g. after
-            // awaiting establishment on a peer that closed without sending params).
-            // Storing it unconditionally keeps late waiters correct.
-            backend.closed.send_replace(Some(err));
+            // Last, so a waiter woken by the close reason observes every other
+            // cell already closed. First reason wins; storing it here keeps late
+            // `closed()` callers correct (e.g. after awaiting establishment on a
+            // peer that closed without sending params). The OnceLock stays unset,
+            // so the synchronous getter reports `None` on a never-established
+            // session.
+            note_closed(&backend.closed, err);
         });
 
         // Closes the connection once every `Session` clone has dropped.
@@ -1800,41 +1840,35 @@ impl Session {
             is_server,
             config,
             outbound,
-            outbound_priority: control_tx,
-            accept_bi: Arc::new(SharedRecv::new(accept_bi_rx)),
-            accept_uni: Arc::new(SharedRecv::new(accept_uni_rx)),
+            outbound_priority: control,
+            accept_bi,
+            accept_uni,
             streams,
             closed,
             negotiated,
-            established: established_rx,
+            established,
             open_bi_credit,
             open_uni_credit,
             conn_send_credit,
             conn_recv_credit,
-            recv_datagram: Arc::new(SharedRecv::new(recv_datagram_rx)),
+            recv_datagram,
             datagram_max_size,
-            outbound_datagram: outbound_datagram_tx,
+            outbound_datagram,
+            waiter_accept_uni: kio::WaiterCell::new(),
+            waiter_accept_bi: kio::WaiterCell::new(),
+            waiter_open_uni: kio::WaiterCell::new(),
+            waiter_open_bi: kio::WaiterCell::new(),
+            waiter_send_datagram: kio::WaiterCell::new(),
+            waiter_recv_datagram: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
             _guard: guard,
         }
     }
-}
 
-impl generic::Session for Session {
-    type SendStream = SendStream;
-    type RecvStream = RecvStream;
-    type Error = Error;
-
-    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        self.accept_uni.recv().await.ok_or(Error::Closed)
-    }
-
-    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        self.accept_bi.recv().await.ok_or(Error::Closed)
-    }
-
-    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
-        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
-        let index = self.open_uni_credit.claim_index().await?;
+    /// Build and register a locally-initiated send stream for the claimed
+    /// stream-count `index`. Entirely synchronous, so the async and poll open
+    /// paths share it after their respective claims.
+    fn open_uni_at(&self, index: u64) -> SendStream {
         let id = StreamId::new(index, StreamDir::Uni, self.is_server);
 
         let stream_credit = if self.config.version.is_qmux() {
@@ -1884,12 +1918,12 @@ impl generic::Session for Session {
             streams.send.insert(id, send_backend);
         }
 
-        Ok(send_frontend)
+        send_frontend
     }
 
-    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
-        let index = self.open_bi_credit.claim_index().await?;
+    /// Build and register a locally-initiated bidi stream pair for the claimed
+    /// stream-count `index`. See [`open_uni_at`](Self::open_uni_at).
+    fn open_bi_at(&self, index: u64) -> (SendStream, RecvStream) {
         let id = StreamId::new(index, StreamDir::Bi, self.is_server);
 
         let stream_credit = if self.config.version.is_qmux() {
@@ -1949,7 +1983,7 @@ impl generic::Session for Session {
             waiter_closed: kio::WaiterCell::new(),
         };
 
-        // Register both backends before returning the frontends (see `open_uni`).
+        // Register both backends before returning the frontends (see `open_uni_at`).
         // A bidi stream we initiate sends under the peer's `bidi_remote` limit.
         {
             let mut streams = self.streams.lock().unwrap();
@@ -1962,7 +1996,33 @@ impl generic::Session for Session {
             streams.recv.insert(id, recv_backend);
         }
 
-        Ok((send_frontend, recv_frontend))
+        (send_frontend, recv_frontend)
+    }
+}
+
+impl generic::Session for Session {
+    type SendStream = SendStream;
+    type RecvStream = RecvStream;
+    type Error = Error;
+
+    async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
+        self.accept_uni.pop().await.map_err(|_| Error::Closed)
+    }
+
+    async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+        self.accept_bi.pop().await.map_err(|_| Error::Closed)
+    }
+
+    async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
+        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
+        let index = self.open_uni_credit.claim_index().await?;
+        Ok(self.open_uni_at(index))
+    }
+
+    async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
+        // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
+        let index = self.open_bi_credit.claim_index().await?;
+        Ok(self.open_bi_at(index))
     }
 
     fn close(&self, code: u32, reason: &str) {
@@ -1972,23 +2032,19 @@ impl generic::Session for Session {
             code: VarInt::from(code),
             reason: reason.to_string(),
         };
-        let _ = self.outbound_priority.send(frame.into());
+        let _ = self.outbound_priority.try_push(frame.into());
 
-        self.closed
-            .send(Some(Error::ConnectionClosed {
+        note_closed(
+            &self.closed,
+            Error::ConnectionClosed {
                 code: VarInt::from(code),
                 reason: reason.to_string(),
-            }))
-            .ok();
+            },
+        );
     }
 
     async fn closed(&self) -> Self::Error {
-        let mut closed = self.closed.subscribe();
-        closed
-            .wait_for(|err| err.is_some())
-            .await
-            .map(|e| e.clone().unwrap_or(Error::Closed))
-            .unwrap_or(Error::Closed)
+        closed_reason(&self.closed).await
     }
 
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
@@ -2006,10 +2062,10 @@ impl generic::Session for Session {
         // datagram (returning `Ok` — an unreliable datagram is meant to be
         // droppable) rather than block or grow without bound. A closed lane means
         // the session is gone.
-        match self.outbound_datagram.try_send(payload) {
+        match self.outbound_datagram.try_push(payload) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+            Err(kio::PushError::Full(_)) => Ok(()),
+            Err(kio::PushError::Closed(_)) => Err(Error::Closed),
         }
     }
 
@@ -2018,13 +2074,114 @@ impl generic::Session for Session {
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        self.recv_datagram.recv().await.ok_or(Error::Closed)
+        self.recv_datagram.pop().await.map_err(|_| Error::Closed)
     }
 
     fn protocol(&self) -> Option<&str> {
         // The OnceLock holds the resolved protocol (out-of-band cases are set at
         // construction). `None` here means in-band negotiation is still pending.
         self.negotiated.get().and_then(|p| p.as_deref())
+    }
+}
+
+impl generic::poll::Session for Session {
+    type SendStream = SendStream;
+    type RecvStream = RecvStream;
+    type Error = Error;
+
+    fn poll_accept_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::RecvStream, Self::Error>> {
+        let waiter = self.waiter_accept_uni.register(cx);
+        self.accept_uni
+            .poll_pop(waiter)
+            .map(|result| result.map_err(|_| Error::Closed))
+    }
+
+    fn poll_accept_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<generic::poll::BiStreams<Self>, Self::Error>> {
+        let waiter = self.waiter_accept_bi.register(cx);
+        self.accept_bi
+            .poll_pop(waiter)
+            .map(|result| result.map_err(|_| Error::Closed))
+    }
+
+    fn poll_open_uni(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, Self::Error>> {
+        // Claiming the index and registering the stream happen in one synchronous
+        // step, so nothing is retained across a `Pending`.
+        let waiter = self.waiter_open_uni.register(cx);
+        match self.open_uni_credit.poll_claim_index(waiter) {
+            Poll::Ready(Ok(index)) => Poll::Ready(Ok(self.open_uni_at(index))),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_open_bi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<generic::poll::BiStreams<Self>, Self::Error>> {
+        let waiter = self.waiter_open_bi.register(cx);
+        match self.open_bi_credit.poll_claim_index(waiter) {
+            Poll::Ready(Ok(index)) => Poll::Ready(Ok(self.open_bi_at(index))),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_send_datagram(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        let max = self.datagram_max_size.load(Ordering::Acquire);
+        if max == 0 {
+            return Poll::Ready(Err(Error::DatagramsUnsupported));
+        }
+        if payload.len() > max {
+            return Poll::Ready(Err(Error::FrameTooLarge));
+        }
+        // Unlike the fire-and-forget `send_datagram`, the poll contract waits for
+        // room instead of shedding, so a caller can apply backpressure. The
+        // payload is only copied once the lane accepts it.
+        let waiter = self.waiter_send_datagram.register(cx);
+        self.outbound_datagram
+            .poll_push_with(waiter, || Bytes::copy_from_slice(payload))
+            .map(|result| result.map_err(|_| Error::Closed))
+    }
+
+    fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>> {
+        let waiter = self.waiter_recv_datagram.register(cx);
+        self.recv_datagram
+            .poll_pop(waiter)
+            .map(|result| result.map_err(|_| Error::Closed))
+    }
+
+    fn max_datagram_size(&self) -> usize {
+        generic::Session::max_datagram_size(self)
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        generic::Session::protocol(self)
+    }
+
+    fn close(&mut self, code: u32, reason: &str) {
+        generic::Session::close(self, code, reason)
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Self::Error> {
+        let waiter = self.waiter_closed.register(cx);
+        poll_closed_state(&self.closed, waiter)
+    }
+
+    fn stats(&self) -> impl generic::Stats {
+        generic::StatsUnavailable
     }
 }
 
@@ -2068,7 +2225,7 @@ pub struct SendStream {
     id: StreamId,
 
     outbound: PriorityQueue,                         // STREAM
-    outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
+    outbound_priority: Deque<Frame>, // RESET_STREAM
     shared: kio::Shared<SendShared>,
 
     offset: u64,
@@ -2111,7 +2268,7 @@ impl SendStream {
             // the wire. The reset final size only consumes transmitted bytes.
             let dropped = self.outbound.remove(self.id);
             self.release_credit(dropped);
-            self.outbound_priority.send(frame.into()).ok();
+            self.outbound_priority.try_push(frame.into()).ok();
         }
         self.closed = Some(error.clone());
 
@@ -2314,7 +2471,7 @@ impl generic::SendStream for SendStream {
         // congestion window on a stream the peer has abandoned.
         let dropped = self.outbound.remove(self.id);
         self.release_credit(dropped);
-        self.outbound_priority.send(frame.into()).ok();
+        self.outbound_priority.try_push(frame.into()).ok();
         self.closed = Some(Error::StreamReset(code));
     }
 
@@ -2422,7 +2579,7 @@ pub struct RecvStream {
     id: StreamId,
     version: Version,
 
-    outbound_priority: mpsc::UnboundedSender<Frame>, // STOP_SENDING
+    outbound_priority: Deque<Frame>, // STOP_SENDING
     shared: kio::Shared<RecvShared>,
 
     closed: Option<Error>,
@@ -2463,13 +2620,13 @@ impl RecvStream {
                 id: self.id,
                 max: new_max,
             };
-            self.outbound_priority.send(frame).ok();
+            self.outbound_priority.try_push(frame).ok();
         }
 
         // Connection-level window update
         if let Some(new_max) = self.conn_recv_credit.consume(len) {
             let frame = Frame::MaxData(new_max);
-            self.outbound_priority.send(frame).ok();
+            self.outbound_priority.try_push(frame).ok();
         }
     }
 
@@ -2571,7 +2728,7 @@ impl Drop for RecvStream {
                     StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
                     StreamDir::Uni => Frame::MaxStreamsUni(new_max),
                 };
-                self.outbound_priority.send(frame).ok();
+                self.outbound_priority.try_push(frame).ok();
             }
         }
     }
@@ -2610,7 +2767,7 @@ impl generic::RecvStream for RecvStream {
         let code = VarInt::from(code);
         let frame = StopSending { id: self.id, code };
 
-        self.outbound_priority.send(frame.into()).ok();
+        self.outbound_priority.try_push(frame.into()).ok();
         self.closed = Some(Error::StreamStop(code));
     }
 
@@ -2697,8 +2854,6 @@ mod timer_tests {
     };
     use std::time::Duration;
 
-    use tokio::sync::{mpsc, watch};
-
     use super::TimerState;
     use crate::Error;
 
@@ -2707,9 +2862,7 @@ mod timer_tests {
         reader_backpressured: Arc<AtomicBool>,
         last_recv_at: Arc<AtomicU64>,
         last_send_at: Arc<AtomicU64>,
-        closed: watch::Sender<Option<Error>>,
-        // Kept alive so the control lane the timer pings on doesn't close under it.
-        _control_rx: mpsc::UnboundedReceiver<crate::Frame>,
+        closed: kio::Shared<Option<Error>>,
     }
 
     /// Spawn a timer with `idle_ms`, already established, its last-activity clocks
@@ -2721,9 +2874,9 @@ mod timer_tests {
         let reader_backpressured = Arc::new(AtomicBool::new(false));
         let writer_backpressured = Arc::new(AtomicBool::new(false));
         let idle_timeout_ms = Arc::new(AtomicU64::new(idle_ms));
-        let (control, _control_rx) = mpsc::unbounded_channel();
-        let closed = watch::Sender::new(None);
-        let (_est_tx, established) = watch::channel(true);
+        let control = kio::Deque::new();
+        let closed = kio::Shared::new(None);
+        let established = kio::Shared::new(true);
 
         let timer = TimerState {
             base,
@@ -2744,15 +2897,11 @@ mod timer_tests {
             last_recv_at,
             last_send_at,
             closed,
-            _control_rx,
         }
     }
 
     async fn closed_reason(h: &Harness) -> Error {
-        let mut rx = h.closed.subscribe();
-        rx.wait_for(|s| s.is_some()).await.unwrap();
-        let reason = rx.borrow().clone().unwrap();
-        reason
+        super::closed_reason(&h.closed).await
     }
 
     /// A genuinely idle peer (no backpressure) is closed once the idle window
@@ -2779,7 +2928,7 @@ mod timer_tests {
         // Past the raw 100ms window but within the one-window grace: still open.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.read().is_none(),
             "idle-close must be deferred while the reader is backpressured"
         );
 
@@ -2805,7 +2954,7 @@ mod timer_tests {
             h.last_recv_at.store(elapsed, Ordering::Release);
         }
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.read().is_none(),
             "a peer that keeps sending must not be idle-closed"
         );
     }
@@ -2830,7 +2979,7 @@ mod timer_tests {
             }
         }
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.read().is_none(),
             "a one-way sender whose peer still answers must not be idle-closed"
         );
     }
@@ -2901,7 +3050,7 @@ mod negotiate_tests {
 #[cfg(test)]
 mod send_offset_tests {
     use bytes::Bytes;
-    use tokio::sync::mpsc;
+    use kio::Deque;
     use web_transport_trait::SendStream as _;
 
     use super::SendStream;
@@ -2912,7 +3061,7 @@ mod send_offset_tests {
     async fn sequential_writes_and_fin_carry_send_offsets() {
         let id = StreamId::new(0, StreamDir::Uni, false);
         let outbound = PriorityQueue::new(3);
-        let (control, _control_rx) = mpsc::unbounded_channel();
+        let control = Deque::new();
         let mut send = SendStream {
             id,
             outbound: outbound.clone(),
@@ -2960,7 +3109,7 @@ mod send_offset_tests {
 #[cfg(test)]
 mod write_cancel_tests {
     use bytes::{Buf, Bytes};
-    use tokio::sync::mpsc;
+    use kio::Deque;
     use web_transport_trait::SendStream as _;
 
     use super::SendStream;
@@ -2973,7 +3122,7 @@ mod write_cancel_tests {
         stream_credit: Option<Credit>,
         conn_credit: Option<Credit>,
     ) -> SendStream {
-        let (control, _control_rx) = mpsc::unbounded_channel();
+        let control = Deque::new();
         SendStream {
             id: StreamId::new(0, StreamDir::Uni, false),
             outbound,

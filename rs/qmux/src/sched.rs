@@ -97,6 +97,7 @@ impl PriorityQueue {
     ///
     /// Cancel-safe: the slot is claimed synchronously right before returning, so
     /// dropping this future reserves nothing.
+    #[cfg(test)]
     pub async fn reserve(&self) -> Result<Permit, Error> {
         kio::wait(|waiter| self.poll_reserve(waiter)).await
     }
@@ -168,6 +169,7 @@ impl PriorityQueue {
     /// Pop the next frame to send, honoring priority then round-robin fairness
     /// among equal-priority streams. Blocks until a frame is available or the
     /// queue is closed (returns `None` once closed and drained).
+    #[cfg(test)]
     pub async fn pop(&self) -> Option<Frame> {
         kio::wait(|waiter| self.poll_pop(waiter)).await
     }
