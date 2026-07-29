@@ -22,6 +22,9 @@ wss = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-native-roots"]
 [dependencies]
 bytes = "1"
 futures = { version = "0.3", optional = true }
+# TODO(kio-release): switch to the crates.io release once moq-dev/moq#2560
+# (WaiterCell + Deque) ships in a published kio version.
+kio = { git = "https://github.com/moq-dev/moq", rev = "c844ed2e2fadf60963c15fd99793b842cdc17e51" }
 rustls = { version = "0.23", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
