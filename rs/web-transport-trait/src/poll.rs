@@ -102,9 +102,11 @@ pub trait Session {
     /// Returns [`Poll::Pending`] while the transport has no room for it, so a caller
     /// can wait for capacity rather than having the payload dropped underneath it.
     ///
-    /// `payload` is taken by reference because a [`Poll::Pending`] return means the
-    /// caller retries with the same datagram; an implementation clones it — a
-    /// refcount bump — only once it has accepted it.
+    /// `payload` is taken by reference, not by value or as a [`Buf`]: a
+    /// [`Poll::Pending`] return means the caller retries with the same datagram, and
+    /// both of those would have consumed it. (A datagram also needs *contiguous*
+    /// bytes, and the only way to get those from a generic [`Buf`] is
+    /// [`Buf::copy_to_bytes`], which consumes.)
     ///
     /// Accepting a datagram is not delivery. QUIC datagrams may still be dropped:
     /// - Network congestion.
@@ -115,8 +117,22 @@ pub trait Session {
     fn poll_send_datagram(
         &mut self,
         cx: &mut Context<'_>,
-        payload: &Bytes,
+        payload: &[u8],
     ) -> Poll<Result<(), Self::Error>>;
+
+    /// Poll to send a datagram the caller already owns as a [`Bytes`].
+    ///
+    /// The default copies through [`poll_send_datagram`](Self::poll_send_datagram).
+    /// Override it when the transport can take the [`Bytes`] as-is, so a caller
+    /// holding one is not charged a copy — the same split as
+    /// [`SendStream::poll_write`] and a zero-copy chunk write.
+    fn poll_send_datagram_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: &Bytes,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.poll_send_datagram(cx, payload)
+    }
 
     /// Poll for a datagram from the network.
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>>;

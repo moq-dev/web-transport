@@ -973,6 +973,25 @@ impl Session {
         ))
     }
 
+    fn send_datagram_framed(
+        &mut self,
+        cx: &mut Context<'_>,
+        payload: Bytes,
+    ) -> Poll<Result<(), SessionError>> {
+        let conn = self.conn.clone();
+        let payload = Self::frame_datagram(&self.header_datagram, payload);
+        let error = self.error.clone();
+
+        // `send_datagram_wait` is what makes this pollable rather than a drop: it
+        // parks until the transport has room. Retained, because its `Notify`
+        // registration lives in the future.
+        self.op_send_datagram.poll(cx, move || async move {
+            conn.send_datagram_wait(payload)
+                .await
+                .map_err(|e| Session::map_error_owned(&error, e))
+        })
+    }
+
     // Prepend the session ID, as `send_datagram`/`send_datagram_wait` do.
     fn frame_datagram(header: &Bytes, data: Bytes) -> Bytes {
         if header.is_empty() {
@@ -1086,20 +1105,21 @@ impl web_transport_trait::poll::Session for Session {
     fn poll_send_datagram(
         &mut self,
         cx: &mut Context<'_>,
+        payload: &[u8],
+    ) -> Poll<Result<(), SessionError>> {
+        // Quinn's datagram API needs an owned `Bytes`, so a slice costs a copy here.
+        // Callers holding a `Bytes` should use `poll_send_datagram_chunk`, which is
+        // overridden below to avoid it.
+        self.send_datagram_framed(cx, Bytes::copy_from_slice(payload))
+    }
+
+    fn poll_send_datagram_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
         payload: &Bytes,
     ) -> Poll<Result<(), SessionError>> {
-        let conn = self.conn.clone();
-        let payload = Self::frame_datagram(&self.header_datagram, payload.clone());
-        let error = self.error.clone();
-
-        // `send_datagram_wait` is what makes this pollable rather than a drop: it
-        // parks until the transport has room. Retained, because its `Notify`
-        // registration lives in the future.
-        self.op_send_datagram.poll(cx, move || async move {
-            conn.send_datagram_wait(payload)
-                .await
-                .map_err(|e| Session::map_error_owned(&error, e))
-        })
+        // Free on the raw path, where there is no session-ID header to prepend.
+        self.send_datagram_framed(cx, payload.clone())
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {

@@ -301,7 +301,7 @@ impl Session for LocalSession {
     fn poll_send_datagram(
         &mut self,
         cx: &mut Context<'_>,
-        payload: &Bytes,
+        payload: &[u8],
     ) -> Poll<Result<(), LocalError>> {
         let mut inbox = self.tx.borrow_mut();
         if inbox.closed {
@@ -313,7 +313,7 @@ impl Session for LocalSession {
             inbox.park(cx);
             return Poll::Pending;
         }
-        inbox.datagrams.push_back(payload.clone());
+        inbox.datagrams.push_back(Bytes::copy_from_slice(payload));
         inbox.wake();
         Poll::Ready(Ok(()))
     }
@@ -451,7 +451,7 @@ fn datagrams_round_trip() {
     assert!(server.poll_recv_datagram(&mut cx).is_pending());
 
     let payload = Bytes::from_static(b"dgram");
-    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
+    ready(client.poll_send_datagram_chunk(&mut cx, &payload)).unwrap();
     let datagram = ready(server.poll_recv_datagram(&mut cx)).unwrap();
     assert_eq!(&datagram[..], b"dgram");
 }
