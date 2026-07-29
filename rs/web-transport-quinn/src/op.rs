@@ -34,6 +34,25 @@ pub(crate) struct Op<T> {
 }
 
 impl<T: 'static> Op<T> {
+    /// Poll an operation already in flight, if there is one.
+    ///
+    /// `Some` is its result; `None` means the slot is idle and the caller should
+    /// start one. This exists so a caller can build the future's arguments only when
+    /// they will actually be used — `poll` takes them eagerly, and `make` is ignored
+    /// while something is already in flight.
+    pub(crate) fn poll_pending(&mut self, cx: &mut Context<'_>) -> Option<Poll<T>> {
+        let slot = self.future.get_mut().unwrap();
+        let future = slot.as_mut()?;
+
+        match future.as_mut().poll(cx) {
+            Poll::Pending => Some(Poll::Pending),
+            Poll::Ready(output) => {
+                *slot = None;
+                Some(Poll::Ready(output))
+            }
+        }
+    }
+
     /// Poll the operation in progress, starting one with `make` when idle.
     ///
     /// `make` is only called when there is nothing in flight, so the caller can
@@ -72,6 +91,8 @@ impl<T> std::fmt::Debug for Op<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::task::Poll;
+
     use super::Op;
 
     /// The reason `Op` holds a `Mutex`. Every backend `Session` was `Send + Sync`
@@ -81,5 +102,32 @@ mod tests {
     fn op_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Op<()>>();
+    }
+
+    #[test]
+    fn poll_pending_reports_an_idle_slot() {
+        let mut op = Op::<()>::default();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(op.poll_pending(&mut cx).is_none(), "nothing started yet");
+    }
+
+    /// Why callers check `poll_pending` before building arguments: once an operation
+    /// is in flight, `poll` ignores `make` entirely. A caller that computed its
+    /// argument first would allocate it on every poll and then silently discard it —
+    /// and if the argument had *changed*, the change would go missing with no error.
+    #[test]
+    fn an_in_flight_operation_ignores_later_arguments() {
+        let mut op = Op::default();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        // Start one that never finishes.
+        assert!(op.poll(&mut cx, std::future::pending::<u32>).is_pending());
+
+        // A second call hands over a different value; it must not take effect.
+        assert!(op.poll(&mut cx, || std::future::ready(2)).is_pending());
+
+        // And `poll_pending` sees the original, still in flight.
+        assert!(matches!(op.poll_pending(&mut cx), Some(Poll::Pending)));
     }
 }

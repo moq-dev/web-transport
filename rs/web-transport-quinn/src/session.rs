@@ -65,8 +65,6 @@ pub struct Session {
     // registration and we would never be woken. Each is per-clone, so cloning the
     // session is what gives you concurrent operations.
     //
-    // Accept is absent on purpose: `SessionAccept` already holds its stream
-    // persistently, so `poll_accept_*` forwards natively.
     // Only used by `Session::raw`, where there is no `SessionAccept` to forward to
     // and Quinn's own accept futures hold the registration.
     op_accept_uni: crate::op::Op<Result<RecvStream, SessionError>>,
@@ -240,39 +238,22 @@ impl Session {
 
     /// Open a new unidirectional stream. See [`quinn::Connection::open_uni`].
     pub async fn open_uni(&self) -> Result<SendStream, SessionError> {
-        let mut send = self.conn.open_uni().await.map_err(|e| self.map_error(e))?;
-
-        // Set the stream priority to max and then write the stream header.
-        // Otherwise the application could write data with lower priority than the header, resulting in queuing.
-        // Also the header is very important for determining the session ID without reliable reset.
-        send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_uni)
-            .await
-            .map_err(|e| self.map_error(e))?;
-
-        // Reset the stream priority back to the default of 0.
-        send.set_priority(0).ok();
-        Ok(SendStream::new(send, self.error.clone()))
+        Self::open_uni_owned(
+            self.conn.clone(),
+            self.header_uni.clone(),
+            self.error.clone(),
+        )
+        .await
     }
 
     /// Open a new bidirectional stream. See [`quinn::Connection::open_bi`].
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = self.conn.open_bi().await.map_err(|e| self.map_error(e))?;
-
-        // Set the stream priority to max and then write the stream header.
-        // Otherwise the application could write data with lower priority than the header, resulting in queuing.
-        // Also the header is very important for determining the session ID without reliable reset.
-        send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &self.header_bi)
-            .await
-            .map_err(|e| self.map_error(e))?;
-
-        // Reset the stream priority back to the default of 0.
-        send.set_priority(0).ok();
-        Ok((
-            SendStream::new(send, self.error.clone()),
-            RecvStream::new(recv, self.error.clone()),
-        ))
+        Self::open_bi_owned(
+            self.conn.clone(),
+            self.header_bi.clone(),
+            self.error.clone(),
+        )
+        .await
     }
 
     /// Asynchronously receives an application datagram from the remote peer.
@@ -281,27 +262,7 @@ impl Session {
     /// peer over the connection.
     /// It waits for a datagram to become available and returns the received bytes.
     pub async fn read_datagram(&self) -> Result<Bytes, SessionError> {
-        let mut datagram = self
-            .conn
-            .read_datagram()
-            .await
-            .map_err(|e| self.map_error(e))?;
-
-        let mut cursor = Cursor::new(&datagram);
-
-        if let Some(session_id) = self.session_id {
-            // We have to check and strip the session ID from the datagram.
-            let actual_id =
-                VarInt::decode(&mut cursor).map_err(|_| WebTransportError::UnknownSession)?;
-            if actual_id != session_id {
-                return Err(WebTransportError::UnknownSession.into());
-            }
-        }
-
-        // Return the datagram without the session ID.
-        let datagram = datagram.split_off(cursor.position() as usize);
-
-        Ok(datagram)
+        Self::read_datagram_owned(self.conn.clone(), self.session_id, self.error.clone()).await
     }
 
     /// Sends an application datagram to the remote peer.
@@ -978,6 +939,14 @@ impl Session {
         cx: &mut Context<'_>,
         payload: &[u8],
     ) -> Poll<Result<(), SessionError>> {
+        // Resume an in-flight send before touching `payload`. Framing first would
+        // allocate on every poll and then discard it, and would quietly ignore a
+        // caller that retried with a different datagram — the retained future
+        // already owns the one it started with.
+        if let Some(result) = self.op_send_datagram.poll_pending(cx) {
+            return result;
+        }
+
         let conn = self.conn.clone();
         // Quinn's datagram API needs an owned `Bytes` either way, and the HTTP/3 path
         // has to copy regardless to prepend the session ID.

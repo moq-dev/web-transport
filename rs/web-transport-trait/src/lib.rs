@@ -61,8 +61,9 @@ impl Stats for StatsUnavailable {}
 ///
 /// Deliberately *not* `Send + Sync`. Those are required by the async traits below,
 /// whose futures must be spawnable, and are declared there. The [`poll`] traits need
-/// neither, so a transport pinned to one thread can carry an error that borrows its
-/// connection state.
+/// neither, so a transport pinned to one thread can use an error type that is
+/// neither — one holding an [`std::rc::Rc`] to shared connection state, say.
+/// (Still `'static`, so an error cannot *borrow* that state.)
 pub trait Error: std::error::Error + 'static {
     /// Returns the error code and reason if this was an application error.
     ///

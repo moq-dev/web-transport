@@ -125,10 +125,10 @@ async fn datagrams_round_trip_through_the_poll_surface() -> Result<()> {
     Ok(())
 }
 
-/// A `Pending` open must be *resumed*, not restarted. Poll the open once against a
-/// waker that goes nowhere, then drive it to completion on a different one: if the
-/// implementation rebuilt its future per poll it would have dropped Quinn's notifier
-/// registration and this would hang.
+/// A `Pending` operation must be *resumed*, not restarted. Poll `poll_closed` once
+/// against a waker that goes nowhere, then drive it to completion on a different one:
+/// if the implementation rebuilt its close-wait future per poll it would have dropped
+/// Quinn's notifier registration and this would hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_operation_is_resumed_not_restarted() -> Result<()> {
     let (mut client, mut server) = pair().await?;
