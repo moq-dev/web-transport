@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
+    task::{Context, Poll},
 };
 
 use crate::config::Config;
@@ -480,6 +481,8 @@ impl<W: Writer> WriterState<W> {
             _ => None,
         };
 
+        // Retiring an entry marks its shared state closed, so a frontend parked
+        // on `closed()` learns the stream is done (no more signals will arrive).
         match &mut frame {
             Frame::ResetStream(reset) => {
                 // The frontend offset includes frames that may still be queued.
@@ -487,13 +490,18 @@ impl<W: Writer> WriterState<W> {
                 // final size must come from bytes this writer actually emitted.
                 if let Some(send) = self.streams.lock().unwrap().send.remove(&reset.id) {
                     reset.final_size = send.sent_offset;
+                    send.shared.lock().closed = true;
                 }
             }
             Frame::Stream(stream) if stream.fin => {
-                self.streams.lock().unwrap().send.remove(&stream.id);
+                if let Some(send) = self.streams.lock().unwrap().send.remove(&stream.id) {
+                    send.shared.lock().closed = true;
+                }
             }
             Frame::StopSending(stop) => {
-                self.streams.lock().unwrap().recv.remove(&stop.id);
+                if let Some(recv) = self.streams.lock().unwrap().recv.remove(&stop.id) {
+                    recv.shared.lock().closed = true;
+                }
             }
             _ => {}
         }
@@ -552,11 +560,10 @@ mod writer_final_size_tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let streams = Arc::new(Mutex::new(Streams::default()));
         let id = StreamId::new(0, StreamDir::Uni, false);
-        let (stopped, _stopped_rx) = mpsc::unbounded_channel();
         streams.lock().unwrap().send.insert(
             id,
             SendState {
-                inbound_stopped: stopped,
+                shared: kio::Shared::new(SendShared::default()),
                 sent_offset: 0,
                 stream_credit: None,
             },
@@ -617,20 +624,21 @@ mod writer_final_size_tests {
         let id = StreamId::new(0, StreamDir::Uni, false);
         let outbound = PriorityQueue::new(4);
         let (priority, _priority_rx) = mpsc::unbounded_channel();
-        let (_stopped, stopped_rx) = mpsc::unbounded_channel();
         let stream_credit = Credit::new(3);
         let conn_credit = Credit::new(3);
         let mut send = SendStream {
             id,
             outbound,
             outbound_priority: priority,
-            inbound_stopped: stopped_rx,
+            shared: kio::Shared::new(SendShared::default()),
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
             stream_credit: Some(stream_credit.clone()),
             conn_credit: Some(conn_credit.clone()),
+            waiter_write: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         };
 
         assert_eq!(
@@ -951,7 +959,8 @@ impl<R: Reader> SessionState<R> {
                 }
 
                 // Fast path: an existing stream. Check its window and deliver under
-                // a brief lock (never held across an await).
+                // a brief lock (never held across an await). Lock order is always
+                // `streams` then the stream's kio state, never the reverse.
                 {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.get_mut(&stream.id) {
@@ -960,17 +969,21 @@ impl<R: Reader> SessionState<R> {
                         }
                         recv.recv_offset += data_len;
                         // An empty STREAM without FIN carries no state beyond
-                        // opening the stream. Once the stream exists, queuing one
-                        // only allocates an unbounded-channel node without using
-                        // any flow-control credit.
+                        // opening the stream: nothing to buffer, no flag to flip.
                         if data_len == 0 && !stream.fin {
                             return Ok(());
                         }
-                        let id = stream.id;
-                        let fin = stream.fin;
-                        recv.inbound_data.send(stream).ok();
-                        if fin {
-                            streams.recv.remove(&id);
+                        {
+                            let mut shared = recv.shared.lock();
+                            if !stream.data.is_empty() {
+                                shared.buffer.push_back(stream.data);
+                            }
+                            if stream.fin {
+                                shared.fin = true;
+                            }
+                        }
+                        if stream.fin {
+                            streams.recv.remove(&stream.id);
                         }
                         return Ok(());
                     }
@@ -1003,9 +1016,6 @@ impl<R: Reader> SessionState<R> {
                     .record(stream.id.index());
                 }
 
-                let (tx, rx) = mpsc::unbounded_channel();
-                let (tx2, rx2) = mpsc::unbounded_channel();
-
                 // Determine initial stream recv window
                 let recv_window = if self.config.version.is_qmux() {
                     match stream.id.dir() {
@@ -1023,9 +1033,22 @@ impl<R: Reader> SessionState<R> {
                     return Err(Error::FlowControlError);
                 }
 
+                // The first frame's payload (and FIN) seed the shared state, so the
+                // frontend can read them the moment it's accepted.
+                let fin = stream.fin;
+                let mut buffer = VecDeque::new();
+                if !stream.data.is_empty() {
+                    buffer.push_back(stream.data);
+                }
+                let shared = kio::Shared::new(RecvShared {
+                    buffer,
+                    fin,
+                    reset: None,
+                    closed: false,
+                });
+
                 let recv_backend = RecvState {
-                    inbound_data: tx,
-                    inbound_reset: tx2,
+                    shared: shared.clone(),
                     recv_credit: recv_credit.clone(),
                     recv_offset: data_len,
                 };
@@ -1041,16 +1064,15 @@ impl<R: Reader> SessionState<R> {
 
                 let recv_frontend = RecvStream {
                     id: stream.id,
-                    inbound_data: rx,
-                    inbound_reset: rx2,
+                    shared,
                     outbound_priority: self.control.clone(),
-                    buffer: VecDeque::new(),
                     closed: None,
-                    fin: false,
                     recv_credit,
                     conn_recv_credit: self.conn_recv_credit.clone(),
                     version: self.config.version,
                     recv_streams_credit,
+                    waiter_read: kio::WaiterCell::new(),
+                    waiter_closed: kio::WaiterCell::new(),
                 };
 
                 match stream.id.dir() {
@@ -1064,9 +1086,9 @@ impl<R: Reader> SessionState<R> {
                         result.map_err(|_| Error::Closed)?;
                     }
                     StreamDir::Bi => {
-                        let (tx, rx) = mpsc::unbounded_channel();
+                        let send_shared = kio::Shared::new(SendShared::default());
                         let send_backend = SendState {
-                            inbound_stopped: tx,
+                            shared: send_shared.clone(),
                             sent_offset: 0,
                             stream_credit: if self.config.version.is_qmux() {
                                 // Peer opened this bidi stream, so our send limit
@@ -1083,7 +1105,7 @@ impl<R: Reader> SessionState<R> {
                             id: stream.id,
                             outbound: self.outbound.clone(),
                             outbound_priority: self.control.clone(),
-                            inbound_stopped: rx,
+                            shared: send_shared,
                             offset: 0,
                             priority: 0,
                             closed: None,
@@ -1094,6 +1116,8 @@ impl<R: Reader> SessionState<R> {
                             } else {
                                 None
                             },
+                            waiter_write: kio::WaiterCell::new(),
+                            waiter_closed: kio::WaiterCell::new(),
                         };
 
                         self.streams
@@ -1110,16 +1134,11 @@ impl<R: Reader> SessionState<R> {
                     }
                 };
 
-                let id = stream.id;
-                let fin = stream.fin;
-                // The first empty non-FIN frame still opens the stream, but does
-                // not need to reach the application-facing receive queue.
-                if data_len > 0 || fin {
-                    recv_backend.inbound_data.send(stream).ok();
-                }
-
+                // The first frame's data and FIN already seeded the shared state;
+                // a FIN-bearing first frame is terminal, so only a live stream
+                // registers a backend for later frames.
                 if !fin {
-                    self.streams.lock().unwrap().recv.insert(id, recv_backend);
+                    self.streams.lock().unwrap().recv.insert(stream.id, recv_backend);
                 }
             }
             Frame::ResetStream(reset) => {
@@ -1218,7 +1237,7 @@ impl<R: Reader> SessionState<R> {
                 let delivered = {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.remove(&reset_id) {
-                        recv.inbound_reset.send(reset).ok();
+                        recv.shared.lock().reset = Some(reset.code);
                         true
                     } else {
                         false
@@ -1251,7 +1270,12 @@ impl<R: Reader> SessionState<R> {
                 }
 
                 if let Some(send) = self.streams.lock().unwrap().send.get(&stop.id) {
-                    send.inbound_stopped.send(stop).ok();
+                    let mut shared = send.shared.lock();
+                    // The first STOP_SENDING wins; a duplicate must not change the
+                    // code the frontend already surfaced.
+                    if shared.stop.is_none() {
+                        shared.stop = Some(stop.code);
+                    }
                 }
             }
             // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
@@ -1744,9 +1768,19 @@ impl Session {
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
             backend.outbound.close();
-            for send in backend.streams.lock().unwrap().send.values() {
-                if let Some(credit) = &send.stream_credit {
-                    credit.close();
+            // Explicitly close every live stream's shared state: kio state has no
+            // liveness of its own, so a frontend parked on a read or `closed()`
+            // learns of the teardown from this flag, not from a dropped channel.
+            {
+                let streams = backend.streams.lock().unwrap();
+                for send in streams.send.values() {
+                    if let Some(credit) = &send.stream_credit {
+                        credit.close();
+                    }
+                    send.shared.lock().closed = true;
+                }
+                for recv in streams.recv.values() {
+                    recv.shared.lock().closed = true;
                 }
             }
             // `send_replace`, not `send`: the latter drops the value when there
@@ -1803,8 +1837,6 @@ impl generic::Session for Session {
         let index = self.open_uni_credit.claim_index().await?;
         let id = StreamId::new(index, StreamDir::Uni, self.is_server);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-
         let stream_credit = if self.config.version.is_qmux() {
             // For uni streams we initiate, peer's uni limit applies
             Some(Credit::new(0)) // Will be set when peer params arrive
@@ -1812,8 +1844,9 @@ impl generic::Session for Session {
             None
         };
 
+        let send_shared = kio::Shared::new(SendShared::default());
         let send_backend = SendState {
-            inbound_stopped: tx,
+            shared: send_shared.clone(),
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1821,7 +1854,7 @@ impl generic::Session for Session {
             id,
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            shared: send_shared,
             offset: 0,
             priority: 0,
             closed: None,
@@ -1832,6 +1865,8 @@ impl generic::Session for Session {
             } else {
                 None
             },
+            waiter_write: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         };
 
         // Register the backend before returning the frontend, so the stream exists
@@ -1857,9 +1892,6 @@ impl generic::Session for Session {
         let index = self.open_bi_credit.claim_index().await?;
         let id = StreamId::new(index, StreamDir::Bi, self.is_server);
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (tx2, rx2) = mpsc::unbounded_channel();
-
         let stream_credit = if self.config.version.is_qmux() {
             // For bidi streams we initiate, peer's bidi_remote applies to our sends
             Some(Credit::new(0)) // Will be set when peer params arrive
@@ -1867,8 +1899,9 @@ impl generic::Session for Session {
             None
         };
 
+        let send_shared = kio::Shared::new(SendShared::default());
         let send_backend = SendState {
-            inbound_stopped: tx,
+            shared: send_shared.clone(),
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1876,7 +1909,7 @@ impl generic::Session for Session {
             id,
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            shared: send_shared,
             offset: 0,
             priority: 0,
             closed: None,
@@ -1887,33 +1920,33 @@ impl generic::Session for Session {
             } else {
                 None
             },
+            waiter_write: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         };
 
-        let (tx, rx) = mpsc::unbounded_channel();
         let recv_window = if self.config.version.is_qmux() {
             self.config.max_stream_data_bidi_local
         } else {
             u64::MAX
         };
         let recv_credit = Credit::new(recv_window);
+        let recv_shared = kio::Shared::new(RecvShared::default());
         let recv_backend = RecvState {
-            inbound_data: tx,
-            inbound_reset: tx2,
+            shared: recv_shared.clone(),
             recv_credit: recv_credit.clone(),
             recv_offset: 0,
         };
         let recv_frontend = RecvStream {
             id,
-            inbound_data: rx,
-            inbound_reset: rx2,
+            shared: recv_shared,
             outbound_priority: self.outbound_priority.clone(),
-            buffer: VecDeque::new(),
             closed: None,
-            fin: false,
             recv_credit,
             conn_recv_credit: self.conn_recv_credit.clone(),
             version: self.config.version,
             recv_streams_credit: None, // We initiated this stream, no stream count tracking
+            waiter_read: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         };
 
         // Register both backends before returning the frontends (see `open_uni`).
@@ -2010,8 +2043,21 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
     server.iter().find(|p| client.contains(p)).cloned()
 }
 
+/// Peer/backend signals that end a stream's send side, shared between the
+/// backend tasks and the [`SendStream`] frontend. kio-backed so the frontend can
+/// park on it — alone (`closed()`) or alongside the queue and credits it waits
+/// on during a write.
+#[derive(Debug, Default)]
+struct SendShared {
+    /// STOP_SENDING received from the peer (the first code wins).
+    stop: Option<VarInt>,
+    /// No more signals will ever arrive: the writer retired the stream (FIN or
+    /// RESET transmitted), or the session tore down.
+    closed: bool,
+}
+
 struct SendState {
-    inbound_stopped: mpsc::UnboundedSender<StopSending>,
+    shared: kio::Shared<SendShared>,
     /// Bytes that the writer has successfully put on the transport.
     sent_offset: u64,
     stream_credit: Option<Credit>,
@@ -2023,7 +2069,7 @@ pub struct SendStream {
 
     outbound: PriorityQueue,                         // STREAM
     outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
-    inbound_stopped: mpsc::UnboundedReceiver<StopSending>,
+    shared: kio::Shared<SendShared>,
 
     offset: u64,
     /// Scheduling priority (higher = sent first). Threaded into the queue on
@@ -2035,6 +2081,12 @@ pub struct SendStream {
     // Flow control (None for WebTransport version)
     stream_credit: Option<Credit>,
     conn_credit: Option<Credit>,
+
+    // Retained waiters for the `Context`-based poll trait methods, one per
+    // logical operation. The async methods don't use these (`kio::wait` retains
+    // its own).
+    waiter_write: kio::WaiterCell,
+    waiter_closed: kio::WaiterCell,
 }
 
 impl SendStream {
@@ -2076,55 +2128,131 @@ impl SendStream {
         }
     }
 
-    /// Try to claim flow control credit for sending `desired` bytes.
-    /// Returns the number of bytes we're allowed to send.
-    async fn claim_credit(&mut self, desired: u64) -> Result<u64, Error> {
-        let (stream_credit, conn_credit) = match (&self.stream_credit, &self.conn_credit) {
-            (Some(s), Some(c)) => (s, c),
-            _ => return Ok(desired), // No flow control
+    /// Poll one write step: reserve a queue slot and flow-control credit, then
+    /// move at most one frame's worth of `buf` into the outbound queue, returning
+    /// how many bytes were taken.
+    ///
+    /// Nothing is retained across a `Pending`: the queue slot and any partially
+    /// claimed credit go straight back, and `waiter` is left registered with the
+    /// stop signal plus whichever resource ran dry — so the retry re-claims from
+    /// scratch and `buf` is only ever consumed on the `Ready(Ok)` path, in the
+    /// same synchronous step that enqueues the frame (the poll-trait partial-write
+    /// contract, and what makes the async wrappers cancel-safe).
+    fn poll_write_step<B: Buf>(
+        &mut self,
+        waiter: &kio::Waiter,
+        buf: &mut B,
+    ) -> Poll<Result<usize, Error>> {
+        if let Some(error) = &self.closed {
+            return Poll::Ready(Err(error.clone()));
+        }
+        if self.fin {
+            return Poll::Ready(Err(Error::StreamClosed));
+        }
+        if !buf.has_remaining() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Surface a STOP_SENDING (or session teardown) first. While neither has
+        // happened this leaves `waiter` registered with the shared state, so a
+        // stop arriving while we're parked on capacity or credit re-polls us.
+        // (Matching on the poll expression drops its guard at the statement, so
+        // `recv_stop` below can borrow `self` mutably.)
+        let signal = match self.shared.poll(waiter, |shared| {
+            if shared.stop.is_some() || shared.closed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }) {
+            Poll::Ready(shared) => Some(shared.stop),
+            Poll::Pending => None,
+        };
+        if let Some(stop) = signal {
+            return Poll::Ready(Err(match stop {
+                Some(code) => self.recv_stop(code),
+                None => Error::Closed,
+            }));
+        }
+
+        // Reserve the queue slot before consuming anything from `buf`.
+        let permit = match self.outbound.poll_reserve(waiter) {
+            Poll::Ready(Ok(permit)) => permit,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
         };
 
-        loop {
-            // 1. Try to claim stream credit
-            let stream_claimed = stream_credit.try_claim(desired);
-            if stream_claimed == 0 {
-                // Wait for stream credit or stop_sending
-                tokio::select! {
-                    result = stream_credit.claim(desired) => {
-                        let claimed = result?;
-                        // Release and retry the full loop to coordinate with conn credit
-                        stream_credit.release(claimed);
+        let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
+
+        // Claim credit, stream then connection. A `Pending` from either releases
+        // everything claimed so far (the permit drops, returning its slot).
+        let allowed = match (&self.stream_credit, &self.conn_credit) {
+            (Some(stream), Some(conn)) => {
+                let stream_claimed = match stream.poll_claim(waiter, chunk_len) {
+                    Poll::Ready(Ok(claimed)) => claimed,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => return Poll::Pending,
+                };
+                match conn.poll_claim(waiter, stream_claimed) {
+                    Poll::Ready(Ok(claimed)) => {
+                        // Return excess stream credit if the connection had less.
+                        if claimed < stream_claimed {
+                            stream.release(stream_claimed - claimed);
+                        }
+                        claimed
                     }
-                    Some(stop) = self.inbound_stopped.recv() => {
-                        return Err(self.recv_stop(stop.code));
+                    Poll::Ready(Err(err)) => {
+                        stream.release(stream_claimed);
+                        return Poll::Ready(Err(err));
+                    }
+                    Poll::Pending => {
+                        stream.release(stream_claimed);
+                        return Poll::Pending;
                     }
                 }
-                continue;
             }
+            _ => chunk_len, // No flow control
+        };
 
-            // 2. Try to claim connection credit (may get less than stream_claimed)
-            let conn_claimed = conn_credit.try_claim(stream_claimed);
-            if conn_claimed == 0 {
-                stream_credit.release(stream_claimed);
-                tokio::select! {
-                    result = conn_credit.claim(1) => {
-                        let claimed = result?;
-                        conn_credit.release(claimed); // Release, retry full loop
-                    }
-                    Some(stop) = self.inbound_stopped.recv() => {
-                        return Err(self.recv_stop(stop.code));
-                    }
-                }
-                continue;
-            }
-
-            // Return excess stream credit if connection had less
-            if conn_claimed < stream_claimed {
-                stream_credit.release(stream_claimed - conn_claimed);
-            }
-
-            return Ok(conn_claimed);
+        // Committed: everything below is synchronous, so the bytes can't strand.
+        let to_send = allowed as usize;
+        let frame = Stream {
+            id: self.id,
+            offset: self.offset,
+            data: buf.copy_to_bytes(to_send),
+            fin: false,
+        };
+        if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
+            // The session closed while we held the permit; the data was never sent.
+            self.release_credit(to_send as u64);
+            return Poll::Ready(Err(err));
         }
+        self.offset += to_send as u64;
+        Poll::Ready(Ok(to_send))
+    }
+
+    /// Poll until the stream is closed by either side; see
+    /// [`generic::SendStream::closed`] for what that includes.
+    fn poll_closed_impl(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+        if let Some(error) = &self.closed {
+            return Poll::Ready(Err(error.clone()));
+        }
+
+        let stop = match self.shared.poll(waiter, |shared| {
+            if shared.stop.is_some() || shared.closed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }) {
+            Poll::Ready(shared) => shared.stop,
+            Poll::Pending => return Poll::Pending,
+        };
+
+        Poll::Ready(Err(match stop {
+            Some(code) => self.recv_stop(code),
+            None => Error::Closed,
+        }))
     }
 }
 
@@ -2147,50 +2275,14 @@ impl generic::SendStream for SendStream {
     }
 
     async fn write_buf<B: Buf + Send>(&mut self, buf: &mut B) -> Result<usize, Self::Error> {
-        if let Some(error) = &self.closed {
-            return Err(error.clone());
-        }
-
-        if self.fin {
-            return Err(Error::StreamClosed);
-        }
-
+        // Each step waits for queue capacity and flow-control credit *before*
+        // taking any bytes out of `buf` (see `poll_write_step`). Callers race this
+        // future against other work (moq re-prioritizes a stream mid-write), so a
+        // cancel between steps leaves `buf` exactly at the bytes already queued.
         let mut total = 0;
-
         while buf.has_remaining() {
-            let chunk_len = buf.chunk().len().min(MAX_FRAME_PAYLOAD) as u64;
-
-            // Wait for queue capacity and flow-control credit *before* taking any
-            // bytes out of `buf`. Callers race this future against other work (moq
-            // re-prioritizes a stream mid-write), so every await here has to leave
-            // the caller's buffer untouched: dropping the future returns the permit
-            // and claims no credit, and the caller just retries. Taking the bytes
-            // first and awaiting after would let a cancel strand them — gone from
-            // `buf` but never queued, a silent hole the peer decodes as garbage.
-            let permit = tokio::select! {
-                result = self.outbound.reserve() => result?,
-                Some(stop) = self.inbound_stopped.recv() => return Err(self.recv_stop(stop.code)),
-            };
-
-            let allowed = self.claim_credit(chunk_len).await?;
-            let to_send = allowed as usize;
-
-            // Committed: no await between taking the bytes and queueing them.
-            let frame = Stream {
-                id: self.id,
-                offset: self.offset,
-                data: buf.copy_to_bytes(to_send),
-                fin: false,
-            };
-            if let Err(err) = permit.send(self.priority, self.id, frame.into()) {
-                // The session closed while we held the permit; the data was never sent.
-                self.release_credit(to_send as u64);
-                return Err(err);
-            }
-            self.offset += to_send as u64;
-            total += to_send;
+            total += kio::wait(|waiter| self.poll_write_step(waiter, buf)).await?;
         }
-
         Ok(total)
     }
 
@@ -2250,20 +2342,77 @@ impl generic::SendStream for SendStream {
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
-        if let Some(error) = &self.closed {
-            return Err(error.clone());
-        }
-
-        match self.inbound_stopped.recv().await {
-            Some(stop) => Err(self.recv_stop(stop.code)),
-            None => Err(Error::Closed),
-        }
+        kio::wait(|waiter| self.poll_closed_impl(waiter)).await
     }
 }
 
+impl generic::poll::SendStream for SendStream {
+    type Error = Error;
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
+        let mut src = buf;
+        generic::poll::SendStream::poll_write_buf(self, cx, &mut src)
+    }
+
+    fn poll_write_buf<B: Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<Result<usize, Self::Error>> {
+        // Take the cell so its waiter can be borrowed while `self` runs the step.
+        let mut cell = std::mem::take(&mut self.waiter_write);
+        let result = self.poll_write_step(cell.register(cx), buf);
+        self.waiter_write = cell;
+        result
+    }
+
+    fn set_priority(&mut self, order: u8) {
+        generic::SendStream::set_priority(self, order)
+    }
+
+    fn finish(&mut self) -> Result<(), Self::Error> {
+        generic::SendStream::finish(self)
+    }
+
+    fn reset(&mut self, code: u32) {
+        generic::SendStream::reset(self, code)
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut cell = std::mem::take(&mut self.waiter_closed);
+        let result = self.poll_closed_impl(cell.register(cx));
+        self.waiter_closed = cell;
+        result
+    }
+}
+
+/// A receive stream's inbound state, shared between the reader task (producing)
+/// and the [`RecvStream`] frontend (draining). Merging the delivery channel and
+/// the frontend's read buffer into one kio-backed value means data lands where
+/// reads happen: `closed()` observing the FIN can't clobber unread data, and a
+/// read parks on the same state a reset or teardown flips.
+#[derive(Debug, Default)]
+struct RecvShared {
+    /// Received but unread chunks, in stream order.
+    ///
+    /// Under QMux the receive window bounds this: chunks are only charged to flow
+    /// control as they're read out. `Version::WebTransport` has no flow control,
+    /// so an unread stream is unbounded here.
+    buffer: VecDeque<Bytes>,
+
+    /// FIN received; the stream ends once `buffer` drains.
+    fin: bool,
+
+    /// RESET_STREAM received (the code). Mutually exclusive with `fin`: the
+    /// reader retires the stream on whichever arrives first.
+    reset: Option<VarInt>,
+
+    /// Session teardown: no more data or signals will ever arrive.
+    closed: bool,
+}
+
 pub(crate) struct RecvState {
-    inbound_data: mpsc::UnboundedSender<Stream>,
-    inbound_reset: mpsc::UnboundedSender<ResetStream>,
+    shared: kio::Shared<RecvShared>,
     recv_credit: Credit,
     recv_offset: u64,
 }
@@ -2274,21 +2423,9 @@ pub struct RecvStream {
     version: Version,
 
     outbound_priority: mpsc::UnboundedSender<Frame>, // STOP_SENDING
-    inbound_data: mpsc::UnboundedReceiver<Stream>,
-    inbound_reset: mpsc::UnboundedReceiver<ResetStream>,
-
-    /// Received but unread chunks, in stream order. A queue rather than a single
-    /// chunk because `closed` also drains STREAM frames to observe the FIN, so
-    /// data can arrive while a partially read chunk is still outstanding.
-    ///
-    /// Under QMux the receive window bounds this: chunks are only charged to flow
-    /// control as they're read out. `Version::WebTransport` has no flow control,
-    /// so an unread stream is unbounded there — but it already is upstream in
-    /// `inbound_data`, which this queue only drains from.
-    buffer: VecDeque<Bytes>,
+    shared: kio::Shared<RecvShared>,
 
     closed: Option<Error>,
-    fin: bool,
 
     // Flow control: per-stream and connection-level recv credit
     recv_credit: Credit,
@@ -2296,6 +2433,12 @@ pub struct RecvStream {
 
     // Stream count credit — consume(1) on drop triggers MAX_STREAMS
     recv_streams_credit: Option<Credit>,
+
+    // Retained waiters for the `Context`-based poll trait methods, one per
+    // logical operation. The async methods don't use these (`kio::wait` retains
+    // its own).
+    waiter_read: kio::WaiterCell,
+    waiter_closed: kio::WaiterCell,
 }
 
 impl RecvStream {
@@ -2306,33 +2449,6 @@ impl RecvStream {
 
         self.closed = Some(Error::StreamReset(code));
         Error::StreamReset(code)
-    }
-
-    /// Queue a received chunk for the application to read.
-    ///
-    /// Empty chunks are dropped so the queue head is always readable; a STREAM
-    /// frame can carry no payload (an empty FIN, for example), and its `fin` flag
-    /// is tracked separately.
-    fn recv_data(&mut self, data: Bytes) {
-        if !data.is_empty() {
-            self.buffer.push_back(data);
-        }
-    }
-
-    /// Take up to `max` bytes from the head of the queue, charging them to flow
-    /// control. Returns `None` only when nothing is buffered.
-    fn take_buffered(&mut self, max: usize) -> Option<Bytes> {
-        let chunk = self.buffer.front_mut()?;
-        let to_read = max.min(chunk.len());
-        let data = chunk.split_to(to_read);
-        if chunk.is_empty() {
-            self.buffer.pop_front();
-        }
-
-        // Report consumed bytes and send window updates if needed
-        self.report_consumed(to_read as u64);
-
-        Some(data)
     }
 
     /// Report consumed bytes to flow control, sending window updates as needed.
@@ -2356,11 +2472,95 @@ impl RecvStream {
             self.outbound_priority.send(frame).ok();
         }
     }
+
+    /// Poll for the next chunk, up to `max` bytes, charging what's taken to flow
+    /// control. Buffered data drains before a reset, FIN, or teardown is
+    /// surfaced, in that order.
+    fn poll_read_step(
+        &mut self,
+        waiter: &kio::Waiter,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Error>> {
+        if let Some(error) = &self.closed {
+            return Poll::Ready(Err(error.clone()));
+        }
+
+        // An empty destination is not end of stream (see the poll-trait docs).
+        if max == 0 {
+            return Poll::Ready(Ok(Some(Bytes::new())));
+        }
+
+        // Drain (or observe) under the guard, then act on `self` after the match
+        // statement has dropped it.
+        let outcome = match self.shared.poll(waiter, |shared| {
+            if !shared.buffer.is_empty() || shared.fin || shared.reset.is_some() || shared.closed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(mut shared) => match shared.buffer.front_mut() {
+                Some(chunk) => {
+                    let to_read = max.min(chunk.len());
+                    let data = chunk.split_to(to_read);
+                    if chunk.is_empty() {
+                        shared.buffer.pop_front();
+                    }
+                    Ok(data)
+                }
+                None => Err((shared.reset, shared.fin)),
+            },
+        };
+
+        Poll::Ready(match outcome {
+            Ok(data) => {
+                // Report consumed bytes and send window updates if needed.
+                self.report_consumed(data.len() as u64);
+                Ok(Some(data))
+            }
+            Err((Some(code), _fin)) => Err(self.recv_reset(code)),
+            Err((None, true)) => Ok(None),
+            Err((None, false)) => Err(Error::Closed),
+        })
+    }
+
+    /// Poll until the stream is closed by either side; see
+    /// [`generic::RecvStream::closed`] for what that includes. Unread data stays
+    /// buffered: observing the FIN here never consumes anything.
+    fn poll_closed_impl(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+        if let Some(error) = &self.closed {
+            return Poll::Ready(Err(error.clone()));
+        }
+
+        let (reset, fin) = match self.shared.poll(waiter, |shared| {
+            if shared.fin || shared.reset.is_some() || shared.closed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }) {
+            Poll::Ready(shared) => (shared.reset, shared.fin),
+            Poll::Pending => return Poll::Pending,
+        };
+
+        Poll::Ready(match reset {
+            Some(code) => Err(self.recv_reset(code)),
+            None if fin => Ok(()),
+            None => Err(Error::Closed),
+        })
+    }
 }
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if !self.fin && self.closed.is_none() {
+        // No STOP_SENDING once the peer already ended the stream (FIN or RESET):
+        // the backend has retired it and the frame would be post-terminal noise.
+        let ended = {
+            let shared = self.shared.read();
+            shared.fin || shared.reset.is_some()
+        };
+        if !ended && self.closed.is_none() {
             generic::RecvStream::stop(self, 0);
         }
 
@@ -2381,50 +2581,24 @@ impl generic::RecvStream for RecvStream {
     type Error = Error;
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-        loop {
-            if let Some(data) = self.take_buffered(max) {
-                return Ok(Some(data));
-            }
-
-            if self.fin {
-                return Ok(None);
-            }
-
-            if let Some(error) = &self.closed {
-                return Err(error.clone());
-            }
-
-            tokio::select! {
-                Some(stream) = self.inbound_data.recv() => {
-                    assert_eq!(stream.id, self.id);
-                    self.fin = stream.fin;
-                    self.recv_data(stream.data);
-                }
-                Some(reset) = self.inbound_reset.recv() => {
-                    return Err(self.recv_reset(reset.code));
-                }
-                else => return Err(Error::Closed),
-            }
-        }
+        kio::wait(|waiter| self.poll_read_step(waiter, max)).await
     }
 
     async fn read_buf<B: BufMut + Send>(
         &mut self,
         buf: &mut B,
     ) -> Result<Option<usize>, Self::Error> {
-        if let Some(data) = self.take_buffered(buf.remaining_mut()) {
-            let to_read = data.len();
-            buf.put(data);
-            return Ok(Some(to_read));
+        // A destination with no room is not a closed stream (see the trait docs).
+        if !buf.has_remaining_mut() {
+            return Ok(Some(0));
         }
-
         Ok(match self.read_chunk(buf.remaining_mut()).await? {
-            Some(data) if !data.is_empty() => {
+            Some(data) => {
                 let size = data.len();
                 buf.put(data);
                 Some(size)
             }
-            _ => None,
+            None => None,
         })
     }
 
@@ -2441,31 +2615,77 @@ impl generic::RecvStream for RecvStream {
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
-        if let Some(error) = &self.closed {
-            return Err(error.clone());
+        kio::wait(|waiter| self.poll_closed_impl(waiter)).await
+    }
+}
+
+impl generic::poll::RecvStream for RecvStream {
+    type Error = Error;
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        dst: &mut [u8],
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        let mut cell = std::mem::take(&mut self.waiter_read);
+        let result = self.poll_read_step(cell.register(cx), dst.len());
+        self.waiter_read = cell;
+
+        result.map(|result| {
+            result.map(|data| {
+                data.map(|data| {
+                    dst[..data.len()].copy_from_slice(&data);
+                    data.len()
+                })
+            })
+        })
+    }
+
+    fn poll_read_buf<B: BufMut>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut B,
+    ) -> Poll<Result<Option<usize>, Self::Error>> {
+        // A destination with no room is not a closed stream (see the trait docs).
+        if !buf.has_remaining_mut() {
+            return Poll::Ready(Ok(Some(0)));
         }
 
-        loop {
-            if self.fin {
-                return Ok(());
-            }
+        let max = buf.remaining_mut();
+        generic::poll::RecvStream::poll_read_chunk(self, cx, max).map(|result| {
+            result.map(|data| {
+                data.map(|data| {
+                    let size = data.len();
+                    // `put` handles a multi-chunk destination, so `max` may exceed
+                    // the first chunk without truncating the copy.
+                    buf.put(data);
+                    size
+                })
+            })
+        })
+    }
 
-            tokio::select! {
-                Some(reset) = self.inbound_reset.recv() => {
-                    return Err(self.recv_reset(reset.code));
-                }
-                // Observing the FIN means draining data frames, which have to
-                // queue behind anything a partial read left unread.
-                Some(stream) = self.inbound_data.recv() => {
-                    assert_eq!(stream.id, self.id);
-                    self.recv_data(stream.data);
-                    self.fin = stream.fin;
-                }
-                else => {
-                    return Err(Error::Closed);
-                }
-            }
-        }
+    /// Hands out the buffered [`Bytes`] directly, avoiding the default's copy.
+    fn poll_read_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        max: usize,
+    ) -> Poll<Result<Option<Bytes>, Self::Error>> {
+        let mut cell = std::mem::take(&mut self.waiter_read);
+        let result = self.poll_read_step(cell.register(cx), max);
+        self.waiter_read = cell;
+        result
+    }
+
+    fn stop(&mut self, code: u32) {
+        generic::RecvStream::stop(self, code)
+    }
+
+    fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let mut cell = std::mem::take(&mut self.waiter_closed);
+        let result = self.poll_closed_impl(cell.register(cx));
+        self.waiter_closed = cell;
+        result
     }
 }
 
@@ -2693,18 +2913,19 @@ mod send_offset_tests {
         let id = StreamId::new(0, StreamDir::Uni, false);
         let outbound = PriorityQueue::new(3);
         let (control, _control_rx) = mpsc::unbounded_channel();
-        let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
         let mut send = SendStream {
             id,
             outbound: outbound.clone(),
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            shared: kio::Shared::new(super::SendShared::default()),
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
             stream_credit: None,
             conn_credit: None,
+            waiter_write: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         };
 
         send.write(&[1, 2, 3]).await.unwrap();
@@ -2753,18 +2974,19 @@ mod write_cancel_tests {
         conn_credit: Option<Credit>,
     ) -> SendStream {
         let (control, _control_rx) = mpsc::unbounded_channel();
-        let (_stop_tx, stop_rx) = mpsc::unbounded_channel();
         SendStream {
             id: StreamId::new(0, StreamDir::Uni, false),
             outbound,
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            shared: kio::Shared::new(super::SendShared::default()),
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
             stream_credit,
             conn_credit,
+            waiter_write: kio::WaiterCell::new(),
+            waiter_closed: kio::WaiterCell::new(),
         }
     }
 
@@ -3105,7 +3327,7 @@ mod recv_open_tests {
             .expect("marker accept_uni failed");
 
         assert_eq!(
-            recv.inbound_data.len(),
+            recv.shared.read().buffer.len(),
             0,
             "empty non-FIN STREAM frames accumulated behind a stalled reader"
         );
