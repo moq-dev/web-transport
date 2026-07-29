@@ -13,7 +13,7 @@ use crate::transport::{Reader, Transport, Writer};
 use crate::{
     proto::{max_stream_payload, varint_size},
     ApplicationClose, ConnectionClose, Error, Frame, ResetStream, StopSending, Stream, StreamDir,
-    StreamId, TransportParams, Version, MAX_FRAME_SIZE,
+    StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE,
 };
 use bytes::{Buf, BufMut, Bytes};
 use tokio::sync::{mpsc, watch};
@@ -2212,10 +2212,11 @@ impl generic::SendStream for SendStream {
         let mut total = 0;
 
         while buf.has_remaining() {
-            // Fill the frame the peer accepts, less this frame's own header. The
-            // offset varint grows as the stream advances, so size it per frame.
+            // Size from the peer's frame budget and this frame's actual header,
+            // then apply the compatibility ceiling for released receivers.
             let max_payload =
-                max_stream_payload(self.version, self.frame_budget(), self.id, self.offset);
+                max_stream_payload(self.version, self.frame_budget(), self.id, self.offset)
+                    .min(MAX_FRAME_PAYLOAD as u64);
             if max_payload == 0 {
                 // Unreachable with a conforming peer: max_record_size is validated
                 // against the draft-01 minimum on arrival. Fail rather than loop.
@@ -3298,8 +3299,8 @@ mod recv_open_tests {
 }
 
 // STREAM frame sizing. What we accept is bounded by the `max_record_size` we
-// advertised (enforced on the record, not on the frame inside it), and what we
-// send is bounded by the peer's — measured per frame, not by a fixed reservation.
+// advertised (enforced on the record, not on the frame inside it). What we send
+// also keeps the compatibility ceiling required by released receivers.
 #[cfg(test)]
 mod stream_payload_tests {
     use std::sync::{Arc, Mutex};
@@ -3311,7 +3312,7 @@ mod stream_payload_tests {
 
     use super::{Reader, Session, Transport, Writer};
     use crate::proto::{Frame, Stream, DEFAULT_MAX_RECORD_SIZE};
-    use crate::{Config, Error, StreamDir, StreamId, Version};
+    use crate::{Config, Error, StreamDir, StreamId, Version, MAX_FRAME_PAYLOAD};
 
     /// A scripted transport that also keeps every record the session wrote, so a
     /// test can measure the frames it emitted.
@@ -3457,6 +3458,17 @@ mod stream_payload_tests {
         .expect("the session did not write the expected stream records")
     }
 
+    fn stream_payload_len(record: &Bytes) -> usize {
+        Frame::decode_record(record.clone())
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame {
+                Frame::Stream(stream) => Some(stream.data.len()),
+                _ => None,
+            })
+            .expect("record did not contain a STREAM frame")
+    }
+
     /// A record of exactly the `max_record_size` we advertised: a 5-byte STREAM
     /// header plus 16377 payload bytes. Refusing this refuses the very size the
     /// handshake invited — and a peer chunking at any other header budget (an
@@ -3508,10 +3520,10 @@ mod stream_payload_tests {
         assert!(matches!(err, Error::FrameTooLarge), "got {err:?}");
     }
 
-    /// The frames we emit have to reach the peer's limit: a fixed header
-    /// reservation would leave the tail of every record unused.
+    /// Released receivers enforce the historical payload ceiling even though the
+    /// record they advertise can hold a slightly larger STREAM frame.
     #[tokio::test]
-    async fn we_fill_the_record_the_peer_advertised() {
+    async fn stream_payloads_stay_within_the_released_receiver_ceiling() {
         let (session, peer) = scripted_session(Version::QMux01);
         peer.params(DEFAULT_MAX_RECORD_SIZE);
 
@@ -3524,35 +3536,12 @@ mod stream_payload_tests {
             .unwrap();
 
         let records = wait_for_stream_records(&peer, 1).await;
-        assert_eq!(records[0].len(), DEFAULT_MAX_RECORD_SIZE as usize);
+        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
     }
 
-    /// A budget that straddles a varint boundary still has to be filled exactly:
-    /// the length field describing the payload is narrower than one describing the
-    /// space left for it, and those two bytes are usable.
+    /// A larger peer record limit does not bypass the compatibility ceiling.
     #[tokio::test]
-    async fn we_fill_a_record_across_a_varint_boundary() {
-        const MAX_RECORD_SIZE: u64 = 16_387;
-
-        let (session, peer) = scripted_session(Version::QMux01);
-        peer.params(MAX_RECORD_SIZE);
-
-        let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
-            .await
-            .expect("open_uni timed out")
-            .expect("open_uni failed");
-        send.write(&vec![0x5a; MAX_RECORD_SIZE as usize * 2])
-            .await
-            .unwrap();
-
-        let records = wait_for_stream_records(&peer, 1).await;
-        assert_eq!(records[0].len(), MAX_RECORD_SIZE as usize);
-    }
-
-    /// The budget is the peer's, not a constant of ours, so a peer that accepts
-    /// more gets larger records.
-    #[tokio::test]
-    async fn we_fill_a_larger_record_when_the_peer_advertises_one() {
+    async fn larger_record_limit_keeps_the_compatibility_ceiling() {
         const MAX_RECORD_SIZE: u64 = 32_768;
 
         let (session, peer) = scripted_session(Version::QMux01);
@@ -3567,7 +3556,7 @@ mod stream_payload_tests {
             .unwrap();
 
         let records = wait_for_stream_records(&peer, 1).await;
-        assert_eq!(records[0].len(), MAX_RECORD_SIZE as usize);
+        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
     }
 }
 

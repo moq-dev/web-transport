@@ -1384,8 +1384,8 @@ describe("Session.accept (server role)", () => {
 });
 
 // STREAM frame sizing. What we accept is bounded by the `max_record_size` we
-// advertised (enforced on the record, not on the frame inside it), and what we
-// send is bounded by the peer's — measured per frame, not by a fixed reservation.
+// advertised (enforced on the record, not on the frame inside it). What we send
+// also keeps the compatibility ceiling required by released receivers.
 describe("STREAM frame size", () => {
 	afterEach(() => {
 		if (ORIGINAL_WSS === undefined) {
@@ -1498,9 +1498,7 @@ describe("STREAM frame size", () => {
 		expect(sentCloseCode(peer)).toBe(1002);
 	});
 
-	test("we fill the record the peer advertised", async () => {
-		// The frame we emit has to reach the peer's limit: a fixed header
-		// reservation would leave the tail of every record unused.
+	test("we keep STREAM payloads within the released-receiver ceiling", async () => {
 		const { session, peer } = connect();
 		await session.ready;
 		peer.send({ type: "transport_parameters", params: peerParams() });
@@ -1509,25 +1507,8 @@ describe("STREAM frame size", () => {
 		await writable.getWriter().write(new Uint8Array(Number(DEFAULT_MAX_RECORD_SIZE) * 2).fill(0x5a));
 
 		await waitFor(() => peer.has("stream"));
-		const records = peer.sent.filter((bytes) => Frame.decodeRecord(bytes).some((f) => f.type === "stream"));
-		expect(records[0].byteLength).toBe(Number(DEFAULT_MAX_RECORD_SIZE));
-		session.close();
-	});
-
-	test("we fill a record whose size straddles a varint boundary", async () => {
-		// The length field describing the payload is narrower than one describing
-		// the space left for it, and those two bytes are usable.
-		const maxRecordSize = 16_387n;
-		const { session, peer } = connect();
-		await session.ready;
-		peer.send({ type: "transport_parameters", params: peerParams({ maxRecordSize }) });
-
-		const writable = await session.createUnidirectionalStream();
-		await writable.getWriter().write(new Uint8Array(Number(maxRecordSize) * 2).fill(0x5a));
-
-		await waitFor(() => peer.has("stream"));
-		const records = peer.sent.filter((bytes) => Frame.decodeRecord(bytes).some((f) => f.type === "stream"));
-		expect(records[0].byteLength).toBe(Number(maxRecordSize));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data.byteLength).toBe(Frame.MAX_FRAME_PAYLOAD);
 		session.close();
 	});
 
@@ -1548,9 +1529,7 @@ describe("STREAM frame size", () => {
 		session.close();
 	});
 
-	test("we fill a larger record when the peer advertises one", async () => {
-		// The budget is the peer's, not a constant of ours, so a peer that accepts
-		// more gets larger records — and one that accepts less is never overrun.
+	test("a larger peer record limit does not bypass the compatibility ceiling", async () => {
 		const maxRecordSize = 32_768n;
 		const { session, peer } = connect();
 		await session.ready;
@@ -1560,8 +1539,8 @@ describe("STREAM frame size", () => {
 		await writable.getWriter().write(new Uint8Array(Number(maxRecordSize) * 2).fill(0x5a));
 
 		await waitFor(() => peer.has("stream"));
-		const records = peer.sent.filter((bytes) => Frame.decodeRecord(bytes).some((f) => f.type === "stream"));
-		expect(records[0].byteLength).toBe(Number(maxRecordSize));
+		const stream = peer.received().find((f) => f.type === "stream") as Frame.Data;
+		expect(stream.data.byteLength).toBe(Frame.MAX_FRAME_PAYLOAD);
 		session.close();
 	});
 });

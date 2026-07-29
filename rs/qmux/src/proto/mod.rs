@@ -23,13 +23,22 @@ pub use params::DEFAULT_MAX_RECORD_SIZE;
 /// only bounds draft-00 and the legacy WebTransport binding.
 pub const MAX_FRAME_SIZE: usize = 16384;
 
+/// Send-only compatibility ceiling for STREAM payloads on the currently
+/// supported wire formats.
+///
+/// Released peers historically enforce this value on receive. A future QMux wire
+/// version can remove the ceiling once it cannot negotiate with those peers.
+/// Never use this value to validate inbound frames.
+pub const MAX_FRAME_PAYLOAD: usize = MAX_FRAME_SIZE - 32;
+
 /// Largest STREAM payload that keeps the encoded frame within `budget` bytes.
 ///
 /// The budget is what the peer accepts for one frame — its `max_record_size` on
 /// the record-framed drafts, [`MAX_FRAME_SIZE`] otherwise — so the frame's own
 /// header comes out of it: the type, the stream ID, and (QMux only) the offset and
 /// the length varint. Header widths are the ones this frame actually encodes, not
-/// a worst-case reservation, so a chunk fills the record the peer advertised.
+/// a worst-case reservation. The session applies any send-only compatibility
+/// ceiling after calculating this exact peer budget.
 pub fn max_stream_payload(version: Version, budget: u64, id: StreamId, offset: u64) -> u64 {
     // The type is 0x0e/0x0f on QMux and 0x08/0x09 on the legacy binding: one byte
     // either way.

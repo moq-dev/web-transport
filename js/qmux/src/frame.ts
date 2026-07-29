@@ -16,6 +16,14 @@ export type WireFormat = "webtransport" | "qmux-00" | "qmux-01" | "qmux-02";
  * only bounds draft-00 and the legacy WebTransport binding. */
 export const MAX_FRAME_SIZE = 16384;
 
+/** Send-only compatibility ceiling for STREAM payloads on the currently
+ * supported wire formats.
+ *
+ * Released peers historically enforce this value on receive. A future QMux wire
+ * version can remove the ceiling once it cannot negotiate with those peers.
+ * Never use this value to validate inbound frames. */
+export const MAX_FRAME_PAYLOAD = MAX_FRAME_SIZE - 32;
+
 /** Largest value each varint width encodes (RFC 9000 §16). */
 const VARINT_MAX = [63n, 16383n, 1073741823n, 4611686018427387903n];
 
@@ -45,7 +53,8 @@ function maxLengthPrefixedPayload(available: bigint): bigint {
  * the record-framed drafts, {@link MAX_FRAME_SIZE} otherwise — so the frame's own
  * header comes out of it: the type, the stream ID, and (QMux only) the offset and
  * the length varint. Header widths are the ones this frame actually encodes, not
- * a worst-case reservation, so a chunk fills the record the peer advertised.
+ * a worst-case reservation. The session applies any send-only compatibility
+ * ceiling after calculating this exact peer budget.
  *
  * `budget` and the result are `bigint`: `max_record_size` is a varint, so a peer
  * may advertise up to 2^62-1, which `number` cannot hold exactly. */

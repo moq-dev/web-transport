@@ -1532,13 +1532,16 @@ export default class Session implements WebTransport {
 		return this.#paramsReceived ? this.#peerParams.maxRecordSize : Frame.DEFAULT_MAX_RECORD_SIZE;
 	}
 
-	/** The largest payload one STREAM frame at `offset` can carry to the peer.
+	/** The largest payload we may send in one STREAM frame at `offset`.
 	 *
-	 * A `bigint`: the peer's `max_record_size` is a varint, so it can exceed what
-	 * `number` holds exactly. Callers clamp it to the bytes they actually have
-	 * before converting. */
+	 * This respects the peer's frame budget and the send-only compatibility
+	 * ceiling for released receivers. A `bigint`: the peer's `max_record_size` is
+	 * a varint, so it can exceed what `number` holds exactly. Callers clamp it to
+	 * the bytes they actually have before converting. */
 	#maxStreamPayload(id: Stream.Id, offset: bigint): bigint {
-		const max = Frame.maxStreamPayload(this.#version, this.#sendFrameBudget(), id, offset);
+		const peerMax = Frame.maxStreamPayload(this.#version, this.#sendFrameBudget(), id, offset);
+		const compatibilityMax = BigInt(Frame.MAX_FRAME_PAYLOAD);
+		const max = peerMax < compatibilityMax ? peerMax : compatibilityMax;
 		// Unreachable with a conforming peer: max_record_size is validated against
 		// the draft-01 minimum on arrival. Guard anyway — a zero budget would make
 		// the chunking loops below spin forever instead of failing.
@@ -1573,8 +1576,8 @@ export default class Session implements WebTransport {
 
 		for (let offset = 0; offset < data.byteLength; ) {
 			const remaining = BigInt(data.byteLength - offset);
-			// Fill the frame the peer accepts, less this frame's own header. The
-			// offset varint grows as the stream advances, so size it per frame.
+			// Size from the peer's frame budget and this frame's actual header, then
+			// apply the compatibility ceiling for released receivers.
 			const payloadMax = this.#maxStreamPayload(id, flow.sendOffset);
 			const chunkMax = Number(payloadMax < remaining ? payloadMax : remaining);
 
