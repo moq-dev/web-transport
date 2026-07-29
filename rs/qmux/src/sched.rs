@@ -15,10 +15,10 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    task::Poll,
 };
 
-use tokio::sync::Notify;
+use kio::Waiter;
 
 use crate::{Error, Frame, StreamId};
 
@@ -59,13 +59,15 @@ impl Inner {
 /// session's writer loop (consumer) and its `SendStream`s (producers).
 ///
 /// Cloning shares the same underlying queue.
+///
+/// Backed by [`kio::Shared`], whose single waiter list covers both the consumer
+/// (waiting for a frame) and blocked producers (waiting for capacity): any
+/// mutation wakes everyone parked, and whoever finds their condition still
+/// unmet re-parks. That trades a few spurious wakeups for waker registrations
+/// that survive an abandoned poll — the property the poll-based callers need.
 #[derive(Clone)]
 pub struct PriorityQueue {
-    inner: Arc<Mutex<Inner>>,
-    /// Notified when a frame becomes available (or the queue is closed).
-    non_empty: Arc<Notify>,
-    /// Notified when capacity frees up (or the queue is closed).
-    has_space: Arc<Notify>,
+    state: kio::Shared<Inner>,
     capacity: usize,
 }
 
@@ -74,14 +76,12 @@ impl PriorityQueue {
     /// blocks. Outstanding [`Permit`]s count against the bound.
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            state: kio::Shared::new(Inner {
                 bands: BTreeMap::new(),
                 streams: HashMap::new(),
                 len: 0,
                 closed: false,
-            })),
-            non_empty: Arc::new(Notify::new()),
-            has_space: Arc::new(Notify::new()),
+            }),
             capacity,
         }
     }
@@ -98,27 +98,34 @@ impl PriorityQueue {
     /// Cancel-safe: the slot is claimed synchronously right before returning, so
     /// dropping this future reserves nothing.
     pub async fn reserve(&self) -> Result<Permit, Error> {
-        loop {
-            // Register interest *before* checking, so a `notify_one` that fires
-            // between our check and `.await` isn't lost.
-            let notified = self.has_space.notified();
-            {
-                let mut inner = self.inner.lock().unwrap();
+        kio::wait(|waiter| self.poll_reserve(waiter)).await
+    }
+
+    /// Poll to reserve one slot; see [`reserve`](Self::reserve) for the contract.
+    ///
+    /// Registers `waiter` while the queue is full, so a pop (or close) re-polls
+    /// the caller. Nothing is retained on `Pending`.
+    pub fn poll_reserve(&self, waiter: &Waiter) -> Poll<Result<Permit, Error>> {
+        self.state
+            .poll(waiter, |inner| {
+                if inner.closed || inner.len < self.capacity {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .map(|mut inner| {
                 if inner.closed {
                     return Err(Error::Closed);
                 }
-                if inner.len < self.capacity {
-                    // Hold the slot against the capacity bound until the permit
-                    // is used or dropped.
-                    inner.len += 1;
-                    return Ok(Permit {
-                        queue: self.clone(),
-                        armed: true,
-                    });
-                }
-            }
-            notified.await;
-        }
+                // Hold the slot against the capacity bound until the permit is
+                // used or dropped.
+                inner.len += 1;
+                Ok(Permit {
+                    queue: self.clone(),
+                    armed: true,
+                })
+            })
     }
 
     /// Enqueue a frame synchronously, bypassing the capacity bound — for small,
@@ -127,23 +134,23 @@ impl PriorityQueue {
     /// detached to a task (racing reset/teardown). The frame still lands in the
     /// stream's band, after its data. Fails only if the queue is closed.
     pub fn push_now(&self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.state.lock();
         if inner.closed {
             return Err(Error::Closed);
         }
-        self.push_locked(&mut inner, priority, id, frame);
+        Self::push_locked(&mut inner, priority, id, frame);
         Ok(())
     }
 
-    fn push_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
-        self.enqueue_locked(inner, priority, id, frame);
+    fn push_locked(inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
+        Self::enqueue_locked(inner, priority, id, frame);
         inner.len += 1;
     }
 
     /// Append `frame` to `id`'s FIFO without touching `len`. Callers own the
     /// capacity accounting: `push_now` bumps it after the fact, while a
     /// [`Permit`] already reserved its slot in `reserve`.
-    fn enqueue_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
+    fn enqueue_locked(inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
         match inner.streams.get_mut(&id) {
             Some(slot) => {
                 // Already scheduled (its band points at `id`); just append.
@@ -156,29 +163,34 @@ impl PriorityQueue {
                 inner.arm(id, priority);
             }
         }
-        self.non_empty.notify_one();
     }
 
     /// Pop the next frame to send, honoring priority then round-robin fairness
     /// among equal-priority streams. Blocks until a frame is available or the
     /// queue is closed (returns `None` once closed and drained).
     pub async fn pop(&self) -> Option<Frame> {
-        loop {
-            let notified = self.non_empty.notified();
-            {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(frame) = self.pop_locked(&mut inner) {
-                    return Some(frame);
-                }
-                if inner.closed {
-                    return None;
-                }
-            }
-            notified.await;
-        }
+        kio::wait(|waiter| self.poll_pop(waiter)).await
     }
 
-    fn pop_locked(&self, inner: &mut Inner) -> Option<Frame> {
+    /// Poll for the next frame; see [`pop`](Self::pop) for the contract.
+    ///
+    /// Registers `waiter` while the queue is empty, so a push (or close)
+    /// re-polls the caller. Nothing is consumed on `Pending`.
+    pub fn poll_pop(&self, waiter: &Waiter) -> Poll<Option<Frame>> {
+        self.state
+            .poll(waiter, |inner| {
+                // `bands`, not `len`: an outstanding permit counts against `len`
+                // without any frame to pop yet.
+                if inner.closed || !inner.bands.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .map(|mut inner| Self::pop_locked(&mut inner))
+    }
+
+    fn pop_locked(inner: &mut Inner) -> Option<Frame> {
         // Highest band first.
         let (&band, queue) = inner.bands.iter_mut().next_back()?;
         let id = queue.pop_front().expect("scheduled band must be non-empty");
@@ -207,7 +219,6 @@ impl PriorityQueue {
         }
 
         inner.len -= 1;
-        self.has_space.notify_one();
         Some(frame)
     }
 
@@ -215,7 +226,7 @@ impl PriorityQueue {
     /// scheduling pointer relocates from the old band to `new`. No-op if the
     /// stream has no queued frames.
     pub fn set_priority(&self, id: StreamId, new: u8) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.state.lock();
         let old = match inner.streams.get(&id) {
             Some(slot) => slot.priority,
             None => return,
@@ -247,7 +258,7 @@ impl PriorityQueue {
     /// the wire. Used when a stream is reset: buffered STREAM data must not trail
     /// RESET_STREAM. Returns zero if the stream has nothing queued.
     pub fn remove(&self, id: StreamId) -> u64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.state.lock();
         let Some(slot) = inner.streams.remove(&id) else {
             return 0;
         };
@@ -273,23 +284,17 @@ impl PriorityQueue {
         }
 
         inner.len -= removed;
-        drop(inner);
-        // Freed `removed` slots; wake that many blocked producers (mirrors the
-        // per-slot notify in `pop_locked`).
-        for _ in 0..removed {
-            self.has_space.notify_one();
-        }
+        // Dropping the guard wakes everyone parked, including producers blocked
+        // on the freed capacity.
         removed_bytes
     }
 
     /// Close the queue, unblocking any blocked producers and the consumer.
     pub fn close(&self) {
-        {
-            let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.state.lock();
+        if !inner.closed {
             inner.closed = true;
         }
-        self.non_empty.notify_waiters();
-        self.has_space.notify_waiters();
     }
 }
 
@@ -313,7 +318,7 @@ impl Permit {
     /// has already stopped popping, so enqueuing here would strand the frame and
     /// report success for data that will never be sent.
     pub fn send(mut self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
-        let mut inner = self.queue.inner.lock().unwrap();
+        let mut inner = self.queue.state.lock();
         if inner.closed {
             // Release the lock before returning: `self` still counts as armed, so
             // its `Drop` re-locks to hand the slot back.
@@ -322,7 +327,7 @@ impl Permit {
         }
         self.armed = false;
         // `reserve` already counted this frame against `len`.
-        self.queue.enqueue_locked(&mut inner, priority, id, frame);
+        PriorityQueue::enqueue_locked(&mut inner, priority, id, frame);
         Ok(())
     }
 }
@@ -332,11 +337,8 @@ impl Drop for Permit {
         if !self.armed {
             return;
         }
-        {
-            let mut inner = self.queue.inner.lock().unwrap();
-            inner.len -= 1;
-        }
-        self.queue.has_space.notify_one();
+        // Dropping the guard wakes producers blocked on the returned slot.
+        self.queue.state.lock().len -= 1;
     }
 }
 
