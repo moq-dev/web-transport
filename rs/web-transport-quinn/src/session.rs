@@ -976,9 +976,11 @@ impl Session {
     fn send_datagram_framed(
         &mut self,
         cx: &mut Context<'_>,
-        payload: Bytes,
+        payload: &[u8],
     ) -> Poll<Result<(), SessionError>> {
         let conn = self.conn.clone();
+        // Quinn's datagram API needs an owned `Bytes` either way, and the HTTP/3 path
+        // has to copy regardless to prepend the session ID.
         let payload = Self::frame_datagram(&self.header_datagram, payload);
         let error = self.error.clone();
 
@@ -993,16 +995,13 @@ impl Session {
     }
 
     // Prepend the session ID, as `send_datagram`/`send_datagram_wait` do.
-    fn frame_datagram(header: &Bytes, data: Bytes) -> Bytes {
-        if header.is_empty() {
-            return data;
-        }
-
-        // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
-        // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
+    //
+    // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
+    // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
+    fn frame_datagram(header: &Bytes, data: &[u8]) -> Bytes {
         let mut buf = BytesMut::with_capacity(header.len() + data.len());
         buf.extend_from_slice(header);
-        buf.extend_from_slice(&data);
+        buf.extend_from_slice(data);
         buf.into()
     }
 
@@ -1107,19 +1106,7 @@ impl web_transport_trait::poll::Session for Session {
         cx: &mut Context<'_>,
         payload: &[u8],
     ) -> Poll<Result<(), SessionError>> {
-        // Quinn's datagram API needs an owned `Bytes`, so a slice costs a copy here.
-        // Callers holding a `Bytes` should use `poll_send_datagram_chunk`, which is
-        // overridden below to avoid it.
-        self.send_datagram_framed(cx, Bytes::copy_from_slice(payload))
-    }
-
-    fn poll_send_datagram_chunk(
-        &mut self,
-        cx: &mut Context<'_>,
-        payload: &Bytes,
-    ) -> Poll<Result<(), SessionError>> {
-        // Free on the raw path, where there is no session-ID header to prepend.
-        self.send_datagram_framed(cx, payload.clone())
+        self.send_datagram_framed(cx, payload)
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {

@@ -451,7 +451,7 @@ fn datagrams_round_trip() {
     assert!(server.poll_recv_datagram(&mut cx).is_pending());
 
     let payload = Bytes::from_static(b"dgram");
-    ready(client.poll_send_datagram_chunk(&mut cx, &payload)).unwrap();
+    ready(client.poll_send_datagram(&mut cx, &payload)).unwrap();
     let datagram = ready(server.poll_recv_datagram(&mut cx)).unwrap();
     assert_eq!(&datagram[..], b"dgram");
 }

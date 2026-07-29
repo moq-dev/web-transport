@@ -12,7 +12,6 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use bytes::Bytes;
 use rcgen::{CertifiedKey, KeyPair};
 use web_transport_proto::ConnectRequest;
 use web_transport_quinn::quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -118,20 +117,10 @@ async fn a_bi_stream_round_trips_through_the_poll_surface() -> Result<()> {
 async fn datagrams_round_trip_through_the_poll_surface() -> Result<()> {
     let (mut client, mut server) = pair().await?;
 
-    // The zero-copy form, for a caller that already holds a `Bytes`.
-    let payload = Bytes::from_static(b"dgram");
-    poll_fn(|cx| client.poll_send_datagram_chunk(cx, &payload)).await?;
+    poll_fn(|cx| client.poll_send_datagram(cx, b"dgram")).await?;
 
     let received = poll_fn(|cx| server.poll_recv_datagram(cx)).await?;
     assert_eq!(&received[..], b"dgram");
-
-    // The caller still owns it, which is the point of taking it by reference.
-    assert_eq!(&payload[..], b"dgram");
-
-    // And the slice form, for a caller that does not.
-    poll_fn(|cx| client.poll_send_datagram(cx, b"slice")).await?;
-    let received = poll_fn(|cx| server.poll_recv_datagram(cx)).await?;
-    assert_eq!(&received[..], b"slice");
 
     Ok(())
 }

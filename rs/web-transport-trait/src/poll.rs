@@ -120,20 +120,6 @@ pub trait Session {
         payload: &[u8],
     ) -> Poll<Result<(), Self::Error>>;
 
-    /// Poll to send a datagram the caller already owns as a [`Bytes`].
-    ///
-    /// The default copies through [`poll_send_datagram`](Self::poll_send_datagram).
-    /// Override it when the transport can take the [`Bytes`] as-is, so a caller
-    /// holding one is not charged a copy — the same split as
-    /// [`SendStream::poll_write`] and a zero-copy chunk write.
-    fn poll_send_datagram_chunk(
-        &mut self,
-        cx: &mut Context<'_>,
-        payload: &Bytes,
-    ) -> Poll<Result<(), Self::Error>> {
-        self.poll_send_datagram(cx, payload)
-    }
-
     /// Poll for a datagram from the network.
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Self::Error>>;
 
