@@ -60,11 +60,12 @@ the stream-id space each side owns.
 
 `closed` follows the WebTransport contract:
 
-- **Fulfills** with `{ closeCode, reason }` when the session ends gracefully — a `CONNECTION_CLOSE`
-  arrived, from either side calling `close()`. That includes a peer that closes because *it* caught
-  a protocol violation: it told us why, so you get its close code and reason.
-- **Rejects** when the session ends abnormally, with no `CONNECTION_CLOSE`: the socket dropped, the
-  peer went idle, or *this* endpoint caught the peer violating the protocol.
+- **Fulfills** with `{ closeCode, reason }` on a graceful end: either side called `close()`, which
+  puts an `APPLICATION_CLOSE` (`0x1d`) on the wire.
+- **Rejects** on an abnormal end: a `CONNECTION_CLOSE` (`0x1c`) arrived — the transport variant a
+  peer sends when *it* caught a protocol violation — or no close frame arrived at all, because the
+  socket dropped or the peer went idle. This endpoint rejects the same way when it catches the peer
+  violating the protocol, and sends a `CONNECTION_CLOSE` so the peer rejects too.
 
 ```ts
 try {
@@ -76,8 +77,10 @@ try {
 }
 ```
 
-Don't reach for `closeCode` to tell the two apart — close codes are application-defined, so an app
-closing with `1006` is indistinguishable from a dropped socket. The settled state is the signal.
+Don't reach for `closeCode` to tell the two apart — close codes are application-defined, so a
+graceful close may carry any value, including one that looks like a violation, and an app closing
+with `1006` is indistinguishable from a dropped socket. Which frame arrived is the signal, and the
+settled state is how you read it.
 
 ### Stream reset codes
 
