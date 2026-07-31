@@ -1,7 +1,7 @@
 use futures::ready;
+use kio::Waiter;
 use std::{
     collections::VecDeque,
-    future::poll_fn,
     io,
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -11,7 +11,7 @@ use tokio_quiche::quiche;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::ez::DriverState;
+use crate::{ez::DriverState, waiters::Parked};
 
 use super::{Lock, StreamError, StreamId};
 
@@ -69,7 +69,7 @@ impl RecvState {
 
     pub fn poll_read_chunk(
         &mut self,
-        waker: &Waker,
+        waiter: &Waiter,
         max: usize,
     ) -> Poll<Result<Option<Bytes>, StreamError>> {
         if let Some(reset) = self.reset {
@@ -98,12 +98,14 @@ impl RecvState {
         }
 
         self.max = max;
-        self.blocked = Some(waker.clone());
+        // A stream has a single reader, so one slot is enough here — unlike the
+        // connection-wide lists, which every stream and accepter parks on.
+        self.blocked = Some(waiter.waker().clone());
 
         Poll::Pending
     }
 
-    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub fn poll_closed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
         if self.fin && self.queued.is_empty() {
             Poll::Ready(Ok(()))
         } else if let Some(reset) = self.reset {
@@ -111,7 +113,7 @@ impl RecvState {
         } else if let Some(stop) = self.stop {
             Poll::Ready(Err(StreamError::Stop(stop)))
         } else {
-            self.blocked = Some(waker.clone());
+            self.blocked = Some(waiter.waker().clone());
             Poll::Pending
         }
     }
@@ -222,11 +224,19 @@ pub struct RecvStream {
     id: StreamId,
     state: Lock<RecvState>,
     driver: Lock<DriverState>,
+
+    // For the `AsyncRead` impl, which is handed a `Context` rather than a waiter.
+    parked: Parked,
 }
 
 impl RecvStream {
     pub(super) fn new(id: StreamId, state: Lock<RecvState>, driver: Lock<DriverState>) -> Self {
-        Self { id, state, driver }
+        Self {
+            id,
+            state,
+            driver,
+            parked: Parked::default(),
+        }
     }
 
     /// Returns the QUIC stream ID.
@@ -248,7 +258,7 @@ impl RecvStream {
     ///
     /// Returns [None] if the stream has been finished by the remote.
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, StreamError> {
-        poll_fn(|cx| self.poll_read_chunk(cx.waker(), max)).await
+        kio::wait(|waiter| self.poll_read_chunk(waiter, max)).await
     }
 
     /// Poll to read some data into the buffer, returning the amount read.
@@ -256,10 +266,10 @@ impl RecvStream {
     /// Returns `None` if the stream has been finished by the remote.
     pub fn poll_read(
         &mut self,
-        waker: &Waker,
+        waiter: &Waiter,
         buf: &mut [u8],
     ) -> Poll<Result<Option<usize>, StreamError>> {
-        let chunk = ready!(self.poll_read_chunk(waker, buf.len()))?;
+        let chunk = ready!(self.poll_read_chunk(waiter, buf.len()))?;
 
         Poll::Ready(Ok(chunk.map(|chunk| {
             buf[..chunk.len()].copy_from_slice(&chunk);
@@ -272,17 +282,17 @@ impl RecvStream {
     /// Returns `None` if the stream has been finished by the remote.
     pub fn poll_read_chunk(
         &mut self,
-        waker: &Waker,
+        waiter: &Waiter,
         max: usize,
     ) -> Poll<Result<Option<Bytes>, StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_read_chunk(waker, max) {
+        if let Poll::Ready(res) = self.state.lock().poll_read_chunk(waiter, max) {
             return Poll::Ready(res);
         }
 
         let mut driver = self.driver.lock();
 
         // Check if the connection is closed.
-        if let Poll::Ready(res) = driver.error(waker) {
+        if let Poll::Ready(res) = driver.error(waiter) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -345,12 +355,12 @@ impl RecvStream {
     }
 
     /// Poll until the stream is closed by either side.
-    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_closed(waker) {
+    pub fn poll_closed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
+        if let Poll::Ready(res) = self.state.lock().poll_closed(waiter) {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().error(waker) {
+        if let Poll::Ready(res) = self.driver.lock().error(waiter) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -366,7 +376,7 @@ impl RecvStream {
     ///
     /// **NOTE**: This takes `&mut` to match quiche and slightly simplify the implementation.
     pub async fn closed(&mut self) -> Result<(), StreamError> {
-        poll_fn(|cx| self.poll_closed(cx.waker())).await
+        kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 }
 
@@ -393,7 +403,11 @@ impl AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        match ready!(self.poll_read_chunk(cx.waker(), buf.remaining())) {
+        let waiter = Waiter::new(cx.waker().clone());
+        let res = self.poll_read_chunk(&waiter, buf.remaining());
+        self.parked.park(waiter);
+
+        match ready!(res) {
             Ok(Some(chunk)) => buf.put_slice(&chunk),
             Ok(None) => {}
             Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),

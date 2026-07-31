@@ -32,6 +32,7 @@ mod error;
 mod recv;
 mod send;
 mod server;
+mod waiters;
 
 pub use client::*;
 pub use connection::*;
@@ -47,6 +48,10 @@ pub use ez::{
 
 pub use http;
 pub use web_transport_proto as proto;
+
+/// Re-export kio, whose [`Waiter`](kio::Waiter) is how a caller of [`SessionAccept`]'s
+/// poll methods holds its place in the accept queue.
+pub use kio;
 
 /// The ALPN used for WebTransport over HTTP/3.
 pub const ALPN: &str = "h3";

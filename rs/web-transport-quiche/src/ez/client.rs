@@ -272,9 +272,7 @@ impl Connecting {
     /// Returns the connection once the handshake is complete, or an error if the connection
     /// is closed before the handshake finishes.
     pub async fn established(self) -> Result<Connection, ConnectionError> {
-        use std::future::poll_fn;
-
-        poll_fn(|cx| self.driver.lock().poll_handshake(cx.waker())).await?;
+        kio::wait(|waiter| self.driver.lock().poll_handshake(waiter)).await?;
 
         Ok(self.connection)
     }

@@ -1,11 +1,16 @@
-use crate::{ez, h3, ClientError, RecvStream, SendStream, SessionError};
+use crate::{
+    ez, h3,
+    waiters::{AcceptWaiters, Parked},
+    ClientError, RecvStream, SendStream, SessionError,
+};
 
 use bytes::{Bytes, BytesMut};
 use futures::{stream::FuturesUnordered, Stream, StreamExt};
+use kio::Waiter;
 use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt};
 
 use std::{
-    future::{poll_fn, Future},
+    future::Future,
     io::Cursor,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -72,6 +77,16 @@ pub struct Connection {
     // "clone the session for concurrency".
     open_uni: OpenUni,
     open_bi: OpenBi,
+
+    // Both `SessionAccept` and `ez` hold their waiters weakly, so the handle this clone
+    // registered with has to outlive the poll that made it: one cell per operation,
+    // per-clone, like the state above.
+    parked_accept_uni: Parked,
+    parked_accept_bi: Parked,
+    parked_open_uni: Parked,
+    parked_open_bi: Parked,
+    parked_recv_datagram: Parked,
+    parked_closed: Parked,
 }
 
 /// Where an in-progress `poll_open_uni` got to.
@@ -148,6 +163,12 @@ impl Connection {
             settings: Some(Arc::new(settings)),
             open_uni: OpenUni::Idle,
             open_bi: OpenBi::Idle,
+            parked_accept_uni: Parked::default(),
+            parked_accept_bi: Parked::default(),
+            parked_open_uni: Parked::default(),
+            parked_open_bi: Parked::default(),
+            parked_recv_datagram: Parked::default(),
+            parked_closed: Parked::default(),
         };
 
         // Run a background task to check if the connect stream is closed.
@@ -213,7 +234,9 @@ impl Connection {
     /// Returns a [RecvStream] that can be used to read data from the stream.
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx)).await
+            // `kio::wait` owns the waiter, so dropping this future — a `timeout` that
+            // expires, say — also drops its registration in `SessionAccept`.
+            kio::wait(|waiter| accept.lock().unwrap().poll_accept_uni(waiter)).await
         } else {
             self.conn
                 .accept_uni()
@@ -229,7 +252,7 @@ impl Connection {
     /// Returns a ([SendStream], [RecvStream]) pair for sending and receiving data.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx)).await
+            kio::wait(|waiter| accept.lock().unwrap().poll_accept_bi(waiter)).await
         } else {
             self.conn
                 .accept_bi()
@@ -376,6 +399,12 @@ impl Connection {
             response: response.into(),
             open_uni: OpenUni::Idle,
             open_bi: OpenBi::Idle,
+            parked_accept_uni: Parked::default(),
+            parked_accept_bi: Parked::default(),
+            parked_open_uni: Parked::default(),
+            parked_open_bi: Parked::default(),
+            parked_recv_datagram: Parked::default(),
+            parked_closed: Parked::default(),
         }
     }
 
@@ -501,13 +530,16 @@ pub struct SessionAccept {
     pending_uni: FuturesUnordered<Pin<Box<PendingUni>>>,
     pending_bi: FuturesUnordered<Pin<Box<PendingBi>>>,
 
-    // Wakers from concurrent callers of accept_bi / accept_uni.
-    // When one caller gets a stream, all others are woken so they can retry.
-    // Every clone polls this one struct, which would otherwise keep only the most
-    // recent waker, so a second accepter would register through a waker the first
-    // had already replaced and never wake.
-    bi_wakers: Vec<Waker>,
-    uni_wakers: Vec<Waker>,
+    // Waiters from concurrent callers of accept_bi / accept_uni.
+    // Every clone of the session polls this one struct, so an arrival has to be fanned
+    // out: each caller registers here and all of them are woken when a stream lands.
+    bi_waiters: Arc<AcceptWaiters>,
+    uni_waiters: Arc<AcceptWaiters>,
+
+    // `Waker::from(waiters.clone())`, cached so the inner streams see the same waker
+    // every time — `ez` deduplicates by `will_wake`, so it parks exactly one.
+    bi_waker: Waker,
+    uni_waker: Waker,
 }
 
 impl SessionAccept {
@@ -521,6 +553,11 @@ impl SessionAccept {
             Some((conn.accept_bi().await, conn))
         }));
 
+        let bi_waiters = Arc::new(AcceptWaiters::default());
+        let uni_waiters = Arc::new(AcceptWaiters::default());
+        let bi_waker = Waker::from(bi_waiters.clone());
+        let uni_waker = Waker::from(uni_waiters.clone());
+
         Self {
             session_id,
 
@@ -533,18 +570,25 @@ impl SessionAccept {
             pending_uni: FuturesUnordered::new(),
             pending_bi: FuturesUnordered::new(),
 
-            bi_wakers: Vec::new(),
-            uni_wakers: Vec::new(),
+            bi_waiters,
+            uni_waiters,
+            bi_waker,
+            uni_waker,
         }
     }
 
     // This is poll-based because we accept and decode streams in parallel.
     // In async land I would use tokio::JoinSet, but that requires a runtime.
     // It's better to use FuturesUnordered instead because it's agnostic.
-    pub fn poll_accept_uni(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<RecvStream, SessionError>> {
+    pub fn poll_accept_uni(&mut self, waiter: &Waiter) -> Poll<Result<RecvStream, SessionError>> {
+        // Register before polling, not on the way out: the shared waker can fire from
+        // the `ez` driver at any point below, and a wake that lands before the caller
+        // is on the list would be lost.
+        self.uni_waiters.register(waiter);
+
+        let waker = self.uni_waker.clone();
+        let cx = &mut Context::from_waker(&waker);
+
         loop {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_uni.poll_next_unpin(cx) {
@@ -552,9 +596,7 @@ impl SessionAccept {
                 let recv = match res {
                     Ok(recv) => recv,
                     Err(e) => {
-                        for waker in self.uni_wakers.drain(..) {
-                            waker.wake();
-                        }
+                        self.uni_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -572,21 +614,14 @@ impl SessionAccept {
                     tracing::warn!(?err, "failed to decode unidirectional stream");
                     continue;
                 }
-                Poll::Ready(None) | Poll::Pending => {
-                    if !self.uni_wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                        self.uni_wakers.push(cx.waker().clone());
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
             };
 
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv);
-                    for waker in self.uni_wakers.drain(..) {
-                        waker.wake();
-                    }
+                    self.uni_waiters.wake_all();
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -630,8 +665,14 @@ impl SessionAccept {
 
     pub fn poll_accept_bi(
         &mut self,
-        cx: &mut Context<'_>,
+        waiter: &Waiter,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        // Register before polling; see `poll_accept_uni`.
+        self.bi_waiters.register(waiter);
+
+        let waker = self.bi_waker.clone();
+        let cx = &mut Context::from_waker(&waker);
+
         loop {
             // Accept any new streams.
             if let Poll::Ready(Some(res)) = self.accept_bi.poll_next_unpin(cx) {
@@ -639,9 +680,7 @@ impl SessionAccept {
                 let (send, recv) = match res {
                     Ok(pair) => pair,
                     Err(e) => {
-                        for waker in self.bi_wakers.drain(..) {
-                            waker.wake();
-                        }
+                        self.bi_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -659,21 +698,14 @@ impl SessionAccept {
                     tracing::warn!(?err, "failed to decode bidirectional stream");
                     continue;
                 }
-                Poll::Ready(None) | Poll::Pending => {
-                    if !self.bi_wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                        self.bi_wakers.push(cx.waker().clone());
-                    }
-                    return Poll::Pending;
-                }
+                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
             };
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
-                for waker in self.bi_wakers.drain(..) {
-                    waker.wake();
-                }
+                self.bi_waiters.wake_all();
                 return Poll::Ready(Ok((send, recv)));
             }
 
@@ -715,10 +747,14 @@ impl web_transport_trait::poll::Session for Connection {
     fn poll_accept_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, SessionError>> {
         match self.accept.clone() {
             // `SessionAccept` decodes stream headers, so it keeps its own state and
-            // waker list; forward to it.
-            Some(accept) => accept.lock().unwrap().poll_accept_uni(cx),
+            // waiter list; forward to it, holding on to our registration.
+            Some(accept) => {
+                let waiter = self.parked_accept_uni.hold(cx);
+                accept.lock().unwrap().poll_accept_uni(waiter)
+            }
             None => {
-                let recv = ready!(self.conn.poll_accept_uni(cx.waker()))?;
+                let waiter = self.parked_accept_uni.hold(cx);
+                let recv = ready!(self.conn.poll_accept_uni(waiter))?;
                 Poll::Ready(Ok(RecvStream::new(recv)))
             }
         }
@@ -729,24 +765,32 @@ impl web_transport_trait::poll::Session for Connection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
         match self.accept.clone() {
-            Some(accept) => accept.lock().unwrap().poll_accept_bi(cx),
+            Some(accept) => {
+                let waiter = self.parked_accept_bi.hold(cx);
+                accept.lock().unwrap().poll_accept_bi(waiter)
+            }
             None => {
-                let (send, recv) = ready!(self.conn.poll_accept_bi(cx.waker()))?;
+                let waiter = self.parked_accept_bi.hold(cx);
+                let (send, recv) = ready!(self.conn.poll_accept_bi(waiter))?;
                 Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))))
             }
         }
     }
 
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<SendStream, SessionError>> {
+        // One waiter for the whole operation: it can be registered with the connection
+        // now and the stream later, and both registrations die together.
+        let waiter = self.parked_open_uni.hold(cx);
+
         loop {
             match &mut self.open_uni {
                 OpenUni::Idle => {
-                    let send = ready!(self.conn.poll_open_uni(cx.waker()))?;
+                    let send = ready!(self.conn.poll_open_uni(waiter))?;
                     self.open_uni = OpenUni::Header { send, offset: 0 };
                 }
                 OpenUni::Header { send, offset } => {
                     while *offset < self.header_uni.len() {
-                        let size = ready!(send.poll_write(cx, &self.header_uni[*offset..]))
+                        let size = ready!(send.poll_write(waiter, &self.header_uni[*offset..]))
                             .map_err(SessionError::Header)?;
                         *offset += size;
                     }
@@ -768,10 +812,12 @@ impl web_transport_trait::poll::Session for Connection {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+        let waiter = self.parked_open_bi.hold(cx);
+
         loop {
             match &mut self.open_bi {
                 OpenBi::Idle => {
-                    let (send, recv) = ready!(self.conn.poll_open_bi(cx.waker()))?;
+                    let (send, recv) = ready!(self.conn.poll_open_bi(waiter))?;
                     self.open_bi = OpenBi::Header {
                         send,
                         recv,
@@ -780,7 +826,7 @@ impl web_transport_trait::poll::Session for Connection {
                 }
                 OpenBi::Header { send, offset, .. } => {
                     while *offset < self.header_bi.len() {
-                        let size = ready!(send.poll_write(cx, &self.header_bi[*offset..]))
+                        let size = ready!(send.poll_write(waiter, &self.header_bi[*offset..]))
                             .map_err(SessionError::Header)?;
                         *offset += size;
                     }
@@ -813,7 +859,8 @@ impl web_transport_trait::poll::Session for Connection {
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {
-        let datagram = ready!(self.conn.poll_read_datagram(cx.waker()))?;
+        let waiter = self.parked_recv_datagram.hold(cx);
+        let datagram = ready!(self.conn.poll_read_datagram(waiter))?;
         Poll::Ready(self.strip_datagram_header(datagram))
     }
 
@@ -830,7 +877,8 @@ impl web_transport_trait::poll::Session for Connection {
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<SessionError> {
-        self.conn.poll_closed(cx.waker()).map(Into::into)
+        let waiter = self.parked_closed.hold(cx);
+        self.conn.poll_closed(waiter).map(Into::into)
     }
 
     #[allow(refining_impl_trait)]

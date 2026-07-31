@@ -6,7 +6,7 @@ use std::{
 use bytes::{BufMut, Bytes};
 use tokio::io::{AsyncRead, ReadBuf};
 
-use crate::{ez, StreamError};
+use crate::{ez, waiters::Parked, StreamError};
 
 // "recv" in ascii; if you see this then read everything or close(code)
 // hex: 0x44454356, or 0x52E4EA9B7F80 as an HTTP error code
@@ -16,11 +16,20 @@ const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x44454356);
 /// A stream that can be used to receive bytes.
 pub struct RecvStream {
     inner: ez::RecvStream,
+
+    // For the poll traits, which are handed a `Context` rather than a waiter. One cell
+    // covers both read methods: they are the same operation.
+    parked_read: Parked,
+    parked_closed: Parked,
 }
 
 impl RecvStream {
     pub(super) fn new(inner: ez::RecvStream) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            parked_read: Parked::default(),
+            parked_closed: Parked::default(),
+        }
     }
 
     /// Read some data into the buffer and return the amount read.
@@ -111,7 +120,8 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         cx: &mut Context<'_>,
         dst: &mut [u8],
     ) -> Poll<Result<Option<usize>, Self::Error>> {
-        self.inner.poll_read(cx.waker(), dst).map_err(Into::into)
+        let waiter = self.parked_read.hold(cx);
+        self.inner.poll_read(waiter, dst).map_err(Into::into)
     }
 
     fn poll_read_chunk(
@@ -120,9 +130,8 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         max: usize,
     ) -> Poll<Result<Option<Bytes>, Self::Error>> {
         // ez already owns the bytes, so this hands them over instead of copying.
-        self.inner
-            .poll_read_chunk(cx.waker(), max)
-            .map_err(Into::into)
+        let waiter = self.parked_read.hold(cx);
+        self.inner.poll_read_chunk(waiter, max).map_err(Into::into)
     }
 
     fn stop(&mut self, code: u32) {
@@ -130,6 +139,7 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_closed(cx.waker()).map_err(Into::into)
+        let waiter = self.parked_closed.hold(cx);
+        self.inner.poll_closed(waiter).map_err(Into::into)
     }
 }

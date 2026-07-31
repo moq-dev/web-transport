@@ -31,6 +31,7 @@ mod recv;
 mod send;
 mod server;
 mod session;
+mod waiters;
 
 pub use client::*;
 pub use error::*;
@@ -60,6 +61,10 @@ pub use quinn;
 
 /// Re-export the http crate because it's in the public API.
 pub use http;
+
+/// Re-export kio, whose [`Waiter`](kio::Waiter) is how a caller of
+/// [`SessionAccept`]'s poll methods holds its place in the accept queue.
+pub use kio;
 
 /// Re-export the generic WebTransport implementation.
 pub use web_transport_trait as generic;

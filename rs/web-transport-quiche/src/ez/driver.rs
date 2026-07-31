@@ -2,7 +2,6 @@ use bytes::Bytes;
 use rustls_pki_types::CertificateDer;
 use std::{
     collections::{hash_map, HashMap, HashSet, VecDeque},
-    future::poll_fn,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -10,6 +9,8 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
+
+use kio::{Waiter, WaiterList};
 use tokio_quiche::{
     buf_factory::BufFactory,
     quic::{HandshakeInfo, QuicheConnection},
@@ -27,13 +28,6 @@ const DROP_CODE: u64 = 0x64726F70;
 
 /// How many datagrams to hold for the application before dropping the oldest.
 const DGRAM_QUEUE_CAPACITY: usize = 32;
-
-/// Register `waker` unless an equivalent one is already parked.
-fn park(wakers: &mut Vec<Waker>, waker: &Waker) {
-    if !wakers.iter().any(|w| w.will_wake(waker)) {
-        wakers.push(waker.clone());
-    }
-}
 
 type AcceptBiResult = Poll<Result<(StreamId, Lock<SendState>, Lock<RecvState>), ConnectionError>>;
 
@@ -70,8 +64,8 @@ pub(super) struct DriverState {
     /// The peer's certificate chain, set after the handshake completes.
     peer_certs: Option<Vec<CertificateDer<'static>>>,
 
-    /// Wakers waiting for the handshake to complete.
-    handshake_wakers: Vec<Waker>,
+    /// Whoever is waiting for the handshake to complete.
+    handshake_waiters: WaiterList,
 
     /// Latest connection statistics, refreshed by the driver each poll.
     stats: ConnectionStats,
@@ -85,17 +79,19 @@ pub(super) struct DriverState {
     ///
     /// A channel would be the obvious home, but its receive future owns the waker
     /// registration and drops it with the future — so an abandoned poll would never
-    /// be woken again. Parking the waker here is what makes `poll_accept_*` honest.
+    /// be woken again. Parking here is what makes `poll_accept_*` honest, and the
+    /// registrations are weak so an abandoned poll releases its slot rather than
+    /// leaving a waker parked until the connection closes.
     accept_bi: VecDeque<(StreamId, Lock<SendState>, Lock<RecvState>)>,
     accept_uni: VecDeque<(StreamId, Lock<RecvState>)>,
-    accept_bi_wakers: Vec<Waker>,
-    accept_uni_wakers: Vec<Waker>,
+    accept_bi_waiters: WaiterList,
+    accept_uni_waiters: WaiterList,
 
     /// Datagrams received from the peer. Bounded: when the application cannot keep
     /// up the *oldest* is dropped, which is the unreliable-datagram contract and
     /// keeps the freshest data, unlike a channel that rejects the newest.
     dgram_in: VecDeque<Bytes>,
-    dgram_in_wakers: Vec<Waker>,
+    dgram_in_waiters: WaiterList,
 }
 
 impl DriverState {
@@ -121,13 +117,13 @@ impl DriverState {
             alpn: None,
             server_name: None,
             peer_certs: None,
-            handshake_wakers: Vec::new(),
+            handshake_waiters: WaiterList::new(),
             accept_bi: VecDeque::new(),
             accept_uni: VecDeque::new(),
-            accept_bi_wakers: Vec::new(),
-            accept_uni_wakers: Vec::new(),
+            accept_bi_waiters: WaiterList::new(),
+            accept_uni_waiters: WaiterList::new(),
             dgram_in: VecDeque::new(),
-            dgram_in_wakers: Vec::new(),
+            dgram_in_waiters: WaiterList::new(),
             stats: ConnectionStats::default(),
         }
     }
@@ -137,28 +133,30 @@ impl DriverState {
         self.stats
     }
 
-    pub fn close(&mut self, err: ConnectionError) -> Vec<Waker> {
+    #[must_use = "wake the waiters"]
+    pub fn close(&mut self, err: ConnectionError) -> WaiterList {
         self.close_requested.abort(err)
     }
 
-    pub fn closed(&self, waker: &Waker) -> Poll<ConnectionError> {
-        self.closed.poll(waker)
+    pub fn closed(&self, waiter: &Waiter) -> Poll<ConnectionError> {
+        self.closed.poll(waiter)
     }
 
-    fn finish_close(&self, err: ConnectionError) -> Vec<Waker> {
+    #[must_use = "wake the waiters"]
+    fn finish_close(&self, err: ConnectionError) -> WaiterList {
         self.closed.abort(err)
     }
 
-    fn close_requested(&self, waker: &Waker) -> Poll<ConnectionError> {
-        self.close_requested.poll(waker)
+    fn close_requested(&self, waiter: &Waiter) -> Poll<ConnectionError> {
+        self.close_requested.poll(waiter)
     }
 
-    pub fn error(&self, waker: &Waker) -> Poll<ConnectionError> {
-        if let Poll::Ready(err) = self.close_requested.poll(waker) {
+    pub fn error(&self, waiter: &Waiter) -> Poll<ConnectionError> {
+        if let Poll::Ready(err) = self.close_requested.poll(waiter) {
             return Poll::Ready(err);
         }
 
-        self.closed.poll(waker)
+        self.closed.poll(waiter)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -182,27 +180,27 @@ impl DriverState {
 
     /// Poll for handshake completion.
     /// Returns Ready once the handshake completes, or if the connection is closed.
-    pub fn poll_handshake(&mut self, waker: &Waker) -> Poll<Result<(), ConnectionError>> {
+    pub fn poll_handshake(&mut self, waiter: &Waiter) -> Poll<Result<(), ConnectionError>> {
         // Check if already established
         if self.established {
             return Poll::Ready(Ok(()));
         }
 
         // Check if connection is closed
-        if let Poll::Ready(err) = self.error(waker) {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
         // Wait for handshake
-        self.handshake_wakers.push(waker.clone());
+        waiter.register(&mut self.handshake_waiters);
         Poll::Pending
     }
 
-    /// Notify all wakers waiting for handshake completion.
-    /// Should be called when the handshake completes.
-    #[must_use = "wake the handshake wakers"]
-    pub fn complete_handshake(&mut self) -> Vec<Waker> {
-        std::mem::take(&mut self.handshake_wakers)
+    /// Take everyone waiting for handshake completion, to be woken once the caller has
+    /// released the lock. Should be called when the handshake completes.
+    #[must_use = "wake the handshake waiters"]
+    pub fn complete_handshake(&mut self) -> WaiterList {
+        self.handshake_waiters.take()
     }
 
     /// Take the driver's waker, if any. The caller is responsible for waking it.
@@ -232,13 +230,13 @@ impl DriverState {
     }
 
     // Try to create the next bidirectional stream, although it may not be possible yet.
-    pub fn open_bi(&mut self, waker: &Waker) -> OpenBiResult {
-        if let Poll::Ready(err) = self.error(waker) {
+    pub fn open_bi(&mut self, waiter: &Waiter) -> OpenBiResult {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
         if self.bi.capacity == 0 {
-            self.bi.wakers.push(waker.clone());
+            waiter.register(&mut self.bi.waiters);
             return Poll::Pending;
         }
         self.bi.capacity -= 1;
@@ -258,46 +256,48 @@ impl DriverState {
     ///
     /// The caller wakes them after releasing the lock, matching the rest of this
     /// type.
+    #[must_use = "wake the waiters"]
     pub fn push_accept_bi(
         &mut self,
         id: StreamId,
         send: Lock<SendState>,
         recv: Lock<RecvState>,
-    ) -> Vec<Waker> {
+    ) -> WaiterList {
         self.accept_bi.push_back((id, send, recv));
-        std::mem::take(&mut self.accept_bi_wakers)
+        self.accept_bi_waiters.take()
     }
 
-    pub fn push_accept_uni(&mut self, id: StreamId, recv: Lock<RecvState>) -> Vec<Waker> {
+    #[must_use = "wake the waiters"]
+    pub fn push_accept_uni(&mut self, id: StreamId, recv: Lock<RecvState>) -> WaiterList {
         self.accept_uni.push_back((id, recv));
-        std::mem::take(&mut self.accept_uni_wakers)
+        self.accept_uni_waiters.take()
     }
 
-    pub fn poll_accept_bi(&mut self, waker: &Waker) -> AcceptBiResult {
+    pub fn poll_accept_bi(&mut self, waiter: &Waiter) -> AcceptBiResult {
         // Drain what already arrived before reporting a close: streams the peer
         // opened are finite and the application is entitled to them.
         if let Some(parts) = self.accept_bi.pop_front() {
             return Poll::Ready(Ok(parts));
         }
 
-        if let Poll::Ready(err) = self.error(waker) {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
-        park(&mut self.accept_bi_wakers, waker);
+        waiter.register(&mut self.accept_bi_waiters);
         Poll::Pending
     }
 
-    pub fn poll_accept_uni(&mut self, waker: &Waker) -> AcceptUniResult {
+    pub fn poll_accept_uni(&mut self, waiter: &Waiter) -> AcceptUniResult {
         if let Some(parts) = self.accept_uni.pop_front() {
             return Poll::Ready(Ok(parts));
         }
 
-        if let Poll::Ready(err) = self.error(waker) {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
-        park(&mut self.accept_uni_wakers, waker);
+        waiter.register(&mut self.accept_uni_waiters);
         Poll::Pending
     }
 
@@ -305,36 +305,37 @@ impl DriverState {
     ///
     /// Drops the oldest when full rather than the new arrival: for unreliable
     /// datagrams the freshest data is the useful data.
-    pub fn push_dgram_in(&mut self, datagram: Bytes) -> Vec<Waker> {
+    #[must_use = "wake the waiters"]
+    pub fn push_dgram_in(&mut self, datagram: Bytes) -> WaiterList {
         while self.dgram_in.len() >= DGRAM_QUEUE_CAPACITY {
             tracing::trace!("dropping oldest incoming datagram: queue full");
             self.dgram_in.pop_front();
         }
 
         self.dgram_in.push_back(datagram);
-        std::mem::take(&mut self.dgram_in_wakers)
+        self.dgram_in_waiters.take()
     }
 
-    pub fn poll_dgram_in(&mut self, waker: &Waker) -> Poll<Result<Bytes, ConnectionError>> {
+    pub fn poll_dgram_in(&mut self, waiter: &Waiter) -> Poll<Result<Bytes, ConnectionError>> {
         if let Some(datagram) = self.dgram_in.pop_front() {
             return Poll::Ready(Ok(datagram));
         }
 
-        if let Poll::Ready(err) = self.error(waker) {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
-        park(&mut self.dgram_in_wakers, waker);
+        waiter.register(&mut self.dgram_in_waiters);
         Poll::Pending
     }
 
-    pub fn open_uni(&mut self, waker: &Waker) -> OpenUniResult {
-        if let Poll::Ready(err) = self.error(waker) {
+    pub fn open_uni(&mut self, waiter: &Waiter) -> OpenUniResult {
+        if let Poll::Ready(err) = self.error(waiter) {
             return Poll::Ready(Err(err));
         }
 
         if self.uni.capacity == 0 {
-            self.uni.wakers.push(waker.clone());
+            waiter.register(&mut self.uni.waiters);
             return Poll::Pending;
         }
 
@@ -453,7 +454,7 @@ impl Driver {
             Ordering::Relaxed,
         );
 
-        let wakers = {
+        let mut waiters = {
             let mut state = self.state.lock();
             state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
             state.server_name = server_name;
@@ -465,12 +466,10 @@ impl Driver {
         };
 
         // Wake all tasks waiting for handshake completion.
-        for waker in wakers {
-            waker.wake();
-        }
+        waiters.wake();
 
         // Run poll once to advance any pending operations.
-        match self.poll(Waker::noop(), qconn) {
+        match self.poll(&Waiter::noop(), qconn) {
             Poll::Ready(Err(e)) => Err(e),
             _ => Ok(()),
         }
@@ -533,14 +532,12 @@ impl Driver {
         let state = Lock::new(state);
         self.send.insert(stream_id, state.clone());
 
-        let wakers = self
+        let mut waiters = self
             .state
             .lock()
             .push_accept_bi(stream_id, state.clone(), recv_state);
 
-        for waker in wakers {
-            waker.wake();
-        }
+        waiters.wake();
 
         Ok(())
     }
@@ -558,11 +555,9 @@ impl Driver {
         let state = Lock::new(state);
         self.recv.insert(stream_id, state.clone());
 
-        let wakers = self.state.lock().push_accept_uni(stream_id, state);
+        let mut waiters = self.state.lock().push_accept_uni(stream_id, state);
 
-        for waker in wakers {
-            waker.wake();
-        }
+        waiters.wake();
 
         Ok(())
     }
@@ -598,17 +593,17 @@ impl Driver {
     }
 
     async fn wait(&mut self, qconn: &mut QuicheConnection) -> Result<(), ConnectionError> {
-        poll_fn(|cx| self.poll(cx.waker(), qconn)).await
+        kio::wait(|waiter| self.poll(waiter, qconn)).await
     }
 
     fn poll(
         &mut self,
-        waker: &Waker,
+        waiter: &Waiter,
         qconn: &mut QuicheConnection,
     ) -> Poll<Result<(), ConnectionError>> {
         if !qconn.is_draining() {
             // Check if the application wants to close the connection.
-            if let Poll::Ready(err) = self.state.lock().close_requested(waker) {
+            if let Poll::Ready(err) = self.state.lock().close_requested(waiter) {
                 // Close the connection and return the error.
                 return Poll::Ready(
                     match err {
@@ -641,7 +636,7 @@ impl Driver {
         // ack-eliciting, so a tick on a busy connection costs nothing.
         let mut keep_alive = false;
         if let Some(k) = self.keep_alive.as_mut() {
-            if k.poll(&mut Context::from_waker(waker)) {
+            if k.poll(&mut Context::from_waker(waiter.waker())) {
                 qconn.send_ack_eliciting()?;
                 keep_alive = true;
             }
@@ -650,7 +645,7 @@ impl Driver {
         // Snapshot stats while we hold an immutable view; stored under the lock below.
         let stats = ConnectionStats::from_quiche(qconn);
 
-        let (sleep, send, recv, bi_wakers, uni_wakers) = {
+        let (sleep, send, recv, bi_waiters, uni_waiters) = {
             let mut driver = self.state.lock();
             driver.stats = stats;
             // Park the waker before checking for work. `send_datagram` pushes
@@ -658,7 +653,10 @@ impl Driver {
             // queue after we publish the waker means any racing producer is
             // guaranteed to either (a) see our waker and wake us, or (b) have
             // already enqueued an item we will see here.
-            driver.waker = Some(waker.clone());
+            //
+            // A plain `Waker`, not a registration: this slot has one owner, the driver
+            // task, and whoever takes it wakes it exactly once.
+            driver.waker = Some(waiter.waker().clone());
 
             let dgram_work = !self.dgram_out.is_empty();
 
@@ -681,26 +679,21 @@ impl Driver {
 
             // If we have spare capacity, wake up any blocked wakers.
             driver.bi.capacity = qconn.peer_streams_left_bidi();
-            let bi_wakers = (driver.bi.capacity > 0).then(|| std::mem::take(&mut driver.bi.wakers));
+            let bi_waiters = (driver.bi.capacity > 0).then(|| driver.bi.waiters.take());
 
             // If we have spare capacity, wake up any blocked wakers.
             driver.uni.capacity = qconn.peer_streams_left_uni();
-            let uni_wakers =
-                (driver.uni.capacity > 0).then(|| std::mem::take(&mut driver.uni.wakers));
+            let uni_waiters = (driver.uni.capacity > 0).then(|| driver.uni.waiters.take());
 
             let send = std::mem::take(&mut driver.send);
             let recv = std::mem::take(&mut driver.recv);
 
-            (sleep, send, recv, bi_wakers, uni_wakers)
+            (sleep, send, recv, bi_waiters, uni_waiters)
         };
 
-        for waker in bi_wakers.unwrap_or_default() {
-            waker.wake();
-        }
+        bi_waiters.unwrap_or_default().wake();
 
-        for waker in uni_wakers.unwrap_or_default() {
-            waker.wake();
-        }
+        uni_waiters.unwrap_or_default().wake();
 
         for stream_id in recv {
             self.flush_recv(qconn, stream_id)?;
@@ -774,10 +767,8 @@ impl Driver {
     }
 
     fn abort(&mut self, err: ConnectionError) {
-        let wakers = self.state.lock().close_requested.abort(err);
-        for waker in wakers {
-            waker.wake();
-        }
+        let mut waiters = self.state.lock().close_requested.abort(err);
+        waiters.wake();
     }
 }
 
@@ -827,11 +818,9 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
             match qconn.dgram_recv(&mut self.buf) {
                 Ok(len) => {
                     let buf = Bytes::copy_from_slice(&self.buf[..len]);
-                    let wakers = self.state.lock().push_dgram_in(buf);
+                    let mut waiters = self.state.lock().push_dgram_in(buf);
 
-                    for waker in wakers {
-                        waker.wake();
-                    }
+                    waiters.wake();
                 }
                 Err(quiche::Error::Done) => break,
                 Err(err) => {
@@ -873,7 +862,7 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     ) {
         let state = self.state.lock();
 
-        let err = if let Poll::Ready(err) = state.close_requested.poll(Waker::noop()) {
+        let err = if let Poll::Ready(err) = state.close_requested.poll(&Waiter::noop()) {
             err
         } else if let Some(local) = qconn.local_error() {
             let reason = String::from_utf8_lossy(&local.reason).to_string();
@@ -890,16 +879,12 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         // Mark the connection closed only after the driver is done. In particular,
         // a local close request must not make Connection::closed resolve before
         // quiche has had an opportunity to emit CONNECTION_CLOSE.
-        let wakers = state.finish_close(err.clone());
-        for waker in wakers {
-            waker.wake();
-        }
+        let mut waiters = state.finish_close(err.clone());
+        waiters.wake();
 
-        // Also wake up any local wakers if the peer closed.
-        let wakers = state.close_requested.abort(err);
-        for waker in wakers {
-            waker.wake();
-        }
+        // Also wake up anyone waiting locally if the peer closed.
+        let mut waiters = state.close_requested.abort(err);
+        waiters.wake();
     }
 }
 
@@ -907,7 +892,7 @@ struct DriverOpen<T> {
     next: StreamId,
     capacity: u64,
     create: Vec<(StreamId, T)>,
-    wakers: Vec<Waker>,
+    waiters: WaiterList,
 }
 
 impl<T> DriverOpen<T> {
@@ -916,7 +901,7 @@ impl<T> DriverOpen<T> {
             next,
             capacity: 0,
             create: Vec::new(),
-            wakers: Vec::new(),
+            waiters: WaiterList::new(),
         }
     }
 }
@@ -931,32 +916,32 @@ mod tests {
         // connection that negotiates no ALPN must still hand back a Connection
         // rather than wait forever.
         let mut state = DriverState::new(false);
-        let waker = Waker::noop();
+        let waiter = Waiter::noop();
 
-        assert!(state.poll_handshake(waker).is_pending());
+        assert!(state.poll_handshake(&waiter).is_pending());
 
         state.established = true;
         let _ = state.complete_handshake();
 
         assert!(state.alpn().is_none());
-        assert!(matches!(state.poll_handshake(waker), Poll::Ready(Ok(()))));
+        assert!(matches!(state.poll_handshake(&waiter), Poll::Ready(Ok(()))));
     }
 
     #[test]
     fn closed_waits_for_driver_completion() {
         let mut state = DriverState::new(false);
-        let waker = Waker::noop();
+        let waiter = Waiter::noop();
         let err = ConnectionError::Local(42, "done".to_string());
 
-        assert!(state.closed(waker).is_pending());
+        assert!(state.closed(&waiter).is_pending());
 
-        state.close(err.clone());
+        let _ = state.close(err.clone());
 
-        assert!(state.close_requested(waker).is_ready());
-        assert!(state.closed(waker).is_pending());
+        assert!(state.close_requested(&waiter).is_ready());
+        assert!(state.closed(&waiter).is_pending());
 
-        state.finish_close(err);
+        let _ = state.finish_close(err);
 
-        assert!(state.closed(waker).is_ready());
+        assert!(state.closed(&waiter).is_ready());
     }
 }

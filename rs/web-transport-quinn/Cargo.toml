@@ -26,6 +26,7 @@ qlog = ["quinn/qlog"]
 bytes = "1"
 futures = "0.3"
 http = "1"
+kio = "0.5.2"
 
 quinn = { version = "0.11", default-features = false, features = [
     "platform-verifier",

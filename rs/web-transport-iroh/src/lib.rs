@@ -32,6 +32,7 @@ mod session;
 mod settings;
 #[cfg(test)]
 mod tests;
+mod waiters;
 
 pub use client::*;
 pub use connect::*;

@@ -1,15 +1,15 @@
 use bytes::Bytes;
+use kio::{Waiter, WaiterList};
 use rustls_pki_types::CertificateDer;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
-    future::poll_fn,
     ops::Deref,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Mutex,
     },
-    task::{ready, Poll, Waker},
+    task::{ready, Poll},
 };
 use thiserror::Error;
 use tokio_quiche::quiche;
@@ -87,7 +87,13 @@ pub enum ConnectionError {
 #[derive(Default)]
 struct ConnectionClosedState {
     err: Option<ConnectionError>,
-    wakers: Vec<Waker>,
+
+    /// Everyone waiting to hear that the connection went away.
+    ///
+    /// Every blocked read, write, accept and handshake parks here, so this is the list
+    /// that most needs weak registrations: a caller that gives up releases its slot
+    /// instead of leaving a waker parked for the life of the connection.
+    waiters: WaiterList,
 }
 
 #[derive(Clone, Default)]
@@ -96,24 +102,25 @@ pub(super) struct ConnectionClosed {
 }
 
 impl ConnectionClosed {
-    pub fn abort(&self, err: ConnectionError) -> Vec<Waker> {
+    #[must_use = "wake the waiters"]
+    pub fn abort(&self, err: ConnectionError) -> WaiterList {
         let mut state = self.state.lock().unwrap();
         if state.err.is_some() {
-            return Vec::new();
+            return WaiterList::new();
         }
 
         state.err = Some(err);
-        std::mem::take(&mut state.wakers)
+        state.waiters.take()
     }
 
     // Blocks until the connection is closed and drained.
-    pub fn poll(&self, waker: &Waker) -> Poll<ConnectionError> {
+    pub fn poll(&self, waiter: &Waiter) -> Poll<ConnectionError> {
         let mut state = self.state.lock().unwrap();
         if state.err.is_some() {
             return Poll::Ready(state.err.clone().unwrap());
         }
 
-        state.wakers.push(waker.clone());
+        waiter.register(&mut state.waiters);
 
         Poll::Pending
     }
@@ -134,22 +141,20 @@ impl ConnectionClose {
     }
 
     pub fn close(&self, err: ConnectionError) {
-        let wakers = self.driver.lock().close(err);
-
-        for waker in wakers {
-            waker.wake();
-        }
+        // Wake outside the lock, as everywhere else in this module.
+        let mut waiters = self.driver.lock().close(err);
+        waiters.wake();
     }
 
     /// Only the test below still needs this: accept and datagram reads used to race
     /// it in a `select!`, and now poll the driver's own error state directly.
     #[cfg(test)]
     pub async fn error(&self) -> ConnectionError {
-        poll_fn(|cx| self.driver.lock().error(cx.waker())).await
+        kio::wait(|waiter| self.driver.lock().error(waiter)).await
     }
 
     pub async fn wait(&self) -> ConnectionError {
-        poll_fn(|cx| self.driver.lock().closed(cx.waker())).await
+        kio::wait(|waiter| self.driver.lock().closed(waiter)).await
     }
 
     pub fn is_closed(&self) -> bool {
@@ -214,15 +219,15 @@ impl Connection {
 
     /// Accept a bidirectional stream created by the remote peer.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        poll_fn(|cx| self.poll_accept_bi(cx.waker())).await
+        kio::wait(|waiter| self.poll_accept_bi(waiter)).await
     }
 
     /// Poll for a bidirectional stream created by the remote peer.
     pub fn poll_accept_bi(
         &self,
-        waker: &Waker,
+        waiter: &Waiter,
     ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
-        let (id, send, recv) = ready!(self.driver.lock().poll_accept_bi(waker))?;
+        let (id, send, recv) = ready!(self.driver.lock().poll_accept_bi(waiter))?;
 
         Poll::Ready(Ok((
             SendStream::new(id, send, self.driver.clone()),
@@ -232,12 +237,12 @@ impl Connection {
 
     /// Accept a unidirectional stream created by the remote peer.
     pub async fn accept_uni(&self) -> Result<RecvStream, ConnectionError> {
-        poll_fn(|cx| self.poll_accept_uni(cx.waker())).await
+        kio::wait(|waiter| self.poll_accept_uni(waiter)).await
     }
 
     /// Poll for a unidirectional stream created by the remote peer.
-    pub fn poll_accept_uni(&self, waker: &Waker) -> Poll<Result<RecvStream, ConnectionError>> {
-        let (id, recv) = ready!(self.driver.lock().poll_accept_uni(waker))?;
+    pub fn poll_accept_uni(&self, waiter: &Waiter) -> Poll<Result<RecvStream, ConnectionError>> {
+        let (id, recv) = ready!(self.driver.lock().poll_accept_uni(waiter))?;
         Poll::Ready(Ok(RecvStream::new(id, recv, self.driver.clone())))
     }
 
@@ -245,7 +250,8 @@ impl Connection {
     ///
     /// May block while there are too many concurrent streams.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), ConnectionError> {
-        let (wakeup, id, send, recv) = poll_fn(|cx| self.driver.lock().open_bi(cx.waker())).await?;
+        let (wakeup, id, send, recv) =
+            kio::wait(|waiter| self.driver.lock().open_bi(waiter)).await?;
         if let Some(wakeup) = wakeup {
             wakeup.wake();
         }
@@ -260,7 +266,7 @@ impl Connection {
     ///
     /// May block while there are too many concurrent streams.
     pub async fn open_uni(&self) -> Result<SendStream, ConnectionError> {
-        let (wakeup, id, send) = poll_fn(|cx| self.driver.lock().open_uni(cx.waker())).await?;
+        let (wakeup, id, send) = kio::wait(|waiter| self.driver.lock().open_uni(waiter)).await?;
         if let Some(wakeup) = wakeup {
             wakeup.wake();
         }
@@ -270,8 +276,8 @@ impl Connection {
     }
 
     /// Poll to open a new unidirectional stream.
-    pub fn poll_open_uni(&self, waker: &Waker) -> Poll<Result<SendStream, ConnectionError>> {
-        let (wakeup, id, send) = ready!(self.driver.lock().open_uni(waker))?;
+    pub fn poll_open_uni(&self, waiter: &Waiter) -> Poll<Result<SendStream, ConnectionError>> {
+        let (wakeup, id, send) = ready!(self.driver.lock().open_uni(waiter))?;
         if let Some(wakeup) = wakeup {
             wakeup.wake();
         }
@@ -282,9 +288,9 @@ impl Connection {
     /// Poll to open a new bidirectional stream.
     pub fn poll_open_bi(
         &self,
-        waker: &Waker,
+        waiter: &Waiter,
     ) -> Poll<Result<(SendStream, RecvStream), ConnectionError>> {
-        let (wakeup, id, send, recv) = ready!(self.driver.lock().open_bi(waker))?;
+        let (wakeup, id, send, recv) = ready!(self.driver.lock().open_bi(waiter))?;
         if let Some(wakeup) = wakeup {
             wakeup.wake();
         }
@@ -296,20 +302,20 @@ impl Connection {
     }
 
     /// Poll until the connection is closed and drained.
-    pub fn poll_closed(&self, waker: &Waker) -> Poll<ConnectionError> {
-        self.driver.lock().closed(waker)
+    pub fn poll_closed(&self, waiter: &Waiter) -> Poll<ConnectionError> {
+        self.driver.lock().closed(waiter)
     }
 
     /// Receive the next application datagram from the remote peer.
     ///
     /// Waits until a datagram arrives or the connection is closed.
     pub async fn read_datagram(&self) -> Result<Bytes, ConnectionError> {
-        poll_fn(|cx| self.poll_read_datagram(cx.waker())).await
+        kio::wait(|waiter| self.poll_read_datagram(waiter)).await
     }
 
     /// Poll for the next application datagram from the remote peer.
-    pub fn poll_read_datagram(&self, waker: &Waker) -> Poll<Result<Bytes, ConnectionError>> {
-        self.driver.lock().poll_dgram_in(waker)
+    pub fn poll_read_datagram(&self, waiter: &Waiter) -> Poll<Result<Bytes, ConnectionError>> {
+        self.driver.lock().poll_dgram_in(waiter)
     }
 
     /// Queue an application datagram for the driver to send.

@@ -26,6 +26,7 @@ bytes = "1"
 flume = "0.12"
 futures = "0.3"
 http = "1"
+kio = "0.5.2"
 rustls-pki-types = "1"
 
 thiserror = "2"

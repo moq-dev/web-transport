@@ -7,7 +7,7 @@ use std::{
 use bytes::Buf;
 use tokio::io::AsyncWrite;
 
-use crate::{ez, StreamError};
+use crate::{ez, waiters::Parked, StreamError};
 
 // "send" in ascii; if you see this then call finish().await or close(code)
 // hex: 0x73656E64, or 0x52E51B4DCE20 as an HTTP error code
@@ -20,11 +20,20 @@ const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
 /// WebTransport uses u32 error codes and they're mapped in a reserved HTTP/3 error space.
 pub struct SendStream {
     inner: ez::SendStream,
+
+    // For the poll traits, which are handed a `Context` rather than a waiter. One cell
+    // covers both write methods: they are the same operation.
+    parked_write: Parked,
+    parked_closed: Parked,
 }
 
 impl SendStream {
     pub(super) fn new(inner: ez::SendStream) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            parked_write: Parked::default(),
+            parked_closed: Parked::default(),
+        }
     }
 
     /// Write some data to the stream, returning the size written.
@@ -135,7 +144,8 @@ impl web_transport_trait::poll::SendStream for SendStream {
     type Error = StreamError;
 
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
-        self.inner.poll_write(cx, buf).map_err(Into::into)
+        let waiter = self.parked_write.hold(cx);
+        self.inner.poll_write(waiter, buf).map_err(Into::into)
     }
 
     fn poll_write_buf<B: Buf>(
@@ -145,7 +155,8 @@ impl web_transport_trait::poll::SendStream for SendStream {
     ) -> Poll<Result<usize, Self::Error>> {
         // ez advances `buf` by exactly what it accepted, so this keeps the
         // partial-write contract while skipping the default's extra copy.
-        self.inner.poll_write_buf(cx, buf).map_err(Into::into)
+        let waiter = self.parked_write.hold(cx);
+        self.inner.poll_write_buf(waiter, buf).map_err(Into::into)
     }
 
     fn set_priority(&mut self, order: u8) {
@@ -161,6 +172,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_closed(cx.waker()).map_err(Into::into)
+        let waiter = self.parked_closed.hold(cx);
+        self.inner.poll_closed(waiter).map_err(Into::into)
     }
 }

@@ -330,3 +330,97 @@ async fn two_tasks_can_accept_concurrently() -> n0_error::Result<()> {
 
     Ok(())
 }
+
+/// An accepter that walks away must not leave its waker behind.
+///
+/// `H3SessionAccept` used to keep a `Vec<Waker>` with no way to say "I'm gone": it was
+/// only ever cleared by a stream arriving or the connection failing. A caller that
+/// started an accept and dropped the future — a `timeout` around `accept_uni()`, say —
+/// left its waker there forever, so distinct tasks doing that on a quiet connection grew
+/// the list without bound, retaining a task allocation apiece.
+///
+/// No stream is ever delivered here: an arrival drains the list, which would hide
+/// exactly what is under test.
+#[tokio::test]
+#[traced_test]
+async fn abandoned_accepters_release_their_wakers() -> n0_error::Result<()> {
+    /// Well past any plausible bound on concurrent accepters.
+    const ABANDONED: usize = 256;
+
+    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Client::new(client);
+
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_id = server.id();
+    let server_addr = server.addr();
+
+    let url: Url = format!("https://{}/foo", server_id).parse().unwrap();
+
+    // The client holds the connection open until the server has finished checking, and
+    // the server waits for the handshake to complete before it starts.
+    let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let client_task = tokio::task::spawn(async move {
+        let session = client.connect_h3(server_addr, url).await.unwrap();
+        connected_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        session.close(0, b"bye");
+        client.close().await;
+    });
+
+    let server_task = tokio::task::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let session = H3Request::accept(conn).await.unwrap().ok().await.unwrap();
+        connected_rx.await.unwrap();
+
+        // Each iteration is a distinct task's worth of waker, registered by a single
+        // poll and abandoned when the future drops at the end of the scope.
+        let mut abandoned = Vec::with_capacity(ABANDONED);
+        for _ in 0..ABANDONED {
+            let flag = Arc::new(FlagWaker::default());
+            let waker = Waker::from(flag.clone());
+
+            let mut accept = std::pin::pin!(session.accept_uni());
+            assert!(
+                accept
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending(),
+                "no stream should be available yet"
+            );
+
+            abandoned.push(flag);
+        }
+
+        // Every abandoned waker should be uniquely owned by this test again. The inner
+        // accept future holds the shared waker, not the caller's, so there is nothing to
+        // displace first.
+        let retained = abandoned
+            .iter()
+            .filter(|flag| Arc::strong_count(flag) > 1)
+            .count();
+        assert_eq!(
+            retained, 0,
+            "{retained} of {ABANDONED} abandoned accepters are still parked"
+        );
+
+        done_tx.send(()).unwrap();
+        server.close().await;
+    });
+
+    timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client task timed out")
+        .unwrap();
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
+
+    Ok(())
+}

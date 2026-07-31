@@ -1,6 +1,6 @@
+use kio::Waiter;
 use std::{
     collections::VecDeque,
-    future::poll_fn,
     io,
     pin::Pin,
     task::{ready, Context, Poll, Waker},
@@ -12,7 +12,7 @@ use tokio::io::AsyncWrite;
 
 use tokio_quiche::quic::QuicheConnection;
 
-use crate::ez::DriverState;
+use crate::{ez::DriverState, waiters::Parked};
 
 use super::{Lock, StreamError, StreamId};
 
@@ -67,7 +67,7 @@ impl SendState {
     // Returns the number of bytes written for convenience.
     fn poll_write_buf<B: Buf>(
         &mut self,
-        cx: &mut Context<'_>,
+        waiter: &Waiter,
         buf: &mut B,
     ) -> Poll<Result<usize, StreamError>> {
         if let Some(reset) = self.reset {
@@ -79,7 +79,9 @@ impl SendState {
         }
 
         if self.capacity == 0 {
-            self.blocked = Some(cx.waker().clone());
+            // A stream has a single writer, so one slot is enough here — unlike the
+            // connection-wide lists, which every stream and accepter parks on.
+            self.blocked = Some(waiter.waker().clone());
             return Poll::Pending;
         }
 
@@ -94,7 +96,7 @@ impl SendState {
         Poll::Ready(Ok(n))
     }
 
-    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub fn poll_closed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
         if let Some(reset) = self.reset {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
@@ -105,12 +107,12 @@ impl SendState {
             return Poll::Ready(Ok(()));
         }
 
-        self.blocked = Some(waker.clone());
+        self.blocked = Some(waiter.waker().clone());
 
         Poll::Pending
     }
 
-    pub fn poll_flushed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
+    pub fn poll_flushed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
         if let Some(reset) = self.reset {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
@@ -119,7 +121,7 @@ impl SendState {
             return Poll::Ready(Ok(()));
         }
 
-        self.blocked = Some(waker.clone());
+        self.blocked = Some(waiter.waker().clone());
 
         Poll::Pending
     }
@@ -231,11 +233,19 @@ pub struct SendStream {
     id: StreamId,
     state: Lock<SendState>,
     driver: Lock<DriverState>,
+
+    // For the `AsyncWrite` impl, which is handed a `Context` rather than a waiter.
+    parked: Parked,
 }
 
 impl SendStream {
     pub(super) fn new(id: StreamId, state: Lock<SendState>, driver: Lock<DriverState>) -> Self {
-        Self { id, state, driver }
+        Self {
+            id,
+            state,
+            driver,
+            parked: Parked::default(),
+        }
     }
 
     /// Returns the QUIC stream ID.
@@ -246,17 +256,13 @@ impl SendStream {
     /// Write some data to the stream, returning the size written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
         let mut buf = io::Cursor::new(buf);
-        poll_fn(|cx| self.poll_write_buf(cx, &mut buf)).await
+        kio::wait(|waiter| self.poll_write_buf(waiter, &mut buf)).await
     }
 
     /// Poll to write some data to the stream, returning the size written.
-    pub fn poll_write(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, StreamError>> {
+    pub fn poll_write(&mut self, waiter: &Waiter, buf: &[u8]) -> Poll<Result<usize, StreamError>> {
         let mut buf = io::Cursor::new(buf);
-        self.poll_write_buf(cx, &mut buf)
+        self.poll_write_buf(waiter, &mut buf)
     }
 
     /// Poll to write some of the buffer to the stream, advancing the internal
@@ -265,10 +271,10 @@ impl SendStream {
     /// Returns the number of bytes written for convenience.
     pub fn poll_write_buf<B: Buf>(
         &mut self,
-        cx: &mut Context<'_>,
+        waiter: &Waiter,
         buf: &mut B,
     ) -> Poll<Result<usize, StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_write_buf(cx, buf) {
+        if let Poll::Ready(res) = self.state.lock().poll_write_buf(waiter, buf) {
             // Tell the driver that the stream has data to send.
             let waker = self.driver.lock().send(self.id);
             if let Some(waker) = waker {
@@ -278,7 +284,7 @@ impl SendStream {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().error(cx.waker()) {
+        if let Poll::Ready(res) = self.driver.lock().error(waiter) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -298,7 +304,7 @@ impl SendStream {
     ///
     /// Returns the number of bytes written for convenience.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, StreamError> {
-        poll_fn(|cx| self.poll_write_buf(cx, buf)).await
+        kio::wait(|waiter| self.poll_write_buf(waiter, buf)).await
     }
 
     /// Write the entire buffer to the stream, advancing the internal position.
@@ -364,24 +370,24 @@ impl SendStream {
     }
 
     /// Poll until the stream is closed by either side.
-    pub fn poll_closed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_closed(waker) {
+    pub fn poll_closed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
+        if let Poll::Ready(res) = self.state.lock().poll_closed(waiter) {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().error(waker) {
+        if let Poll::Ready(res) = self.driver.lock().error(waiter) {
             return Poll::Ready(Err(res.into()));
         }
 
         Poll::Pending
     }
 
-    fn poll_flushed(&mut self, waker: &Waker) -> Poll<Result<(), StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_flushed(waker) {
+    fn poll_flushed(&mut self, waiter: &Waiter) -> Poll<Result<(), StreamError>> {
+        if let Poll::Ready(res) = self.state.lock().poll_flushed(waiter) {
             return Poll::Ready(res);
         }
 
-        if let Poll::Ready(res) = self.driver.lock().closed(waker) {
+        if let Poll::Ready(res) = self.driver.lock().closed(waiter) {
             return Poll::Ready(Err(res.into()));
         }
 
@@ -397,7 +403,7 @@ impl SendStream {
     ///
     /// Note: This takes `&mut` to match quiche and to simplify the implementation.
     pub async fn closed(&mut self) -> Result<(), StreamError> {
-        poll_fn(|cx| self.poll_closed(cx.waker())).await
+        kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 
     /// Set the priority of this stream.
@@ -437,15 +443,22 @@ impl AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let mut buf = io::Cursor::new(buf);
-        match ready!(self.poll_write_buf(cx, &mut buf)) {
+        let waiter = Waiter::new(cx.waker().clone());
+        let res = self.poll_write_buf(&waiter, &mut buf);
+        self.parked.park(waiter);
+
+        match ready!(res) {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) => Poll::Ready(Err(io::Error::other(e.to_string()))),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.poll_flushed(cx.waker())
-            .map_err(|e| io::Error::other(e.to_string()))
+        let waiter = Waiter::new(cx.waker().clone());
+        let res = self.poll_flushed(&waiter);
+        self.parked.park(waiter);
+
+        res.map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn poll_shutdown(
@@ -462,7 +475,10 @@ impl AsyncWrite for SendStream {
             Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
         }
 
-        self.poll_closed(cx.waker())
-            .map_err(|e| io::Error::other(e.to_string()))
+        let waiter = Waiter::new(cx.waker().clone());
+        let res = self.poll_closed(&waiter);
+        self.parked.park(waiter);
+
+        res.map_err(|e| io::Error::other(e.to_string()))
     }
 }
