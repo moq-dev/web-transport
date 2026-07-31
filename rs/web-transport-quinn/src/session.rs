@@ -220,7 +220,7 @@ impl Session {
         if let Some(accept) = &self.accept {
             // `kio::wait` owns the waiter, so dropping this future — a `timeout` that
             // expires, say — also drops its registration in `SessionAccept`.
-            kio::wait(|waiter| accept.lock().unwrap().poll_accept_uni(waiter))
+            kio::wait(|waiter| poll_accept_uni_shared(accept, waiter))
                 .await
                 .map_err(|e| self.map_error(e))
         } else {
@@ -236,7 +236,7 @@ impl Session {
     /// Accept a new bidirectional stream. See [`quinn::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(accept) = &self.accept {
-            kio::wait(|waiter| accept.lock().unwrap().poll_accept_bi(waiter))
+            kio::wait(|waiter| poll_accept_bi_shared(accept, waiter))
                 .await
                 .map_err(|e| self.map_error(e))
         } else {
@@ -571,6 +571,49 @@ impl PartialEq for Session {
 
 impl Eq for Session {}
 
+// Poll the shared accept state, then wake the *other* accepters once the lock is
+// released.
+//
+// `SessionAccept` does not wake them itself: a waker is free to resume its task
+// inline, and the first thing a resumed accepter does is take this same lock. An
+// arrival or a failure is exactly what the others are parked waiting to retry
+// after, so `Ready` is the signal.
+fn poll_accept_uni_shared(
+    accept: &Mutex<SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<RecvStream, SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let result = accept.poll_accept_uni(waiter);
+        let waiters = result.is_ready().then(|| accept.uni_waiters.clone());
+        (result, waiters)
+    };
+
+    if let Some(waiters) = waiters {
+        waiters.wake_all();
+    }
+
+    result
+}
+
+fn poll_accept_bi_shared(
+    accept: &Mutex<SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let result = accept.poll_accept_bi(waiter);
+        let waiters = result.is_ready().then(|| accept.bi_waiters.clone());
+        (result, waiters)
+    };
+
+    if let Some(waiters) = waiters {
+        waiters.wake_all();
+    }
+
+    result
+}
+
 // Type aliases just so clippy doesn't complain about the complexity.
 type AcceptUni = dyn Stream<Item = Result<quinn::RecvStream, quinn::ConnectionError>> + Send;
 type AcceptBi = dyn Stream<Item = Result<(quinn::SendStream, quinn::RecvStream), quinn::ConnectionError>>
@@ -600,7 +643,8 @@ pub struct SessionAccept {
 
     // Waiters from concurrent callers of accept_bi / accept_uni.
     // Every clone of the session polls this one struct, so an arrival has to be fanned
-    // out: each caller registers here and all of them are woken when a stream lands.
+    // out: each caller registers here and all of them are woken when a stream lands —
+    // by the caller that saw it, once it has released the lock on this struct.
     bi_waiters: Arc<AcceptWaiters>,
     uni_waiters: Arc<AcceptWaiters>,
 
@@ -671,7 +715,6 @@ impl SessionAccept {
                 let recv = match res {
                     Ok(recv) => recv,
                     Err(e) => {
-                        self.uni_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -696,7 +739,6 @@ impl SessionAccept {
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv, self.error.clone());
-                    self.uni_waiters.wake_all();
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -755,7 +797,6 @@ impl SessionAccept {
                 let (send, recv) = match res {
                     Ok(pair) => pair,
                     Err(e) => {
-                        self.bi_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -780,7 +821,6 @@ impl SessionAccept {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send, self.error.clone());
                 let recv = RecvStream::new(recv, self.error.clone());
-                self.bi_waiters.wake_all();
                 return Poll::Ready(Ok((send, recv)));
             }
 
@@ -1032,7 +1072,7 @@ impl web_transport_trait::poll::Session for Session {
         if let Some(accept) = self.accept.clone() {
             return self
                 .parked_accept_uni
-                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_uni(waiter));
+                .poll(cx, |waiter| poll_accept_uni_shared(&accept, waiter));
         }
 
         let conn = self.conn.clone();
@@ -1054,7 +1094,7 @@ impl web_transport_trait::poll::Session for Session {
         if let Some(accept) = self.accept.clone() {
             return self
                 .parked_accept_bi
-                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_bi(waiter));
+                .poll(cx, |waiter| poll_accept_bi_shared(&accept, waiter));
         }
 
         let conn = self.conn.clone();

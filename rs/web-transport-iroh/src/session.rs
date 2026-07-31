@@ -103,7 +103,7 @@ impl Session {
         if let Some(h3) = &self.h3 {
             // `kio::wait` owns the waiter, so dropping this future — a `timeout` that
             // expires, say — also drops its registration in `H3SessionAccept`.
-            kio::wait(|waiter| h3.accept.lock().unwrap().poll_accept_uni(waiter)).await
+            kio::wait(|waiter| poll_accept_uni_shared(&h3.accept, waiter)).await
         } else {
             self.conn
                 .accept_uni()
@@ -116,7 +116,7 @@ impl Session {
     /// Accept a new bidirectional stream. See [`iroh::endpoint::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(h3) = &self.h3 {
-            kio::wait(|waiter| h3.accept.lock().unwrap().poll_accept_bi(waiter)).await
+            kio::wait(|waiter| poll_accept_bi_shared(&h3.accept, waiter)).await
         } else {
             self.conn
                 .accept_bi()
@@ -351,6 +351,49 @@ type PendingUni =
 type PendingBi = dyn Future<Output = Result<Option<(endpoint::SendStream, endpoint::RecvStream)>, SessionError>>
     + Send;
 
+// Poll the shared accept state, then wake the *other* accepters once the lock is
+// released.
+//
+// `H3SessionAccept` does not wake them itself: a waker is free to resume its task
+// inline, and the first thing a resumed accepter does is take this same lock. An
+// arrival or a failure is exactly what the others are parked waiting to retry
+// after, so `Ready` is the signal.
+fn poll_accept_uni_shared(
+    accept: &Mutex<H3SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<RecvStream, SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let result = accept.poll_accept_uni(waiter);
+        let waiters = result.is_ready().then(|| accept.uni_waiters.clone());
+        (result, waiters)
+    };
+
+    if let Some(waiters) = waiters {
+        waiters.wake_all();
+    }
+
+    result
+}
+
+fn poll_accept_bi_shared(
+    accept: &Mutex<H3SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
+    let (result, waiters) = {
+        let mut accept = accept.lock().unwrap();
+        let result = accept.poll_accept_bi(waiter);
+        let waiters = result.is_ready().then(|| accept.bi_waiters.clone());
+        (result, waiters)
+    };
+
+    if let Some(waiters) = waiters {
+        waiters.wake_all();
+    }
+
+    result
+}
+
 // Logic just for accepting streams, which is annoying because of the stream header.
 struct H3SessionAccept {
     session_id: VarInt,
@@ -369,8 +412,8 @@ struct H3SessionAccept {
 
     // Waiters from concurrent callers of accept_bi / accept_uni.
     // Every clone of the session polls this one struct, so an arrival has to be fanned
-    // out: each caller registers here and all of them are woken when a stream lands.
-    //
+    // out: each caller registers here and all of them are woken when a stream lands —
+    // by the caller that saw it, once it has released the lock on this struct.
     bi_waiters: Arc<AcceptWaiters>,
     uni_waiters: Arc<AcceptWaiters>,
 
@@ -436,7 +479,6 @@ impl H3SessionAccept {
                 let recv = match res {
                     Ok(recv) => recv,
                     Err(e) => {
-                        self.uni_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -461,7 +503,6 @@ impl H3SessionAccept {
             match typ {
                 StreamUni::WEBTRANSPORT => {
                     let recv = RecvStream::new(recv);
-                    self.uni_waiters.wake_all();
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -520,7 +561,6 @@ impl H3SessionAccept {
                 let (send, recv) = match res {
                     Ok(pair) => pair,
                     Err(e) => {
-                        self.bi_waiters.wake_all();
                         return Poll::Ready(Err(e.into()));
                     }
                 };
@@ -545,7 +585,6 @@ impl H3SessionAccept {
                 // Wrap the streams in our own types for correct error codes.
                 let send = SendStream::new(send);
                 let recv = RecvStream::new(recv);
-                self.bi_waiters.wake_all();
                 return Poll::Ready(Ok((send, recv)));
             }
 

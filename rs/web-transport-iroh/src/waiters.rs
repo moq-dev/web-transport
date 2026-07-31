@@ -41,8 +41,13 @@ impl AcceptWaiters {
     }
 
     /// Wake every parked accepter so it can retry.
+    ///
+    /// The list is taken under the lock and woken outside it. A waker is free to resume
+    /// its task inline, and the first thing a resumed accepter does is register here
+    /// again — waking underneath the lock would deadlock on this very mutex.
     pub(crate) fn wake_all(&self) {
-        self.waiters.lock().unwrap().wake();
+        let mut waiters = self.waiters.lock().unwrap().take();
+        waiters.wake();
     }
 }
 
@@ -53,5 +58,60 @@ impl Wake for AcceptWaiters {
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.wake_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Weak, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    use super::*;
+
+    /// A waker that re-enters the list from `wake`, standing in for an executor that
+    /// polls a resumed task inline: the first thing a resumed accepter does is register
+    /// itself again.
+    struct Reentrant {
+        waiters: Weak<AcceptWaiters>,
+    }
+
+    impl Wake for Reentrant {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            if let Some(waiters) = self.waiters.upgrade() {
+                waiters.register(&Waiter::new(std::task::Waker::noop().clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn waking_does_not_hold_the_lock() {
+        let waiters = Arc::new(AcceptWaiters::default());
+        let inline = Arc::new(Reentrant {
+            waiters: Arc::downgrade(&waiters),
+        });
+
+        // Kept alive for the whole test: the registration dies with it.
+        let waiter = Waiter::new(std::task::Waker::from(inline));
+        waiters.register(&waiter);
+
+        // On a deadlock this thread never finishes, so the test cannot hang.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn({
+            let waiters = waiters.clone();
+            move || {
+                waiters.wake_all();
+                let _ = tx.send(());
+            }
+        });
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("wake_all woke a waker while holding the lock, and the wake re-entered it");
     }
 }
