@@ -400,6 +400,33 @@ struct WriterState<W: Writer> {
     last_send_at: Arc<AtomicU64>,
 }
 
+/// Holds a retired send stream's shared state across the FIN write, publishing
+/// [`SendEnd::Finished`] only if the write lands.
+///
+/// A guard rather than a plain field because the stream is already out of the
+/// `streams` map by then: nothing else — not the write's own error path, not
+/// session teardown walking the map — would ever wake a frontend parked on
+/// `closed()`. Dropping without [`Self::finished`] (a failed write, or the whole
+/// `transmit` cancelled mid-frame) therefore has to publish a close.
+struct Finishing(Option<kio::Shared<SendShared>>);
+
+impl Finishing {
+    /// Publish a graceful finish, consuming the guard so `Drop` does nothing.
+    fn finished(mut self) {
+        if let Some(shared) = self.0.take() {
+            shared.lock().end = Some(SendEnd::Finished);
+        }
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.take() {
+            shared.lock().end = Some(SendEnd::Closed);
+        }
+    }
+}
+
 /// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
 enum Transmitted {
     /// The frame was written; keep running.
@@ -506,8 +533,11 @@ impl<W: Writer> WriterState<W> {
             _ => None,
         };
 
-        // Retiring an entry marks its shared state closed, so a frontend parked
+        // Retiring an entry marks its shared state terminal, so a frontend parked
         // on `closed()` learns the stream is done (no more signals will arrive).
+        // A FIN is the exception: its outcome isn't known until the write lands,
+        // so it rides along in `finishing` and is published below.
+        let mut finishing = None;
         match &mut frame {
             Frame::ResetStream(reset) => {
                 // The frontend offset includes frames that may still be queued.
@@ -515,12 +545,12 @@ impl<W: Writer> WriterState<W> {
                 // final size must come from bytes this writer actually emitted.
                 if let Some(send) = self.streams.lock().unwrap().send.remove(&reset.id) {
                     reset.final_size = send.sent_offset;
-                    send.shared.lock().closed = true;
+                    send.shared.lock().end = Some(SendEnd::Closed);
                 }
             }
             Frame::Stream(stream) if stream.fin => {
                 if let Some(send) = self.streams.lock().unwrap().send.remove(&stream.id) {
-                    send.shared.lock().closed = true;
+                    finishing = Some(Finishing(Some(send.shared)));
                 }
             }
             Frame::StopSending(stop) => {
@@ -548,6 +578,15 @@ impl<W: Writer> WriterState<W> {
         self.writer_backpressured.store(true, Ordering::Release);
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
+        // The FIN reached the transport, so the stream finished gracefully. Any
+        // other outcome — including this write erroring, or the whole `transmit`
+        // being dropped mid-frame on teardown — leaves `Finishing::drop` to
+        // publish a plain close instead.
+        if result.is_ok() {
+            if let Some(finishing) = finishing.take() {
+                finishing.finished();
+            }
+        }
         result?;
         if let Some((id, len)) = transmitted_stream {
             if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
@@ -1817,7 +1856,9 @@ impl Session {
                     if let Some(credit) = &send.stream_credit {
                         credit.close();
                     }
-                    send.shared.lock().closed = true;
+                    // Only streams still in the map, i.e. ones the writer never
+                    // retired, so none of these can already be `Finished`.
+                    send.shared.lock().end = Some(SendEnd::Closed);
                 }
                 for recv in streams.recv.values() {
                     recv.shared.lock().closed = true;
@@ -2201,6 +2242,20 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
     server.iter().find(|p| client.contains(p)).cloned()
 }
 
+/// How a send stream reached its terminal state, as published by the writer.
+///
+/// Distinguishing these is what lets [`generic::SendStream::closed`] report a
+/// graceful finish as `Ok(())` rather than an error: a stream that is merely
+/// "no longer in the map" could equally be one whose FIN never made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendEnd {
+    /// Our FIN reached the transport, so the stream completed gracefully.
+    Finished,
+    /// Retired without a clean finish: a RESET was sent, the session tore down,
+    /// or the FIN write failed or was abandoned mid-frame.
+    Closed,
+}
+
 /// Peer/backend signals that end a stream's send side, shared between the
 /// backend tasks and the [`SendStream`] frontend. kio-backed so the frontend can
 /// park on it — alone (`closed()`) or alongside the queue and credits it waits
@@ -2209,9 +2264,8 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
 struct SendShared {
     /// STOP_SENDING received from the peer (the first code wins).
     stop: Option<VarInt>,
-    /// No more signals will ever arrive: the writer retired the stream (FIN or
-    /// RESET transmitted), or the session tore down.
-    closed: bool,
+    /// Set once the stream is terminal; no more signals will ever arrive.
+    end: Option<SendEnd>,
 }
 
 struct SendState {
@@ -2317,7 +2371,7 @@ impl SendStream {
         // (Matching on the poll expression drops its guard at the statement, so
         // `recv_stop` below can borrow `self` mutably.)
         let signal = match self.shared.poll(waiter, |shared| {
-            if shared.stop.is_some() || shared.closed {
+            if shared.stop.is_some() || shared.end.is_some() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -2396,21 +2450,25 @@ impl SendStream {
             return Poll::Ready(Err(error.clone()));
         }
 
-        let stop = match self.shared.poll(waiter, |shared| {
-            if shared.stop.is_some() || shared.closed {
+        let (stop, end) = match self.shared.poll(waiter, |shared| {
+            if shared.stop.is_some() || shared.end.is_some() {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         }) {
-            Poll::Ready(shared) => shared.stop,
+            Poll::Ready(shared) => (shared.stop, shared.end),
             Poll::Pending => return Poll::Pending,
         };
 
-        Poll::Ready(Err(match stop {
-            Some(code) => self.recv_stop(code),
-            None => Error::Closed,
-        }))
+        Poll::Ready(match (end, stop) {
+            // A FIN that reached the transport completes the stream, even if the
+            // peer then stopped it: there is nothing left to abandon, so this
+            // must not fall through to `recv_stop` and emit a RESET.
+            (Some(SendEnd::Finished), _) => Ok(()),
+            (_, Some(code)) => Err(self.recv_stop(code)),
+            _ => Err(Error::Closed),
+        })
     }
 }
 

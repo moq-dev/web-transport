@@ -120,6 +120,66 @@ async fn datagrams_round_trip_through_the_poll_surface() {
     assert_eq!(&received[..], b"dgram");
 }
 
+/// A finished stream closes *gracefully*. The writer publishes completion only
+/// once the FIN reaches the transport, so this must report success rather than
+/// the generic close error a merely-retired stream would give.
+#[tokio::test]
+async fn a_finished_stream_closes_gracefully() {
+    let (mut client, mut server) = pair(|_| {}).await;
+
+    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx)))
+        .await
+        .unwrap();
+    bounded(poll_fn(|cx| send.poll_write(cx, b"bye")))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+
+    bounded(poll_fn(|cx| send.poll_closed(cx)))
+        .await
+        .expect("a finished stream should close gracefully");
+
+    // The peer sees the same stream end cleanly.
+    let mut recv = bounded(poll_fn(|cx| server.poll_accept_uni(cx)))
+        .await
+        .unwrap();
+    let chunk = bounded(poll_fn(|cx| recv.poll_read_chunk(cx, 16)))
+        .await
+        .unwrap()
+        .expect("stream ended early");
+    assert_eq!(&chunk[..], b"bye");
+    assert_eq!(
+        bounded(poll_fn(|cx| recv.poll_read_chunk(cx, 16)))
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// A stream the peer stops is *not* graceful, even though it is equally
+/// terminal: the two outcomes must stay distinguishable.
+#[tokio::test]
+async fn a_stopped_stream_still_closes_with_an_error() {
+    let (mut client, mut server) = pair(|_| {}).await;
+
+    let mut send = bounded(poll_fn(|cx| client.poll_open_uni(cx)))
+        .await
+        .unwrap();
+    bounded(poll_fn(|cx| send.poll_write(cx, b"data")))
+        .await
+        .unwrap();
+
+    let mut recv = bounded(poll_fn(|cx| server.poll_accept_uni(cx)))
+        .await
+        .unwrap();
+    recv.stop(9);
+
+    let err = bounded(poll_fn(|cx| send.poll_closed(cx)))
+        .await
+        .expect_err("a stopped stream is closed with an error");
+    assert_eq!(err.stream_error(), Some(9), "got {err:?}");
+}
+
 /// A `Pending` operation must be resumed, not restarted: poll `poll_closed` once
 /// against a waker that goes nowhere, then drive it to completion on a real one.
 /// An implementation that lost its registration when the first poll was abandoned

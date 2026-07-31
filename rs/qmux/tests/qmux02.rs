@@ -84,6 +84,38 @@ async fn default_config_uses_qmux02() {
     session.close(0, "done");
 }
 
+/// `SendStream::closed()` reports a graceful finish as success. The stream is
+/// retired the moment its FIN is written, so this only works if the writer
+/// distinguishes "finished" from "gone" — otherwise a cleanly completed stream
+/// looks identical to a torn-down one.
+#[tokio::test]
+async fn finished_stream_closes_gracefully() {
+    use qmux::transport::Stream;
+    use qmux::{Config, Session};
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let config = Config::new(Version::QMux02);
+    let ta = Stream::new(a, config.version, config.max_record_size);
+    let tb = Stream::new(b, config.version, config.max_record_size);
+    let (client, server) = tokio::join!(
+        Session::connect(ta, config.clone()),
+        Session::accept(tb, config),
+    );
+    let (client, server) = (client.unwrap(), server.unwrap());
+
+    let mut send = client.open_uni().await.unwrap();
+    send.write(b"done").await.unwrap();
+    send.finish().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), send.closed())
+        .await
+        .expect("closed() timed out")
+        .expect("a finished stream should close gracefully");
+
+    let mut recv = server.accept_uni().await.unwrap();
+    assert_eq!(recv.read_all().await.unwrap().as_ref(), b"done");
+}
+
 /// Two idle QMux02 peers keep each other alive with QX_PING, exercising the
 /// draft-02 sequence validation end-to-end: each side's timer emits strictly
 /// increasing requests and echoes the peer's, and neither the strict-increase
