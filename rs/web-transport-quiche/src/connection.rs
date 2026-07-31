@@ -832,9 +832,20 @@ impl web_transport_trait::poll::Session for Connection {
         _cx: &mut Context<'_>,
         payload: &[u8],
     ) -> Poll<Result<(), SessionError>> {
-        // `ez` queues outbound datagrams into a bounded channel and drops on full,
-        // which is the unreliable contract — there is no capacity to wait for, so
-        // this never parks.
+        // NOTE: this knowingly diverges from the trait, which asks for `Pending`
+        // while the transport has no room. It never parks, and a datagram dropped
+        // for lack of room still reports `Ready(Ok(()))`.
+        //
+        // Parking on `ez`'s bounded channel would not fix that, only relocate it:
+        // the driver drains that channel on every pass and hands each datagram to
+        // `quiche::dgram_send`, which drops it when *its* queue is full. Honest
+        // backpressure therefore has to come from quiche's datagram capacity,
+        // plumbed back through the driver — a design change for the `ez` layer
+        // (which deliberately drops rather than buffer under backpressure), not
+        // something this shim can paper over.
+        //
+        // Until then, callers wanting real capacity signalling should use
+        // `max_datagram_size` and their own pacing.
         let mut buf = BytesMut::with_capacity(self.header_datagram.len() + payload.len());
         buf.extend_from_slice(&self.header_datagram);
         buf.extend_from_slice(payload);
