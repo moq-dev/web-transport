@@ -744,19 +744,36 @@ impl web_transport_trait::poll::Session for Connection {
                     let send = ready!(self.conn.poll_open_uni(cx.waker()))?;
                     self.open_uni = OpenUni::Header { send, offset: 0 };
                 }
-                OpenUni::Header { send, offset } => {
-                    while *offset < self.header_uni.len() {
-                        let size = ready!(send.poll_write(cx, &self.header_uni[*offset..]))
-                            .map_err(SessionError::Header)?;
-                        *offset += size;
-                    }
-
-                    // Header written: hand the stream over and go idle.
-                    let OpenUni::Header { send, .. } =
-                        std::mem::replace(&mut self.open_uni, OpenUni::Idle)
+                OpenUni::Header { .. } => {
+                    // Take the operation out of the slot up front, and put it back
+                    // only to record genuine progress. Retaining it across an
+                    // *error* would make every later open resume — and re-fail —
+                    // on the same dead stream, so one stream the peer rejected
+                    // mid-header would disable opening entirely. Structuring it
+                    // this way makes that unrepresentable rather than a path to
+                    // remember: the slot is already `Idle` on every exit but the
+                    // explicit `Pending` below.
+                    let OpenUni::Header {
+                        mut send,
+                        mut offset,
+                    } = std::mem::replace(&mut self.open_uni, OpenUni::Idle)
                     else {
                         unreachable!("checked above");
                     };
+
+                    while offset < self.header_uni.len() {
+                        match send.poll_write(cx, &self.header_uni[offset..]) {
+                            Poll::Ready(Ok(size)) => offset += size,
+                            Poll::Ready(Err(err)) => {
+                                // Dropping `send` resets the failed stream.
+                                return Poll::Ready(Err(SessionError::Header(err)));
+                            }
+                            Poll::Pending => {
+                                self.open_uni = OpenUni::Header { send, offset };
+                                return Poll::Pending;
+                            }
+                        }
+                    }
 
                     return Poll::Ready(Ok(SendStream::new(send)));
                 }
@@ -778,18 +795,31 @@ impl web_transport_trait::poll::Session for Connection {
                         offset: 0,
                     };
                 }
-                OpenBi::Header { send, offset, .. } => {
-                    while *offset < self.header_bi.len() {
-                        let size = ready!(send.poll_write(cx, &self.header_bi[*offset..]))
-                            .map_err(SessionError::Header)?;
-                        *offset += size;
-                    }
-
-                    let OpenBi::Header { send, recv, .. } =
-                        std::mem::replace(&mut self.open_bi, OpenBi::Idle)
+                OpenBi::Header { .. } => {
+                    // See `poll_open_uni`: taken out up front so a failed header
+                    // can't poison every later open.
+                    let OpenBi::Header {
+                        mut send,
+                        recv,
+                        mut offset,
+                    } = std::mem::replace(&mut self.open_bi, OpenBi::Idle)
                     else {
                         unreachable!("checked above");
                     };
+
+                    while offset < self.header_bi.len() {
+                        match send.poll_write(cx, &self.header_bi[offset..]) {
+                            Poll::Ready(Ok(size)) => offset += size,
+                            Poll::Ready(Err(err)) => {
+                                // Dropping the pair resets the failed stream.
+                                return Poll::Ready(Err(SessionError::Header(err)));
+                            }
+                            Poll::Pending => {
+                                self.open_bi = OpenBi::Header { send, recv, offset };
+                                return Poll::Pending;
+                            }
+                        }
+                    }
 
                     return Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))));
                 }
