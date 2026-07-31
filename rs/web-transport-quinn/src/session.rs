@@ -1030,8 +1030,9 @@ impl web_transport_trait::poll::Session for Session {
     // keeps a waiter list, so the only thing to retain is our registration in it.
     fn poll_accept_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, SessionError>> {
         if let Some(accept) = self.accept.clone() {
-            let waiter = self.parked_accept_uni.hold(cx);
-            return accept.lock().unwrap().poll_accept_uni(waiter);
+            return self
+                .parked_accept_uni
+                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_uni(waiter));
         }
 
         let conn = self.conn.clone();
@@ -1051,8 +1052,9 @@ impl web_transport_trait::poll::Session for Session {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
         if let Some(accept) = self.accept.clone() {
-            let waiter = self.parked_accept_bi.hold(cx);
-            return accept.lock().unwrap().poll_accept_bi(waiter);
+            return self
+                .parked_accept_bi
+                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_bi(waiter));
         }
 
         let conn = self.conn.clone();

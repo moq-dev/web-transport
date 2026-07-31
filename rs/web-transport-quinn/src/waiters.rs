@@ -11,7 +11,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    task::{Context, Wake},
+    task::{Context, Poll, Wake},
 };
 
 use kio::{Waiter, WaiterList};
@@ -68,24 +68,41 @@ impl Wake for AcceptWaiters {
 /// The `async` methods have no need for it — [`kio::wait`] keeps the waiter inside the
 /// future it builds, so dropping the future drops the registration.
 ///
-/// kio grew a `WaiterCell` for exactly this after 0.5.2 (moq-dev/moq#2560); replace this
-/// with it once that releases. Its `hold` also *reuses* the waiter when the task is
-/// unchanged and every registration was already drained, which saves the allocation this
-/// one makes on each poll.
+/// kio grew a `WaiterCell` for exactly this after 0.5.2 (moq-dev/moq#2560); this can go
+/// once that releases. Its `hold` also *reuses* the waiter when the task is unchanged and
+/// every registration was already drained, which saves the allocation this one makes on
+/// each poll — though it holds the waiter across a `Ready`, so keep retiring it here.
 #[derive(Default)]
 pub(crate) struct Parked {
     waiter: Option<Waiter>,
 }
 
 impl Parked {
-    /// Adopt `cx`'s waker for this poll, retiring the previous handle and with it the
-    /// registration it left behind.
+    /// Run one poll with a retained waiter.
     ///
-    /// Always replaces rather than reusing: [`WaiterList`] reclaims a slot only when the
-    /// `Waiter` that registered it dies, so re-registering a live one would stack a
-    /// duplicate entry on every spurious re-poll.
-    pub(crate) fn hold(&mut self, cx: &mut Context<'_>) -> &Waiter {
-        self.waiter.insert(Waiter::new(cx.waker().clone()))
+    /// The waiter is kept only while the poll is `Pending`. On `Ready` there is nothing
+    /// left to wake, and holding the waker would pin the polling task's allocation until
+    /// something polled this cell again — for a stream that finished its last read and
+    /// then sat idle, that is the rest of the connection.
+    pub(crate) fn poll<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: impl FnOnce(&Waiter) -> Poll<T>,
+    ) -> Poll<T> {
+        let waiter = Waiter::new(cx.waker().clone());
+        let result = poll(&waiter);
+        self.park(waiter, &result);
+        result
+    }
+
+    /// The two-step form of [`poll`](Self::poll), for a poll that needs `&mut self` of
+    /// the struct holding this cell while the waiter is alive — the borrow checker allows
+    /// only one of those at a time, so the closure form will not compile there. Build the
+    /// waiter from the `Context`, poll with it, then hand it here with the result.
+    pub(crate) fn park<T>(&mut self, waiter: Waiter, result: &Poll<T>) {
+        // Retiring the previous waiter *after* the poll matters: the new one is already
+        // registered by then, so there is no window with nothing registered.
+        self.waiter = result.is_pending().then_some(waiter);
     }
 }
 

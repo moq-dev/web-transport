@@ -120,8 +120,9 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         cx: &mut Context<'_>,
         dst: &mut [u8],
     ) -> Poll<Result<Option<usize>, Self::Error>> {
-        let waiter = self.parked_read.hold(cx);
-        self.inner.poll_read(waiter, dst).map_err(Into::into)
+        self.parked_read
+            .poll(cx, |waiter| self.inner.poll_read(waiter, dst))
+            .map_err(Into::into)
     }
 
     fn poll_read_chunk(
@@ -130,8 +131,9 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         max: usize,
     ) -> Poll<Result<Option<Bytes>, Self::Error>> {
         // ez already owns the bytes, so this hands them over instead of copying.
-        let waiter = self.parked_read.hold(cx);
-        self.inner.poll_read_chunk(waiter, max).map_err(Into::into)
+        self.parked_read
+            .poll(cx, |waiter| self.inner.poll_read_chunk(waiter, max))
+            .map_err(Into::into)
     }
 
     fn stop(&mut self, code: u32) {
@@ -139,7 +141,8 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let waiter = self.parked_closed.hold(cx);
-        self.inner.poll_closed(waiter).map_err(Into::into)
+        self.parked_closed
+            .poll(cx, |waiter| self.inner.poll_closed(waiter))
+            .map_err(Into::into)
     }
 }

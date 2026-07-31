@@ -17,14 +17,17 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    task::{Context, Wake, Waker},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
 
 use anyhow::{Context as _, Result};
 use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::time::timeout;
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    time::timeout,
+};
 use web_transport_quiche::ez;
 
 /// How many callers give up, one after another. Well past any plausible bound on
@@ -184,6 +187,52 @@ async fn abandoned_datagram_reads_release_their_wakers() -> Result<()> {
     assert_eq!(
         retained, 0,
         "{retained} abandoned datagram reads are still parked"
+    );
+
+    client.close(0, "bye");
+    Ok(())
+}
+
+/// The other half of the rule: a poll that *finishes* must not keep the poller's waker
+/// either. The bridge retains a waiter so its registrations survive a `Pending`; holding
+/// it past a `Ready` would pin the polling task's allocation to the stream until
+/// something polled it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_read_releases_the_poller() -> Result<()> {
+    let (client, server) = pair().await?;
+
+    let mut send = client.open_uni().await?;
+    send.write_all(b"done").await?;
+
+    let mut recv = server.accept_uni().await?;
+
+    // Read through `AsyncRead`, which is the surface that has to bridge a `Context`.
+    let flag = Arc::new(FlagWaker::default());
+    let waker = Waker::from(flag.clone());
+    let mut dst = [0u8; 16];
+    let mut buf = ReadBuf::new(&mut dst);
+
+    loop {
+        let read =
+            std::pin::Pin::new(&mut recv).poll_read(&mut Context::from_waker(&waker), &mut buf);
+        match read {
+            Poll::Ready(res) => {
+                res?;
+                break;
+            }
+            // Not arrived yet: yield and retry, so the tracked waker is the one that
+            // completes the read rather than one left parked.
+            Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+    assert_eq!(buf.filled(), b"done");
+
+    // The test's own `Waker` counts too, so it goes first.
+    drop(waker);
+    assert_eq!(
+        Arc::strong_count(&flag),
+        1,
+        "the finished read is still holding the poller's waker"
     );
 
     client.close(0, "bye");

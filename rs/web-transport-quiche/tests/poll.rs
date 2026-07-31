@@ -8,6 +8,11 @@
 use std::{
     future::poll_fn,
     net::{Ipv4Addr, SocketAddr},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
 use anyhow::{Context as _, Result};
@@ -120,6 +125,69 @@ async fn datagrams_round_trip_through_the_poll_surface() -> Result<()> {
 
     let received = poll_fn(|cx| server.poll_recv_datagram(cx)).await?;
     assert_eq!(&received[..], b"dgram");
+
+    Ok(())
+}
+
+/// A waker whose `Arc` count the test watches: anything still holding a clone is
+/// retaining this allocation. Not `Waker::noop`, which is a static and so cannot be
+/// counted.
+#[derive(Default)]
+struct FlagWaker {
+    woken: AtomicBool,
+}
+
+impl Wake for FlagWaker {
+    fn wake(self: Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A poll that finishes must not keep the poller's waker.
+///
+/// The bridge from `Context` to a `kio::Waiter` has to retain the waiter while a poll is
+/// pending, or the registration it made dies with the poll. Retaining it past a `Ready`
+/// is a different thing entirely: the stream is done with that caller, but goes on
+/// holding its waker — and so the polling task's allocation — until something polls it
+/// again. A stream whose last read completed and then sat idle would hold one for the
+/// rest of the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_poll_releases_the_poller() -> Result<()> {
+    let (mut client, mut server) = pair().await?;
+
+    let mut send = poll_fn(|cx| client.poll_open_uni(cx)).await?;
+    poll_fn(|cx| send.poll_write(cx, b"done")).await?;
+
+    let mut recv = poll_fn(|cx| server.poll_accept_uni(cx)).await?;
+
+    // Poll until the read is ready, tracking only the waker that sees it through.
+    let mut dst = [0u8; 16];
+    let flag = Arc::new(FlagWaker::default());
+    let waker = Waker::from(flag.clone());
+
+    loop {
+        match recv.poll_read(&mut Context::from_waker(&waker), &mut dst) {
+            Poll::Ready(res) => {
+                assert_eq!(res?.context("stream ended early")?, 4);
+                break;
+            }
+            // Not arrived yet: yield and retry, so the tracked waker is the one that
+            // completes the read rather than one left parked.
+            Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    // The test's own `Waker` counts too, so it goes first.
+    drop(waker);
+    assert_eq!(
+        Arc::strong_count(&flag),
+        1,
+        "the finished read is still holding the poller's waker"
+    );
 
     Ok(())
 }

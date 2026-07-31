@@ -748,15 +748,13 @@ impl web_transport_trait::poll::Session for Connection {
         match self.accept.clone() {
             // `SessionAccept` decodes stream headers, so it keeps its own state and
             // waiter list; forward to it, holding on to our registration.
-            Some(accept) => {
-                let waiter = self.parked_accept_uni.hold(cx);
-                accept.lock().unwrap().poll_accept_uni(waiter)
-            }
-            None => {
-                let waiter = self.parked_accept_uni.hold(cx);
+            Some(accept) => self
+                .parked_accept_uni
+                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_uni(waiter)),
+            None => self.parked_accept_uni.poll(cx, |waiter| {
                 let recv = ready!(self.conn.poll_accept_uni(waiter))?;
                 Poll::Ready(Ok(RecvStream::new(recv)))
-            }
+            }),
         }
     }
 
@@ -765,24 +763,20 @@ impl web_transport_trait::poll::Session for Connection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
         match self.accept.clone() {
-            Some(accept) => {
-                let waiter = self.parked_accept_bi.hold(cx);
-                accept.lock().unwrap().poll_accept_bi(waiter)
-            }
-            None => {
-                let waiter = self.parked_accept_bi.hold(cx);
+            Some(accept) => self
+                .parked_accept_bi
+                .poll(cx, |waiter| accept.lock().unwrap().poll_accept_bi(waiter)),
+            None => self.parked_accept_bi.poll(cx, |waiter| {
                 let (send, recv) = ready!(self.conn.poll_accept_bi(waiter))?;
                 Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))))
-            }
+            }),
         }
     }
 
     fn poll_open_uni(&mut self, cx: &mut Context<'_>) -> Poll<Result<SendStream, SessionError>> {
         // One waiter for the whole operation: it can be registered with the connection
         // now and the stream later, and both registrations die together.
-        let waiter = self.parked_open_uni.hold(cx);
-
-        loop {
+        self.parked_open_uni.poll(cx, |waiter| loop {
             match &mut self.open_uni {
                 OpenUni::Idle => {
                     let send = ready!(self.conn.poll_open_uni(waiter))?;
@@ -805,16 +799,14 @@ impl web_transport_trait::poll::Session for Connection {
                     return Poll::Ready(Ok(SendStream::new(send)));
                 }
             }
-        }
+        })
     }
 
     fn poll_open_bi(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
-        let waiter = self.parked_open_bi.hold(cx);
-
-        loop {
+        self.parked_open_bi.poll(cx, |waiter| loop {
             match &mut self.open_bi {
                 OpenBi::Idle => {
                     let (send, recv) = ready!(self.conn.poll_open_bi(waiter))?;
@@ -840,7 +832,7 @@ impl web_transport_trait::poll::Session for Connection {
                     return Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))));
                 }
             }
-        }
+        })
     }
 
     fn poll_send_datagram(
@@ -859,8 +851,10 @@ impl web_transport_trait::poll::Session for Connection {
     }
 
     fn poll_recv_datagram(&mut self, cx: &mut Context<'_>) -> Poll<Result<Bytes, SessionError>> {
-        let waiter = self.parked_recv_datagram.hold(cx);
-        let datagram = ready!(self.conn.poll_read_datagram(waiter))?;
+        let datagram = ready!(self
+            .parked_recv_datagram
+            .poll(cx, |waiter| self.conn.poll_read_datagram(waiter)))?;
+
         Poll::Ready(self.strip_datagram_header(datagram))
     }
 
@@ -877,8 +871,9 @@ impl web_transport_trait::poll::Session for Connection {
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<SessionError> {
-        let waiter = self.parked_closed.hold(cx);
-        self.conn.poll_closed(waiter).map(Into::into)
+        self.parked_closed
+            .poll(cx, |waiter| self.conn.poll_closed(waiter))
+            .map(Into::into)
     }
 
     #[allow(refining_impl_trait)]
