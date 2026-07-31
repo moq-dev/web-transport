@@ -52,6 +52,17 @@ impl AcceptWaiters {
         let mut waiters = self.waiters.lock().unwrap().take();
         waiters.wake();
     }
+
+    /// How many slots the list is holding, read out of its `Debug` — [`WaiterList`]
+    /// exposes no length, and the test below has to see that repeated polls do not stack
+    /// entries. Panics rather than guessing if kio's format ever changes.
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        let list = format!("{:?}", self.waiters.lock().unwrap());
+        list.rsplit_once("len: ")
+            .and_then(|(_, len)| len.trim_end_matches(&[' ', '}'][..]).parse().ok())
+            .expect("WaiterList Debug should report a length")
+    }
 }
 
 impl Wake for AcceptWaiters {
@@ -178,5 +189,35 @@ mod tests {
 
         rx.recv_timeout(Duration::from_secs(5))
             .expect("wake_all woke a waker while holding the lock, and the wake re-entered it");
+    }
+
+    /// Repeated polls must not stack registrations.
+    ///
+    /// Both routes in build a fresh `Waiter` per poll and drop the previous one — kio's
+    /// `wait` for the `async` methods, the `Context` bridge for the `poll_*` ones — so
+    /// the list reclaims the dead slot instead of growing. A bridge that reused a *live*
+    /// waiter would add an entry on every re-poll, which is the trap `kio::WaiterCell`
+    /// warns about, and this is the guard for whatever ends up replacing that bridge.
+    #[test]
+    fn repeated_polls_do_not_stack_registrations() {
+        let waiters = AcceptWaiters::default();
+
+        // Retained across iterations exactly as a poll bridge retains it: assigning the
+        // next one drops the previous, killing the registration it left behind.
+        let mut held = None;
+
+        for _ in 0..100 {
+            let waiter = Waiter::new(std::task::Waker::noop().clone());
+            waiters.register(&waiter);
+            held = Some(waiter);
+        }
+
+        assert!(
+            waiters.slots() <= 2,
+            "100 polls left {} registrations behind",
+            waiters.slots()
+        );
+
+        drop(held);
     }
 }

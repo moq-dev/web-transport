@@ -696,9 +696,20 @@ impl SessionAccept {
         }
     }
 
-    // This is poll-based because we accept and decode streams in parallel.
-    // In async land I would use tokio::JoinSet, but that requires a runtime.
-    // It's better to use FuturesUnordered instead because it's agnostic.
+    /// Poll for the next unidirectional WebTransport stream.
+    ///
+    /// `waiter` is parked until a stream arrives, the accept fails, or the caller drops
+    /// it. The registration is weak and owned by the caller: keep the [`Waiter`] alive
+    /// until it is woken, or it will be reclaimed and nothing will wake you. Drive this
+    /// with [`kio::wait`], which holds the waiter inside the future it builds.
+    ///
+    /// A `Ready` here means every *other* parked accepter should be woken so it can
+    /// retry. This does not do that itself — see `poll_accept_uni_shared`, which wakes
+    /// them once the lock on this struct is released.
+    //
+    // Poll-based because we accept and decode streams in parallel. In async land this
+    // would be a `tokio::JoinSet`, but that needs a runtime; `FuturesUnordered` is
+    // runtime-agnostic.
     pub fn poll_accept_uni(&mut self, waiter: &Waiter) -> Poll<Result<RecvStream, SessionError>> {
         // Register before polling, not on the way out: the shared waker can fire from
         // Quinn's driver at any point below, and a wake that lands before the caller is
@@ -780,6 +791,11 @@ impl SessionAccept {
         Ok((typ, recv))
     }
 
+    /// Poll for the next bidirectional WebTransport stream.
+    ///
+    /// The same contract as [`poll_accept_uni`](Self::poll_accept_uni): the `waiter`
+    /// registration is weak and owned by the caller, and a `Ready` is what the other
+    /// parked accepters need to be woken for.
     pub fn poll_accept_bi(
         &mut self,
         waiter: &Waiter,
