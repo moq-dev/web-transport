@@ -20,9 +20,13 @@ use kio::{Waiter, WaiterList};
 struct AcceptState {
     waiters: WaiterList,
 
-    /// A poll is holding the lock on the accept state, so a wake arriving now is
-    /// recorded rather than delivered. See [`AcceptWaiters::arm`].
-    armed: bool,
+    /// How many polls are holding the lock on the accept state. While this is non-zero
+    /// a wake is recorded rather than delivered. See [`AcceptWaiters::arm`].
+    ///
+    /// A count, not a flag: one poll releases the accept lock before it disarms, so
+    /// another can be armed and mid-poll by then, and a flag would let the first one
+    /// clear the second's protection.
+    armed: usize,
 
     /// A wake arrived while `armed`, and is owed to the list.
     deferred: bool,
@@ -60,7 +64,7 @@ impl AcceptWaiters {
     pub(crate) fn wake_all(&self) {
         let mut waiters = {
             let mut state = self.state.lock().unwrap();
-            if state.armed {
+            if state.armed > 0 {
                 state.deferred = true;
                 return;
             }
@@ -80,16 +84,23 @@ impl AcceptWaiters {
     /// lock, which it takes as its first move. So it is recorded instead, and
     /// [`disarm`](Self::disarm) hands it back once the lock is gone.
     pub(crate) fn arm(&self) {
-        self.state.lock().unwrap().armed = true;
+        self.state.lock().unwrap().armed += 1;
     }
 
-    /// Stop holding wakes back, reporting whether one arrived while armed.
+    /// Stop holding wakes back, reporting whether one arrived and is this caller's to
+    /// deliver.
     ///
     /// Only ever called with the accept lock released, and the caller owes the list a
-    /// [`wake_all`](Self::wake_all) when this returns true.
+    /// [`wake_all`](Self::wake_all) when this returns true. False while another poll is
+    /// still armed: a deferred wake stays owed until the last one leaves, and that one
+    /// delivers it.
     pub(crate) fn disarm(&self) -> bool {
         let mut state = self.state.lock().unwrap();
-        state.armed = false;
+        state.armed = state.armed.saturating_sub(1);
+        if state.armed > 0 {
+            return false;
+        }
+
         std::mem::take(&mut state.deferred)
     }
 
@@ -314,5 +325,31 @@ mod tests {
         let waiters = AcceptWaiters::default();
         waiters.arm();
         assert!(!waiters.disarm());
+    }
+
+    /// One poll releasing the accept lock must not drop another's protection.
+    ///
+    /// The lock is released before `disarm`, so a second poll can be armed and running
+    /// by then. With a flag instead of a count, the first one leaving would expose the
+    /// second to exactly the inline wake this is here to prevent.
+    #[test]
+    fn overlapping_polls_stay_armed_until_the_last_one_leaves() {
+        let waiters = AcceptWaiters::default();
+
+        let flag = Arc::new(Flag::default());
+        let waiter = Waiter::new(std::task::Waker::from(flag.clone()));
+        waiters.register(&waiter);
+
+        waiters.arm(); // first poll
+        waiters.arm(); // second poll, overlapping
+
+        assert!(!waiters.disarm(), "the first out does not own the wake");
+
+        waiters.wake_all();
+        assert!(!flag.woken(), "a poll is still holding the accept lock");
+
+        assert!(waiters.disarm(), "the last one out owes the deferred wake");
+        waiters.wake_all();
+        assert!(flag.woken());
     }
 }
