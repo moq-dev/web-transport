@@ -374,7 +374,7 @@ fn poll_accept_uni_shared(
         (result, waiters)
     };
 
-    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
     if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }
@@ -398,7 +398,7 @@ fn poll_accept_bi_shared(
         (result, waiters)
     };
 
-    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
     if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }

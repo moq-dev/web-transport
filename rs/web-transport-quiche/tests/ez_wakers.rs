@@ -238,3 +238,78 @@ async fn a_finished_read_releases_the_poller() -> Result<()> {
     client.close(0, "bye");
     Ok(())
 }
+
+/// Teardown must wake outside the driver lock.
+///
+/// The driver settles the connection error under the state lock, and the same lock is
+/// the first thing a resumed task reaches for. Waking underneath it deadlocks the driver
+/// mid-teardown, which strands the close and everything parked on it.
+///
+/// The probe never blocks the driver: it hands the lock attempt to a scratch thread and
+/// gives up after a moment, so a regression fails this test instead of wedging the
+/// runtime — a worker stuck on a `std` mutex would outlive any timeout, because dropping
+/// the runtime waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_wakes_outside_the_driver_lock() -> Result<()> {
+    let (client, server) = pair().await?;
+
+    struct Probe {
+        conn: ez::Connection,
+        woken: AtomicBool,
+        locked_out: AtomicBool,
+    }
+
+    impl Wake for Probe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // What a resumed task does first, on a thread of its own so that a driver
+            // still holding the lock stalls the probe rather than itself.
+            let conn = self.conn.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = conn.is_closed();
+                let _ = tx.send(());
+            });
+
+            let held = rx.recv_timeout(Duration::from_secs(2)).is_err();
+            self.locked_out.store(held, Ordering::SeqCst);
+            self.woken.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let probe = Arc::new(Probe {
+        conn: server.clone(),
+        woken: AtomicBool::new(false),
+        locked_out: AtomicBool::new(false),
+    });
+    let waker = Waker::from(probe.clone());
+
+    // Parks on the datagram queue and, through it, on the connection-closed lists that
+    // teardown wakes. Held for the rest of the test: the registration is weak.
+    let mut parked = std::pin::pin!(server.read_datagram());
+    assert!(parked
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+
+    // The peer goes away, so the driver runs its teardown and wakes what is parked.
+    client.close(0, "bye");
+
+    timeout(Duration::from_secs(10), async {
+        while !probe.woken.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("teardown never woke the parked reader")?;
+
+    assert!(
+        !probe.locked_out.load(Ordering::SeqCst),
+        "teardown woke a parked reader while still holding the driver lock"
+    );
+
+    Ok(())
+}

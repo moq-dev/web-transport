@@ -529,7 +529,7 @@ fn poll_accept_uni_shared(
         (result, waiters)
     };
 
-    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
     if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }
@@ -553,7 +553,7 @@ fn poll_accept_bi_shared(
         (result, waiters)
     };
 
-    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    // `disarm` runs first either way: the count has to come down even on a `Ready`.
     if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }
@@ -592,8 +592,10 @@ pub struct SessionAccept {
     bi_waiters: Arc<AcceptWaiters>,
     uni_waiters: Arc<AcceptWaiters>,
 
-    // `Waker::from(waiters.clone())`, cached so the inner streams see the same waker
-    // every time — `ez` deduplicates by `will_wake`, so it parks exactly one.
+    // `Waker::from(waiters.clone())`, cached so `ez` is polled with the same waker every
+    // time. That waker outlives every caller, so an accepter that drops its future
+    // cannot take the wakeup path with it, and `ez` holds one registration rather than
+    // one per caller.
     bi_waker: Waker,
     uni_waker: Waker,
 }
