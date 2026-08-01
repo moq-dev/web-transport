@@ -15,6 +15,18 @@ use std::{
 
 use kio::{Waiter, WaiterList};
 
+#[derive(Default)]
+struct AcceptState {
+    waiters: WaiterList,
+
+    /// A poll is holding the lock on the accept state, so a wake arriving now is
+    /// recorded rather than delivered. See [`AcceptWaiters::arm`].
+    armed: bool,
+
+    /// A wake arrived while `armed`, and is owed to the list.
+    deferred: bool,
+}
+
 /// The accepters parked on one direction, plus the waker that wakes all of them.
 ///
 /// The shared accept futures are polled with a [`Waker`](std::task::Waker) made from
@@ -25,9 +37,7 @@ use kio::{Waiter, WaiterList};
 /// everyone on the list.
 #[derive(Default)]
 pub(crate) struct AcceptWaiters {
-    // Held only to register or to wake, never across a poll of the inner futures, which
-    // take locks of their own further down.
-    waiters: Mutex<WaiterList>,
+    state: Mutex<AcceptState>,
 }
 
 impl AcceptWaiters {
@@ -37,17 +47,49 @@ impl AcceptWaiters {
     /// `timeout` around `accept_uni`, or a task that just drops the future — releases
     /// its slot instead of leaving a waker parked here forever.
     pub(crate) fn register(&self, waiter: &Waiter) {
-        waiter.register(&mut self.waiters.lock().unwrap());
+        waiter.register(&mut self.state.lock().unwrap().waiters);
     }
 
-    /// Wake every parked accepter so it can retry.
+    /// Wake every parked accepter so it can retry, or record the wake while a poll is
+    /// [armed](Self::arm).
     ///
     /// The list is taken under the lock and woken outside it. A waker is free to resume
     /// its task inline, and the first thing a resumed accepter does is register here
     /// again — waking underneath the lock would deadlock on this very mutex.
     pub(crate) fn wake_all(&self) {
-        let mut waiters = self.waiters.lock().unwrap().take();
+        let mut waiters = {
+            let mut state = self.state.lock().unwrap();
+            if state.armed {
+                state.deferred = true;
+                return;
+            }
+
+            state.waiters.take()
+        };
+
         waiters.wake();
+    }
+
+    /// Hold back wakes for the duration of a poll that holds the lock on the accept
+    /// state.
+    ///
+    /// That poll drives the shared accept futures with this list's waker, and one of
+    /// them may wake it *inline* — `FuturesUnordered`, for one, notifies its parent from
+    /// a child's `wake`. Delivering that would resume an accepter underneath the accept
+    /// lock, which it takes as its first move. So it is recorded instead, and
+    /// [`disarm`](Self::disarm) hands it back once the lock is gone.
+    pub(crate) fn arm(&self) {
+        self.state.lock().unwrap().armed = true;
+    }
+
+    /// Stop holding wakes back, reporting whether one arrived while armed.
+    ///
+    /// Only ever called with the accept lock released, and the caller owes the list a
+    /// [`wake_all`](Self::wake_all) when this returns true.
+    pub(crate) fn disarm(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.armed = false;
+        std::mem::take(&mut state.deferred)
     }
 
     /// How many slots the list is holding, read out of its `Debug` — [`WaiterList`]
@@ -55,7 +97,7 @@ impl AcceptWaiters {
     /// entries. Panics rather than guessing if kio's format ever changes.
     #[cfg(test)]
     fn slots(&self) -> usize {
-        let list = format!("{:?}", self.waiters.lock().unwrap());
+        let list = format!("{:?}", self.state.lock().unwrap().waiters);
         list.rsplit_once("len: ")
             .and_then(|(_, len)| len.trim_end_matches(&[' ', '}'][..]).parse().ok())
             .expect("WaiterList Debug should report a length")
@@ -81,6 +123,28 @@ mod tests {
     };
 
     use super::*;
+
+    /// Records whether it was woken.
+    #[derive(Default)]
+    struct Flag {
+        woken: std::sync::atomic::AtomicBool,
+    }
+
+    impl Flag {
+        fn woken(&self) -> bool {
+            self.woken.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.woken.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     /// A waker that re-enters the list from `wake`, standing in for an executor that
     /// polls a resumed task inline: the first thing a resumed accepter does is register
@@ -154,5 +218,38 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// A wake that lands mid-poll is held until the accept lock is gone.
+    ///
+    /// The shared accept futures are driven with this list's waker while the poll holds
+    /// that lock, and an inner future can wake it inline. Delivering it there would
+    /// resume an accepter straight into the lock it is standing on.
+    #[test]
+    fn a_wake_during_a_poll_is_deferred() {
+        let waiters = AcceptWaiters::default();
+
+        let flag = Arc::new(Flag::default());
+        let waiter = Waiter::new(std::task::Waker::from(flag.clone()));
+        waiters.register(&waiter);
+
+        waiters.arm();
+        waiters.wake_all();
+        assert!(
+            !flag.woken(),
+            "the wake was delivered while the accept lock was held"
+        );
+
+        assert!(waiters.disarm(), "the deferred wake was dropped");
+        waiters.wake_all();
+        assert!(flag.woken(), "the deferred wake never arrived");
+    }
+
+    /// Nothing owed when nothing woke.
+    #[test]
+    fn disarming_a_quiet_poll_owes_no_wake() {
+        let waiters = AcceptWaiters::default();
+        waiters.arm();
+        assert!(!waiters.disarm());
     }
 }

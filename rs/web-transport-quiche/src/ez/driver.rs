@@ -879,12 +879,19 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         // Mark the connection closed only after the driver is done. In particular,
         // a local close request must not make Connection::closed resolve before
         // quiche has had an opportunity to emit CONNECTION_CLOSE.
-        let mut waiters = state.finish_close(err.clone());
-        waiters.wake();
+        let mut closed = state.finish_close(err.clone());
 
         // Also wake up anyone waiting locally if the peer closed.
-        let mut waiters = state.close_requested.abort(err);
-        waiters.wake();
+        let mut requested = state.close_requested.abort(err);
+
+        // Both lists are woken *after* the guard goes, unlike everywhere else in this
+        // file where the guard is a temporary that drops with the statement. A resumed
+        // task's first move is to take this same lock, and this is the teardown path:
+        // deadlocking here would strand the close and everything waiting on it.
+        drop(state);
+
+        closed.wake();
+        requested.wake();
     }
 }
 

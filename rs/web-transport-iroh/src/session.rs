@@ -364,12 +364,18 @@ fn poll_accept_uni_shared(
 ) -> Poll<Result<RecvStream, SessionError>> {
     let (result, waiters) = {
         let mut accept = accept.lock().unwrap();
+        let waiters = accept.uni_waiters.clone();
+
+        // The poll below drives the shared accept futures with this list's waker, and
+        // one of them may wake it inline. Hold those back until the lock is gone.
+        waiters.arm();
         let result = accept.poll_accept_uni(waiter);
-        let waiters = result.is_ready().then(|| accept.uni_waiters.clone());
+
         (result, waiters)
     };
 
-    if let Some(waiters) = waiters {
+    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }
 
@@ -382,12 +388,18 @@ fn poll_accept_bi_shared(
 ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
     let (result, waiters) = {
         let mut accept = accept.lock().unwrap();
+        let waiters = accept.bi_waiters.clone();
+
+        // The poll below drives the shared accept futures with this list's waker, and
+        // one of them may wake it inline. Hold those back until the lock is gone.
+        waiters.arm();
         let result = accept.poll_accept_bi(waiter);
-        let waiters = result.is_ready().then(|| accept.bi_waiters.clone());
+
         (result, waiters)
     };
 
-    if let Some(waiters) = waiters {
+    // `disarm` runs first either way: it has to clear the flag even on a `Ready`.
+    if waiters.disarm() || result.is_ready() {
         waiters.wake_all();
     }
 
