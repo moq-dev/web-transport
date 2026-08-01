@@ -159,15 +159,32 @@ impl Wake for FlagWaker {
 async fn a_finished_poll_releases_the_poller() -> Result<()> {
     let (mut client, mut server) = pair().await?;
 
+    // An opening byte, so the stream reaches the peer and can be accepted.
     let mut send = poll_fn(|cx| client.poll_open_uni(cx)).await?;
-    poll_fn(|cx| send.poll_write(cx, b"done")).await?;
+    poll_fn(|cx| send.poll_write(cx, b"hi")).await?;
 
     let mut recv = poll_fn(|cx| server.poll_accept_uni(cx)).await?;
+    let mut drained = [0u8; 2];
+    assert_eq!(
+        poll_fn(|cx| recv.poll_read(cx, &mut drained))
+            .await?
+            .context("stream ended early")?,
+        2
+    );
 
     // Poll until the read is ready, tracking only the waker that sees it through.
     let mut dst = [0u8; 16];
     let flag = Arc::new(FlagWaker::default());
     let waker = Waker::from(flag.clone());
+
+    // Park first, so the waiter this poll retains is the one the `Ready` below has to
+    // let go of. Nothing more has been sent and the stream is open, so this cannot be
+    // ready yet.
+    assert!(recv
+        .poll_read(&mut Context::from_waker(&waker), &mut dst)
+        .is_pending());
+
+    poll_fn(|cx| send.poll_write(cx, b"done")).await?;
 
     loop {
         match recv.poll_read(&mut Context::from_waker(&waker), &mut dst) {

@@ -201,16 +201,29 @@ async fn abandoned_datagram_reads_release_their_wakers() -> Result<()> {
 async fn a_finished_read_releases_the_poller() -> Result<()> {
     let (client, server) = pair().await?;
 
+    // An opening byte, so the stream reaches the peer and can be accepted.
     let mut send = client.open_uni().await?;
-    send.write_all(b"done").await?;
+    send.write_all(b"hi").await?;
 
     let mut recv = server.accept_uni().await?;
+    let mut drained = [0u8; 2];
+    assert_eq!(recv.read(&mut drained).await?, Some(2));
 
     // Read through `AsyncRead`, which is the surface that has to bridge a `Context`.
     let flag = Arc::new(FlagWaker::default());
     let waker = Waker::from(flag.clone());
     let mut dst = [0u8; 16];
     let mut buf = ReadBuf::new(&mut dst);
+
+    // Park first, so the waiter this poll retains is the one the `Ready` below has to
+    // let go of. Nothing more has been sent and the stream is open, so this cannot be
+    // ready yet.
+    assert!(std::pin::Pin::new(&mut recv)
+        .poll_read(&mut Context::from_waker(&waker), &mut buf)
+        .is_pending());
+    assert!(buf.filled().is_empty());
+
+    send.write_all(b"done").await?;
 
     loop {
         let read =
