@@ -180,8 +180,11 @@ impl Session {
     }
 
     /// Return the application protocol used to create the session.
+    ///
+    /// For a WebTransport session this is the negotiated subprotocol; for a raw QUIC
+    /// session it is the negotiated ALPN.
     pub fn protocol(&self) -> Option<&str> {
-        self.inner.response().protocol.as_deref()
+        self.inner.protocol()
     }
 }
 

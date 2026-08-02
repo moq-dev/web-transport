@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("connected");
 
-    match (&args.protocol, &session.response().protocol) {
+    match (&args.protocol, session.protocol()) {
         (Some(_), Some(protocol)) => {
             tracing::info!(%protocol, "negotiated protocol");
         }

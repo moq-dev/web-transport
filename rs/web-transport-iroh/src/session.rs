@@ -38,10 +38,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session from a raw QUIC connection and a URL.
+    /// Create a new session from a raw QUIC connection.
     ///
-    /// This is used to pretend like a QUIC connection is a WebTransport session.
-    /// It's a hack, but it makes it much easier to support WebTransport and raw QUIC simultaneously.
+    /// This is used to pretend like a QUIC connection is a WebTransport session,
+    /// making it easier to support WebTransport and raw QUIC simultaneously.
+    ///
+    /// There is no HTTP/3 exchange, so [`Self::request`] and [`Self::response`] both
+    /// return `None`. [`Self::protocol`] reports the ALPN negotiated by the QUIC
+    /// handshake instead.
     pub fn raw(conn: Connection) -> Self {
         Self { conn, h3: None }
     }

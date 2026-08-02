@@ -285,7 +285,7 @@ impl NapiSession {
     /// The subprotocol selected by the server during WT-Available-Protocols negotiation.
     #[napi(getter)]
     pub fn protocol(&self) -> Option<String> {
-        self.inner.response().protocol.clone()
+        self.inner.protocol().map(str::to_string)
     }
 
     /// Accept an incoming unidirectional stream.

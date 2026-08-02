@@ -19,6 +19,32 @@ use crate::{
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
 
+/// The ALPN the QUIC handshake negotiated, or `None` if there was none, the handshake
+/// has not completed, or it is not valid UTF-8.
+///
+/// Noq only exposes the ALPN via a downcast of the boxed handshake data, so the result
+/// is owned rather than borrowed from the connection.
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn negotiated_alpn(conn: &noq::Connection) -> Option<String> {
+    let data = conn.handshake_data()?;
+    let data = data.downcast::<noq::crypto::rustls::HandshakeData>().ok()?;
+
+    String::from_utf8(data.protocol?).ok()
+}
+
+/// `noq::crypto::rustls` only exists once a TLS backend is enabled, so there is no
+/// handshake data type to name here.
+///
+/// This crate's own builders are gated the same way, so normally there is no connection
+/// to read an ALPN from either. A caller that enables a provider on `noq` directly and
+/// brings its own endpoint can still establish one, and [`Session::protocol`] reports
+/// `None` for those raw sessions. Enable this crate's `aws-lc-rs` or `ring` feature to
+/// get the ALPN.
+#[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+fn negotiated_alpn(_conn: &noq::Connection) -> Option<String> {
+    None
+}
+
 /// An established WebTransport session, acting like a full QUIC connection. See [`noq::Connection`].
 ///
 /// It is important to remember that WebTransport is layered on top of QUIC:
@@ -59,8 +85,20 @@ pub struct Session {
     // The request sent by the client, or None for a raw QUIC session.
     request: Option<ConnectRequest>,
 
-    // The response sent by the server.
-    response: ConnectResponse,
+    // The response sent by the server, or None for a raw QUIC session.
+    response: Option<ConnectResponse>,
+
+    // The ALPN negotiated by the QUIC handshake, for raw QUIC sessions. Noq only
+    // exposes it behind an allocating downcast, so `protocol()` has nothing in the
+    // connection to borrow from and needs somewhere to keep the result.
+    //
+    // Resolved on first read rather than at construction: `raw()` accepts any
+    // connection, including one whose handshake has not completed and so has no ALPN
+    // yet. Only a successful read is latched, so an early call cannot pin `None` for
+    // the life of the session. Shared across clones.
+    //
+    // Unused by HTTP/3 sessions, which read the subprotocol out of the response.
+    alpn: Arc<OnceLock<String>>,
 }
 
 impl Session {
@@ -96,7 +134,8 @@ impl Session {
             connect_send: Arc::new(Mutex::new(Some(connect.send))),
             error: error.clone(),
             request: Some(connect.request.clone()),
-            response: connect.response.clone(),
+            response: Some(connect.response.clone()),
+            alpn: Default::default(),
         };
 
         // Run a background task to read capsules from the CONNECT recv stream.
@@ -488,9 +527,11 @@ impl Session {
     /// This is used to pretend like a QUIC connection is a WebTransport session,
     /// making it easier to support WebTransport and raw QUIC simultaneously.
     ///
-    /// There is no CONNECT request, so [`Self::request`] returns `None`. The response
-    /// is supplied by the caller to carry the negotiated ALPN via [`Self::protocol`].
-    pub fn raw(conn: noq::Connection, response: impl Into<ConnectResponse>) -> Self {
+    /// There is no HTTP/3 exchange, so [`Self::request`] and [`Self::response`] both
+    /// return `None`. [`Self::protocol`] reports the ALPN negotiated by the QUIC
+    /// handshake, read from `conn` on demand — a connection that is still handshaking
+    /// (from `into_0rtt`, say) is fine, it just has no ALPN to report until it is done.
+    pub fn raw(conn: noq::Connection) -> Self {
         Self {
             conn,
             session_id: None,
@@ -502,7 +543,8 @@ impl Session {
             connect_send: Arc::new(Mutex::new(None)),
             error: Arc::new(OnceLock::new()),
             request: None,
-            response: response.into(),
+            response: None,
+            alpn: Default::default(),
         }
     }
 
@@ -512,8 +554,31 @@ impl Session {
         self.request.as_ref()
     }
 
-    pub fn response(&self) -> &ConnectResponse {
-        &self.response
+    /// Returns the [`ConnectResponse`] if this session was established over HTTP/3,
+    /// or `None` for a raw QUIC session.
+    pub fn response(&self) -> Option<&ConnectResponse> {
+        self.response.as_ref()
+    }
+
+    /// Returns the application protocol negotiated for this session.
+    ///
+    /// For an HTTP/3 session this is the subprotocol the server selected via
+    /// `WT-Available-Protocols`; for a raw QUIC session it is the negotiated ALPN.
+    /// `None` if neither was negotiated, the ALPN is not valid UTF-8, or the raw
+    /// connection is still handshaking.
+    pub fn protocol(&self) -> Option<&str> {
+        if let Some(response) = &self.response {
+            return response.protocol.as_deref();
+        }
+
+        if let Some(alpn) = self.alpn.get() {
+            return Some(alpn);
+        }
+
+        // Latch only a successful read, so a call made while the connection is still
+        // handshaking cannot pin `None` for the life of the session.
+        let alpn = negotiated_alpn(&self.conn)?;
+        Some(self.alpn.get_or_init(|| alpn))
     }
 
     /// Return connection-level statistics.
@@ -954,7 +1019,7 @@ impl web_transport_trait::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.response.protocol.as_deref()
+        Self::protocol(self)
     }
 
     #[allow(refining_impl_trait)]

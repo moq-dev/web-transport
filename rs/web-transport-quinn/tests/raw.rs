@@ -1,8 +1,8 @@
 //! Raw QUIC sessions: a QUIC connection using a non-HTTP/3 ALPN, wrapped in a
 //! [`Session`] so callers can treat WebTransport and raw QUIC uniformly.
 //!
-//! There is no CONNECT request on this path, so there is no request URL. The
-//! negotiated ALPN is carried by the response instead.
+//! There is no HTTP/3 exchange on this path, so there is neither a request URL nor
+//! a response. The session reports the negotiated ALPN as its protocol instead.
 
 // A crypto provider is needed to establish the connection, matching the gate on
 // the crate's own builders.
@@ -11,6 +11,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -18,8 +19,7 @@ use rcgen::{CertifiedKey, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 // The trait provides `protocol()`; imported anonymously to avoid clashing with
 // the concrete `Session`.
-use web_transport_quinn::generic::Session as _;
-use web_transport_quinn::{proto::ConnectResponse, Session};
+use web_transport_quinn::Session;
 
 /// A raw QUIC ALPN, i.e. anything other than the `h3` used by WebTransport.
 const RAW_ALPN: &str = "moq-00";
@@ -50,8 +50,8 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     }
 }
 
-/// Bind a QUIC server and connect a client to it, both offering only `RAW_ALPN`.
-async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
+/// Bind a server endpoint and a client endpoint, both offering only `RAW_ALPN`.
+fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
     let (cert, key) = self_signed()?;
     let provider = crypto_provider();
 
@@ -60,6 +60,7 @@ async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
         .with_no_client_auth()
         .with_single_cert(vec![cert.clone()], key)?;
     server_crypto.alpn_protocols = vec![RAW_ALPN.as_bytes().to_vec()];
+    server_crypto.max_early_data_size = u32::MAX;
 
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -77,6 +78,9 @@ async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![RAW_ALPN.as_bytes().to_vec()];
+    // Needed for the client-side 0-RTT test below; harmless elsewhere. The default
+    // `resumption` is an in-memory store, so one endpoint can resume its own ticket.
+    client_crypto.enable_early_data = true;
 
     let client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
@@ -84,6 +88,13 @@ async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
 
     let mut client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into())?;
     client.set_default_client_config(client_config);
+
+    Ok((server, client, server_addr))
+}
+
+/// Bind a QUIC server and connect a client to it, both fully handshaken.
+async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
+    let (server, client, server_addr) = endpoints()?;
 
     let accept = tokio::spawn(async move {
         let conn = server.accept().await.context("no connection")?.await?;
@@ -114,22 +125,94 @@ fn negotiated_alpn(conn: &quinn::Connection) -> Result<String> {
 async fn raw_session_has_no_request() -> Result<()> {
     let (client_conn, _server_conn) = connect_raw().await?;
 
-    let session = Session::raw(client_conn, ConnectResponse::OK);
+    let session = Session::raw(client_conn);
     assert!(session.request().is_none());
+    assert!(session.response().is_none());
 
     Ok(())
 }
 
-/// The response is what carries the negotiated ALPN on the raw path.
+/// `protocol()` reports the ALPN the QUIC handshake negotiated, read off the
+/// connection rather than supplied by the caller.
 #[tokio::test]
 async fn raw_session_reports_alpn_as_protocol() -> Result<()> {
-    let (client_conn, _server_conn) = connect_raw().await?;
+    let (client_conn, server_conn) = connect_raw().await?;
 
-    let alpn = negotiated_alpn(&client_conn)?;
-    assert_eq!(alpn, RAW_ALPN);
+    // Independently confirm what was negotiated, so the assertion below is checking
+    // the session against the connection rather than against itself.
+    assert_eq!(negotiated_alpn(&client_conn)?, RAW_ALPN);
 
-    let session = Session::raw(client_conn, ConnectResponse::OK.with_protocol(&alpn));
-    assert_eq!(session.protocol(), Some(RAW_ALPN));
+    // Both directions: the server reads the ALPN from its own handshake data too.
+    assert_eq!(Session::raw(client_conn).protocol(), Some(RAW_ALPN));
+    assert_eq!(Session::raw(server_conn).protocol(), Some(RAW_ALPN));
+
+    Ok(())
+}
+
+/// Wrapping a connection that is still handshaking must not pin `protocol()` to
+/// `None` for the life of the session.
+///
+/// A resuming client gets its [`quinn::Connection`] from `into_0rtt` before the server
+/// has answered, so the ALPN genuinely is not negotiated yet. Reading `protocol()` in
+/// that window must not stop a later read from seeing the real value.
+#[tokio::test]
+async fn a_handshaking_session_reports_its_alpn_once_it_completes() -> Result<()> {
+    let (server, client, server_addr) = endpoints()?;
+
+    // Accept connections for the whole test; 0-RTT needs a prior session to resume.
+    let accepting = tokio::spawn(async move {
+        while let Some(incoming) = server.accept().await {
+            tokio::spawn(async move {
+                if let Ok(conn) = incoming.await {
+                    conn.closed().await;
+                }
+            });
+        }
+    });
+
+    // 0-RTT needs a ticket from an earlier session, and the ticket arrives after that
+    // handshake with no completion to await. Connect until one is available rather than
+    // sleeping on a guess: the first attempt is what produces the ticket, and a later
+    // one resumes it.
+    let mut zero_rtt = None;
+    for _ in 0..10 {
+        match client.connect(server_addr, "localhost")?.into_0rtt() {
+            Ok(resumed) => {
+                zero_rtt = Some(resumed);
+                break;
+            }
+            Err(connecting) => {
+                let conn = connecting.await?;
+                // The ticket arrives on this connection shortly after the handshake,
+                // with nothing to await on, so hold it open long enough to receive
+                // one. Retrying is what makes this robust — not the wait itself.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                conn.close(0u32.into(), b"");
+                conn.closed().await;
+            }
+        }
+    }
+
+    let (conn, accepted) = zero_rtt.context("0-RTT never became available")?;
+
+    let session = Session::raw(conn);
+
+    // The ALPN is not negotiated yet, so this read has nothing to report...
+    assert_eq!(
+        session.protocol(),
+        None,
+        "expected no ALPN before the handshake completed"
+    );
+
+    // ...and it must not have poisoned the answer for later reads.
+    assert!(accepted.await, "0-RTT was rejected by the server");
+    assert_eq!(
+        session.protocol(),
+        Some(RAW_ALPN),
+        "an early read pinned protocol() to None for the life of the session"
+    );
+
+    accepting.abort();
 
     Ok(())
 }
@@ -140,8 +223,8 @@ async fn raw_session_reports_alpn_as_protocol() -> Result<()> {
 async fn raw_session_streams_omit_webtransport_header() -> Result<()> {
     let (client_conn, server_conn) = connect_raw().await?;
 
-    let client = Session::raw(client_conn, ConnectResponse::OK);
-    let server = Session::raw(server_conn, ConnectResponse::OK);
+    let client = Session::raw(client_conn);
+    let server = Session::raw(server_conn);
 
     let mut send = client.open_uni().await?;
     send.write_all(b"hello").await?;
