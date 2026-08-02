@@ -3,6 +3,29 @@
 //! Provides QUIC-style multiplexed streams over TCP, TLS, and WebSocket.
 //! Speaks draft-02 by default, negotiating down to draft-01 or draft-00, with
 //! backwards compatibility for the legacy `webtransport` wire format.
+//!
+//! # Layout
+//!
+//! The crate root holds the transport-independent session API: [`Session`] and
+//! its [`SendStream`] / [`RecvStream`] halves, plus the [`Config`], [`Version`],
+//! and [`Error`] types they share.
+//!
+//! Everything tied to a specific transport lives in that transport's module, so
+//! the generic names stay unambiguous when several are in scope at once:
+//!
+//! | Module | Entry point | Feature |
+//! | --- | --- | --- |
+//! | `tcp` | `tcp::Config` | `tcp` |
+//! | `uds` | `uds::Config` | `uds` (Unix only) |
+//! | `tls` | `tls::Client`, `tls::Server` | `tls` |
+//! | `ws` | `ws::Client`, `ws::Server`, `ws::Upgraded` | `ws` |
+//! | [`transport`] | [`transport::Stream`] | `tcp` or `uds` |
+//!
+//! For anything the built-in modules don't cover, wrap an
+//! [`AsyncRead`](tokio::io::AsyncRead) + [`AsyncWrite`](tokio::io::AsyncWrite)
+//! byte stream in [`transport::Stream`], or implement
+//! [`transport::Transport`] yourself, and pass it to [`Session::connect`] /
+//! [`Session::accept`].
 
 // ALPN/subprotocol negotiation is only used by the TLS and WebSocket transports.
 #[cfg(any(feature = "tls", feature = "ws"))]
@@ -36,17 +59,6 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
-// Re-export the WebSocket dependencies so downstream integrations can use the
-// exact versions compatible with QMux's public WebSocket types.
-#[cfg(feature = "ws")]
-pub use tokio_tungstenite;
-
-#[cfg(feature = "ws")]
-pub use tokio_tungstenite::tungstenite;
-
-#[cfg(feature = "ws")]
-pub use ws::{Client, KeepAlive, Server};
-
 use proto::*;
 
 pub use config::{Config, Protocol};
@@ -54,11 +66,9 @@ pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
 pub use stream::{StreamDir, StreamId};
-pub use transport::Transport;
-// The transport half-traits live at `transport::{Reader, Writer}` and the concrete
-// byte-stream transport at `transport::Stream`, rather than the crate root — the
-// bare `Reader`/`Writer`/`Stream` names would be too generic (and `Stream` would
-// collide with the STREAM-frame `Stream` type) alongside the rest of the API.
+// Transport-specific types are deliberately *not* re-exported here; they stay
+// behind their module path (`transport::Transport`, `ws::Client`, `tls::Client`,
+// ...) so that names shared across transports don't collide at the crate root.
 
 /// All supported ALPN identifiers, in preference order.
 ///

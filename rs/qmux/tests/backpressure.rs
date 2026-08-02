@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use qmux::transport::{Reader, Writer};
-use qmux::{Config, Error, Session, Transport, Version};
+use qmux::transport::{Reader, Transport, Writer};
+use qmux::{Config, Error, Session, Version};
 use tokio::sync::{mpsc, watch};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 

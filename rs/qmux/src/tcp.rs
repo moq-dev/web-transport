@@ -24,7 +24,7 @@ use crate::{Error, Protocol, Session, Version};
 /// ```
 ///
 /// For flow-control tuning beyond version + protocols, build a [`crate::Config`]
-/// and drive [`crate::Stream`] + [`Session::connect`] yourself.
+/// and drive [`crate::transport::Stream`] + [`Session::connect`] yourself.
 #[derive(Debug, Clone)]
 pub struct Config {
     inner: crate::Config,

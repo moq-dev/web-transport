@@ -1,11 +1,16 @@
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::tungstenite;
 
 use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
 use crate::{alpn, Config, Error, Session, Version};
+
+// Re-exported so downstream integrations can depend on the exact versions
+// compatible with the public WebSocket types below, rather than pinning their
+// own and hitting a type mismatch.
+pub use tokio_tungstenite;
+pub use tokio_tungstenite::tungstenite;
 
 /// Keep-alive configuration for WebSocket transports.
 ///

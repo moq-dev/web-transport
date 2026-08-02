@@ -11,6 +11,9 @@ edition = "2021"
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
 categories = ["network-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = ["tls", "wss"]
 tcp = ["tokio/net", "tokio/io-util"]
