@@ -6,10 +6,19 @@ use crate::protocol::validate_protocol;
 use crate::transport::WsTransport;
 use crate::{alpn, Config, Error, Session, Version};
 
-// Re-exported so downstream integrations can depend on the exact versions
-// compatible with the public WebSocket types below, rather than pinning their
-// own and hitting a type mismatch.
+/// The `tokio-tungstenite` version this crate is built against.
+///
+/// [`Client::with_connector`] and [`Upgraded`] take `tokio-tungstenite` types
+/// directly, so use this re-export rather than a separately pinned dependency —
+/// a different minor version is a distinct crate to the compiler and fails to
+/// typecheck against these APIs.
 pub use tokio_tungstenite;
+
+/// The `tungstenite` version this crate is built against, matching
+/// [`tokio_tungstenite`].
+///
+/// [`Client::with_config`] and [`Upgraded`] name `tungstenite` types, and
+/// [`Error::WebSocket`] wraps a `tungstenite::Error`.
 pub use tokio_tungstenite::tungstenite;
 
 /// Keep-alive configuration for WebSocket transports.
