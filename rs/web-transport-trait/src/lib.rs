@@ -124,7 +124,8 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// Return the application protocol negotiated for this session, if any.
     ///
     /// For WebTransport over HTTP/3 this is the selected WebTransport subprotocol;
-    /// for raw QUIC it is the negotiated ALPN.
+    /// for raw QUIC it is the negotiated ALPN. Returns `None` if neither was
+    /// negotiated or the ALPN is not valid UTF-8.
     fn protocol(&self) -> Option<&str> {
         None
     }

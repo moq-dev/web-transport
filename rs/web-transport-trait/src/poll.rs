@@ -130,9 +130,9 @@ pub trait Session {
     ///
     /// For WebTransport over HTTP/3 this is the selected WebTransport subprotocol;
     /// for raw QUIC it is the negotiated ALPN. Return `None` if the transport does
-    /// not negotiate either. This is required rather than defaulted: a transport
-    /// that negotiates an application protocol and forgets to report it is a silent
-    /// bug, and the default hid that.
+    /// not negotiate either or the ALPN is not valid UTF-8. This is required rather
+    /// than defaulted: a transport that negotiates an application protocol and
+    /// forgets to report it is a silent bug, and the default hid that.
     fn protocol(&self) -> Option<&str>;
 
     /// Close the connection immediately with a code and reason.

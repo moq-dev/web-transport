@@ -105,7 +105,7 @@ impl Session {
     /// Returns the application protocol negotiated for this session.
     ///
     /// For an HTTP/3 session this is the subprotocol the server selected via
-    /// `WT-Available-Protocols`; for a raw QUIC session it is the negotiated ALPN.
+    /// `WT-Protocol`; for a raw QUIC session it is the negotiated ALPN.
     /// Returns `None` if neither was negotiated or the ALPN is not valid UTF-8.
     pub fn protocol(&self) -> Option<&str> {
         match self.h3.as_ref() {
