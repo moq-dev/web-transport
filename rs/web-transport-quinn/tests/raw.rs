@@ -17,8 +17,7 @@ use std::{
 use anyhow::{Context, Result};
 use rcgen::{CertifiedKey, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-// The trait provides `protocol()`; imported anonymously to avoid clashing with
-// the concrete `Session`.
+// `Session::raw` and the inherent `protocol()` accessor are used directly.
 use web_transport_quinn::Session;
 
 /// A raw QUIC ALPN, i.e. anything other than the `h3` used by WebTransport.

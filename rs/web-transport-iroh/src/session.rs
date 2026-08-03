@@ -102,6 +102,18 @@ impl Session {
         self.h3.as_ref().map(|s| &s.response)
     }
 
+    /// Returns the application protocol negotiated for this session.
+    ///
+    /// For an HTTP/3 session this is the subprotocol the server selected via
+    /// `WT-Available-Protocols`; for a raw QUIC session it is the negotiated ALPN.
+    /// Returns `None` if neither was negotiated or the ALPN is not valid UTF-8.
+    pub fn protocol(&self) -> Option<&str> {
+        match self.h3.as_ref() {
+            None => std::str::from_utf8(self.conn.alpn()).ok(),
+            Some(h3) => h3.response.protocol.as_deref(),
+        }
+    }
+
     /// Accept a new unidirectional stream. See [`iroh::endpoint::Connection::accept_uni`].
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(h3) = &self.h3 {
@@ -692,10 +704,7 @@ impl web_transport_trait::Session for Session {
     }
 
     fn protocol(&self) -> Option<&str> {
-        match self.h3.as_ref() {
-            None => std::str::from_utf8(self.conn.alpn()).ok(),
-            Some(h3) => h3.response.protocol.as_deref(),
-        }
+        Self::protocol(self)
     }
 
     fn stats(&self) -> impl web_transport_trait::Stats {

@@ -121,7 +121,10 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// The maximum size of a datagram that can be sent.
     fn max_datagram_size(&self) -> usize;
 
-    /// Return the negotiated WebTransport subprotocol, if any.
+    /// Return the application protocol negotiated for this session, if any.
+    ///
+    /// For WebTransport over HTTP/3 this is the selected WebTransport subprotocol;
+    /// for raw QUIC it is the negotiated ALPN.
     fn protocol(&self) -> Option<&str> {
         None
     }

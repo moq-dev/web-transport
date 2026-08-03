@@ -228,6 +228,7 @@ async fn quic_smoke() -> n0_error::Result<()> {
             println!("session established");
             assert_eq!(session.remote_id(), server_id);
             assert!(session.request().is_none());
+            assert_eq!(session.protocol(), Some(ALPN));
             let reason = session.closed().await;
             assert!(
                 matches!(reason, SessionError::ConnectionError(ConnectionError::ApplicationClosed(frame)) if frame.error_code.into_inner() == 23)
@@ -244,6 +245,7 @@ async fn quic_smoke() -> n0_error::Result<()> {
             assert_eq!(request.conn().remote_id(), client_id);
             let session = request.ok();
             assert!(session.request().is_none());
+            assert_eq!(session.protocol(), Some(ALPN));
             assert_eq!(session.conn().remote_id(), client_id);
             session.close(23, b"bye");
             server.close().await;
