@@ -371,7 +371,7 @@ impl KeepAlive {
     }
 
     /// Returns true when a keep-alive is due.
-    fn poll(&mut self, cx: &mut Context) -> bool {
+    fn poll(&mut self, waiter: &Waiter) -> bool {
         let period = self.period;
         let ticker = self.ticker.get_or_insert_with(|| {
             // The first tick is one period out; `interval` would instead fire
@@ -384,7 +384,10 @@ impl KeepAlive {
             ticker
         });
 
-        ticker.poll_tick(cx).is_ready()
+        // `poll_tick` wants a `Context`; everything else in `ez` is handed a waiter.
+        ticker
+            .poll_tick(&mut Context::from_waker(waiter.waker()))
+            .is_ready()
     }
 }
 
@@ -636,7 +639,7 @@ impl Driver {
         // ack-eliciting, so a tick on a busy connection costs nothing.
         let mut keep_alive = false;
         if let Some(k) = self.keep_alive.as_mut() {
-            if k.poll(&mut Context::from_waker(waiter.waker())) {
+            if k.poll(waiter) {
                 qconn.send_ack_eliciting()?;
                 keep_alive = true;
             }
