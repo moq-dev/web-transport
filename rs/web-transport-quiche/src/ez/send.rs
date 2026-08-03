@@ -443,9 +443,9 @@ impl AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let mut buf = io::Cursor::new(buf);
-        let waiter = Waiter::new(cx.waker().clone());
+        let waiter = self.parked.hold(cx);
         let res = self.poll_write_buf(&waiter, &mut buf);
-        self.parked.park(waiter, &res);
+        self.parked.settle(&res);
 
         match ready!(res) {
             Ok(n) => Poll::Ready(Ok(n)),
@@ -454,9 +454,9 @@ impl AsyncWrite for SendStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        let waiter = Waiter::new(cx.waker().clone());
+        let waiter = self.parked.hold(cx);
         let res = self.poll_flushed(&waiter);
-        self.parked.park(waiter, &res);
+        self.parked.settle(&res);
 
         res.map_err(|e| io::Error::other(e.to_string()))
     }
@@ -475,9 +475,9 @@ impl AsyncWrite for SendStream {
             Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
         }
 
-        let waiter = Waiter::new(cx.waker().clone());
+        let waiter = self.parked.hold(cx);
         let res = self.poll_closed(&waiter);
-        self.parked.park(waiter, &res);
+        self.parked.settle(&res);
 
         res.map_err(|e| io::Error::other(e.to_string()))
     }

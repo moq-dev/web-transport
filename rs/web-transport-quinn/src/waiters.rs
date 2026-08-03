@@ -6,15 +6,15 @@
 //! [`kio::WaiterList`] are for.
 //!
 //! [`AcceptWaiters`] is the list, plus the waker the shared accept futures are polled
-//! with. [`Parked`] is the caller's end of a registration in that list, for a caller
-//! that only has a `Context` to work with.
+//! with. [`Parked`] is the caller's end of a registration, a [`kio::Park`] that also
+//! lets go of its waiter once the poll finishes.
 
 use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll, Wake},
 };
 
-use kio::{Waiter, WaiterList};
+use kio::{Park, Waiter, WaiterList};
 
 #[derive(Default)]
 struct AcceptState {
@@ -126,65 +126,49 @@ impl Wake for AcceptWaiters {
     }
 }
 
-/// A [`Waiter`] retained across `poll` calls.
+/// A [`kio::Park`] that lets go of its waiter once the poll finishes.
 ///
-/// A registration in [`AcceptWaiters`] stays live only while the caller holds the
-/// [`Waiter`] it registered, which is what lets a caller that walks away release its
-/// slot. So the handle has to live somewhere the *caller* owns, and a `poll_*` method is
-/// handed nothing but a `Context`. This is that somewhere: one cell per operation, held
-/// by whoever polls.
+/// `Park` retains the waiter until the next poll or until it drops, which is what a
+/// pending operation needs: a registration in [`AcceptWaiters`] (or any
+/// [`kio::WaiterList`]) lives only as long as the [`Waiter`] that made it. A *finished*
+/// poll is the other case. The stream is done with that caller, and going on holding its
+/// waker pins the polling task's allocation until something polls the cell again — for a
+/// stream whose last read completed and then sat idle, that is the rest of the
+/// connection. So this releases it on `Ready`.
 ///
-/// The `async` methods have no need for it — [`kio::wait`] keeps the waiter inside the
-/// future it builds, so dropping the future drops the registration.
-///
-/// kio grew a `WaiterCell` for exactly this after 0.5.2 (moq-dev/moq#2560); this can go
-/// once that releases. Its `hold` also *reuses* the waiter when the task is unchanged and
-/// every registration was already drained, which saves the allocation this one makes on
-/// each poll — though it holds the waiter across a `Ready`, so keep retiring it here.
-#[derive(Default)]
-pub(crate) struct Parked {
-    waiter: Option<Waiter>,
-}
+/// The `async` methods have no need for any of it — [`kio::wait`] keeps the waiter inside
+/// the future it builds, so dropping the future drops the registration.
+#[derive(Clone, Default)]
+pub(crate) struct Parked(Park);
 
 impl Parked {
-    /// Run one poll with a retained waiter.
-    ///
-    /// The waiter is kept only while the poll is `Pending`. On `Ready` there is nothing
-    /// left to wake, and holding the waker would pin the polling task's allocation until
-    /// something polled this cell again — for a stream that finished its last read and
-    /// then sat idle, that is the rest of the connection.
+    /// Run one poll with a retained waiter, releasing it if the poll finishes.
     pub(crate) fn poll<T>(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &Context<'_>,
         poll: impl FnOnce(&Waiter) -> Poll<T>,
     ) -> Poll<T> {
-        let waiter = Waiter::new(cx.waker().clone());
+        let waiter = self.hold(cx);
         let result = poll(&waiter);
-        self.park(waiter, &result);
+        self.settle(&result);
         result
     }
 
-    /// The two-step form of [`poll`](Self::poll), for a poll that needs `&mut self` of
-    /// the struct holding this cell while the waiter is alive — the borrow checker allows
-    /// only one of those at a time, so the closure form will not compile there. Build the
-    /// waiter from the `Context`, poll with it, then hand it here with the result.
-    pub(crate) fn park<T>(&mut self, waiter: Waiter, result: &Poll<T>) {
-        // Retiring the previous waiter *after* the poll matters: the new one is already
-        // registered by then, so there is no window with nothing registered.
-        self.waiter = result.is_pending().then_some(waiter);
+    /// Hold a waiter for this poll, for a body that needs `&mut self` of the struct
+    /// holding this cell — the borrow checker allows only one of those at a time, so the
+    /// closure form above will not compile there. Pair it with [`settle`](Self::settle).
+    ///
+    /// The clone shares the parked waiter's identity, so nothing is lost by taking one,
+    /// and it ends the borrow on the cell.
+    pub(crate) fn hold(&mut self, cx: &Context<'_>) -> Waiter {
+        self.0.hold(cx).clone()
     }
-}
 
-impl Clone for Parked {
-    /// A clone starts unregistered: a registration belongs to the handle that parked it.
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
-impl std::fmt::Debug for Parked {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Parked").finish_non_exhaustive()
+    /// Release the held waiter if the poll finished.
+    pub(crate) fn settle<T>(&mut self, result: &Poll<T>) {
+        if result.is_ready() {
+            self.0 = Park::default();
+        }
     }
 }
 

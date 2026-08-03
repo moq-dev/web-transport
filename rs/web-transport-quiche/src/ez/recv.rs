@@ -403,9 +403,9 @@ impl AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        let waiter = Waiter::new(cx.waker().clone());
+        let waiter = self.parked.hold(cx);
         let res = self.poll_read_chunk(&waiter, buf.remaining());
-        self.parked.park(waiter, &res);
+        self.parked.settle(&res);
 
         match ready!(res) {
             Ok(Some(chunk)) => buf.put_slice(&chunk),
