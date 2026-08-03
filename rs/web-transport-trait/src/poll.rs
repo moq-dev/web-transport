@@ -7,12 +7,14 @@
 //! Two properties are deliberate, and both are constraints on what an implementation
 //! is *allowed* to be rather than features it gets:
 //!
-//! - **No `Send` or `Sync` bound.** A transport pinned to one thread — a
-//!   thread-per-core `io_uring` runtime, say — can implement these. The async traits
-//!   in the crate root add `MaybeSend` on top, because their futures need it; the
-//!   poll traits do not, so a `!Send` stack stays expressible all the way down.
-//!   [`Session`]'s associated stream types only require the poll halves, so the
-//!   bound cannot leak back in through them.
+//! - **No `Send` or `Sync` bound on sessions or streams.** A transport pinned to one
+//!   thread — a thread-per-core `io_uring` runtime, say — can implement these. The
+//!   async traits in the crate root add `MaybeSend` on top, because their futures
+//!   need it; the poll traits do not, so a `!Send` stack stays expressible all the
+//!   way down. [`Session`]'s associated stream types only require the poll halves,
+//!   so the bound cannot leak back in through them. Error types still implement the
+//!   shared crate-level [`crate::Error`] trait and retain its `MaybeSend + MaybeSync`
+//!   bounds.
 //!
 //! - **`&mut self` throughout, and no `Clone`.** A sans-I/O state machine owns its
 //!   state and mutates it in place. A `&self` surface would force every

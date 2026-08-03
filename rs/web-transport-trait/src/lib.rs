@@ -59,12 +59,8 @@ impl Stats for StatsUnavailable {}
 
 /// Error trait for WebTransport operations.
 ///
-/// Deliberately *not* `Send + Sync`. Those are required by the async traits below,
-/// whose futures must be spawnable, and are declared there. The [`poll`] traits need
-/// neither, so a transport pinned to one thread can use an error type that is
-/// neither — one holding an [`std::rc::Rc`] to shared connection state, say.
-/// (Still `'static`, so an error cannot *borrow* that state.)
-pub trait Error: std::error::Error + 'static {
+/// Implementations must be Send + Sync + 'static for use across async boundaries.
+pub trait Error: std::error::Error + MaybeSend + MaybeSync + 'static {
     /// Returns the error code and reason if this was an application error.
     ///
     /// NOTE: Reason reasons are technically bytes on the wire, but we convert to a String for convenience.
@@ -83,9 +79,7 @@ pub trait Error: std::error::Error + 'static {
 pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     type SendStream: SendStream;
     type RecvStream: RecvStream;
-    // `Send` so a spawned future can carry it out; `Sync` so it boxes into
-    // `Box<dyn Error + Send + Sync>` and `anyhow::Error` like any other error.
-    type Error: Error + MaybeSend + MaybeSync;
+    type Error: Error;
 
     /// Block until the peer creates a new unidirectional stream.
     fn accept_uni(&self)
@@ -143,7 +137,7 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 /// QUIC streams have flow control, which means the send rate is limited by the peer's receive window.
 /// The stream will be closed with a graceful FIN when dropped.
 pub trait SendStream: MaybeSend {
-    type Error: Error + MaybeSend + MaybeSync;
+    type Error: Error;
 
     /// Write some of the buffer to the stream, returning how many bytes were
     /// written. See [`write_buf`](Self::write_buf) for the cancel-safety contract,
@@ -259,7 +253,7 @@ pub trait SendStream: MaybeSend {
 /// All bytes are flushed in order and the stream is flow controlled.
 /// The stream will be closed with STOP_SENDING code=0 when dropped.
 pub trait RecvStream: MaybeSend {
-    type Error: Error + MaybeSend + MaybeSync;
+    type Error: Error;
 
     /// Read the next chunk of data, up to the max size.
     ///
