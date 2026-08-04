@@ -138,6 +138,9 @@ impl Wake for AcceptWaiters {
 /// stream whose last read completed and then sat idle, that is the rest of the
 /// connection. So this releases it on `Ready`.
 ///
+/// `Park` also clones empty, so a cloned handle never inherits another handle's live
+/// registration.
+///
 /// The `async` methods have no need for any of it — [`kio::wait`] keeps the waiter inside
 /// the future it builds, so dropping the future drops the registration.
 #[derive(Clone, Default)]
@@ -160,8 +163,8 @@ impl Parked {
     /// holding this cell — the borrow checker allows only one of those at a time, so the
     /// closure form above will not compile there. Pair it with [`settle`](Self::settle).
     ///
-    /// The clone shares the parked waiter's identity, so nothing is lost by taking one,
-    /// and it ends the borrow on the cell.
+    /// The returned clone shares the parked waiter's identity, so nothing is lost by
+    /// taking one, and it ends the borrow on the cell.
     pub(crate) fn hold(&mut self, cx: &Context<'_>) -> Waiter {
         self.0.hold(cx).clone()
     }
@@ -204,6 +207,31 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.woken.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn cloning_a_pending_handle_does_not_retain_the_poller() {
+        let waiters = AcceptWaiters::default();
+        let flag = Arc::new(Flag::default());
+        let waker = std::task::Waker::from(flag.clone());
+        let mut parked = Parked::default();
+
+        assert!(parked
+            .poll(&Context::from_waker(&waker), |waiter| {
+                waiters.register(waiter);
+                Poll::<()>::Pending
+            })
+            .is_pending());
+
+        let cloned = parked.clone();
+        drop(parked);
+        waiters.wake_all();
+
+        assert!(
+            !flag.woken(),
+            "the clone retained the original handle's parked poller"
+        );
+        drop(cloned);
     }
 
     /// A waker that re-enters the list from `wake`, standing in for an executor that
