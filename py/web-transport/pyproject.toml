@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "ai-and-i", email = "ai.and.i.project@gmail.com" }]
 keywords = ["webtransport", "quic", "http3", "asyncio", "networking"]
-dependencies = ["cryptography>=48.0.1"]
+dependencies = ["cryptography>=50.0.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
