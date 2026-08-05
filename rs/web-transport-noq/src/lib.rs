@@ -30,7 +30,6 @@ mod recv;
 mod send;
 mod server;
 mod session;
-mod waiters;
 
 pub use client::*;
 pub use error::*;

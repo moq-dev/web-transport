@@ -11,11 +11,10 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
-use kio::Waiter;
+use kio::{Fan, Waiter};
 
 use crate::{
     proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt},
-    waiters::AcceptWaiters,
     ClientError, Connected, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
 
@@ -629,21 +628,24 @@ fn poll_accept_uni_shared(
     accept: &Mutex<SessionAccept>,
     waiter: &Waiter,
 ) -> Poll<Result<RecvStream, SessionError>> {
-    let (result, waiters) = {
+    let (result, waiters, hold) = {
         let mut accept = accept.lock().unwrap();
         let waiters = accept.uni_waiters.clone();
 
-        // The poll below drives the shared accept futures with this list's waker, and
-        // one of them may wake it inline. Hold those back until the lock is gone.
-        waiters.arm();
+        // The poll below drives the shared accept futures with this list's waker, and one
+        // of them may wake it inline. `Fan` holds those back while this guard is alive.
+        let hold = waiters.hold();
         let result = accept.poll_accept_uni(waiter);
 
-        (result, waiters)
+        (result, waiters, hold)
     };
 
-    // `disarm` runs first either way: the count has to come down even on a `Ready`.
-    if waiters.disarm() || result.is_ready() {
-        waiters.wake_all();
+    // Dropped after the accept lock, never before: that is where a held-back wake is
+    // delivered, and delivering it under the lock is the hazard the hold exists for.
+    drop(hold);
+
+    if result.is_ready() {
+        waiters.wake();
     }
 
     result
@@ -653,21 +655,24 @@ fn poll_accept_bi_shared(
     accept: &Mutex<SessionAccept>,
     waiter: &Waiter,
 ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
-    let (result, waiters) = {
+    let (result, waiters, hold) = {
         let mut accept = accept.lock().unwrap();
         let waiters = accept.bi_waiters.clone();
 
-        // The poll below drives the shared accept futures with this list's waker, and
-        // one of them may wake it inline. Hold those back until the lock is gone.
-        waiters.arm();
+        // The poll below drives the shared accept futures with this list's waker, and one
+        // of them may wake it inline. `Fan` holds those back while this guard is alive.
+        let hold = waiters.hold();
         let result = accept.poll_accept_bi(waiter);
 
-        (result, waiters)
+        (result, waiters, hold)
     };
 
-    // `disarm` runs first either way: the count has to come down even on a `Ready`.
-    if waiters.disarm() || result.is_ready() {
-        waiters.wake_all();
+    // Dropped after the accept lock, never before: that is where a held-back wake is
+    // delivered, and delivering it under the lock is the hazard the hold exists for.
+    drop(hold);
+
+    if result.is_ready() {
+        waiters.wake();
     }
 
     result
@@ -705,8 +710,8 @@ pub struct SessionAccept {
     // out: each caller registers here and all of them are woken when a stream lands —
     // by the caller that saw it, once it has released the lock on this struct.
     //
-    bi_waiters: Arc<AcceptWaiters>,
-    uni_waiters: Arc<AcceptWaiters>,
+    bi_waiters: Fan,
+    uni_waiters: Fan,
 
     // `Waker::from(waiters.clone())`, cached so the inner accept futures are polled with
     // the same waker every time. That waker outlives every caller, so an accepter that
@@ -731,10 +736,10 @@ impl SessionAccept {
             Some((conn.accept_bi().await, conn))
         }));
 
-        let bi_waiters = Arc::new(AcceptWaiters::default());
-        let uni_waiters = Arc::new(AcceptWaiters::default());
-        let bi_waker = Waker::from(bi_waiters.clone());
-        let uni_waker = Waker::from(uni_waiters.clone());
+        let bi_waiters = Fan::new();
+        let uni_waiters = Fan::new();
+        let bi_waker = bi_waiters.waker();
+        let uni_waker = uni_waiters.waker();
 
         Self {
             session_id,
