@@ -48,6 +48,7 @@
           pkgs.pkg-config
           pkgs.glib
           pkgs.gtk3
+          pkgs.cmake
           # Required to compile boringssl (via bindgen loading libclang)
           pkgs.llvmPackages.libclang.lib
           # Only for NPM publishing
