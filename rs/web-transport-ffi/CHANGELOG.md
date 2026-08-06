@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.1.1...web-transport-ffi-v0.1.2) - 2026-08-06
+
+### Other
+
+- updated the following local packages: web-transport-quinn
+
 ## [0.1.1](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.1.0...web-transport-ffi-v0.1.1) - 2026-05-24
 
 ### Other

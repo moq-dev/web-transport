@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.5...web-transport-node-v0.0.6) - 2026-08-06
+
+### Other
+
+- [**breaking**] drop the synthesized CONNECT request and response from raw QUIC sessions ([#326](https://github.com/moq-dev/web-transport/pull/326))
+
 ## [0.0.5](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.4...web-transport-node-v0.0.5) - 2026-07-16
 
 ### Fixed

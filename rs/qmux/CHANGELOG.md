@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.4.1...qmux-v0.5.0) - 2026-08-06
+
+### Fixed
+
+- *(qmux)* size STREAM frames from the negotiated max_record_size ([#348](https://github.com/moq-dev/web-transport/pull/348))
+- *(qmux)* queue inbound chunks so closed() can't clobber unread data ([#346](https://github.com/moq-dev/web-transport/pull/346))
+- *(qmux)* only let a send restart the idle timer once per receive ([#341](https://github.com/moq-dev/web-transport/pull/341))
+
+### Other
+
+- *(qmux)* [**breaking**] keep transport types behind their module path ([#356](https://github.com/moq-dev/web-transport/pull/356))
+- Add the sans-I/O poll surface, and implement it for quinn and quiche ([#350](https://github.com/moq-dev/web-transport/pull/350))
+
 ## [0.4.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.4.0...qmux-v0.4.1) - 2026-07-16
 
 ### Added

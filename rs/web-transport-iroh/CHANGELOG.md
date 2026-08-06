@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.6.0...web-transport-iroh-v0.7.0) - 2026-08-06
+
+### Fixed
+
+- [**breaking**] release accept and ez waker registrations when a caller gives up ([#353](https://github.com/moq-dev/web-transport/pull/353))
+
+### Other
+
+- collapse the four AcceptWaiters copies onto kio::Fan ([#359](https://github.com/moq-dev/web-transport/pull/359))
+- finish the ez waiter conversion, and build the poll bridge on kio::Park ([#358](https://github.com/moq-dev/web-transport/pull/358))
+- [**breaking**] drop the synthesized CONNECT request and response from raw QUIC sessions ([#326](https://github.com/moq-dev/web-transport/pull/326))
+- Fix write_chunk truncation and lost accept wakers in iroh and quiche ([#349](https://github.com/moq-dev/web-transport/pull/349))
+
 ## [0.5.1](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.5.0...web-transport-iroh-v0.5.1) - 2026-05-24
 
 ### Other

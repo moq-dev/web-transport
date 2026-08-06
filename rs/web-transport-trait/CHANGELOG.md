@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.3.7...web-transport-trait-v0.4.0) - 2026-08-06
+
+### Other
+
+- [**breaking**] drop the synthesized CONNECT request and response from raw QUIC sessions ([#326](https://github.com/moq-dev/web-transport/pull/326))
+- Restore Error send and sync bounds ([#357](https://github.com/moq-dev/web-transport/pull/357))
+- Add the sans-I/O poll surface, and implement it for quinn and quiche ([#350](https://github.com/moq-dev/web-transport/pull/350))
+- Fix write_chunk truncation and lost accept wakers in iroh and quiche ([#349](https://github.com/moq-dev/web-transport/pull/349))
+
 ## [0.3.7](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.3.6...web-transport-trait-v0.3.7) - 2026-07-16
 
 ### Fixed
