@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { WebSocketLike, WebSocketStreamLike } from "@moq/web-socket-stream";
 import { SessionError, StreamError } from "./error.ts";
 import * as Frame from "./frame.ts";
@@ -306,6 +306,38 @@ describe("Session integration (scripted peer)", () => {
 		const reset = peer.received().find((f) => f.type === "reset_stream") as Frame.ResetStream;
 		expect(reset.code.value).toBe(0n);
 		session.close();
+	});
+
+	test("application aborts do not log warnings", async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const { session, peer } = connect();
+
+		try {
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const uni = await session.createUnidirectionalStream();
+			await uni.abort(new Error("application closed uni stream"));
+
+			const bidi = await session.createBidirectionalStream();
+			await bidi.writable.abort(new Error("application closed local bidi stream"));
+
+			peer.send({
+				type: "stream",
+				id: Stream.Id.create(0n, Stream.Dir.Bi, true),
+				data: new Uint8Array([1]),
+				fin: false,
+			});
+			const incoming = await session.incomingBidirectionalStreams.getReader().read();
+			if (!incoming.value) throw new Error("expected an incoming bidirectional stream");
+			await incoming.value.writable.abort(new Error("application closed incoming bidi stream"));
+
+			await waitFor(() => peer.count("reset_stream") === 3);
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			session.close();
+			warn.mockRestore();
+		}
 	});
 
 	test("cancelling with a WebTransportError sends its streamErrorCode as STOP_SENDING", async () => {

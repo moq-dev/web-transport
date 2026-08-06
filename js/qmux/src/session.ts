@@ -1375,7 +1375,6 @@ export default class Session implements WebTransport {
 						await this.#sendStreamData(frame.id, chunk);
 					},
 					abort: (e) => {
-						console.warn("abort", e);
 						this.#scheduler?.dropStream(streamId, e instanceof Error ? e : new Error("stream aborted"));
 						this.#sendPriorityFrame({
 							type: "reset_stream",
@@ -1711,7 +1710,6 @@ export default class Session implements WebTransport {
 				await this.#sendStreamData(streamId, chunk);
 			},
 			abort: (e) => {
-				console.warn("abort", e);
 				this.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
 				this.#sendPriorityFrame({
 					type: "reset_stream",
@@ -1791,7 +1789,6 @@ export default class Session implements WebTransport {
 				await session.#sendStreamData(streamId, chunk);
 			},
 			abort(e) {
-				console.warn("abort", e);
 				session.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
 				session.#sendPriorityFrame({
 					type: "reset_stream",
