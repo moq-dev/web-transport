@@ -31,6 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.12...web-transport-quinn-v0.12.0) - 2026-08-07
+
+### Fixed
+
+- [**breaking**] release accept and ez waker registrations when a caller gives up ([#353](https://github.com/moq-dev/web-transport/pull/353))
+
+### Other
+
+- release ([#338](https://github.com/moq-dev/web-transport/pull/338))
+- collapse the four AcceptWaiters copies onto kio::Fan ([#359](https://github.com/moq-dev/web-transport/pull/359))
+- finish the ez waiter conversion, and build the poll bridge on kio::Park ([#358](https://github.com/moq-dev/web-transport/pull/358))
+- [**breaking**] drop the synthesized CONNECT request and response from raw QUIC sessions ([#326](https://github.com/moq-dev/web-transport/pull/326))
+- Add the sans-I/O poll surface, and implement it for quinn and quiche ([#350](https://github.com/moq-dev/web-transport/pull/350))
+
 ## [0.12.0](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.12...web-transport-quinn-v0.12.0) - 2026-08-06
 
 ### Fixed
