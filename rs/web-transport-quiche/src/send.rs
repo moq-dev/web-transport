@@ -14,6 +14,11 @@ use crate::{ez, waiters::Parked, StreamError};
 // decimal: 1685221232, or 91143959072288 as an HTTP error code
 const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
 
+/// Convert the trait's higher-first send order to Quiche's lower-first urgency.
+const fn send_order_to_urgency(order: u8) -> u8 {
+    u8::MAX - order
+}
+
 /// A stream that can be used to send bytes.
 ///
 /// This wrapper is mainly needed for error codes.
@@ -124,7 +129,7 @@ impl web_transport_trait::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: u8) {
-        self.set_priority(order)
+        SendStream::set_priority(self, send_order_to_urgency(order))
     }
 
     fn reset(&mut self, code: u32) {
@@ -162,7 +167,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: u8) {
-        self.set_priority(order)
+        SendStream::set_priority(self, send_order_to_urgency(order))
     }
 
     fn reset(&mut self, code: u32) {
@@ -177,5 +182,18 @@ impl web_transport_trait::poll::SendStream for SendStream {
         self.parked_closed
             .poll(cx, |waiter| self.inner.poll_closed(waiter))
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trait_send_order_maps_to_quiche_urgency() {
+        assert_eq!(send_order_to_urgency(u8::MAX), 0);
+        assert_eq!(send_order_to_urgency(0), u8::MAX);
+        assert!((0u8..u8::MAX)
+            .all(|order| send_order_to_urgency(order) > send_order_to_urgency(order + 1)));
     }
 }
