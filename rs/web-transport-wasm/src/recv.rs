@@ -8,7 +8,7 @@ use js_sys::Uint8Array;
 use web_sys::{ReadableStreamDefaultReader, WebTransportReceiveStream};
 
 use crate::{
-    error::stream_error,
+    error::{stream_error, stream_error_code},
     js::{ignore, promise, read_value, Op},
     Error,
 };
@@ -116,7 +116,7 @@ impl RecvStream {
     }
 
     /// Poll until the stream has been closed, returning the error code if any.
-    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<u8>, Error>> {
+    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<u32>, Error>> {
         let err = match ready!(self.poll_closed_raw(cx)) {
             Ok(()) => return Poll::Ready(Ok(None)),
             Err(err) => err,
@@ -124,7 +124,7 @@ impl RecvStream {
 
         // If it's a WebTransportError, we can extract the error code.
         if let Error::Stream(err) = &err {
-            if let Some(code) = err.stream_error_code() {
+            if let Some(code) = stream_error_code(err) {
                 return Poll::Ready(Ok(Some(code)));
             }
         }
@@ -138,15 +138,13 @@ impl RecvStream {
     /// received *and* its queue drained, and rejects it on a reset or on our own
     /// cancel, which is the whole contract with no emulation needed.
     ///
-    /// One thing it cannot know about is the chunk we took from that queue and have
-    /// not handed over yet, so this stays pending until the caller reads it. No
-    /// waker is registered for that wait, because the caller is the only one who can
-    /// end it, and the read that does wakes them anyway.
+    /// This can resolve while bytes we already pulled off that queue are still
+    /// buffered here. Keep reading until [`poll_read`](Self::poll_read) returns
+    /// `None`: closed describes the transport, not what the caller has consumed,
+    /// and the buffered bytes are still delivered afterwards. Deferring instead
+    /// would deadlock, since this borrows `&mut self` and so a caller waiting here
+    /// is a caller who cannot read.
     pub(crate) fn poll_closed_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-        if !self.buffer.is_empty() {
-            return Poll::Pending;
-        }
-
         let reader = &self.reader;
         ready!(self.closed.poll(cx, || promise(reader.closed())))?;
         Poll::Ready(Ok(()))
@@ -182,7 +180,7 @@ impl RecvStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         poll_fn(|cx| self.poll_closed(cx)).await
     }
 }

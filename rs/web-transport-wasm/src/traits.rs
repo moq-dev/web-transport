@@ -14,7 +14,7 @@ use std::{
 use bytes::Bytes;
 use web_transport_trait::{Stats, StatsUnavailable};
 
-use crate::{Error, RecvStream, SendStream, Session};
+use crate::{error::stream_error_code, Error, RecvStream, SendStream, Session};
 
 impl web_transport_trait::Error for Error {
     /// The browser reports one numeric code either way, so the variant is the only
@@ -23,16 +23,14 @@ impl web_transport_trait::Error for Error {
     /// first.
     fn session_error(&self) -> Option<(u32, String)> {
         match self {
-            Error::Session(err) => {
-                Some((err.stream_error_code().unwrap_or(0).into(), err.message()))
-            }
+            Error::Session(err) => Some((stream_error_code(err).unwrap_or(0), err.message())),
             _ => None,
         }
     }
 
     fn stream_error(&self) -> Option<u32> {
         match self {
-            Error::Stream(err) => err.stream_error_code().map(u32::from),
+            Error::Stream(err) => stream_error_code(err),
             _ => None,
         }
     }
@@ -125,7 +123,9 @@ impl web_transport_trait::Session for Session {
     /// payload is handed over without waiting for capacity. A datagram was never
     /// guaranteed to arrive anyway.
     fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
-        Session::try_send_datagram(self, &payload)
+        // A datagram the browser has no room for is dropped rather than queued;
+        // the trait already lists that among the ways one fails to arrive.
+        Session::try_send_datagram(self, &payload).map(|_| ())
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Error> {

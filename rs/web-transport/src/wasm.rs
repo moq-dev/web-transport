@@ -160,7 +160,7 @@ impl SendStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         self.0.closed().await
     }
 }
@@ -184,7 +184,7 @@ impl RecvStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         self.0.closed().await
     }
 }

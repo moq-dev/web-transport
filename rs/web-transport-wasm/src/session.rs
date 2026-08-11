@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     future::poll_fn,
     rc::Rc,
     task::{ready, Context, Poll},
@@ -8,7 +9,8 @@ use std::{
 use bytes::Bytes;
 use js_sys::{Function, Reflect, Uint8Array};
 use url::Url;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
     WebTransportCloseInfo, WebTransportDatagramDuplexStream, WritableStream,
@@ -16,6 +18,7 @@ use web_sys::{
 };
 
 use crate::{
+    error::session_error,
     js::{promise, read_value, Op},
     Error, RecvStream, SendStream,
 };
@@ -43,20 +46,54 @@ pub struct Session {
 
 /// State that every clone of a session shares.
 ///
-/// The readers and the datagram writer are here rather than on the handle because a
-/// browser stream can only be locked once; duplicating them would throw. Sharing
-/// them costs nothing, because each clone still calls `read()` for itself — the
-/// streams spec queues concurrent reads and fulfills them in order, so one clone's
-/// pending read is never handed to another.
+/// The stream locks live here because a browser stream can only be locked once;
+/// duplicating them would throw. Sharing them costs a clone nothing, because it
+/// still calls `read()` for itself — the streams spec queues concurrent reads and
+/// fulfills them in order, so one clone's pending read is never handed to another.
 struct Shared {
     inner: WebTransport,
     url: Url,
     protocol: Option<String>,
 
-    accept_uni: RefCell<Option<ReadableStreamDefaultReader>>,
-    accept_bi: RefCell<Option<ReadableStreamDefaultReader>>,
-    recv_datagram: RefCell<Option<ReadableStreamDefaultReader>>,
+    accept_uni: Incoming,
+    accept_bi: Incoming,
+    datagrams: Incoming,
     send_datagram: RefCell<Option<WritableStreamDefaultWriter>>,
+}
+
+/// One browser stream this session reads from.
+///
+/// The reader is shared because a browser stream can only be locked once. So are
+/// the orphans, for a subtler reason: a `read()` cannot be cancelled. Once it is
+/// issued the browser will hand the next value to *that* request, so a read whose
+/// handle was dropped has to be picked up by a surviving clone or the stream it was
+/// about to deliver is stranded and nobody ever sees it.
+#[derive(Default)]
+struct Incoming {
+    reader: RefCell<Option<ReadableStreamDefaultReader>>,
+    orphans: RefCell<VecDeque<JsFuture>>,
+}
+
+impl Incoming {
+    /// Lock `stream` on first use, handing out the reader every time after.
+    ///
+    /// `stream` is a closure so the browser getter behind it runs once rather than
+    /// on every poll.
+    fn reader(
+        &self,
+        stream: impl FnOnce() -> ReadableStream,
+    ) -> Result<ReadableStreamDefaultReader, Error> {
+        let mut slot = self.reader.borrow_mut();
+
+        match slot.as_ref() {
+            Some(reader) => Ok(reader.clone()),
+            None => {
+                let reader = ReadableStreamDefaultReader::new(&stream())?;
+                *slot = Some(reader.clone());
+                Ok(reader)
+            }
+        }
+    }
 }
 
 /// The datagram writer. The current spec exposes it via `createWritable()`; the
@@ -75,51 +112,11 @@ fn datagram_writable(dg: &WebTransportDatagramDuplexStream) -> WritableStream {
         .unwrap_or_else(|| dg.writable())
 }
 
-/// Lock `stream` on first use, handing out the reader every time after.
-///
-/// `stream` is a closure so the browser getter behind it runs once rather than on
-/// every poll.
-fn reader(
-    slot: &RefCell<Option<ReadableStreamDefaultReader>>,
-    stream: impl FnOnce() -> ReadableStream,
-) -> Result<ReadableStreamDefaultReader, Error> {
-    let mut slot = slot.borrow_mut();
-
-    match slot.as_ref() {
-        Some(reader) => Ok(reader.clone()),
-        None => {
-            let reader = ReadableStreamDefaultReader::new(&stream())?;
-            *slot = Some(reader.clone());
-            Ok(reader)
-        }
-    }
-}
-
 /// Split a browser bidirectional stream into our two halves.
 fn bi_streams(stream: WebTransportBidirectionalStream) -> Result<(SendStream, RecvStream), Error> {
     let send = SendStream::new(stream.writable())?;
     let recv = RecvStream::new(stream.readable())?;
     Ok((send, recv))
-}
-
-/// The error described by a close info, which is how a clean close reaches a caller.
-fn session_error(info: WebTransportCloseInfo) -> Error {
-    let reason = info.get_reason().unwrap_or_default();
-
-    let options = web_sys::WebTransportErrorOptions::new();
-    options.set_source(web_sys::WebTransportErrorSource::Session);
-
-    // `WebTransportError` carries the code as a byte, so an application close code
-    // above 255 arrives as none rather than as some other code's meaning.
-    options.set_stream_error_code(
-        info.get_close_code()
-            .and_then(|code| u8::try_from(code).ok()),
-    );
-
-    match web_sys::WebTransportError::new_with_message_and_options(&reason, &options) {
-        Ok(err) => Error::Session(err),
-        Err(err) => Error::from(err),
-    }
 }
 
 impl Session {
@@ -135,9 +132,9 @@ impl Session {
                 inner,
                 url,
                 protocol,
-                accept_uni: RefCell::new(None),
-                accept_bi: RefCell::new(None),
-                recv_datagram: RefCell::new(None),
+                accept_uni: Incoming::default(),
+                accept_bi: Incoming::default(),
+                datagrams: Incoming::default(),
                 send_datagram: RefCell::new(None),
             }),
             accept_uni: Op::default(),
@@ -153,14 +150,12 @@ impl Session {
     /// Poll for a unidirectional stream created by the peer.
     pub fn poll_accept_uni(&self, cx: &mut Context<'_>) -> Poll<Result<RecvStream, Error>> {
         let inner = &self.shared.inner;
-        let reader = match reader(&self.shared.accept_uni, || {
-            inner.incoming_unidirectional_streams()
-        }) {
-            Ok(reader) => reader,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-
-        let result = ready!(self.accept_uni.poll(cx, || promise(reader.read())))?;
+        let result = ready!(self.poll_incoming(
+            cx,
+            &self.accept_uni,
+            &self.shared.accept_uni,
+            || { inner.incoming_unidirectional_streams() }
+        ))?;
 
         match read_value(result) {
             Some(stream) => Poll::Ready(RecvStream::new(stream)),
@@ -175,14 +170,12 @@ impl Session {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), Error>> {
         let inner = &self.shared.inner;
-        let reader = match reader(&self.shared.accept_bi, || {
-            inner.incoming_bidirectional_streams()
-        }) {
-            Ok(reader) => reader,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-
-        let result = ready!(self.accept_bi.poll(cx, || promise(reader.read())))?;
+        let result = ready!(self.poll_incoming(
+            cx,
+            &self.accept_bi,
+            &self.shared.accept_bi,
+            || { inner.incoming_bidirectional_streams() }
+        ))?;
 
         match read_value(result) {
             Some(stream) => Poll::Ready(bi_streams(stream)),
@@ -225,43 +218,78 @@ impl Session {
         cx: &mut Context<'_>,
         payload: &[u8],
     ) -> Poll<Result<(), Error>> {
+        // Draining the previous write is what bounds this path: one datagram
+        // outstanding per handle, never a queue.
         ready!(self.send_datagram.poll_settled(cx))?;
 
-        match self.try_send_datagram(payload) {
-            Ok(()) => Poll::Ready(Ok(())),
-            Err(err) => Poll::Ready(Err(err)),
+        let writer = match self.datagram_writer() {
+            Ok(writer) => writer,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+
+        self.write_datagram(&writer, payload);
+        Poll::Ready(Ok(()))
+    }
+
+    /// Hand a datagram to the browser if it has room, reporting whether it took it.
+    ///
+    /// Unlike [`poll_send_datagram`](Self::poll_send_datagram) this never waits, so
+    /// it has to drop rather than queue: a datagram offered while the previous one
+    /// is still outstanding, or while the browser reports no room, is discarded.
+    /// Queueing instead would grow without bound on a stalled connection, and
+    /// nothing downstream discards the excess — a browser write cannot be
+    /// cancelled, so the backlog would eventually go out stale. Dropping is a
+    /// datagram's normal fate anyway; congestion, loss and size do it too.
+    pub fn try_send_datagram(&self, payload: &[u8]) -> Result<bool, Error> {
+        if self.send_datagram.is_pending() {
+            return Ok(false);
+        }
+
+        let writer = self.datagram_writer()?;
+
+        // `desiredSize` is the writer's own backpressure signal: at or below zero
+        // the queue is already at its high water mark. `None` is an errored stream,
+        // which the write itself reports, so let that one through.
+        if let Ok(Some(size)) = writer.desired_size() {
+            if size <= 0.0 {
+                return Ok(false);
+            }
+        }
+
+        self.write_datagram(&writer, payload);
+        Ok(true)
+    }
+
+    /// Lock the datagram writable on first use, handing out the writer after.
+    fn datagram_writer(&self) -> Result<WritableStreamDefaultWriter, Error> {
+        let mut slot = self.shared.send_datagram.borrow_mut();
+
+        match slot.as_ref() {
+            Some(writer) => Ok(writer.clone()),
+            None => {
+                let writable = datagram_writable(&self.shared.inner.datagrams());
+                let writer = WritableStreamDefaultWriter::new(&writable)?;
+                *slot = Some(writer.clone());
+                Ok(writer)
+            }
         }
     }
 
-    /// Hand a datagram to the browser without waiting for capacity.
-    ///
-    /// Delivery was never guaranteed — a datagram can be dropped for congestion,
-    /// loss, or size — so there is nothing to report beyond failing to hand it over.
-    pub fn try_send_datagram(&self, payload: &[u8]) -> Result<(), Error> {
-        let mut slot = self.shared.send_datagram.borrow_mut();
-        let writer = match slot.as_ref() {
-            Some(writer) => writer,
-            None => {
-                let writable = datagram_writable(&self.shared.inner.datagrams());
-                slot.insert(WritableStreamDefaultWriter::new(&writable)?)
-            }
-        };
-
+    /// Hand a datagram over, keeping the write as this handle's in-flight operation.
+    fn write_datagram(&self, writer: &WritableStreamDefaultWriter, payload: &[u8]) {
         self.send_datagram
             .start(promise(writer.write_with_chunk(&Uint8Array::from(payload))));
-
-        Ok(())
     }
 
     /// Poll for a datagram from the network.
     pub fn poll_recv_datagram(&self, cx: &mut Context<'_>) -> Poll<Result<Bytes, Error>> {
         let inner = &self.shared.inner;
-        let reader = match reader(&self.shared.recv_datagram, || inner.datagrams().readable()) {
-            Ok(reader) => reader,
-            Err(err) => return Poll::Ready(Err(err)),
-        };
-
-        let result = ready!(self.recv_datagram.poll(cx, || promise(reader.read())))?;
+        let result = ready!(self.poll_incoming(
+            cx,
+            &self.recv_datagram,
+            &self.shared.datagrams,
+            || { inner.datagrams().readable() }
+        ))?;
 
         match read_value::<Uint8Array>(result) {
             Some(data) => Poll::Ready(Ok(data.to_vec().into())),
@@ -280,7 +308,32 @@ impl Session {
             Err(err) => return Poll::Ready(err),
         };
 
-        Poll::Ready(session_error(info.unchecked_into()))
+        let info: WebTransportCloseInfo = info.unchecked_into();
+        Poll::Ready(session_error(&info))
+    }
+
+    /// Poll a read against one of the shared browser queues.
+    ///
+    /// Adopts a read orphaned by a dropped handle before issuing a new one, which
+    /// is what keeps that handle's disappearance from swallowing a stream. The
+    /// browser fulfills read requests in the order they were made, so taking the
+    /// oldest orphan first also preserves that order.
+    fn poll_incoming(
+        &self,
+        cx: &mut Context<'_>,
+        op: &Op,
+        incoming: &Incoming,
+        stream: impl FnOnce() -> ReadableStream,
+    ) -> Poll<Result<JsValue, Error>> {
+        let reader = match incoming.reader(stream) {
+            Ok(reader) => reader,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+
+        op.poll_with(cx, || {
+            let orphan = incoming.orphans.borrow_mut().pop_front();
+            orphan.unwrap_or_else(|| JsFuture::from(promise(reader.read())))
+        })
     }
 
     /// Accept a new unidirectional stream from the peer.
@@ -339,6 +392,30 @@ impl Session {
     /// Return the application protocol used to create the session.
     pub fn protocol(&self) -> Option<&str> {
         self.shared.protocol.as_deref()
+    }
+}
+
+impl Drop for Session {
+    /// Leave any read this handle had in flight to the clones that remain.
+    ///
+    /// A browser read request cannot be cancelled, so the browser will still hand
+    /// the next stream or datagram to it. Dropping it here would strand that value:
+    /// the request is satisfied, nothing is listening, and no surviving clone ever
+    /// learns the stream existed.
+    ///
+    /// Only reads need this. An orphaned open or datagram write has already done
+    /// what it was asked to, and the session's `closed` promise can be subscribed
+    /// to again from scratch.
+    fn drop(&mut self) {
+        for (op, incoming) in [
+            (&self.accept_uni, &self.shared.accept_uni),
+            (&self.accept_bi, &self.shared.accept_bi),
+            (&self.recv_datagram, &self.shared.datagrams),
+        ] {
+            if let Some(future) = op.take() {
+                incoming.orphans.borrow_mut().push_back(future);
+            }
+        }
     }
 }
 

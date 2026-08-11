@@ -8,7 +8,7 @@ use js_sys::{Reflect, Uint8Array};
 use web_sys::{WebTransportSendStream, WritableStreamDefaultWriter};
 
 use crate::{
-    error::stream_error,
+    error::{stream_error, stream_error_code},
     js::{ignore, promise, Op},
     Error,
 };
@@ -65,7 +65,7 @@ impl SendStream {
     }
 
     /// Poll until the stream has been closed, returning the error code if any.
-    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<u8>, Error>> {
+    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<u32>, Error>> {
         let err = match ready!(self.poll_closed_raw(cx)) {
             Ok(()) => return Poll::Ready(Ok(None)),
             Err(err) => err,
@@ -73,7 +73,7 @@ impl SendStream {
 
         // If it's a WebTransportError, we can extract the error code.
         if let Error::Stream(err) = &err {
-            if let Some(code) = err.stream_error_code() {
+            if let Some(code) = stream_error_code(err) {
                 return Poll::Ready(Ok(Some(code)));
             }
         }
@@ -141,7 +141,7 @@ impl SendStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&mut self) -> Result<Option<u8>, Error> {
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
         poll_fn(|cx| self.poll_closed(cx)).await
     }
 }

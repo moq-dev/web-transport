@@ -76,11 +76,33 @@ impl Op {
         cx: &mut Context<'_>,
         start: impl FnOnce() -> Promise,
     ) -> Poll<Result<JsValue, Error>> {
+        self.poll_with(cx, || JsFuture::from(start()))
+    }
+
+    /// Poll the operation in flight, taking `make` for one when idle.
+    ///
+    /// Lazy in `make`, which is what lets a caller adopt a future orphaned by a
+    /// dropped handle instead of asking the browser for a fresh one.
+    pub(crate) fn poll_with(
+        &self,
+        cx: &mut Context<'_>,
+        make: impl FnOnce() -> JsFuture,
+    ) -> Poll<Result<JsValue, Error>> {
         let mut slot = self.future.borrow_mut();
-        let future = slot.get_or_insert_with(|| JsFuture::from(start()));
+        let future = slot.get_or_insert_with(make);
         let output = ready!(Pin::new(future).poll(cx));
         *slot = None;
         Poll::Ready(output.map_err(Error::from))
+    }
+
+    /// Whether an operation is in flight.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.future.borrow().is_some()
+    }
+
+    /// Take the operation in flight, leaving the slot idle.
+    pub(crate) fn take(&self) -> Option<JsFuture> {
+        self.future.borrow_mut().take()
     }
 
     /// Poll an operation already in flight, reporting an idle slot as settled.
