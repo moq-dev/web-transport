@@ -5,6 +5,18 @@
 # web-transport-wasm
 A wrapper around the WebTransport browser API.
 
+## Poll and async
+
+The browser API is a set of promises, but the surface here is a state machine. Every operation is a
+`poll_*` method that a caller steps from its own loop, with the `async` methods as thin wrappers over
+them. That is what implements [`web-transport-trait`](https://docs.rs/web-transport-trait)'s `poll`
+module, so a sans-I/O caller needs no adapter, and it is what makes an abandoned operation safe: the
+promise stays subscribed, so a chunk or an accepted stream is never dropped on the floor between
+polls.
+
+Clone the `Session` to run operations concurrently. Each clone keeps its own in-flight operation,
+while the underlying browser stream locks are shared — a browser stream can only be locked once.
+
 ## Requirements
 
 `web-sys` still gates the WebTransport bindings behind `--cfg=web_sys_unstable_apis`, so this crate

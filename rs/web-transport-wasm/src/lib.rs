@@ -3,6 +3,15 @@
 //! This crate wraps the WebTransport API and provides ergonomic Rust bindings.
 //! Some liberties have been taken to make the API more Rust-like and closer to native.
 //!
+//! # Poll and async
+//!
+//! The browser API is a set of promises, but the surface here is a state machine:
+//! every operation is a `poll_*` method that a caller steps from its own loop, with
+//! the `async` methods as thin wrappers over them. That is what implements
+//! [`web_transport_trait::poll`], so a sans-I/O caller needs no adapter, and it is
+//! what makes an abandoned operation safe — the promise stays subscribed, so a chunk
+//! or an accepted stream is never dropped on the floor between polls.
+//!
 //! # Requirements
 //!
 //! `web-sys` still gates the WebTransport bindings behind `--cfg=web_sys_unstable_apis`,
@@ -31,19 +40,26 @@ mod client;
 #[cfg(web_sys_unstable_apis)]
 mod error;
 #[cfg(web_sys_unstable_apis)]
+mod js;
+#[cfg(web_sys_unstable_apis)]
 mod recv;
 #[cfg(web_sys_unstable_apis)]
 mod send;
 #[cfg(web_sys_unstable_apis)]
 mod session;
+#[cfg(all(web_sys_unstable_apis, target_family = "wasm"))]
+mod traits;
 
 #[cfg(web_sys_unstable_apis)]
 pub use client::*;
 #[cfg(web_sys_unstable_apis)]
-pub use error::*;
+pub use error::Error;
 #[cfg(web_sys_unstable_apis)]
 pub use recv::*;
 #[cfg(web_sys_unstable_apis)]
 pub use send::*;
 #[cfg(web_sys_unstable_apis)]
 pub use session::*;
+
+/// The traits this crate implements, re-exported to simplify `Cargo.toml`.
+pub use web_transport_trait as generic;
