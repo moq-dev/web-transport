@@ -190,10 +190,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trait_send_order_maps_to_quiche_urgency() {
-        assert_eq!(send_order_to_urgency(u8::MAX), 0);
-        assert_eq!(send_order_to_urgency(0), u8::MAX);
-        assert!((0u8..u8::MAX)
-            .all(|order| send_order_to_urgency(order) > send_order_to_urgency(order + 1)));
+    fn inherent_priority_stays_lower_first() {
+        let mut stream = SendStream::new(ez::SendStream::new_test());
+
+        stream.set_priority(42);
+
+        assert_eq!(stream.inner.priority(), Some(42));
+    }
+
+    #[test]
+    fn future_trait_send_order_maps_to_quiche_urgency() {
+        let mut stream = SendStream::new(ez::SendStream::new_test());
+
+        web_transport_trait::SendStream::set_priority(&mut stream, 200);
+
+        assert_eq!(stream.inner.priority(), Some(55));
+    }
+
+    #[test]
+    fn poll_trait_send_order_maps_to_quiche_urgency() {
+        let mut stream = SendStream::new(ez::SendStream::new_test());
+
+        web_transport_trait::poll::SendStream::set_priority(&mut stream, 100);
+
+        assert_eq!(stream.inner.priority(), Some(155));
     }
 }

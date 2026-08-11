@@ -248,6 +248,21 @@ impl SendStream {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_test() -> Self {
+        let id = StreamId::CLIENT_UNI;
+        Self::new(
+            id,
+            Lock::new(SendState::new(id)),
+            Lock::new(DriverState::new(false)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn priority(&self) -> Option<u8> {
+        self.state.lock().priority
+    }
+
     /// Returns the QUIC stream ID.
     pub fn id(&self) -> StreamId {
         self.id
