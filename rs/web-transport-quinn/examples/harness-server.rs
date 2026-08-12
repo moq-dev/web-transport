@@ -98,14 +98,11 @@ async fn run_session(session: Session) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             res = session.accept_bi() => {
-                let (send, mut recv) = res?;
-                let command = recv.read_to_end(4096).await?;
-                let command = String::from_utf8_lossy(&command).trim().to_string();
-                tracing::info!(%command, "command");
+                let (send, recv) = res?;
 
                 let session = session.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = run_command(session, send, command).await {
+                    if let Err(err) = read_command(session, send, recv).await {
                         tracing::warn!(?err, "command failed");
                     }
                 });
@@ -117,6 +114,25 @@ async fn run_session(session: Session) -> anyhow::Result<()> {
             },
         }
     }
+}
+
+async fn read_command(
+    session: Session,
+    send: web_transport_quinn::SendStream,
+    mut recv: web_transport_quinn::RecvStream,
+) -> anyhow::Result<()> {
+    let command = match recv.read_to_end(4096).await {
+        Ok(command) => command,
+        // The dropped-open regression deliberately resets command streams before
+        // writing anything. That abandons one command, not the whole session.
+        Err(err) => {
+            tracing::debug!(?err, "command stream abandoned");
+            return Ok(());
+        }
+    };
+    let command = String::from_utf8_lossy(&command).trim().to_string();
+    tracing::info!(%command, "command");
+    run_command(session, send, command).await
 }
 
 async fn run_command(

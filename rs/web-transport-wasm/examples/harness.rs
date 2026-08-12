@@ -61,6 +61,10 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     }
 
     check!("echo round trip", echo_round_trip);
+    check!(
+        "dropped pending opens release stream credit",
+        dropped_pending_opens_release_credit
+    );
     check!("accept_uni delivers every stream", accept_all);
     check!("a dropped clone does not swallow a stream", orphaned_accept);
     check!(
@@ -113,6 +117,38 @@ async fn echo_round_trip(session: Session) -> Result<String, Error> {
     let got = read_all(&mut recv).await?;
 
     expect(got == "hello harness", format!("echoed {got:?}"))
+}
+
+/// Dropping a handle cannot cancel the browser promise returned by open. Churn
+/// past the peer's stream limit, then prove those abandoned opens were reset and
+/// returned their credit rather than blocking the next real stream forever.
+async fn dropped_pending_opens_release_credit(session: Session) -> Result<String, Error> {
+    for _ in 0..110 {
+        let doomed = session.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        match doomed.poll_open_bi(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok((mut send, mut recv))) => {
+                send.reset(0);
+                recv.stop(0);
+            }
+            Poll::Ready(Err(err)) => return Err(err),
+        }
+    }
+
+    sleep(250).await;
+    let got = timeout(
+        async {
+            let mut recv = command(&session, "echo credit returned").await?;
+            read_all(&mut recv).await
+        },
+        3_000,
+    )
+    .await
+    .map_err(|_| stalled("an abandoned open retained the peer's stream credit"))??;
+
+    expect(got == "credit returned", format!("echoed {got:?}"))
 }
 
 /// Every stream the peer opens is delivered, in order.
@@ -383,4 +419,12 @@ async fn timeout<T>(future: impl std::future::Future<Output = T>, millis: i32) -
         futures::future::Either::Left((value, _)) => Ok(value),
         futures::future::Either::Right(_) => Err(()),
     }
+}
+
+async fn sleep(millis: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let window = web_sys::window().expect("no window");
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }

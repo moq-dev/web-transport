@@ -13,8 +13,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
-    WebTransportCloseInfo, WebTransportDatagramDuplexStream, WebTransportSendStreamOptions,
-    WritableStream, WritableStreamDefaultWriter,
+    WebTransportCloseInfo, WebTransportDatagramDuplexStream, WebTransportSendStream,
+    WebTransportSendStreamOptions, WritableStream, WritableStreamDefaultWriter,
 };
 
 use crate::{
@@ -553,16 +553,13 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// Leave any read this handle had in flight to the clones that remain.
+    /// Preserve or dispose of browser operations that outlive this handle.
     ///
     /// A browser read request cannot be cancelled, so the browser will still hand
     /// the next stream or datagram to it. Dropping it here would strand that value:
     /// the request is satisfied, nothing is listening, and no surviving clone ever
     /// learns the stream existed.
     ///
-    /// Only reads need this. An orphaned open or datagram write has already done
-    /// what it was asked to, and the session's `closed` promise can be subscribed
-    /// to again from scratch.
     fn drop(&mut self) {
         for (op, incoming) in [
             (&self.accept_uni, &self.shared.accept_uni),
@@ -581,6 +578,32 @@ impl Drop for Session {
                     waiter.wake_by_ref();
                 }
             }
+        }
+
+        // Browser open promises cannot be cancelled either. If one settles after
+        // its handle disappears, close the resulting stream so it does not retain
+        // peer stream credit forever.
+        if let Some(future) = self.open_uni.take() {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(stream) = future.await {
+                    let stream: WebTransportSendStream = stream.unchecked_into();
+                    if let Ok(mut stream) = SendStream::new(stream) {
+                        stream.reset(0);
+                    }
+                }
+            });
+        }
+
+        if let Some(future) = self.open_bi.take() {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(stream) = future.await {
+                    let stream: WebTransportBidirectionalStream = stream.unchecked_into();
+                    if let Ok((mut send, mut recv)) = bi_streams(stream) {
+                        send.reset(0);
+                        recv.stop(0);
+                    }
+                }
+            });
         }
     }
 }
