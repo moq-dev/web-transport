@@ -207,7 +207,10 @@ mod tests {
 
     /// The urgency that would be handed to `quiche::Connection::stream_priority`.
     fn urgency(stream: &SendStream) -> u8 {
-        stream.inner.urgency().expect("urgency is set on construction")
+        stream
+            .inner
+            .urgency()
+            .expect("urgency is set on construction")
     }
 
     #[test]
