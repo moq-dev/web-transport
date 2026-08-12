@@ -99,6 +99,19 @@ harness port="8080":
 
 	[ -f dev/localhost.crt ] || ./dev/setup
 
+	# wasm-bindgen refuses to process a file built against a different schema, and
+	# its error does not say where either version came from. The nix shell pins its
+	# own wasm-bindgen-cli, which is routinely older than the crate we build with.
+	want=$(cargo metadata --format-version 1 --locked \
+		| python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wasm-bindgen"))')
+	got=$(wasm-bindgen --version | awk '{print $2}')
+	if [ "$want" != "$got" ]; then
+		echo "wasm-bindgen CLI is $got but the build uses $want." >&2
+		echo "Install the matching one, outside the nix shell if that is where this came from:" >&2
+		echo "    cargo binstall -y --force wasm-bindgen-cli@$want" >&2
+		exit 1
+	fi
+
 	# Build the harness and generate its JS bindings next to the page.
 	out="target/harness"
 	cargo build --example harness -p web-transport-wasm --target wasm32-unknown-unknown
