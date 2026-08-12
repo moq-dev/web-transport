@@ -19,6 +19,14 @@ use super::{Lock, StreamError, StreamId};
 // "send" in ascii; if you see this then call finish().await or close(code)
 const DROP_CODE: u64 = 0x73656E64;
 
+/// The priority every stream starts at.
+const DEFAULT_PRIORITY: u8 = 0;
+
+/// quiche schedules lower values first, so flip our higher-is-first priority to match.
+const fn quiche_urgency(priority: u8) -> u8 {
+    u8::MAX - priority
+}
+
 // TODO Move a lot of this into a state machine enum.
 pub(super) struct SendState {
     id: StreamId,
@@ -41,8 +49,8 @@ pub(super) struct SendState {
     // received
     stop: Option<u64>,
 
-    // pending stream_priority update; Quiche defaults to 127 until this is set
-    urgency: Option<u8>,
+    // pending SET_PRIORITY, higher is sent first
+    priority: Option<u8>,
 
     // No more progress can be made on the stream.
     closed: bool,
@@ -58,7 +66,9 @@ impl SendState {
             fin: false,
             reset: None,
             stop: None,
-            urgency: None,
+            // Pin every stream to the default rather than inheriting quiche's, so that a
+            // stream explicitly assigned a low priority can't be outranked by an untouched one.
+            priority: Some(DEFAULT_PRIORITY),
             closed: false,
         }
     }
@@ -145,9 +155,9 @@ impl SendState {
             return Ok(self.blocked.take());
         }
 
-        if let Some(urgency) = self.urgency.take() {
-            tracing::trace!(stream_id = ?self.id, urgency, "updating STREAM");
-            qconn.stream_priority(self.id.into(), urgency, true)?;
+        if let Some(priority) = self.priority.take() {
+            tracing::trace!(stream_id = ?self.id, priority, "updating STREAM");
+            qconn.stream_priority(self.id.into(), quiche_urgency(priority), true)?;
         }
 
         while let Some(mut chunk) = self.queued.pop_front() {
@@ -259,8 +269,8 @@ impl SendStream {
     }
 
     #[cfg(test)]
-    pub(crate) fn urgency(&self) -> Option<u8> {
-        self.state.lock().urgency
+    pub(crate) fn priority(&self) -> Option<u8> {
+        self.state.lock().priority
     }
 
     /// Returns the QUIC stream ID.
@@ -421,14 +431,14 @@ impl SendStream {
         kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 
-    /// Set the QUIC urgency of this stream.
+    /// Set the priority of this stream.
     ///
-    /// This is Quiche's native convention: lower values are sent first. Streams that are
-    /// never assigned an urgency keep Quiche's default of 127.
+    /// Streams with a higher priority are sent first, but are not guaranteed to arrive first.
+    /// Defaults to 0.
     ///
-    /// Note that [`crate::SendStream`] uses the opposite, WebTransport-facing convention.
-    pub fn set_urgency(&mut self, urgency: u8) {
-        self.state.lock().urgency = Some(urgency);
+    /// Note that this is the opposite of quiche's urgency, which is inverted internally.
+    pub fn set_priority(&mut self, priority: u8) {
+        self.state.lock().priority = Some(priority);
 
         let waker = self.driver.lock().send(self.id);
         if let Some(waker) = waker {
@@ -498,5 +508,53 @@ impl AsyncWrite for SendStream {
         self.parked.settle(&res);
 
         res.map_err(|e| io::Error::other(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The urgency handed to `quiche::Connection::stream_priority`.
+    fn urgency(stream: &SendStream) -> u8 {
+        quiche_urgency(stream.priority().expect("priority is set on construction"))
+    }
+
+    #[test]
+    fn higher_priority_is_sent_first() {
+        let mut low = SendStream::new_test();
+        let mut high = SendStream::new_test();
+
+        low.set_priority(1);
+        high.set_priority(2);
+
+        // quiche sends lower urgencies first.
+        assert!(urgency(&high) < urgency(&low));
+    }
+
+    #[test]
+    fn untouched_stream_is_outranked_by_any_promotion() {
+        // quiche's own default urgency is 127, which would outrank anything below priority 128.
+        for priority in [1, 55, 100, 128, 200, 255] {
+            let untouched = SendStream::new_test();
+            let mut promoted = SendStream::new_test();
+
+            promoted.set_priority(priority);
+
+            assert!(
+                urgency(&promoted) < urgency(&untouched),
+                "priority {priority} should outrank an untouched stream"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_default_matches_untouched() {
+        let untouched = SendStream::new_test();
+        let mut explicit = SendStream::new_test();
+
+        explicit.set_priority(DEFAULT_PRIORITY);
+
+        assert_eq!(urgency(&explicit), urgency(&untouched));
     }
 }
