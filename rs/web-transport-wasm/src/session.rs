@@ -334,18 +334,17 @@ impl Session {
                 Ok(size) if datagram_has_capacity(size) => break,
                 Ok(_) => match self.send_datagram.poll(cx, || promise(writer.ready())) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(_)) => match writer.desired_size() {
-                        Ok(size) if datagram_has_capacity(size) => continue,
-                        // `ready` also fulfills when the writer closes. Its closed
-                        // promise distinguishes that terminal zero from ordinary
-                        // backpressure and prevents an already-ready wake loop.
-                        Ok(_) => match self.send_datagram.poll(cx, || promise(writer.closed())) {
-                            Poll::Pending => return Poll::Pending,
-                            Poll::Ready(Ok(_)) => return Poll::Ready(Err(Error::Closed)),
-                            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                        },
-                        Err(err) => return Poll::Ready(Err(err.into())),
-                    },
+                    // Recheck, and resubscribe when the capacity is gone again. A
+                    // clone that lost the race to it holds a `ready` that has
+                    // already fulfilled and never will again, so only the writer's
+                    // current promise can wake it — the slot this `poll` just
+                    // cleared is what the next pass subscribes through. Waiting on
+                    // `closed` here instead would wait out the session, which is
+                    // the deadlock `concurrent_datagram_senders` pins.
+                    //
+                    // A writer that closed rather than filled rejects `ready`, so
+                    // that case leaves through the arm below rather than spinning.
+                    Poll::Ready(Ok(_)) => continue,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 },
                 Err(err) => return Poll::Ready(Err(err.into())),
