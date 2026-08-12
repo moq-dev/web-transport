@@ -13,8 +13,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
-    WebTransportCloseInfo, WebTransportDatagramDuplexStream, WritableStream,
-    WritableStreamDefaultWriter,
+    WebTransportCloseInfo, WebTransportDatagramDuplexStream, WebTransportSendStreamOptions,
+    WritableStream, WritableStreamDefaultWriter,
 };
 
 use crate::{
@@ -196,6 +196,27 @@ fn bi_streams(stream: WebTransportBidirectionalStream) -> Result<(SendStream, Re
     Ok((send, recv))
 }
 
+/// Options used when opening a stream.
+///
+/// `waitUntilAvailable` asks the browser to wait for stream credit when the peer's
+/// concurrent stream limit is exhausted, instead of failing the returned promise.
+/// Waiting is what the other backends do, and what `open_uni`/`open_bi` promise.
+/// <https://www.w3.org/TR/webtransport/#dom-webtransportsendstreamoptions-waituntilavailable>
+///
+/// No engine honors it yet: Chromium omits the member pending
+/// <https://crbug.com/487117768>, WebKit has it commented out, and Gecko's
+/// dictionary carries only `sendGroup`/`sendOrder`. Unknown dictionary members
+/// are ignored, so this is inert until they ship it rather than an error.
+///
+/// TODO use the web_sys setter when the binding exists; the dictionary currently
+/// only exposes `sendOrder`.
+fn stream_options() -> WebTransportSendStreamOptions {
+    let options = WebTransportSendStreamOptions::new();
+    Reflect::set(&options, &"waitUntilAvailable".into(), &JsValue::TRUE)
+        .expect("failed to set waitUntilAvailable");
+    options
+}
+
 impl Session {
     pub fn new(inner: WebTransport, url: Url) -> Self {
         // TODO use the web_sys bindings when updated.
@@ -264,9 +285,9 @@ impl Session {
     /// concurrent streams.
     pub fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, Error>> {
         let inner = &self.shared.inner;
-        let stream = ready!(self
-            .open_uni
-            .poll(cx, || promise(inner.create_unidirectional_stream())))?;
+        let stream = ready!(self.open_uni.poll(cx, || {
+            promise(inner.create_unidirectional_stream_with_options(&stream_options()))
+        }))?;
 
         Poll::Ready(SendStream::new(stream.unchecked_into()))
     }
@@ -278,9 +299,9 @@ impl Session {
         cx: &mut Context<'_>,
     ) -> Poll<Result<(SendStream, RecvStream), Error>> {
         let inner = &self.shared.inner;
-        let stream = ready!(self
-            .open_bi
-            .poll(cx, || promise(inner.create_bidirectional_stream())))?;
+        let stream = ready!(self.open_bi.poll(cx, || {
+            promise(inner.create_bidirectional_stream_with_options(&stream_options()))
+        }))?;
 
         Poll::Ready(bi_streams(stream.unchecked_into()))
     }
@@ -449,11 +470,19 @@ impl Session {
     }
 
     /// Creates a new bidirectional stream.
+    ///
+    /// This asks the browser to wait, rather than fail, when the peer's concurrent
+    /// stream limit has been reached. No engine implements that yet, so this can
+    /// still return an error on exhaustion.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         poll_fn(|cx| self.poll_open_bi(cx)).await
     }
 
     /// Creates a new unidirectional stream.
+    ///
+    /// This asks the browser to wait, rather than fail, when the peer's concurrent
+    /// stream limit has been reached. No engine implements that yet, so this can
+    /// still return an error on exhaustion.
     pub async fn open_uni(&self) -> Result<SendStream, Error> {
         poll_fn(|cx| self.poll_open_uni(cx)).await
     }
