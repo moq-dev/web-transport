@@ -88,8 +88,9 @@ impl SendStream {
     /// stream, so watching for that does not block a concurrent write.
     pub(crate) fn poll_closed_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let writer = &self.writer;
-        ready!(self.closed.poll(cx, || promise(writer.closed())))?;
-        Poll::Ready(Ok(()))
+        let result = ready!(self.closed.poll(cx, || promise(writer.closed())));
+        self.terminate();
+        Poll::Ready(result.map(|_| ()))
     }
 
     /// Write *all* of the given bytes to the stream.
@@ -112,7 +113,7 @@ impl SendStream {
 
     /// Send an immediate reset code, closing the stream with an error.
     pub fn reset(&mut self, code: u32) {
-        self.terminal = true;
+        self.terminate();
         ignore(self.writer.abort_with_reason(&stream_error(code)));
     }
 
@@ -127,9 +128,15 @@ impl SendStream {
             return Ok(());
         }
 
-        self.terminal = true;
+        self.terminate();
         ignore(self.writer.close());
         Ok(())
+    }
+
+    /// Enter a terminal state and release progress that no future write can poll.
+    fn terminate(&mut self) {
+        self.terminal = true;
+        self.write.take();
     }
 
     /// Set the stream's priority.

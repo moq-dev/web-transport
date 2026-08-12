@@ -39,6 +39,12 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         .parse()
         .map_err(|_| JsValue::from_str("bad harness url"))?;
 
+    results.push(&row(
+        "malformed certificate hash is rejected",
+        decode_hex("é").is_none(),
+        "non-ASCII input returned None without panicking",
+    ));
+
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
     macro_rules! check {
@@ -240,7 +246,7 @@ async fn datagram_round_trip(session: Session) -> Result<String, Error> {
 async fn cloned_poll_sends_honor_capacity(session: Session) -> Result<String, Error> {
     let first = session.clone();
     let second = session.clone();
-    let mut cx = Context::from_waker(Waker::noop());
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
 
     match first.poll_send_datagram(&mut cx, b"first") {
         Poll::Ready(Ok(())) => {}
@@ -336,14 +342,17 @@ fn row(name: &str, ok: bool, detail: &str) -> Object {
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
+    let hex = hex.trim().as_bytes();
+    let pairs = hex.chunks_exact(2);
+    if !pairs.remainder().is_empty() {
         return None;
     }
 
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+    pairs
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
         .collect()
 }
 

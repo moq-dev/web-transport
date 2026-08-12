@@ -97,7 +97,9 @@ harness port="8080":
 	#!/usr/bin/env bash
 	set -euo pipefail
 
-	[ -f dev/localhost.crt ] || ./dev/setup
+	if [ ! -f dev/localhost.crt ] || [ ! -f dev/localhost.key ] || [ ! -f dev/localhost.hex ]; then
+		./dev/setup
+	fi
 
 	# wasm-bindgen refuses to process a file built against a different schema, but
 	# adjacent crate and CLI versions can share one. Let the CLI make that decision;
