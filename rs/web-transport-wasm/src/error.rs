@@ -44,10 +44,10 @@ impl From<JsValue> for Error {
         if let Some(e) = v.dyn_ref::<web_sys::WebTransportError>().cloned() {
             match e.source() {
                 web_sys::WebTransportErrorSource::Stream => Error::Stream(e),
-                web_sys::WebTransportErrorSource::Session => Error::Session {
-                    code: stream_error_code(&e).unwrap_or(0),
-                    reason: e.message(),
-                },
+                // A browser-generated session failure has no application close
+                // code. Only a resolved `closed()` promise has close info, which
+                // `session_error` converts without inventing a code.
+                web_sys::WebTransportErrorSource::Session => Error::Unknown(v),
                 _ => Error::Unknown(v),
             }
         } else {
