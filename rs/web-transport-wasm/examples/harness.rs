@@ -16,7 +16,11 @@
 
 use std::{
     rc::Rc,
-    task::{Context, Poll, Waker},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
 use js_sys::{Array, Object, Reflect};
@@ -59,6 +63,10 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     );
     check!("peer reset code reaches the receiver", peer_reset_code);
     check!("datagram round trip", datagram_round_trip);
+    check!(
+        "cloned poll sends honor shared capacity",
+        cloned_poll_sends_honor_capacity
+    );
     check!(
         "synchronous datagrams continue after settlement",
         synchronous_datagrams_continue
@@ -129,9 +137,12 @@ async fn accept_all(session: Session) -> Result<String, Error> {
 async fn orphaned_accept(session: Session) -> Result<String, Error> {
     let doomed = session.clone();
     let survivor = session.clone();
+    let doomed_wake = Arc::new(FlagWake::default());
+    let survivor_wake = Arc::new(FlagWake::default());
 
-    // One poll, with a waker that goes nowhere: enough to issue the browser read.
-    let mut cx = Context::from_waker(Waker::noop());
+    // One poll with its own task identity: enough to issue the browser read.
+    let doomed_waker = Waker::from(doomed_wake);
+    let mut cx = Context::from_waker(&doomed_waker);
     match doomed.poll_accept_uni(&mut cx) {
         Poll::Pending => {}
         Poll::Ready(Ok(_)) => {
@@ -142,6 +153,8 @@ async fn orphaned_accept(session: Session) -> Result<String, Error> {
 
     // Issue a newer read on the handle that survives. The older orphan must take
     // precedence over this request, even though this handle is no longer idle.
+    let survivor_waker = Waker::from(survivor_wake.clone());
+    let mut cx = Context::from_waker(&survivor_waker);
     match survivor.poll_accept_uni(&mut cx) {
         Poll::Pending => {}
         Poll::Ready(Ok(_)) => {
@@ -150,10 +163,19 @@ async fn orphaned_accept(session: Session) -> Result<String, Error> {
         Poll::Ready(Err(err)) => return Err(err),
     }
 
-    // Now ask the peer for one, and drop the handle whose read is outstanding.
-    let mut ack = command(&session, "streams 1").await?;
+    // The peer acknowledges before waiting to open the stream, making the drop
+    // happen while both reads are still pending. The dropped task's waker cannot
+    // help once the browser eventually fulfills its older request.
+    let mut ack = command(&session, "streams-after 250 1").await?;
     read_all(&mut ack).await?;
     drop(doomed);
+
+    if !survivor_wake.0.swap(false, Ordering::SeqCst) {
+        return expect(
+            false,
+            "dropping the older read did not wake the survivor".into(),
+        );
+    }
 
     let mut recv = timeout(survivor.accept_uni(), 3_000).await.map_err(|_| {
         stalled("accept_uni never resolved: the surviving clone ignored an older orphan")
@@ -213,6 +235,26 @@ async fn datagram_round_trip(session: Session) -> Result<String, Error> {
     )
 }
 
+/// Every clone shares one browser writer, so an idle per-clone operation slot must
+/// not bypass the writer's shared backpressure signal.
+async fn cloned_poll_sends_honor_capacity(session: Session) -> Result<String, Error> {
+    let first = session.clone();
+    let second = session.clone();
+    let mut cx = Context::from_waker(Waker::noop());
+
+    match first.poll_send_datagram(&mut cx, b"first") {
+        Poll::Ready(Ok(())) => {}
+        Poll::Ready(Err(err)) => return Err(err),
+        Poll::Pending => return expect(false, "the first datagram had no capacity".into()),
+    }
+
+    match second.poll_send_datagram(&mut cx, b"second") {
+        Poll::Pending => expect(true, "the second clone observed shared backpressure".into()),
+        Poll::Ready(Ok(())) => expect(false, "the second clone bypassed shared capacity".into()),
+        Poll::Ready(Err(err)) => Err(err),
+    }
+}
+
 /// A settled promise must not permanently occupy the synchronous trait adapter's
 /// one retained slot. Receiving the first echo proves that write has completed
 /// before a second datagram is offered.
@@ -258,6 +300,19 @@ async fn session_close(session: Session) -> Result<String, Error> {
 }
 
 // --- helpers ------------------------------------------------------------------
+
+#[derive(Default)]
+struct FlagWake(AtomicBool);
+
+impl Wake for FlagWake {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
 
 fn expect(ok: bool, detail: String) -> Result<String, Error> {
     if ok {

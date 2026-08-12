@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     future::poll_fn,
     rc::Rc,
-    task::{ready, Context, Poll},
+    task::{ready, Context, Poll, Waker},
 };
 
 use bytes::Bytes;
@@ -73,6 +73,7 @@ struct Incoming {
     reader: RefCell<Option<ReadableStreamDefaultReader>>,
     next_order: Cell<u64>,
     orphans: RefCell<BTreeMap<u64, JsFuture>>,
+    waiters: RefCell<BTreeMap<u64, Waker>>,
 }
 
 impl Incoming {
@@ -325,6 +326,21 @@ impl Session {
             Err(err) => return Poll::Ready(Err(err)),
         };
 
+        // The writer is shared by every clone, so a local idle slot does not mean
+        // the browser has room. Wait on the shared backpressure promise and
+        // recheck: another clone may consume capacity before this one is polled.
+        loop {
+            match writer.desired_size() {
+                Ok(size) if datagram_has_capacity(size) => break,
+                Ok(_) => match self.send_datagram.poll(cx, || promise(writer.ready())) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                },
+                Err(err) => return Poll::Ready(Err(err.into())),
+            }
+        }
+
         self.write_datagram(&writer, payload);
         Poll::Ready(Ok(()))
     }
@@ -440,6 +456,7 @@ impl Session {
                 .expect("the oldest orphan cannot disappear on one thread");
 
             if let Some((displaced_order, displaced_future)) = op.replace(order, future) {
+                incoming.waiters.borrow_mut().remove(&displaced_order);
                 let previous = incoming
                     .orphans
                     .borrow_mut()
@@ -456,7 +473,16 @@ impl Session {
             order
         });
 
-        op.poll_with(cx, order, || JsFuture::from(promise(reader.read())))
+        incoming
+            .waiters
+            .borrow_mut()
+            .insert(order, cx.waker().clone());
+
+        let result = op.poll_with(cx, order, || JsFuture::from(promise(reader.read())));
+        if result.is_ready() {
+            incoming.waiters.borrow_mut().remove(&order);
+        }
+        result
     }
 
     /// Accept a new unidirectional stream from the peer.
@@ -544,8 +570,16 @@ impl Drop for Session {
             (&self.recv_datagram, &self.shared.datagrams),
         ] {
             if let Some((order, future)) = op.take() {
+                incoming.waiters.borrow_mut().remove(&order);
                 let previous = incoming.orphans.borrow_mut().insert(order, future);
                 assert!(previous.is_none(), "incoming read orders are unique");
+
+                // A clone may already be parked on a newer browser read. Wake it
+                // now so it can adopt this older future and register its waker on
+                // that request before the browser fulfills it.
+                for waiter in incoming.waiters.borrow().values() {
+                    waiter.wake_by_ref();
+                }
             }
         }
     }

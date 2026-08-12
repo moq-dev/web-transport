@@ -17,11 +17,13 @@
 //! - `echo <text>` — write `<text>` back and finish.
 //! - `streams <n>` — open `n` unidirectional streams carrying `stream-0`, `stream-1`,
 //!   … then finish. The harness uses this to exercise accept.
+//! - `streams-after <millis> <n>` — finish the command stream, wait, then open the
+//!   streams. The harness uses this to drop a pending accept before a value exists.
 //! - `reset <code>` — reset this stream with `<code>`, so the client sees a peer
 //!   RESET_STREAM.
 //! - `close <code> <reason>` — close the whole session.
 
-use std::{fs, io, path};
+use std::{fs, io, path, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
@@ -134,18 +136,17 @@ async fn run_command(
         }
         "streams" => {
             let count: usize = rest.trim().parse().context("bad stream count")?;
-
-            // Held until every stream is open, so none is dropped while the harness
-            // is still working through the earlier ones.
-            let mut streams = Vec::with_capacity(count);
-            for i in 0..count {
-                let mut stream = session.open_uni().await?;
-                stream.write_all(format!("stream-{i}").as_bytes()).await?;
-                stream.finish()?;
-                streams.push(stream);
-            }
+            open_streams(&session, count).await?;
+            send.finish()?;
+        }
+        "streams-after" => {
+            let (millis, count) = rest.split_once(' ').context("missing stream count")?;
+            let millis: u64 = millis.trim().parse().context("bad delay")?;
+            let count: usize = count.trim().parse().context("bad stream count")?;
 
             send.finish()?;
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            open_streams(&session, count).await?;
         }
         "reset" => {
             let code: u32 = rest.trim().parse().context("bad reset code")?;
@@ -159,5 +160,18 @@ async fn run_command(
         _ => anyhow::bail!("unknown command: {command}"),
     }
 
+    Ok(())
+}
+
+async fn open_streams(session: &Session, count: usize) -> anyhow::Result<()> {
+    // Held until every stream is open, so none is dropped while the harness is
+    // still working through the earlier ones.
+    let mut streams = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut stream = session.open_uni().await?;
+        stream.write_all(format!("stream-{i}").as_bytes()).await?;
+        stream.finish()?;
+        streams.push(stream);
+    }
     Ok(())
 }

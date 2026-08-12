@@ -102,7 +102,7 @@ harness port="8080":
 	# wasm-bindgen refuses to process a file built against a different schema, but
 	# adjacent crate and CLI versions can share one. Let the CLI make that decision;
 	# if it fails, add the version provenance its schema error omits.
-	want=$(cargo metadata --format-version 1 --locked \
+	want=$(cargo metadata --format-version 1 \
 		| python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wasm-bindgen"))')
 	got=$(wasm-bindgen --version | awk '{print $2}')
 
