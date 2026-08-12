@@ -17,6 +17,13 @@ polls.
 Clone the `Session` to run operations concurrently. Each clone keeps its own in-flight operation,
 while the underlying browser stream locks are shared — a browser stream can only be locked once.
 
+## Testing
+
+CI only compiles this crate: the browser API it wraps exists nowhere else, so the poll paths have no
+automated coverage. `just harness` builds a browser harness and the QUIC peer that drives it, then
+serves the page for a browser to open. It exercises accept, a peer reset code, closed-watches racing
+buffered bytes, datagrams, and a session close, and reports a row per check.
+
 ## Requirements
 
 `web-sys` still gates the WebTransport bindings behind `--cfg=web_sys_unstable_apis`, so this crate

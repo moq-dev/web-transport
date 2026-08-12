@@ -48,5 +48,19 @@ features = [
     "WritableStreamDefaultWriter",
 ]
 
+[dev-dependencies]
+futures = "0.3"
+
+# `Window` is only needed by the harness, for its timeouts.
+[dev-dependencies.web-sys]
+version = "0.3.91"
+features = ["Window"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
+
+# The browser harness. A cdylib so `wasm-bindgen` can generate bindings for it;
+# see `just harness`.
+[[example]]
+crate-type = ["cdylib"]
+name = "harness"

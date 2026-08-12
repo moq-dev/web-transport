@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>web-transport-wasm harness</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8884; vertical-align: top; }
+  td.ok { color: #0a0; font-weight: 600; }
+  td.fail { color: #c00; font-weight: 600; }
+  code { font-family: ui-monospace, monospace; }
+  #summary { margin-top: 1rem; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>web-transport-wasm harness</h1>
+<p>
+  Drives the poll state machine against a real browser and a real QUIC peer.
+  Start <code>harness-server</code> first — see <code>just harness</code>.
+</p>
+<div id="status">loading…</div>
+<table id="results" hidden>
+  <thead><tr><th>check</th><th>result</th><th>detail</th></tr></thead>
+  <tbody></tbody>
+</table>
+<div id="summary"></div>
+
+<script type="module">
+import init, { run } from "./harness.js";
+
+const params = new URLSearchParams(location.search);
+const url = params.get("url") || "https://localhost:4443";
+
+const status = document.getElementById("status");
+const table = document.getElementById("results");
+const tbody = table.querySelector("tbody");
+const summary = document.getElementById("summary");
+
+// Exposed so an automated runner can wait for the result rather than guess.
+window.harness = { done: false, passed: 0, failed: 0, rows: [] };
+
+try {
+  const hash = (await (await fetch("./localhost.hex")).text()).trim();
+  await init();
+
+  status.textContent = `running against ${url}…`;
+  const rows = await run(url, hash);
+
+  table.hidden = false;
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.textContent = row.name;
+    const verdict = document.createElement("td");
+    verdict.textContent = row.ok ? "pass" : "FAIL";
+    verdict.className = row.ok ? "ok" : "fail";
+    const detail = document.createElement("td");
+    detail.textContent = row.detail;
+    tr.append(name, verdict, detail);
+    tbody.append(tr);
+
+    window.harness.rows.push({ name: row.name, ok: row.ok, detail: row.detail });
+    if (row.ok) window.harness.passed++; else window.harness.failed++;
+  }
+
+  status.textContent = `ran against ${url}`;
+  summary.textContent = `${window.harness.passed} passed, ${window.harness.failed} failed`;
+} catch (err) {
+  status.textContent = "harness failed to run: " + err;
+  window.harness.failed = 1;
+} finally {
+  window.harness.done = true;
+}
+</script>
+</body>
+</html>

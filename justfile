@@ -87,6 +87,35 @@ fix:
 	bun install
 	bun run fix
 
+# Run the browser harness for web-transport-wasm.
+#
+# CI only compiles the WASM crate; the browser API it wraps exists nowhere else, so
+# the poll paths that are easiest to get wrong have no automated coverage. This
+# builds the harness, starts its QUIC peer, and serves the page for a browser to
+# open. Requires `dev/setup` to have generated the localhost certificate.
+harness port="8080":
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	[ -f dev/localhost.crt ] || ./dev/setup
+
+	# Build the harness and generate its JS bindings next to the page.
+	out="target/harness"
+	cargo build --example harness -p web-transport-wasm --target wasm32-unknown-unknown
+	wasm-bindgen --target web --out-dir "$out" \
+		target/wasm32-unknown-unknown/debug/examples/harness.wasm
+	cp rs/web-transport-wasm/examples/harness.html "$out/index.html"
+	cp dev/localhost.hex "$out/localhost.hex"
+
+	cargo build --example harness-server -p web-transport-quinn
+	./target/debug/examples/harness-server \
+		--tls-cert dev/localhost.crt --tls-key dev/localhost.key &
+	server=$!
+	trap 'kill $server 2>/dev/null || true' EXIT
+
+	echo "==> open http://localhost:{{port}}/"
+	python3 -m http.server {{port}} --directory "$out"
+
 # Build the FFI staticlib/cdylib for the host and generate language bindings.
 build-ffi:
 	./rs/web-transport-ffi/build.sh --bindings-only --output rs/web-transport-ffi/dist
