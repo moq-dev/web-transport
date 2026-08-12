@@ -23,7 +23,7 @@ impl web_transport_trait::Error for Error {
     /// first.
     fn session_error(&self) -> Option<(u32, String)> {
         match self {
-            Error::Session(err) => Some((stream_error_code(err).unwrap_or(0), err.message())),
+            Error::Session { code, reason } => Some((*code, reason.clone())),
             _ => None,
         }
     }
