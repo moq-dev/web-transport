@@ -1,3 +1,5 @@
+#![cfg(target_family = "wasm")]
+
 //! A browser harness for the poll state machine.
 //!
 //! `cargo check` proves this crate compiles for `wasm32`; nothing in CI runs it,
@@ -57,6 +59,10 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     );
     check!("peer reset code reaches the receiver", peer_reset_code);
     check!("datagram round trip", datagram_round_trip);
+    check!(
+        "synchronous datagrams continue after settlement",
+        synchronous_datagrams_continue
+    );
     check!("session close code and reason survive", session_close);
 
     Ok(results)
@@ -122,10 +128,21 @@ async fn accept_all(session: Session) -> Result<String, Error> {
 /// outstanding before the peer opens anything.
 async fn orphaned_accept(session: Session) -> Result<String, Error> {
     let doomed = session.clone();
+    let survivor = session.clone();
 
     // One poll, with a waker that goes nowhere: enough to issue the browser read.
     let mut cx = Context::from_waker(Waker::noop());
     match doomed.poll_accept_uni(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(Ok(_)) => {
+            return expect(false, "a stream arrived before one was asked for".into())
+        }
+        Poll::Ready(Err(err)) => return Err(err),
+    }
+
+    // Issue a newer read on the handle that survives. The older orphan must take
+    // precedence over this request, even though this handle is no longer idle.
+    match survivor.poll_accept_uni(&mut cx) {
         Poll::Pending => {}
         Poll::Ready(Ok(_)) => {
             return expect(false, "a stream arrived before one was asked for".into())
@@ -138,9 +155,9 @@ async fn orphaned_accept(session: Session) -> Result<String, Error> {
     read_all(&mut ack).await?;
     drop(doomed);
 
-    let mut recv = timeout(session.accept_uni(), 3_000)
-        .await
-        .map_err(|_| stalled("accept_uni never resolved: the dropped clone ate the stream"))??;
+    let mut recv = timeout(survivor.accept_uni(), 3_000).await.map_err(|_| {
+        stalled("accept_uni never resolved: the surviving clone ignored an older orphan")
+    })??;
 
     let got = read_all(&mut recv).await?;
     expect(got == "stream-0", format!("accepted {got:?}"))
@@ -193,6 +210,32 @@ async fn datagram_round_trip(session: Session) -> Result<String, Error> {
     expect(
         got.as_ref() == b"ping",
         format!("received {:?}", String::from_utf8_lossy(&got)),
+    )
+}
+
+/// A settled promise must not permanently occupy the synchronous trait adapter's
+/// one retained slot. Receiving the first echo proves that write has completed
+/// before a second datagram is offered.
+async fn synchronous_datagrams_continue(session: Session) -> Result<String, Error> {
+    web_transport_trait::Session::send_datagram(&session, b"first".as_slice().into())?;
+
+    let first = timeout(session.recv_datagram(), 3_000)
+        .await
+        .map_err(|_| stalled("the first synchronous datagram was not echoed"))??;
+
+    web_transport_trait::Session::send_datagram(&session, b"second".as_slice().into())?;
+
+    let second = timeout(session.recv_datagram(), 3_000)
+        .await
+        .map_err(|_| stalled("a settled write blocked the second synchronous datagram"))??;
+
+    expect(
+        first.as_ref() == b"first" && second.as_ref() == b"second",
+        format!(
+            "received {:?}, then {:?}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        ),
     )
 }
 

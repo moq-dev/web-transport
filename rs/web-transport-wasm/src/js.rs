@@ -95,14 +95,14 @@ impl Op {
         Poll::Ready(output.map_err(Error::from))
     }
 
-    /// Whether an operation is in flight.
-    pub(crate) fn is_pending(&self) -> bool {
-        self.future.borrow().is_some()
-    }
-
     /// Take the operation in flight, leaving the slot idle.
     pub(crate) fn take(&self) -> Option<JsFuture> {
         self.future.borrow_mut().take()
+    }
+
+    /// Replace the operation in flight, returning its predecessor when there was one.
+    pub(crate) fn replace(&self, future: JsFuture) -> Option<JsFuture> {
+        self.future.borrow_mut().replace(future)
     }
 
     /// Poll an operation already in flight, reporting an idle slot as settled.

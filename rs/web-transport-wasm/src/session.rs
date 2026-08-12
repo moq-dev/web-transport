@@ -1,6 +1,6 @@
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
     future::poll_fn,
     rc::Rc,
     task::{ready, Context, Poll},
@@ -35,12 +35,12 @@ use crate::{
 pub struct Session {
     shared: Rc<Shared>,
 
-    accept_uni: Op,
-    accept_bi: Op,
+    accept_uni: IncomingOp,
+    accept_bi: IncomingOp,
     open_uni: Op,
     open_bi: Op,
     send_datagram: Op,
-    recv_datagram: Op,
+    recv_datagram: IncomingOp,
     closed: Op,
 }
 
@@ -71,7 +71,8 @@ struct Shared {
 #[derive(Default)]
 struct Incoming {
     reader: RefCell<Option<ReadableStreamDefaultReader>>,
-    orphans: RefCell<VecDeque<JsFuture>>,
+    next_order: Cell<u64>,
+    orphans: RefCell<BTreeMap<u64, JsFuture>>,
 }
 
 impl Incoming {
@@ -94,6 +95,82 @@ impl Incoming {
             }
         }
     }
+}
+
+/// One handle's read from an [`Incoming`] browser stream.
+///
+/// The order follows the browser's read-request order. It lets a surviving handle
+/// adopt an older orphan without moving its own older request behind a newer one.
+#[derive(Default)]
+struct IncomingOp {
+    order: Cell<Option<u64>>,
+    future: Op,
+}
+
+impl IncomingOp {
+    /// Replace this handle's read with an older orphan, returning the displaced read.
+    fn replace(&self, order: u64, future: JsFuture) -> Option<(u64, JsFuture)> {
+        let previous_order = self.order.replace(Some(order));
+        let previous_future = self.future.replace(future);
+
+        match (previous_order, previous_future) {
+            (Some(order), Some(future)) => Some((order, future)),
+            (None, None) => None,
+            _ => unreachable!("incoming read order and future must move together"),
+        }
+    }
+
+    /// Take this handle's read so another clone can adopt it.
+    fn take(&self) -> Option<(u64, JsFuture)> {
+        let future = self.future.take()?;
+        let order = self
+            .order
+            .take()
+            .expect("an incoming read future always has an order");
+        Some((order, future))
+    }
+
+    /// Poll the assigned read, starting a fresh one with `order` when idle.
+    fn poll_with(
+        &self,
+        cx: &mut Context<'_>,
+        order: u64,
+        make: impl FnOnce() -> JsFuture,
+    ) -> Poll<Result<JsValue, Error>> {
+        let result = self.future.poll_with(cx, || {
+            assert!(
+                self.order.replace(Some(order)).is_none(),
+                "an idle incoming read cannot already have an order"
+            );
+            make()
+        });
+
+        if result.is_ready() {
+            self.order.set(None);
+        }
+
+        result
+    }
+}
+
+/// A cloned session handle starts with no read assigned to it.
+impl Clone for IncomingOp {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// Whether the oldest orphan must run before this handle's assigned read.
+fn should_adopt_orphan(current: Option<u64>, orphan: u64) -> bool {
+    match current {
+        Some(current) => orphan < current,
+        None => true,
+    }
+}
+
+/// Whether the browser writer currently has room for another datagram.
+fn datagram_has_capacity(desired_size: Option<f64>) -> bool {
+    matches!(desired_size, Some(size) if size > 0.0)
 }
 
 /// The datagram writer. The current spec exposes it via `createWritable()`; the
@@ -137,12 +214,12 @@ impl Session {
                 datagrams: Incoming::default(),
                 send_datagram: RefCell::new(None),
             }),
-            accept_uni: Op::default(),
-            accept_bi: Op::default(),
+            accept_uni: IncomingOp::default(),
+            accept_bi: IncomingOp::default(),
             open_uni: Op::default(),
             open_bi: Op::default(),
             send_datagram: Op::default(),
-            recv_datagram: Op::default(),
+            recv_datagram: IncomingOp::default(),
             closed: Op::default(),
         }
     }
@@ -234,26 +311,22 @@ impl Session {
     /// Hand a datagram to the browser if it has room, reporting whether it took it.
     ///
     /// Unlike [`poll_send_datagram`](Self::poll_send_datagram) this never waits, so
-    /// it has to drop rather than queue: a datagram offered while the previous one
-    /// is still outstanding, or while the browser reports no room, is discarded.
+    /// it has to drop rather than queue: a datagram offered while the browser
+    /// reports no room is discarded.
     /// Queueing instead would grow without bound on a stalled connection, and
     /// nothing downstream discards the excess — a browser write cannot be
     /// cancelled, so the backlog would eventually go out stale. Dropping is a
     /// datagram's normal fate anyway; congestion, loss and size do it too.
     pub fn try_send_datagram(&self, payload: &[u8]) -> Result<bool, Error> {
-        if self.send_datagram.is_pending() {
-            return Ok(false);
-        }
-
         let writer = self.datagram_writer()?;
 
         // `desiredSize` is the writer's own backpressure signal: at or below zero
         // the queue is already at its high water mark. `None` is an errored stream,
-        // which the write itself reports, so let that one through.
-        if let Ok(Some(size)) = writer.desired_size() {
-            if size <= 0.0 {
-                return Ok(false);
-            }
+        // which has no capacity either. A prior write future may still occupy our
+        // slot after it settled because this synchronous path cannot poll it; live
+        // writer capacity, rather than that stale slot, decides whether to send.
+        if !datagram_has_capacity(writer.desired_size()?) {
+            return Ok(false);
         }
 
         self.write_datagram(&writer, payload);
@@ -321,7 +394,7 @@ impl Session {
     fn poll_incoming(
         &self,
         cx: &mut Context<'_>,
-        op: &Op,
+        op: &IncomingOp,
         incoming: &Incoming,
         stream: impl FnOnce() -> ReadableStream,
     ) -> Poll<Result<JsValue, Error>> {
@@ -330,10 +403,39 @@ impl Session {
             Err(err) => return Poll::Ready(Err(err)),
         };
 
-        op.poll_with(cx, || {
-            let orphan = incoming.orphans.borrow_mut().pop_front();
-            orphan.unwrap_or_else(|| JsFuture::from(promise(reader.read())))
-        })
+        let oldest_orphan = incoming
+            .orphans
+            .borrow()
+            .first_key_value()
+            .map(|(&order, _)| order);
+
+        if let Some(order) =
+            oldest_orphan.filter(|&order| should_adopt_orphan(op.order.get(), order))
+        {
+            let future = incoming
+                .orphans
+                .borrow_mut()
+                .remove(&order)
+                .expect("the oldest orphan cannot disappear on one thread");
+
+            if let Some((displaced_order, displaced_future)) = op.replace(order, future) {
+                let previous = incoming
+                    .orphans
+                    .borrow_mut()
+                    .insert(displaced_order, displaced_future);
+                assert!(previous.is_none(), "incoming read orders are unique");
+            }
+        }
+
+        let order = op.order.get().unwrap_or_else(|| {
+            let order = incoming.next_order.get();
+            incoming
+                .next_order
+                .set(order.checked_add(1).expect("incoming read order exhausted"));
+            order
+        });
+
+        op.poll_with(cx, order, || JsFuture::from(promise(reader.read())))
     }
 
     /// Accept a new unidirectional stream from the peer.
@@ -412,8 +514,9 @@ impl Drop for Session {
             (&self.accept_bi, &self.shared.accept_bi),
             (&self.recv_datagram, &self.shared.datagrams),
         ] {
-            if let Some(future) = op.take() {
-                incoming.orphans.borrow_mut().push_back(future);
+            if let Some((order, future)) = op.take() {
+                let previous = incoming.orphans.borrow_mut().insert(order, future);
+                assert!(previous.is_none(), "incoming read orders are unique");
             }
         }
     }
@@ -426,3 +529,23 @@ impl PartialEq for Session {
 }
 
 impl Eq for Session {}
+
+#[cfg(test)]
+mod tests {
+    use super::{datagram_has_capacity, should_adopt_orphan};
+
+    #[test]
+    fn only_older_orphans_preempt_an_inflight_read() {
+        assert!(should_adopt_orphan(Some(2), 1));
+        assert!(!should_adopt_orphan(Some(1), 2));
+        assert!(should_adopt_orphan(None, 2));
+    }
+
+    #[test]
+    fn settled_datagram_slot_does_not_override_live_writer_capacity() {
+        assert!(datagram_has_capacity(Some(1.0)));
+        assert!(!datagram_has_capacity(Some(0.0)));
+        assert!(!datagram_has_capacity(Some(-1.0)));
+        assert!(!datagram_has_capacity(None));
+    }
+}
