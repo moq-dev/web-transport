@@ -41,8 +41,8 @@ pub(super) struct SendState {
     // received
     stop: Option<u64>,
 
-    // received SET_PRIORITY
-    priority: Option<u8>,
+    // pending stream_priority update; Quiche defaults to 127 until this is set
+    urgency: Option<u8>,
 
     // No more progress can be made on the stream.
     closed: bool,
@@ -58,7 +58,7 @@ impl SendState {
             fin: false,
             reset: None,
             stop: None,
-            priority: None,
+            urgency: None,
             closed: false,
         }
     }
@@ -145,9 +145,9 @@ impl SendState {
             return Ok(self.blocked.take());
         }
 
-        if let Some(priority) = self.priority.take() {
-            tracing::trace!(stream_id = ?self.id, priority, "updating STREAM");
-            qconn.stream_priority(self.id.into(), priority, true)?;
+        if let Some(urgency) = self.urgency.take() {
+            tracing::trace!(stream_id = ?self.id, urgency, "updating STREAM");
+            qconn.stream_priority(self.id.into(), urgency, true)?;
         }
 
         while let Some(mut chunk) = self.queued.pop_front() {
@@ -259,8 +259,8 @@ impl SendStream {
     }
 
     #[cfg(test)]
-    pub(crate) fn priority(&self) -> Option<u8> {
-        self.state.lock().priority
+    pub(crate) fn urgency(&self) -> Option<u8> {
+        self.state.lock().urgency
     }
 
     /// Returns the QUIC stream ID.
@@ -421,11 +421,14 @@ impl SendStream {
         kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 
-    /// Set the priority of this stream.
+    /// Set the QUIC urgency of this stream.
     ///
-    /// Lower priority values are sent first. Defaults to 0.
-    pub fn set_priority(&mut self, priority: u8) {
-        self.state.lock().priority = Some(priority);
+    /// This is Quiche's native convention: lower values are sent first. Streams that are
+    /// never assigned an urgency keep Quiche's default of 127.
+    ///
+    /// Note that [`crate::SendStream`] uses the opposite, WebTransport-facing convention.
+    pub fn set_urgency(&mut self, urgency: u8) {
+        self.state.lock().urgency = Some(urgency);
 
         let waker = self.driver.lock().send(self.id);
         if let Some(waker) = waker {

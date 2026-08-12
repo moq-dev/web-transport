@@ -14,7 +14,10 @@ use crate::{ez, waiters::Parked, StreamError};
 // decimal: 1685221232, or 91143959072288 as an HTTP error code
 const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
 
-/// Convert the trait's higher-first send order to Quiche's lower-first urgency.
+/// The send order every stream starts at, matching quinn and the W3C `sendOrder` default.
+const DEFAULT_SEND_ORDER: u8 = 0;
+
+/// Convert a higher-first send order to Quiche's lower-first urgency.
 const fn send_order_to_urgency(order: u8) -> u8 {
     u8::MAX - order
 }
@@ -34,11 +37,19 @@ pub struct SendStream {
 
 impl SendStream {
     pub(super) fn new(inner: ez::SendStream) -> Self {
-        Self {
+        let mut this = Self {
             inner,
             parked_write: Parked::default(),
             parked_closed: Parked::default(),
-        }
+        };
+
+        // Pin the stream to the default send order instead of inheriting Quiche's urgency of
+        // 127. Otherwise an untouched stream would outrank any stream explicitly promoted to
+        // an order below 128, inverting the contract. H3 control streams are `ez` streams and
+        // keep 127, so they stay ahead of all WebTransport data.
+        this.set_priority(DEFAULT_SEND_ORDER);
+
+        this
     }
 
     /// Write some data to the stream, returning the size written.
@@ -66,11 +77,16 @@ impl SendStream {
         self.inner.finish().map_err(Into::into)
     }
 
-    /// Set the priority of this stream.
+    /// Set the send order of this stream.
     ///
-    /// Lower priority values are sent first. Defaults to 0.
+    /// Streams with higher values are sent first, but are not guaranteed to arrive first.
+    /// Defaults to 0. This matches the W3C WebTransport `sendOrder` convention and the other
+    /// `web-transport` backends.
+    ///
+    /// Quiche's native urgency runs the other way; use [`ez::SendStream::set_urgency`] if you
+    /// need that convention.
     pub fn set_priority(&mut self, order: u8) {
-        self.inner.set_priority(order)
+        self.inner.set_urgency(send_order_to_urgency(order))
     }
 
     /// Abruptly reset the stream with the provided error code.
@@ -129,7 +145,7 @@ impl web_transport_trait::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: u8) {
-        SendStream::set_priority(self, send_order_to_urgency(order))
+        SendStream::set_priority(self, order)
     }
 
     fn reset(&mut self, code: u32) {
@@ -167,7 +183,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: u8) {
-        SendStream::set_priority(self, send_order_to_urgency(order))
+        SendStream::set_priority(self, order)
     }
 
     fn reset(&mut self, code: u32) {
@@ -189,30 +205,80 @@ impl web_transport_trait::poll::SendStream for SendStream {
 mod tests {
     use super::*;
 
-    #[test]
-    fn inherent_priority_stays_lower_first() {
-        let mut stream = SendStream::new(ez::SendStream::new_test());
-
-        stream.set_priority(42);
-
-        assert_eq!(stream.inner.priority(), Some(42));
+    /// The urgency that would be handed to `quiche::Connection::stream_priority`.
+    fn urgency(stream: &SendStream) -> u8 {
+        stream.inner.urgency().expect("urgency is set on construction")
     }
 
     #[test]
-    fn future_trait_send_order_maps_to_quiche_urgency() {
-        let mut stream = SendStream::new(ez::SendStream::new_test());
+    fn untouched_stream_uses_the_default_send_order() {
+        let stream = SendStream::new(ez::SendStream::new_test());
 
-        web_transport_trait::SendStream::set_priority(&mut stream, 200);
-
-        assert_eq!(stream.inner.priority(), Some(55));
+        // Not Quiche's default of 127, which would rank above a promoted stream.
+        assert_eq!(urgency(&stream), send_order_to_urgency(DEFAULT_SEND_ORDER));
+        assert_eq!(urgency(&stream), 255);
     }
 
     #[test]
-    fn poll_trait_send_order_maps_to_quiche_urgency() {
-        let mut stream = SendStream::new(ez::SendStream::new_test());
+    fn explicit_default_order_matches_untouched() {
+        let untouched = SendStream::new(ez::SendStream::new_test());
+        let mut explicit = SendStream::new(ez::SendStream::new_test());
 
-        web_transport_trait::poll::SendStream::set_priority(&mut stream, 100);
+        explicit.set_priority(DEFAULT_SEND_ORDER);
 
-        assert_eq!(stream.inner.priority(), Some(155));
+        assert_eq!(urgency(&explicit), urgency(&untouched));
+    }
+
+    #[test]
+    fn higher_send_order_is_sent_first() {
+        let mut low = SendStream::new(ez::SendStream::new_test());
+        let mut high = SendStream::new(ez::SendStream::new_test());
+
+        low.set_priority(1);
+        high.set_priority(2);
+
+        // Quiche sends lower urgencies first.
+        assert!(urgency(&high) < urgency(&low));
+    }
+
+    #[test]
+    fn promoted_stream_outranks_untouched_stream() {
+        // The regression: any order above the default must beat a stream nobody touched,
+        // including orders below Quiche's default urgency of 127.
+        for order in [1, 55, 100, 200, 255] {
+            let untouched = SendStream::new(ez::SendStream::new_test());
+            let mut promoted = SendStream::new(ez::SendStream::new_test());
+
+            promoted.set_priority(order);
+
+            assert!(
+                urgency(&promoted) < urgency(&untouched),
+                "send order {order} should outrank an untouched stream"
+            );
+        }
+    }
+
+    #[test]
+    fn async_trait_matches_the_inherent_api() {
+        let mut inherent = SendStream::new(ez::SendStream::new_test());
+        let mut via_trait = SendStream::new(ez::SendStream::new_test());
+
+        inherent.set_priority(200);
+        web_transport_trait::SendStream::set_priority(&mut via_trait, 200);
+
+        assert_eq!(urgency(&via_trait), urgency(&inherent));
+        assert_eq!(urgency(&via_trait), 55);
+    }
+
+    #[test]
+    fn poll_trait_matches_the_inherent_api() {
+        let mut inherent = SendStream::new(ez::SendStream::new_test());
+        let mut via_trait = SendStream::new(ez::SendStream::new_test());
+
+        inherent.set_priority(100);
+        web_transport_trait::poll::SendStream::set_priority(&mut via_trait, 100);
+
+        assert_eq!(urgency(&via_trait), urgency(&inherent));
+        assert_eq!(urgency(&via_trait), 155);
     }
 }
