@@ -21,6 +21,8 @@
 //!   streams. The harness uses this to drop a pending accept before a value exists.
 //! - `reset <code>` — reset this stream with `<code>`, so the client sees a peer
 //!   RESET_STREAM.
+//! - `stop <code>` — stop the client's sending half with `<code>` while keeping the
+//!   response half available.
 //! - `close <code> <reason>` — close the whole session.
 
 use std::{fs, io, path, time::Duration};
@@ -121,23 +123,36 @@ async fn read_command(
     send: web_transport_quinn::SendStream,
     mut recv: web_transport_quinn::RecvStream,
 ) -> anyhow::Result<()> {
-    let command = match recv.read_to_end(4096).await {
-        Ok(command) => command,
-        // The dropped-open regression deliberately resets command streams before
-        // writing anything. That abandons one command, not the whole session.
-        Err(err) => {
-            tracing::debug!(?err, "command stream abandoned");
-            return Ok(());
+    let mut command = Vec::new();
+    let mut buf = [0; 1024];
+    loop {
+        match recv.read(&mut buf).await {
+            Ok(Some(size)) => {
+                command.extend_from_slice(&buf[..size]);
+                anyhow::ensure!(command.len() <= 4096, "command too long");
+                if let Some(newline) = command.iter().position(|&byte| byte == b'\n') {
+                    command.truncate(newline);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            // The dropped-open regression deliberately resets command streams
+            // before writing anything. That abandons one command, not the session.
+            Err(err) => {
+                tracing::debug!(?err, "command stream abandoned");
+                return Ok(());
+            }
         }
-    };
+    }
     let command = String::from_utf8_lossy(&command).trim().to_string();
     tracing::info!(%command, "command");
-    run_command(session, send, command).await
+    run_command(session, send, recv, command).await
 }
 
 async fn run_command(
     session: Session,
     mut send: web_transport_quinn::SendStream,
+    mut recv: web_transport_quinn::RecvStream,
     command: String,
 ) -> anyhow::Result<()> {
     let (verb, rest) = match command.split_once(' ') {
@@ -167,6 +182,10 @@ async fn run_command(
         "reset" => {
             let code: u32 = rest.trim().parse().context("bad reset code")?;
             send.reset(code)?;
+        }
+        "stop" => {
+            let code: u32 = rest.trim().parse().context("bad stop code")?;
+            recv.stop(code)?;
         }
         "close" => {
             let (code, reason) = rest.split_once(' ').unwrap_or((rest, ""));

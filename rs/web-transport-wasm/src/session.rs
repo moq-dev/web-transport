@@ -334,7 +334,18 @@ impl Session {
                 Ok(size) if datagram_has_capacity(size) => break,
                 Ok(_) => match self.send_datagram.poll(cx, || promise(writer.ready())) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(_)) => continue,
+                    Poll::Ready(Ok(_)) => match writer.desired_size() {
+                        Ok(size) if datagram_has_capacity(size) => continue,
+                        // `ready` also fulfills when the writer closes. Its closed
+                        // promise distinguishes that terminal zero from ordinary
+                        // backpressure and prevents an already-ready wake loop.
+                        Ok(_) => match self.send_datagram.poll(cx, || promise(writer.closed())) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Ok(_)) => return Poll::Ready(Err(Error::Closed)),
+                            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                        },
+                        Err(err) => return Poll::Ready(Err(err.into())),
+                    },
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 },
                 Err(err) => return Poll::Ready(Err(err.into())),

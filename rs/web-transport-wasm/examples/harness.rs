@@ -15,6 +15,7 @@
 //! rest.
 
 use std::{
+    future::poll_fn,
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -74,12 +75,20 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("peer reset code reaches the receiver", peer_reset_code);
     check!("datagram round trip", datagram_round_trip);
     check!(
+        "closed datagram writer terminates poll",
+        closed_datagram_writer_terminates
+    );
+    check!(
         "cloned poll sends honor shared capacity",
         cloned_poll_sends_honor_capacity
     );
     check!(
         "synchronous datagrams continue after settlement",
         synchronous_datagrams_continue
+    );
+    check!(
+        "rejected stream write makes the stream terminal",
+        rejected_write_is_terminal
     );
     check!("session close code and reason survive", session_close);
 
@@ -96,7 +105,7 @@ async fn connect(url: &url::Url, hash: &[u8]) -> Result<Session, Error> {
 /// Send a harness command and hand back the stream the reply arrives on.
 async fn command(session: &Session, command: &str) -> Result<RecvStream, Error> {
     let (mut send, recv) = session.open_bi().await?;
-    send.write(command.as_bytes()).await?;
+    send.write(format!("{command}\n").as_bytes()).await?;
     send.finish()?;
     Ok(recv)
 }
@@ -277,6 +286,21 @@ async fn datagram_round_trip(session: Session) -> Result<String, Error> {
     )
 }
 
+async fn closed_datagram_writer_terminates(session: Session) -> Result<String, Error> {
+    session.send_datagram(b"prime".as_slice().into()).await?;
+    let _ = session.recv_datagram().await?;
+    session.close(0, "done");
+    let _ = timeout(session.closed(), 1_000)
+        .await
+        .map_err(|_| stalled("session did not close"))?;
+
+    match timeout(poll_fn(|cx| session.poll_send_datagram(cx, b"late")), 1_000).await {
+        Ok(Err(_)) => expect(true, "closed writer returned an error".into()),
+        Ok(Ok(())) => expect(false, "closed writer accepted a datagram".into()),
+        Err(()) => expect(false, "closed writer stayed in a wake loop".into()),
+    }
+}
+
 /// Every clone shares one browser writer, so an idle per-clone operation slot must
 /// not bypass the writer's shared backpressure signal.
 async fn cloned_poll_sends_honor_capacity(session: Session) -> Result<String, Error> {
@@ -321,6 +345,33 @@ async fn synchronous_datagrams_continue(session: Session) -> Result<String, Erro
             String::from_utf8_lossy(&second)
         ),
     )
+}
+
+async fn rejected_write_is_terminal(session: Session) -> Result<String, Error> {
+    let (mut send, _recv) = session.open_bi().await?;
+    send.write(b"stop 42\n").await?;
+
+    let _first_error = timeout(
+        async {
+            loop {
+                match send.write(b"trigger").await {
+                    Ok(()) => sleep(10).await,
+                    Err(err) => break err,
+                }
+            }
+        },
+        1_000,
+    )
+    .await
+    .map_err(|_| stalled("peer STOP_SENDING never rejected a write"))?;
+
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    match send.poll_write(&mut cx, b"retry") {
+        Poll::Ready(Err(Error::Closed)) => expect(true, "retry returned Closed".into()),
+        Poll::Ready(Err(err)) => expect(false, format!("retry returned {err}")),
+        Poll::Ready(Ok(size)) => expect(false, format!("retry accepted {size} bytes")),
+        Poll::Pending => expect(false, "retry remained pending after failure".into()),
+    }
 }
 
 /// A session close carries its code and reason out through the error.

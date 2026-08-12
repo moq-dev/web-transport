@@ -51,7 +51,10 @@ impl SendStream {
             return Poll::Ready(Err(Error::Closed));
         }
 
-        ready!(self.write.poll_settled(cx))?;
+        if let Err(err) = ready!(self.write.poll_settled(cx)) {
+            self.terminate();
+            return Poll::Ready(Err(err));
+        }
 
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
