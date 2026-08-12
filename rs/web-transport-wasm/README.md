@@ -33,9 +33,14 @@ build. Add it to `.cargo/config.toml`:
 ```toml
 [build]
 rustflags = ["--cfg=web_sys_unstable_apis"]
+rustdocflags = ["--cfg=web_sys_unstable_apis"]
 ```
 
-Or set `RUSTFLAGS="--cfg=web_sys_unstable_apis"` in the environment. `RUSTFLAGS` overrides
-`.cargo/config.toml` rather than adding to it, so use one or the other.
+`rustdocflags` is separate because rustdoc does not inherit `rustflags`; without it `cargo doc` and
+doctests fail even though `cargo build` succeeds.
+
+Or set `RUSTFLAGS="--cfg=web_sys_unstable_apis"` and `RUSTDOCFLAGS="--cfg=web_sys_unstable_apis"` in
+the environment. Both override `.cargo/config.toml` rather than adding to it, so use one or the
+other.
 
 Building without the flag fails with a `compile_error!` pointing back here.

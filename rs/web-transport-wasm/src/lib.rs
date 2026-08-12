@@ -21,7 +21,11 @@
 //! ```toml
 //! [build]
 //! rustflags = ["--cfg=web_sys_unstable_apis"]
+//! rustdocflags = ["--cfg=web_sys_unstable_apis"]
 //! ```
+//!
+//! `rustdocflags` is separate because rustdoc does not inherit `rustflags`; without it
+//! `cargo doc` and doctests fail even though `cargo build` succeeds.
 
 #[cfg(not(web_sys_unstable_apis))]
 compile_error!(
@@ -29,9 +33,12 @@ compile_error!(
      WebTransport bindings behind it. This flag cannot be enabled by a dependency; add it to \
      your own build, for example in `.cargo/config.toml`:\n\n\
      \x20   [build]\n\
-     \x20   rustflags = [\"--cfg=web_sys_unstable_apis\"]\n\n\
-     or set `RUSTFLAGS=\"--cfg=web_sys_unstable_apis\"` in the environment. Note that RUSTFLAGS \
-     overrides `.cargo/config.toml`, so only one of the two takes effect."
+     \x20   rustflags = [\"--cfg=web_sys_unstable_apis\"]\n\
+     \x20   rustdocflags = [\"--cfg=web_sys_unstable_apis\"]\n\n\
+     `rustdocflags` is required separately because rustdoc does not inherit `rustflags`; if you \
+     are seeing this from `cargo doc` or a doctest, that is the missing piece. Alternatively set \
+     `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment, but note that both replace `.cargo/config.toml` \
+     rather than extending it, so only one of the two takes effect."
 );
 
 // Gated so missing web-sys bindings don't bury the error above.

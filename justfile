@@ -60,6 +60,13 @@ test:
 	cargo test --workspace --all-targets --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport --all-targets --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport-wasm --all-targets --all-features
+
+	# --all-targets excludes doctests, so run them separately. These also exercise
+	# the rustdoc path, which needs `rustdocflags` in .cargo/config.toml.
+	cargo test --workspace --doc --all-features
+	cargo test --target wasm32-unknown-unknown -p web-transport --doc --all-features
+	cargo test --target wasm32-unknown-unknown -p web-transport-wasm --doc --all-features
+
 	bun run --cwd js/qmux test
 	bun run --cwd js/qmux test:interop
 
