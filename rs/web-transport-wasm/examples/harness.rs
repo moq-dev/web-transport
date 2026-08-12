@@ -90,6 +90,10 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         "rejected stream write makes the stream terminal",
         rejected_write_is_terminal
     );
+    check!(
+        "concurrent cloned senders all get capacity",
+        concurrent_datagram_senders
+    );
     check!("session close code and reason survive", session_close);
 
     Ok(results)
@@ -390,6 +394,67 @@ async fn session_close(session: Session) -> Result<String, Error> {
         }
         other => expect(false, format!("session_error() was {other:?}")),
     }
+}
+
+/// Cloned senders share one browser writer, so they share its backpressure.
+///
+/// When two are parked on the same `ready` promise and capacity returns, only one
+/// wins. The loser sees the capacity gone again -- and the `ready` it holds has
+/// already fulfilled and never will again, because the writer swaps in a fresh
+/// promise. It has to resubscribe to that new one. Falling back to `closed()`
+/// instead parks it for the life of the session, which is a deadlock dressed up as
+/// backpressure.
+///
+/// Driven by hand rather than by volume: the race needs two clones parked on one
+/// promise at the same instant, and a loop of `await`s lets capacity recover
+/// between polls often enough to miss it entirely.
+async fn concurrent_datagram_senders(session: Session) -> Result<String, Error> {
+    let winner = session.clone();
+    let loser = session.clone();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+    // Take the writer's only slot, so the other two have to wait.
+    match session.poll_send_datagram(&mut cx, b"first") {
+        Poll::Ready(Ok(())) => {}
+        Poll::Ready(Err(err)) => return Err(err),
+        Poll::Pending => return expect(false, "the first datagram had no capacity".into()),
+    }
+
+    // Both park on the *same* ready promise, which is what sets up the race.
+    for (label, clone) in [("winner", &winner), ("loser", &loser)] {
+        match clone.poll_send_datagram(&mut cx, b"queued") {
+            Poll::Pending => {}
+            Poll::Ready(Ok(())) => {
+                return expect(false, format!("the {label} bypassed shared capacity"))
+            }
+            Poll::Ready(Err(err)) => return Err(err),
+        }
+    }
+
+    // Let capacity come back, then let one of them take it.
+    let mut won = false;
+    for _ in 0..20 {
+        sleep(25).await;
+        match winner.poll_send_datagram(&mut cx, b"winner") {
+            Poll::Ready(Ok(())) => {
+                won = true;
+                break;
+            }
+            Poll::Ready(Err(err)) => return Err(err),
+            Poll::Pending => continue,
+        }
+    }
+
+    if !won {
+        return expect(false, "capacity never returned for the winner".into());
+    }
+
+    // The loser is now holding a fulfilled `ready` with no capacity behind it.
+    timeout(poll_fn(|cx| loser.poll_send_datagram(cx, b"loser")), 5_000)
+        .await
+        .map_err(|_| stalled("the clone that lost the capacity race never woke again"))??;
+
+    expect(true, "the loser resubscribed and sent".into())
 }
 
 // --- helpers ------------------------------------------------------------------
