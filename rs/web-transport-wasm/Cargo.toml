@@ -37,6 +37,7 @@ features = [
     "WebTransportBidirectionalStream",
     "WebTransportCloseInfo",
     "WebTransportSendStream",
+    "WebTransportSendStreamOptions",
     "WebTransportReceiveStream",
     "WebTransportDatagramDuplexStream",
     "WebTransportCongestionControl",
