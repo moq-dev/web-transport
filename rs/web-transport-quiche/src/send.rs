@@ -46,7 +46,8 @@ impl SendStream {
         // Pin the stream to the default send order instead of inheriting Quiche's urgency of
         // 127. Otherwise an untouched stream would outrank any stream explicitly promoted to
         // an order below 128, inverting the contract. H3 control streams are `ez` streams and
-        // keep 127, so they stay ahead of all WebTransport data.
+        // keep 127, so they precede data streams at the default order; a stream promoted above
+        // order 128 still outranks them, as it could before this change.
         this.set_priority(DEFAULT_SEND_ORDER);
 
         this
