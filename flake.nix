@@ -42,7 +42,11 @@
           pkgs.cargo-hack
           pkgs.just
           pkgs.bun
-          pkgs.wasm-bindgen-cli
+          # The bindgen schema is unstable, so the CLI has to match the
+          # `wasm-bindgen` crate the workspace links exactly -- `just harness`
+          # aborts on a mismatch rather than emitting bad bindings. nixpkgs
+          # tracks its own default, so pin the version instead of following it.
+          pkgs.wasm-bindgen-cli_0_2_126
           pkgs.python312
           pkgs.uv
           pkgs.pkg-config
