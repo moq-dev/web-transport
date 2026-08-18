@@ -136,16 +136,38 @@ impl SendState {
         Poll::Pending
     }
 
+    /// Close this stream in response to a quiche error, or propagate a genuine
+    /// connection error.
+    ///
+    /// quiche reports the end of an individual stream through errors on otherwise
+    /// ordinary calls: `StreamStopped` once the peer has sent STOP_SENDING, and
+    /// `Done` or `InvalidStreamState` once quiche has reset the stream and collected
+    /// its state. All three mean this stream is over; none of them mean the
+    /// connection is, and promoting one would tear down every other stream on the
+    /// session.
+    #[must_use = "wake the driver"]
+    fn closed_by(&mut self, err: quiche::Error) -> quiche::Result<Option<Waker>> {
+        match err {
+            quiche::Error::StreamStopped(code) => {
+                tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
+                self.stop = Some(code);
+            }
+            quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
+                tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
+            }
+            e => return Err(e),
+        }
+
+        self.closed = true;
+        Ok(self.blocked.take())
+    }
+
     #[must_use = "wake the driver"]
     pub fn flush(&mut self, qconn: &mut QuicheConnection) -> quiche::Result<Option<Waker>> {
         if let Some(code) = self.reset {
             tracing::trace!(stream_id = ?self.id, code, "sending RESET_STREAM");
-            // Resetting a single stream must never tear down the whole connection.
-            // quiche returns Done / InvalidStreamState when the stream is already
-            // finished or gone, which is a benign no-op here, not a fatal error.
-            match qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code) {
-                Ok(()) | Err(quiche::Error::Done) | Err(quiche::Error::InvalidStreamState(_)) => {}
-                Err(e) => return Err(e),
+            if let Err(e) = qconn.stream_shutdown(self.id.into(), quiche::Shutdown::Write, code) {
+                return self.closed_by(e);
             }
             self.closed = true;
             return Ok(self.blocked.take());
@@ -163,15 +185,11 @@ impl SendState {
         while let Some(mut chunk) = self.queued.pop_front() {
             let n = match qconn.stream_send(self.id.into(), &chunk, false) {
                 Ok(n) => n,
+                // Out of connection-level capacity, so retry once writable again.
+                // The same error also covers a collected stream, which the
+                // `stream_writable` registration below reports as gone.
                 Err(quiche::Error::Done) => 0,
-                Err(quiche::Error::StreamStopped(code)) => {
-                    tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
-
-                    self.stop = Some(code);
-                    self.closed = true;
-                    return Ok(self.blocked.take());
-                }
-                Err(e) => return Err(e),
+                Err(e) => return self.closed_by(e),
             };
 
             tracing::trace!(
@@ -187,7 +205,9 @@ impl SendState {
                 self.queued.push_front(remaining);
 
                 // Register a `stream_writable_next` callback when at least one byte is ready to send.
-                qconn.stream_writable(self.id.into(), 1)?;
+                if let Err(e) = qconn.stream_writable(self.id.into(), 1) {
+                    return self.closed_by(e);
+                }
 
                 break;
             }
@@ -195,7 +215,9 @@ impl SendState {
 
         if self.queued.is_empty() && self.fin {
             tracing::trace!(stream_id = ?self.id, "sending FIN");
-            qconn.stream_send(self.id.into(), &[], true)?;
+            if let Err(e) = qconn.stream_send(self.id.into(), &[], true) {
+                return self.closed_by(e);
+            }
 
             self.closed = true;
             return Ok(self.blocked.take());
@@ -203,14 +225,7 @@ impl SendState {
 
         self.capacity = match qconn.stream_capacity(self.id.into()) {
             Ok(capacity) => capacity,
-            Err(quiche::Error::StreamStopped(code)) => {
-                tracing::trace!(stream_id = ?self.id, code, "received STOP_SENDING");
-
-                self.stop = Some(code);
-                self.closed = true;
-                return Ok(self.blocked.take());
-            }
-            Err(e) => return Err(e),
+            Err(e) => return self.closed_by(e),
         };
 
         // A flush waiter can make progress as soon as the internal queue has
