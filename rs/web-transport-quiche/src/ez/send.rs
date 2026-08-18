@@ -49,6 +49,10 @@ pub(super) struct SendState {
     // received
     stop: Option<u64>,
 
+    // quiche discarded the stream before we asked it anything, so the peer stopped us
+    // but the code is gone. Terminal exactly like `stop`, with nothing to report.
+    gone: bool,
+
     // pending SET_PRIORITY, higher is sent first
     priority: Option<u8>,
 
@@ -66,6 +70,7 @@ impl SendState {
             fin: false,
             reset: None,
             stop: None,
+            gone: false,
             // Pin every stream to the default rather than inheriting quiche's, so that a
             // stream explicitly assigned a low priority can't be outranked by an untouched one.
             priority: Some(DEFAULT_PRIORITY),
@@ -84,7 +89,7 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
-        } else if self.fin {
+        } else if self.gone || self.fin {
             return Poll::Ready(Err(StreamError::Closed));
         }
 
@@ -111,6 +116,8 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
+        } else if self.gone {
+            return Poll::Ready(Err(StreamError::Closed));
         } else if self.closed {
             // self.closed means we sent the FIN already
             // TODO wait until the peer has acknowledged the fin
@@ -127,6 +134,10 @@ impl SendState {
             return Poll::Ready(Err(StreamError::Reset(reset)));
         } else if let Some(stop) = self.stop {
             return Poll::Ready(Err(StreamError::Stop(stop)));
+        } else if self.gone {
+            // The queue was discarded rather than sent, so reporting a successful
+            // flush here would tell the application its bytes reached the peer.
+            return Poll::Ready(Err(StreamError::Closed));
         } else if self.queued.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -154,10 +165,11 @@ impl SendState {
             }
             quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
                 tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
-                // quiche kept no record of how the stream ended, so all that is left to
-                // say is that the write side is over. `fin` is what makes a later write
-                // fail and a pending flush resolve.
-                self.fin = true;
+                // Only a peer STOP_SENDING gets a live stream collected, so this is a
+                // stop whose code quiche has already thrown away. It is not a `fin`:
+                // the application's bytes never left, and saying otherwise would report
+                // a successful flush for data the peer refused.
+                self.gone = true;
             }
             e => return Err(e),
         }
@@ -254,6 +266,8 @@ impl SendState {
             Err(StreamError::Reset(reset))
         } else if let Some(stop) = self.stop {
             Err(StreamError::Stop(stop))
+        } else if self.gone {
+            Err(StreamError::Closed)
         } else {
             Ok(self.fin)
         }
@@ -378,7 +392,7 @@ impl SendStream {
                 return Err(StreamError::Reset(reset));
             } else if let Some(stop) = state.stop {
                 return Err(StreamError::Stop(stop));
-            } else if state.fin {
+            } else if state.gone || state.fin {
                 return Err(StreamError::Closed);
             }
 
@@ -477,7 +491,7 @@ impl Drop for SendStream {
     fn drop(&mut self) {
         let mut state = self.state.lock();
 
-        if !state.fin && state.reset.is_none() && state.stop.is_none() {
+        if !state.fin && !state.gone && state.reset.is_none() && state.stop.is_none() {
             // Reset the stream if we're dropped without calling finish.
             state.reset = Some(DROP_CODE);
             drop(state);

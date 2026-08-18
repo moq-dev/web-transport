@@ -18,6 +18,7 @@ use std::{
 use anyhow::{Context, Result};
 use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::AsyncWriteExt as _;
 use url::Url;
 use web_transport_quiche::{
     ClientBuilder, Connection, RecvStream, SendStream, Server, ServerBuilder, SessionError,
@@ -232,6 +233,18 @@ async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
         })
         .await
         .context("writing to a collected stream never returned")?;
+
+        // Neither may report success: the queued bytes were discarded, not sent, so an
+        // `Ok` here would tell the application they reached the peer.
+        let flushed = tokio::time::timeout(Duration::from_secs(10), send.flush())
+            .await
+            .context("flushing a collected stream never returned")?;
+        let closed = tokio::time::timeout(Duration::from_secs(10), send.closed())
+            .await
+            .context("closing a collected stream never returned")?;
+
+        assert!(flushed.is_err(), "flush reported success for unsent bytes");
+        assert!(closed.is_err(), "closed reported success for unsent bytes");
 
         write_msg(&mut sync_send, b"done").await?;
 

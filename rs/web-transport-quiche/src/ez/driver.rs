@@ -587,9 +587,7 @@ impl Driver {
                     }
                 }
                 hash_map::Entry::Vacant(_entry) => {
-                    // Expected: quiche marks a stream writable again when the peer
-                    // stops it, which is also when this driver retires the state.
-                    tracing::trace!(?stream_id, "closed stream was writable");
+                    tracing::warn!(?stream_id, "closed stream was writable");
                 }
             }
         }
@@ -738,9 +736,7 @@ impl Driver {
                 waker.wake();
             }
         } else {
-            // Expected: the application can queue a flush for a stream this driver
-            // has already retired, for example finishing a stream the peer stopped.
-            tracing::trace!(?stream_id, "wakeup for closed stream");
+            tracing::warn!(?stream_id, "wakeup for closed stream");
         }
 
         Ok(())
@@ -767,9 +763,7 @@ impl Driver {
                 waker.wake();
             }
         } else {
-            // Expected: the application can queue a flush for a stream this driver
-            // has already retired, for example finishing a stream the peer stopped.
-            tracing::trace!(?stream_id, "wakeup for closed stream");
+            tracing::warn!(?stream_id, "wakeup for closed stream");
         }
 
         Ok(())
