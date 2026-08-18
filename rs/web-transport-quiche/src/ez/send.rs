@@ -154,11 +154,22 @@ impl SendState {
             }
             quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
                 tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
+                // quiche kept no record of how the stream ended, so all that is left to
+                // say is that the write side is over. `fin` is what makes a later write
+                // fail and a pending flush resolve.
+                self.fin = true;
             }
             e => return Err(e),
         }
 
+        // The driver drops this state as soon as it sees `closed`, so nothing here will
+        // ever be flushed again: leaving bytes queued would park a flush forever, and
+        // leaving capacity behind would let writes keep accumulating into a queue that
+        // no longer reaches the peer.
+        self.queued.clear();
+        self.capacity = 0;
         self.closed = true;
+
         Ok(self.blocked.take())
     }
 
