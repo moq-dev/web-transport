@@ -100,3 +100,62 @@ async fn zero_interval_disables_probing() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(client.stats().rtt(), None);
 }
+
+/// A TCP session reports the kernel's RTT immediately, before any QX_PING could
+/// have completed a round trip.
+///
+/// This is what lets a peer decide at handshake time whether it can report
+/// latency at all: an estimate that only appears one probe interval later is
+/// indistinguishable, at SETUP, from a transport that never reports one.
+#[cfg(unix)]
+#[tokio::test]
+async fn tcp_reports_rtt_immediately() {
+    let mut cfg = Config::new(Version::QMux02);
+    // No QX_PING probing at all, so the only possible source is the socket.
+    cfg.rtt_interval = Duration::ZERO;
+
+    let (client, server) = pair_with_socket_stats(cfg.clone(), cfg).await;
+
+    for (side, session) in [("client", &client), ("server", &server)] {
+        let rtt = session
+            .stats()
+            .rtt()
+            .unwrap_or_else(|| panic!("{side} reported no RTT at handshake"));
+        // Loopback. A wildly wrong figure would mean the mirrored `tcp_info` layout
+        // has drifted and we are reading some other field.
+        assert!(
+            rtt < Duration::from_secs(1),
+            "{side} implausible RTT: {rtt:?}"
+        );
+    }
+}
+
+/// Like [`pair`], but attaches the kernel's view of each socket the way the
+/// `qmux::tcp` builder does.
+#[cfg(unix)]
+async fn pair_with_socket_stats(client_cfg: Config, server_cfg: Config) -> (Session, Session) {
+    use std::sync::Arc;
+
+    fn stats(sock: &TcpStream) -> qmux::SharedSocketStats {
+        Arc::new(qmux::TcpStats::new(sock).unwrap())
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let stats = stats(&sock);
+        let transport = Stream::new(sock, server_cfg.version, server_cfg.max_record_size)
+            .with_socket_stats(stats);
+        Session::accept(transport, server_cfg).await.unwrap()
+    });
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let stats = stats(&sock);
+    let transport =
+        Stream::new(sock, client_cfg.version, client_cfg.max_record_size).with_socket_stats(stats);
+    let client = Session::connect(transport, client_cfg).await.unwrap();
+
+    (client, server.await.unwrap())
+}

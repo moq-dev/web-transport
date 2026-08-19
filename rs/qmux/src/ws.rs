@@ -67,6 +67,7 @@ pub struct Upgraded<T> {
     ws: T,
     alpn: Option<String>,
     keep_alive: Option<KeepAlive>,
+    socket_stats: Option<crate::SharedSocketStats>,
 }
 
 impl<T> Upgraded<T>
@@ -82,6 +83,7 @@ where
             ws,
             alpn: None,
             keep_alive: None,
+            socket_stats: None,
         }
     }
 
@@ -94,6 +96,18 @@ where
     /// Drive a keep-alive Ping/timeout on the WebSocket.
     pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
         self.keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Report statistics for the socket underneath the upgrade.
+    ///
+    /// An HTTP server hands over a type-erased upgraded stream, so QMux can't find
+    /// the socket itself. A server that kept a handle on the accepted connection
+    /// can attach it here and get the kernel's RTT (and, on Linux, delivery rate)
+    /// instead of only QMux's own `QX_PING` measurement. See
+    /// [`TcpStats`](crate::TcpStats).
+    pub fn with_socket_stats(mut self, stats: crate::SharedSocketStats) -> Self {
+        self.socket_stats = Some(stats);
         self
     }
 
@@ -120,7 +134,10 @@ where
     }
 
     fn into_transport(self, version: Version, max_record_size: u64) -> WsTransport<T> {
-        let transport = WsTransport::new(self.ws, version, max_record_size);
+        let mut transport = WsTransport::new(self.ws, version, max_record_size);
+        if let Some(stats) = self.socket_stats {
+            transport = transport.with_socket_stats(stats);
+        }
         match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
             None => transport,

@@ -38,6 +38,10 @@ tracing = "0.1"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
+# TCP_INFO / TCP_CONNECTION_INFO for `SocketStats`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }

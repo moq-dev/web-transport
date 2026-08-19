@@ -139,8 +139,14 @@ pub struct Session {
     // the draft-01 default until the peer's parameters arrive.
     record_limit: Arc<AtomicU64>,
 
-    // Round-trip time measured from QX_PING exchanges, reported by `stats()`.
+    // Round-trip time measured from QX_PING exchanges, reported by `stats()` when
+    // the transport underneath has nothing better.
     rtt: Arc<Rtt>,
+
+    // The transport's own view of the connection, when it has one. Preferred over
+    // `rtt`: the kernel's estimate needs no round trip of ours, so it is available
+    // from the first moment rather than one probe interval in.
+    socket_stats: Option<crate::SharedSocketStats>,
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
@@ -1674,6 +1680,9 @@ impl Session {
         // backpressure must never stall reads. The writer is the sole producer on
         // the wire, pulling the outbound queues in priority order and sharing the
         // stream maps + scalars above with the reader (no message-passing handoff).
+        // Read before the split: the halves go to separate tasks, and the stats
+        // source belongs to neither.
+        let socket_stats = transport.socket_stats();
         let (writer_half, reader_half) = transport.split();
         let mut writer = WriterState {
             writer: writer_half,
@@ -1854,6 +1863,7 @@ impl Session {
             record_limit,
             outbound_datagram: outbound_datagram_tx,
             rtt,
+            socket_stats,
             _guard: guard,
         }
     }
@@ -1865,8 +1875,12 @@ impl generic::Session for Session {
     type Error = Error;
 
     fn stats(&self) -> impl generic::Stats {
+        let socket = self.socket_stats.as_ref();
         SessionStats {
-            rtt: self.rtt.get(),
+            // Fall back to our own QX_PING measurement only when the transport
+            // can't answer; a TCP socket already knows before we've pinged once.
+            rtt: socket.and_then(|s| s.rtt()).or_else(|| self.rtt.get()),
+            estimated_send_rate: socket.and_then(|s| s.estimated_send_rate()),
         }
     }
 
