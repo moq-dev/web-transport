@@ -222,9 +222,15 @@ impl Session {
     pub fn new(inner: WebTransport, url: Url) -> Self {
         // TODO use the web_sys bindings when updated.
         // Until then, we try to access the protocol property on the inner object.
+        //
+        // The browser reports `""` when no subprotocol was negotiated, which is what
+        // `None` means here. Normalizing at the capture site keeps every reader —
+        // the inherent getter and both trait impls — from having to know that, and
+        // stops `Some("")` being matched against an application's protocol table.
         let protocol = Reflect::get(&inner, &"protocol".into())
             .ok()
-            .and_then(|p| p.as_string());
+            .and_then(|p| p.as_string())
+            .filter(|p| !p.is_empty());
 
         Self {
             shared: Rc::new(Shared {
@@ -556,7 +562,8 @@ impl Session {
         &self.shared.url
     }
 
-    /// Return the application protocol used to create the session.
+    /// Return the subprotocol the server selected, or `None` when none was
+    /// negotiated.
     pub fn protocol(&self) -> Option<&str> {
         self.shared.protocol.as_deref()
     }

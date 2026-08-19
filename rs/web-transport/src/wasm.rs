@@ -116,6 +116,8 @@ impl Session {
     }
 
     /// Return the application protocol used to create the session.
+    ///
+    /// This is the negotiated subprotocol, or `None` when none was negotiated.
     pub fn protocol(&self) -> Option<&str> {
         self.0.protocol()
     }

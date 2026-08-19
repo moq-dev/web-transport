@@ -62,6 +62,7 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     }
 
     check!("echo round trip", echo_round_trip);
+    check!("no subprotocol reports None", no_subprotocol_is_none);
     check!(
         "dropped pending opens release stream credit",
         dropped_pending_opens_release_credit
@@ -130,6 +131,19 @@ async fn echo_round_trip(session: Session) -> Result<String, Error> {
     let got = read_all(&mut recv).await?;
 
     expect(got == "hello harness", format!("echoed {got:?}"))
+}
+
+/// `connect` above offers no subprotocols, so the browser negotiates none and
+/// reports `""`. The trait contract says an unnegotiated protocol is `None`, and a
+/// `Some("")` reaching a caller gets matched against their protocol table as if the
+/// peer had chosen something.
+async fn no_subprotocol_is_none(session: Session) -> Result<String, Error> {
+    let protocol = session.protocol();
+
+    expect(
+        protocol.is_none(),
+        format!("protocol() returned {protocol:?}"),
+    )
 }
 
 /// Dropping a handle cannot cancel the browser promise returned by open. Churn
