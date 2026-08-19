@@ -775,6 +775,18 @@ impl IdleActivity {
     }
 }
 
+/// The RTT probe cadence for a configured interval: `None` when disabled.
+///
+/// Clamped to a whole millisecond because the timer stores its last-ping instant
+/// as millis since `base` (see [`millis_since`]). A shorter interval would put the
+/// reconstructed deadline at or before `now` on every wake-up, so `sleep_until`
+/// would return immediately and the loop would spin, flooding the control lane
+/// with pings. The keep-alive cadence is clamped for the same reason.
+fn rtt_cadence(interval: std::time::Duration) -> Option<std::time::Duration> {
+    (interval != std::time::Duration::ZERO)
+        .then(|| interval.max(std::time::Duration::from_millis(1)))
+}
+
 impl TimerState {
     /// Read both clocks and fold them into `activity`, returning the millis of the
     /// newest activity that counts toward the idle deadline.
@@ -810,8 +822,7 @@ impl TimerState {
         let keepalive_every = idle.map(|_| std::time::Duration::from_millis((idle_ms / 3).max(1)));
         // RTT cadence, independent of the idle timeout: a peer may disable the
         // timeout and still want latency reported.
-        let rtt_every =
-            (self.rtt_interval != std::time::Duration::ZERO).then_some(self.rtt_interval);
+        let rtt_every = rtt_cadence(self.rtt_interval);
         if idle.is_none() && rtt_every.is_none() {
             return;
         }
@@ -2607,8 +2618,31 @@ mod timer_tests {
 
     use tokio::sync::{mpsc, watch};
 
-    use super::TimerState;
+    use super::{rtt_cadence, TimerState};
     use crate::Error;
+
+    /// The probe cadence must never be sub-millisecond.
+    ///
+    /// The timer reconstructs its last-ping instant from a millisecond counter, so
+    /// a shorter interval leaves the deadline at or before `now` on every wake-up:
+    /// the loop stops sleeping and floods the control lane with pings. The
+    /// keep-alive cadence is clamped for exactly this reason.
+    #[test]
+    fn rtt_cadence_is_clamped_to_a_whole_milli() {
+        assert_eq!(rtt_cadence(Duration::ZERO), None, "zero disables probing");
+        for tiny in [Duration::from_nanos(1), Duration::from_micros(500)] {
+            assert_eq!(
+                rtt_cadence(tiny),
+                Some(Duration::from_millis(1)),
+                "{tiny:?} must not yield a sub-milli cadence"
+            );
+        }
+        assert_eq!(
+            rtt_cadence(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "a sane interval passes through"
+        );
+    }
 
     /// Handles for driving a `TimerState` in isolation, without a real transport.
     struct Harness {

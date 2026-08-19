@@ -27,7 +27,7 @@ bytes = "1"
 futures = { version = "0.3", optional = true }
 rustls = { version = "0.23", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tokio = { version = "1.27", features = ["sync", "time", "macros", "rt"] }
 
 # Optional: TLS
 tokio-rustls = { version = "0.26", optional = true }
@@ -44,7 +44,7 @@ libc = "0.2"
 
 [dev-dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.27", features = ["full"] }
 url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
