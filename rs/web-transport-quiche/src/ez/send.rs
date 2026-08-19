@@ -318,6 +318,23 @@ impl SendStream {
         self.id
     }
 
+    /// Tell the driver this stream has work to flush.
+    ///
+    /// Skipped once the state is closed: the driver retires a stream as soon as it
+    /// observes that, so a notification afterwards names a stream it no longer
+    /// tracks and is reported as a spurious wakeup.
+    fn notify(&self) {
+        // Take the two locks in sequence, never both at once.
+        let closed = self.state.lock().is_closed();
+        if closed {
+            return;
+        }
+
+        if let Some(waker) = self.driver.lock().send(self.id) {
+            waker.wake();
+        }
+    }
+
     /// Write some data to the stream, returning the size written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
         let mut buf = io::Cursor::new(buf);
@@ -339,12 +356,12 @@ impl SendStream {
         waiter: &Waiter,
         buf: &mut B,
     ) -> Poll<Result<usize, StreamError>> {
-        if let Poll::Ready(res) = self.state.lock().poll_write_buf(waiter, buf) {
+        // Bind before notifying: on edition 2021 the guard from an `if let` scrutinee
+        // lives for the whole block, and `notify` takes the same lock.
+        let polled = self.state.lock().poll_write_buf(waiter, buf);
+        if let Poll::Ready(res) = polled {
             // Tell the driver that the stream has data to send.
-            let waker = self.driver.lock().send(self.id);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            self.notify();
 
             return Poll::Ready(res);
         }
@@ -399,10 +416,7 @@ impl SendStream {
             state.fin = true;
         }
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
 
         Ok(())
     }
@@ -418,10 +432,7 @@ impl SendStream {
     pub fn reset(&mut self, code: u64) {
         self.state.lock().reset = Some(code);
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
     }
 
     /// Returns true if the stream is closed by either side.
@@ -480,10 +491,7 @@ impl SendStream {
     pub fn set_priority(&mut self, priority: u8) {
         self.state.lock().priority = Some(priority);
 
-        let waker = self.driver.lock().send(self.id);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.notify();
     }
 }
 
@@ -496,10 +504,7 @@ impl Drop for SendStream {
             state.reset = Some(DROP_CODE);
             drop(state);
 
-            let waker = self.driver.lock().send(self.id);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            self.notify();
         }
     }
 }
