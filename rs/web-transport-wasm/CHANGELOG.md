@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- bump crate versions by hand ([#384](https://github.com/moq-dev/web-transport/pull/384))
+- *(wasm)* [**breaking**] implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
+
+## [0.6.0](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.10...web-transport-wasm-v0.6.0) - 2026-08-20
+
+### Added
+
+- *(wasm)* set waitUntilAvailable when opening streams ([#370](https://github.com/moq-dev/web-transport/pull/370))
+
+### Fixed
+
+- *(wasm)* report None when no subprotocol was negotiated ([#381](https://github.com/moq-dev/web-transport/pull/381))
+- *(wasm)* resubscribe to ready instead of waiting on closed ([#374](https://github.com/moq-dev/web-transport/pull/374))
+- *(wasm)* set rustdocflags so cargo doc and doctests compile ([#373](https://github.com/moq-dev/web-transport/pull/373))
+
+### Other
+
 - *(wasm)* [**breaking**] implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
 
 ## [0.5.10](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.5.9...web-transport-wasm-v0.5.10) - 2026-07-22

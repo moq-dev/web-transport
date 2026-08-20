@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- bump crate versions by hand ([#384](https://github.com/moq-dev/web-transport/pull/384))
+- *(wasm)* [**breaking**] implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
+
+## [0.12.1](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.12.0...web-transport-quinn-v0.12.1) - 2026-08-20
+
+### Other
+
 - *(wasm)* implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
 
 ## [0.12.0](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.11.12...web-transport-quinn-v0.12.0) - 2026-08-06
