@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.6.0...web-transport-quiche-v0.7.0) - 2026-08-20
+
+### Fixed
+
+- *(quiche)* keep per-stream teardown out of the connection ([#379](https://github.com/moq-dev/web-transport/pull/379))
+- *(quiche)* [**breaking**] make set_priority higher-first across the crate ([#367](https://github.com/moq-dev/web-transport/pull/367))
+
+### Other
+
+- *(quiche)* [**breaking**] move the priority inversion into ez ([#372](https://github.com/moq-dev/web-transport/pull/372))
+
 ## [0.6.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.5.1...web-transport-quiche-v0.6.0) - 2026-08-06
 
 ### Fixed
