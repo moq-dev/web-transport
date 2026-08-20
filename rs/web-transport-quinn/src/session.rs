@@ -613,6 +613,7 @@ impl Session {
         SessionStats {
             stats: self.conn.stats(),
             rtt: self.conn.rtt(),
+            pacing_rate: self.conn.congestion_state().metrics().pacing_rate,
         }
     }
 }
@@ -959,6 +960,7 @@ impl SessionAccept {
 pub struct SessionStats {
     stats: quinn::ConnectionStats,
     rtt: std::time::Duration,
+    pacing_rate: Option<u64>,
 }
 
 impl web_transport_trait::Stats for SessionStats {
@@ -991,6 +993,10 @@ impl web_transport_trait::Stats for SessionStats {
     }
 
     fn estimated_send_rate(&self) -> Option<u64> {
+        // BBR reports 0 until its first rate sample.
+        if let Some(pacing_rate) = self.pacing_rate.filter(|rate| *rate > 0) {
+            return Some(pacing_rate);
+        }
         let rtt_secs = self.rtt.as_secs_f64();
         if self.stats.path.cwnd > 0 && rtt_secs > 0.0 {
             Some((self.stats.path.cwnd as f64 * 8.0 / rtt_secs) as u64)
