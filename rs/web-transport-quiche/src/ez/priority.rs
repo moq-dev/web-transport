@@ -20,7 +20,7 @@
 
 use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
 
-use super::StreamId;
+use super::{StreamId, DEFAULT_PRIORITY};
 
 /// How many distinct priority levels quiche can express.
 const BANDS: usize = u8::MAX as usize + 1;
@@ -56,11 +56,27 @@ impl Priorities {
     /// prioritizes: an unranked stream would keep quiche's own default urgency and
     /// so could outrank a stream that explicitly asked to go last.
     pub fn insert(&mut self, id: StreamId) {
-        self.set(id, 0);
+        self.rank(id, DEFAULT_PRIORITY);
     }
 
     /// Change a stream's send order, where higher values are sent first.
+    ///
+    /// Ignored for a stream that isn't registered, which means the driver has
+    /// already retired it. The application can still be holding the handle then —
+    /// a peer `STOP_SENDING` retires a stream underneath a live `SendStream` — and
+    /// ranking it again would strand a level that nothing is left to remove,
+    /// pushing every live stream below it down a band, plus an urgency update that
+    /// can never be applied because the stream is gone from the driver's map.
     pub fn set(&mut self, id: StreamId, order: i32) {
+        if !self.streams.contains_key(&id) {
+            return;
+        }
+
+        self.rank(id, order);
+    }
+
+    /// Register or move `id` to `order`.
+    fn rank(&mut self, id: StreamId, order: i32) {
         if self.streams.get(&id) == Some(&order) {
             return;
         }
@@ -188,12 +204,20 @@ mod tests {
         StreamId::from(id)
     }
 
+    /// Open a stream and give it a send order, the same two steps `open_uni`
+    /// followed by `set_priority` takes. `set` alone is ignored for a stream the
+    /// driver hasn't registered.
+    fn open(p: &mut Priorities, id: StreamId, order: i32) {
+        p.insert(id);
+        p.set(id, order);
+    }
+
     #[test]
     fn ranks_by_descending_send_order() {
         let mut p = Priorities::default();
         p.insert(sid(0));
-        p.set(sid(4), 100);
-        p.set(sid(8), 50);
+        open(&mut p, sid(4), 100);
+        open(&mut p, sid(8), 50);
 
         let pending = p.take();
         assert_eq!(pending[&sid(4)], 0);
@@ -204,9 +228,9 @@ mod tests {
     #[test]
     fn equal_send_orders_share_a_band() {
         let mut p = Priorities::default();
-        p.set(sid(0), 7);
-        p.set(sid(4), 7);
-        p.set(sid(8), 3);
+        open(&mut p, sid(0), 7);
+        open(&mut p, sid(4), 7);
+        open(&mut p, sid(8), 3);
 
         let pending = p.take();
         assert_eq!(pending[&sid(0)], 0);
@@ -219,9 +243,9 @@ mod tests {
     #[test]
     fn promotion_shifts_the_streams_it_passed() {
         let mut p = Priorities::default();
-        p.set(sid(0), 30);
-        p.set(sid(4), 20);
-        p.set(sid(8), 10);
+        open(&mut p, sid(0), 30);
+        open(&mut p, sid(4), 20);
+        open(&mut p, sid(8), 10);
         let _ = p.take();
 
         p.set(sid(8), 40);
@@ -236,9 +260,9 @@ mod tests {
     #[test]
     fn removal_promotes_the_streams_below() {
         let mut p = Priorities::default();
-        p.set(sid(0), 30);
-        p.set(sid(4), 20);
-        p.set(sid(8), 10);
+        open(&mut p, sid(0), 30);
+        open(&mut p, sid(4), 20);
+        open(&mut p, sid(8), 10);
         let _ = p.take();
 
         p.remove(sid(0));
@@ -254,9 +278,9 @@ mod tests {
     #[test]
     fn removal_within_a_level_does_not_shift() {
         let mut p = Priorities::default();
-        p.set(sid(0), 30);
-        p.set(sid(4), 30);
-        p.set(sid(8), 10);
+        open(&mut p, sid(0), 30);
+        open(&mut p, sid(4), 30);
+        open(&mut p, sid(8), 10);
         let _ = p.take();
 
         p.remove(sid(0));
@@ -270,7 +294,7 @@ mod tests {
         let mut p = Priorities::default();
         // Descending send order, so stream N lands at rank N.
         for i in 0..(BANDS as u64 + 8) {
-            p.set(sid(i * 4), -(i as i32));
+            open(&mut p, sid(i * 4), -(i as i32));
         }
 
         let pending = p.take();
@@ -285,20 +309,59 @@ mod tests {
     fn overflow_streams_are_still_published() {
         let mut p = Priorities::default();
         for i in 0..BANDS as u64 {
-            p.set(sid(i * 4), -(i as i32));
+            open(&mut p, sid(i * 4), -(i as i32));
         }
         let _ = p.take();
 
         let late = sid((BANDS as u64 + 1) * 4);
-        p.set(late, i32::MIN);
+        open(&mut p, late, i32::MIN);
 
         assert_eq!(p.take()[&late], OVERFLOW);
+    }
+
+    /// A `SendStream` outlives the driver's record of it — a peer `STOP_SENDING`
+    /// retires the stream while the application still holds the handle. A
+    /// `set_priority` arriving then must not resurrect it: the level would never be
+    /// cleaned up (nothing is left to remove it), it would displace every live
+    /// stream below it, and its urgency update could never be applied.
+    #[test]
+    fn updates_to_a_retired_stream_are_ignored() {
+        let mut p = Priorities::default();
+        open(&mut p, sid(0), 30);
+        open(&mut p, sid(4), 20);
+        let _ = p.take();
+
+        p.remove(sid(0));
+        let _ = p.take();
+
+        p.set(sid(0), i32::MAX);
+
+        assert!(p.take().is_empty(), "a retired stream must not queue an update");
+        assert_eq!(p.order(sid(0)), None, "a retired stream must stay unregistered");
+        assert_eq!(
+            p.urgency(sid(4)),
+            Some(0),
+            "the live stream must keep the band the retirement promoted it to"
+        );
+    }
+
+    /// The same, for a stream that was never registered at all.
+    #[test]
+    fn updates_to_an_unknown_stream_are_ignored() {
+        let mut p = Priorities::default();
+        open(&mut p, sid(0), 30);
+        let _ = p.take();
+
+        p.set(sid(99), i32::MAX);
+
+        assert!(p.take().is_empty());
+        assert_eq!(p.urgency(sid(0)), Some(0));
     }
 
     #[test]
     fn setting_the_same_order_twice_is_a_noop() {
         let mut p = Priorities::default();
-        p.set(sid(0), 5);
+        open(&mut p, sid(0), 5);
         let _ = p.take();
 
         p.set(sid(0), 5);
