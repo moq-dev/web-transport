@@ -299,7 +299,6 @@ impl DriverState {
         send: Lock<SendState>,
         recv: Lock<RecvState>,
     ) -> WaiterList {
-        self.priority.insert(id);
         self.accept_bi.push_back((id, send, recv));
         self.accept_bi_waiters.take()
     }
@@ -570,13 +569,24 @@ impl Driver {
         let mut state = SendState::new(stream_id);
         state.flush(qconn)?;
 
-        let state = Lock::new(state);
-        self.send.insert(stream_id, state.clone());
+        // The peer can stop the send half before we ever accept it, in which case
+        // that first flush already retired it. Tracking a stream nothing will flush
+        // again would strand it here for the life of the connection: `notify` skips
+        // a closed state and quiche won't report a collected stream writable. The
+        // application still gets the handle, which reports the stop on first use.
+        let live = !state.is_closed();
 
-        let mut waiters = self
-            .state
-            .lock()
-            .push_accept_bi(stream_id, state.clone(), recv_state);
+        let state = Lock::new(state);
+        if live {
+            self.send.insert(stream_id, state.clone());
+        }
+
+        let mut driver = self.state.lock();
+        if live {
+            driver.priority.insert(stream_id);
+        }
+        let mut waiters = driver.push_accept_bi(stream_id, state.clone(), recv_state);
+        drop(driver);
 
         waiters.wake();
 

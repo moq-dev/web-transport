@@ -8,6 +8,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rcgen::{CertifiedKey, KeyPair};
@@ -41,6 +42,14 @@ const CHECKED: usize = 8;
 /// Send order for the urgent tier — the upper half of the tags. Far from the other
 /// tier's 0 to show the value is ranked, not truncated to a `u8`.
 const URGENT: i32 = 1_000_000;
+
+/// Ceiling on the whole exchange.
+///
+/// Every await below is otherwise unbounded, so a stream that stalls would park
+/// `finished.recv()` or a writer join forever and the failure would surface as
+/// CI's job timeout rather than as this test. Generous enough that a loaded
+/// runner won't trip it: 8MB over loopback is well under a second.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 fn make_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let CertifiedKey { cert, signing_key } =
@@ -130,6 +139,12 @@ async fn spawn_server() -> Result<(SocketAddr, mpsc::UnboundedReceiver<u8>)> {
 /// spend and the send order is an `i32`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn higher_priority_finishes_first() -> Result<()> {
+    tokio::time::timeout(TIMEOUT, run())
+        .await
+        .context("timed out waiting for the streams to complete")?
+}
+
+async fn run() -> Result<()> {
     init_tracing();
 
     let (addr, mut finished) = spawn_server().await?;

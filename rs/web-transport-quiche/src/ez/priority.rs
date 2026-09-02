@@ -179,9 +179,11 @@ impl Priorities {
             let band = index.min(OVERFLOW as usize) as u8;
 
             if level.band == band {
-                // Every rebalance leaves each level's band correct, and bands only
-                // grow going down, so an unchanged level already in the overflow
-                // band means everything below it is there too.
+                // Every rebalance leaves each level's band correct and one call
+                // adds or drops at most one level, so a level can only shift by a
+                // single rank before the next rebalance. Reaching an unchanged
+                // overflow level therefore means every level below it was already
+                // at or past [`OVERFLOW`] beforehand, and is still there now.
                 if band == OVERFLOW {
                     break;
                 }
@@ -363,6 +365,90 @@ mod tests {
 
         assert!(p.take().is_empty());
         assert_eq!(p.urgency(sid(0)), Some(0));
+    }
+
+    /// The early exit in [`Priorities::rebalance`] is the one piece of the ranking
+    /// that isn't obviously safe: it stops at the first unchanged overflow level,
+    /// betting that everything below it is already there. Drive a long pseudorandom
+    /// sequence of opens, re-rankings and closes and check every level against a
+    /// from-scratch ranking after each step.
+    ///
+    /// The run has to spend most of its time *past* [`BANDS`] levels or the early
+    /// exit is never reached and this proves nothing, so it grows the live set well
+    /// beyond that and churns there. The `saw_overflow` assertion keeps it honest.
+    #[test]
+    fn rebalance_matches_a_full_ranking() {
+        // xorshift, so the sequence is fixed without pulling in a rng crate.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        // Enough distinct send orders that the live streams spread across more than
+        // [`BANDS`] levels rather than piling into a few.
+        let spread = 4 * BANDS as u64;
+        let target = 2 * BANDS;
+
+        let mut p = Priorities::default();
+        let mut live: Vec<StreamId> = Vec::new();
+        let mut saw_overflow = false;
+
+        for step in 0..10_000u64 {
+            let roll = rand() % 100;
+
+            // Open-heavy until the live set is past `target`, then balanced, so the
+            // run climbs over the overflow boundary and keeps crossing back and forth.
+            let open_odds = if live.len() < target { 70 } else { 34 };
+
+            if roll < open_odds || live.is_empty() {
+                let id = sid(step * 4);
+                p.insert(id);
+                if rand() % 2 == 0 {
+                    p.set(id, (rand() % spread) as i32 - spread as i32 / 2);
+                }
+                live.push(id);
+            } else if roll < open_odds + 15 {
+                let id = live[(rand() % live.len() as u64) as usize];
+                p.set(id, (rand() % spread) as i32 - spread as i32 / 2);
+            } else {
+                let id = live.swap_remove((rand() % live.len() as u64) as usize);
+                p.remove(id);
+            }
+
+            saw_overflow |= p.levels.len() > BANDS;
+
+            let expected: Vec<u8> = (0..p.levels.len())
+                .map(|i| i.min(OVERFLOW as usize) as u8)
+                .collect();
+            let actual: Vec<u8> = p.levels.values().rev().map(|l| l.band).collect();
+            assert_eq!(actual, expected, "bands diverged at step {step}");
+
+            // Nothing is left behind: every level is occupied and every stream is
+            // in the level its send order names.
+            for (order, level) in &p.levels {
+                assert!(!level.streams.is_empty(), "empty level at step {step}");
+                for id in &level.streams {
+                    assert_eq!(
+                        p.streams.get(id),
+                        Some(order),
+                        "stray stream at step {step}"
+                    );
+                }
+            }
+            assert_eq!(
+                p.streams.len(),
+                p.levels.values().map(|l| l.streams.len()).sum::<usize>(),
+                "stream count diverged at step {step}"
+            );
+        }
+
+        assert!(
+            saw_overflow,
+            "the run never exceeded {BANDS} levels, so the overflow early exit went untested"
+        );
     }
 
     #[test]
