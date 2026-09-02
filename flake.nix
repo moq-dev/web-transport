@@ -42,7 +42,17 @@
           pkgs.cargo-hack
           pkgs.just
           pkgs.bun
-          pkgs.wasm-bindgen-cli
+          # The CLI has to supply the same bindgen schema as the `wasm-bindgen`
+          # crate the workspace links, or `just harness` aborts rather than
+          # emitting bad bindings. Schemas span several releases -- 0.2.126
+          # declares 0.2.122 -- so this pins a known-good release rather than
+          # implying release equality. nixpkgs follows its own default, which
+          # drifts independently, hence the explicit version.
+          #
+          # `wasm-bindgen = "0.2"` with an ignored Cargo.lock means the crate
+          # can resolve past this on its own. That surfaces as the harness's
+          # schema error, which names both versions and the command to fix it.
+          pkgs.wasm-bindgen-cli_0_2_126
           pkgs.python312
           pkgs.uv
           pkgs.pkg-config

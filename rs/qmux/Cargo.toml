@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
@@ -27,7 +27,7 @@ bytes = "1"
 futures = { version = "0.3", optional = true }
 rustls = { version = "0.23", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["sync", "time", "macros", "rt"] }
+tokio = { version = "1.27", features = ["sync", "time", "macros", "rt"] }
 
 # Optional: TLS
 tokio-rustls = { version = "0.26", optional = true }
@@ -38,9 +38,13 @@ tracing = "0.1"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
+# TCP_INFO / TCP_CONNECTION_INFO for `SocketStats`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.27", features = ["full"] }
 url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }

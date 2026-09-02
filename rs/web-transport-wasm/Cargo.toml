@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.5.10"
+version = "0.6.0"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -23,11 +23,12 @@ thiserror = "2"
 url = "2"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-streams = "0.1.2"
+web-transport-trait = { workspace = true }
 
 [dependencies.web-sys]
 version = "0.3.91"
 features = [
+    "DomException",
     "ReadableStream",
     "ReadableStreamDefaultReader",
     "ReadableStreamReadResult",
@@ -37,6 +38,7 @@ features = [
     "WebTransportBidirectionalStream",
     "WebTransportCloseInfo",
     "WebTransportSendStream",
+    "WebTransportSendStreamOptions",
     "WebTransportReceiveStream",
     "WebTransportDatagramDuplexStream",
     "WebTransportCongestionControl",
@@ -47,5 +49,19 @@ features = [
     "WritableStreamDefaultWriter",
 ]
 
+[dev-dependencies]
+futures = "0.3"
+
+# `Window` is only needed by the harness, for its timeouts.
+[dev-dependencies.web-sys]
+version = "0.3.91"
+features = ["Window"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
+
+# The browser harness. A cdylib so `wasm-bindgen` can generate bindings for it;
+# see `just harness`.
+[[example]]
+crate-type = ["cdylib"]
+name = "harness"

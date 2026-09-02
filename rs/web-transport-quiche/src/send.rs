@@ -63,9 +63,12 @@ impl SendStream {
 
     /// Set the priority of this stream.
     ///
-    /// Streams with **higher** values are sent first, but are not guaranteed to
-    /// arrive first. Defaults to 0. See [`ez::SendStream::set_priority`] for how the
-    /// `i32` is mapped onto quiche's 8-bit stream urgency.
+    /// Streams with a higher priority are sent first, but are not guaranteed to arrive first.
+    /// Defaults to 0. This matches the W3C WebTransport `sendOrder` convention and the other
+    /// `web-transport` backends.
+    ///
+    /// See [`ez::SendStream::set_priority`] for how the `i32` is ranked onto quiche's
+    /// 8-bit stream urgency.
     pub fn set_priority(&mut self, order: i32) {
         self.inner.set_priority(order)
     }
@@ -126,7 +129,7 @@ impl web_transport_trait::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: i32) {
-        self.set_priority(order)
+        SendStream::set_priority(self, order)
     }
 
     fn reset(&mut self, code: u32) {
@@ -164,7 +167,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: i32) {
-        self.set_priority(order)
+        SendStream::set_priority(self, order)
     }
 
     fn reset(&mut self, code: u32) {
@@ -179,5 +182,47 @@ impl web_transport_trait::poll::SendStream for SendStream {
         self.parked_closed
             .poll(cx, |waiter| self.inner.poll_closed(waiter))
             .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn priority(stream: &SendStream) -> i32 {
+        stream
+            .inner
+            .priority()
+            .expect("priority is set on construction")
+    }
+
+    #[test]
+    fn untouched_stream_uses_the_default_priority() {
+        let stream = SendStream::new(ez::SendStream::new_test());
+        assert_eq!(priority(&stream), 0);
+    }
+
+    #[test]
+    fn async_trait_matches_the_inherent_api() {
+        let mut inherent = SendStream::new(ez::SendStream::new_test());
+        let mut via_trait = SendStream::new(ez::SendStream::new_test());
+
+        inherent.set_priority(200);
+        web_transport_trait::SendStream::set_priority(&mut via_trait, 200);
+
+        assert_eq!(priority(&via_trait), priority(&inherent));
+        assert_eq!(priority(&via_trait), 200);
+    }
+
+    #[test]
+    fn poll_trait_matches_the_inherent_api() {
+        let mut inherent = SendStream::new(ez::SendStream::new_test());
+        let mut via_trait = SendStream::new(ez::SendStream::new_test());
+
+        inherent.set_priority(100);
+        web_transport_trait::poll::SendStream::set_priority(&mut via_trait, 100);
+
+        assert_eq!(priority(&via_trait), priority(&inherent));
+        assert_eq!(priority(&via_trait), 100);
     }
 }

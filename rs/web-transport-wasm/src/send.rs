@@ -1,50 +1,145 @@
+use std::{
+    future::poll_fn,
+    task::{ready, Context, Poll},
+};
+
 use bytes::Buf;
 use js_sys::{Reflect, Uint8Array};
-use web_sys::WebTransportSendStream;
+use web_sys::{WebTransportSendStream, WritableStreamDefaultWriter};
 
-use crate::Error;
-use web_streams::Writer;
+use crate::{
+    error::{stream_error, stream_error_code},
+    js::{ignore, promise, Op},
+    Error,
+};
 
 /// A stream of bytes sent to the remote peer.
 pub struct SendStream {
     stream: WebTransportSendStream,
-    writer: Writer,
+    writer: WritableStreamDefaultWriter,
+
+    /// The chunk handed to the browser but not yet accepted. Its bytes were already
+    /// reported to the caller, so waiting on it costs the caller nothing.
+    write: Op,
+    closed: Op,
+
+    /// `finish` or `reset` was called, so no further writes can be accepted.
+    terminal: bool,
 }
 
 impl SendStream {
     pub(super) fn new(stream: WebTransportSendStream) -> Result<Self, Error> {
-        let writer = Writer::new(&stream)?;
-        Ok(Self { stream, writer })
+        let writer = WritableStreamDefaultWriter::new(&stream)?;
+
+        Ok(Self {
+            stream,
+            writer,
+            write: Op::default(),
+            closed: Op::default(),
+            terminal: false,
+        })
+    }
+
+    /// Poll to write `buf` to the stream, returning how many bytes were written.
+    ///
+    /// The browser's writer takes a chunk whole, so this accepts all of `buf` at
+    /// once. Backpressure comes from the *previous* chunk, waited on before this
+    /// call looks at `buf` — which is what lets a [`Poll::Pending`] here leave the
+    /// caller's buffer untouched, even if they come back with a different one.
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+        if self.terminal {
+            return Poll::Ready(Err(Error::Closed));
+        }
+
+        if let Err(err) = ready!(self.write.poll_settled(cx)) {
+            self.terminate();
+            return Poll::Ready(Err(err));
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let chunk = Uint8Array::from(buf);
+        self.write
+            .start(promise(self.writer.write_with_chunk(&chunk)));
+
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    /// Poll until the stream has been closed, returning the error code if any.
+    pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<u32>, Error>> {
+        let err = match ready!(self.poll_closed_raw(cx)) {
+            Ok(()) => return Poll::Ready(Ok(None)),
+            Err(err) => err,
+        };
+
+        // If it's a WebTransportError, we can extract the error code.
+        if let Error::Stream(err) = &err {
+            if let Some(code) = stream_error_code(err) {
+                return Poll::Ready(Ok(Some(code)));
+            }
+        }
+
+        Poll::Ready(Err(err))
+    }
+
+    /// Poll until the stream is closed by either side.
+    ///
+    /// The browser resolves the writer's `closed` promise once our FIN is through
+    /// and rejects it on a reset or a peer STOP_SENDING. Nothing here owns the
+    /// stream, so watching for that does not block a concurrent write.
+    pub(crate) fn poll_closed_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        let writer = &self.writer;
+        let result = ready!(self.closed.poll(cx, || promise(writer.closed())));
+        self.terminate();
+        Poll::Ready(result.map(|_| ()))
     }
 
     /// Write *all* of the given bytes to the stream.
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), Error> {
-        self.writer
-            .write(&Uint8Array::from(buf))
-            .await
-            .map_err(Into::into)
+        poll_fn(|cx| self.poll_write(cx, buf)).await?;
+        Ok(())
     }
 
     /// Writes some of the given buffer to the stream.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, Error> {
-        let chunk = buf.chunk();
-        let size = chunk.len();
-        self.writer.write(&Uint8Array::from(chunk)).await?;
+        let size = poll_fn(|cx| {
+            let chunk = buf.chunk();
+            self.poll_write(cx, chunk)
+        })
+        .await?;
+
         buf.advance(size);
         Ok(size)
     }
 
     /// Send an immediate reset code, closing the stream with an error.
-    pub fn reset(&mut self, reason: &str) {
-        self.writer.abort(reason);
+    pub fn reset(&mut self, code: u32) {
+        self.terminate();
+        ignore(self.writer.abort_with_reason(&stream_error(code)));
     }
 
     /// Mark the stream as finished.
     ///
+    /// The browser flushes whatever is already queued before the FIN, so this does
+    /// not race a write still in flight.
+    ///
     /// This is automatically called on Drop, but can be called manually.
     pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.close();
+        if self.terminal {
+            return Ok(());
+        }
+
+        self.terminate();
+        ignore(self.writer.close());
         Ok(())
+    }
+
+    /// Enter a terminal state and release progress that no future write can poll.
+    fn terminate(&mut self) {
+        self.terminal = true;
+        self.write.take();
     }
 
     /// Set the stream's priority.
@@ -56,26 +151,14 @@ impl SendStream {
     }
 
     /// Block until the stream has been closed and return the error code, if any.
-    pub async fn closed(&self) -> Result<Option<u8>, Error> {
-        let err = match self.writer.closed().await {
-            Ok(()) => return Ok(None),
-            Err(err) => Error::from(err),
-        };
-
-        // If it's a WebTransportError, we can extract the error code.
-        if let Error::Stream(err) = &err {
-            if let Some(code) = err.stream_error_code() {
-                return Ok(Some(code));
-            }
-        }
-
-        Err(err)
+    pub async fn closed(&mut self) -> Result<Option<u32>, Error> {
+        poll_fn(|cx| self.poll_closed(cx)).await
     }
 }
 
 impl Drop for SendStream {
     /// Close the stream with a FIN.
     fn drop(&mut self) {
-        self.writer.close();
+        let _ = self.finish();
     }
 }

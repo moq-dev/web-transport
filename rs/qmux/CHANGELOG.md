@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.0...qmux-v0.5.1) - 2026-08-20
+
+### Added
+
+- *(qmux)* report RTT and delivery rate from Session::stats() ([#380](https://github.com/moq-dev/web-transport/pull/380))
+
 ## [0.5.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.4.1...qmux-v0.5.0) - 2026-08-06
 
 ### Fixed

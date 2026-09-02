@@ -35,9 +35,11 @@ mod credit;
 mod error;
 mod proto;
 mod protocol;
+mod rtt;
 mod sched;
 mod session;
 mod shared;
+mod socket;
 mod stream;
 
 /// Transport abstraction and the byte-stream [`transport::Stream`] implementation.
@@ -65,6 +67,9 @@ pub use config::{Config, Protocol};
 pub use error::Error;
 pub use proto::Version;
 pub use session::{RecvStream, SendStream, Session};
+#[cfg(unix)]
+pub use socket::TcpStats;
+pub use socket::{SharedSocketStats, SocketStats};
 pub use stream::{StreamDir, StreamId};
 // Transport-specific types are deliberately *not* re-exported here; they stay
 // behind their module path (`transport::Transport`, `ws::Client`, `tls::Client`,

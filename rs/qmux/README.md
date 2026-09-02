@@ -10,7 +10,7 @@ The protocol reuses QUIC frame types and semantics while adapting them for strea
 
 ```toml
 [dependencies]
-qmux = "0.4"
+qmux = "0.5"
 ```
 
 ### Features

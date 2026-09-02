@@ -235,6 +235,25 @@ impl DriverState {
         self.waker.take()
     }
 
+    /// Register a send stream without going through `open_*`, for tests that need
+    /// several streams ranked against each other on one connection.
+    #[cfg(test)]
+    pub fn register_send(&mut self, stream_id: StreamId) {
+        self.priority.insert(stream_id);
+    }
+
+    /// The send order a stream is ranked at, if it is registered.
+    #[cfg(test)]
+    pub fn priority_of(&self, stream_id: StreamId) -> Option<i32> {
+        self.priority.order(stream_id)
+    }
+
+    /// The quiche urgency a stream's send order currently maps to.
+    #[cfg(test)]
+    pub fn urgency_of(&self, stream_id: StreamId) -> Option<u8> {
+        self.priority.urgency(stream_id)
+    }
+
     #[must_use = "wake the driver"]
     pub fn recv(&mut self, stream_id: StreamId) -> Option<Waker> {
         if !self.recv.insert(stream_id) {

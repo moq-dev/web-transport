@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.11.0...web-transport-v0.12.0) - 2026-08-20
+
+### Fixed
+
+- *(wasm)* report None when no subprotocol was negotiated ([#381](https://github.com/moq-dev/web-transport/pull/381))
+
+### Other
+
+- *(wasm)* [**breaking**] implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
+
 ## [0.11.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.10.9...web-transport-v0.11.0) - 2026-08-06
 
 ### Other

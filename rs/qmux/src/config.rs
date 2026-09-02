@@ -82,6 +82,16 @@ pub struct Config {
     /// establishment forever. Default: 10s; a zero duration disables the timeout
     /// (wait indefinitely).
     pub handshake_timeout: Duration,
+
+    /// How often to send a `QX_PING` request purely to measure round-trip time,
+    /// reported by [`Session::stats`](web_transport_trait::Session::stats).
+    ///
+    /// Separate from the keep-alive ping, which is activity-gated and so never
+    /// fires while an application is actively sending. A zero duration disables
+    /// RTT measurement, leaving [`Stats::rtt`](web_transport_trait::Stats::rtt)
+    /// as `None`. Only the record-framed drafts (QMux01+) carry `QX_PING`.
+    /// Default: 1s.
+    pub rtt_interval: Duration,
 }
 
 impl Default for Config {
@@ -100,6 +110,7 @@ impl Default for Config {
             // Fill a full record by default; the record layer bounds the size.
             max_datagram_frame_size: DEFAULT_MAX_RECORD_SIZE,
             handshake_timeout: Duration::from_secs(10),
+            rtt_interval: Duration::from_secs(1),
         }
     }
 }

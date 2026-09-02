@@ -69,6 +69,9 @@ impl Client {
         server_name: &str,
     ) -> Result<Session, Error> {
         let stream = TcpStream::connect(&addr).await?;
+        // Read the socket's stats handle before TLS takes ownership; the kernel's
+        // view of the TCP connection is the same either side of the encryption.
+        let socket_stats = socket_stats(&stream);
 
         let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|_| Error::InvalidServerName)?
@@ -105,7 +108,10 @@ impl Client {
         }
 
         let session_config = Config::negotiated(version, protocol);
-        let transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        if let Some(stats) = socket_stats {
+            transport = transport.with_socket_stats(stats);
+        }
         // `connect` awaits the peer's transport parameters so `protocol()` is resolved.
         Session::connect(transport, session_config).await
     }
@@ -137,6 +143,7 @@ impl Server {
     /// connection with `tokio::spawn` so a slow or non-cooperative peer can't
     /// stall your `listener.accept()` loop.
     pub async fn accept(&self, stream: TcpStream) -> Result<Session, Error> {
+        let socket_stats = socket_stats(&stream);
         let acceptor = TlsAcceptor::from(self.config.clone());
         let tls_stream = acceptor.accept(stream).await?;
 
@@ -148,8 +155,26 @@ impl Server {
         tracing::debug!(?version, ?protocol, "parsed ALPN");
 
         let session_config = Config::negotiated(version, protocol);
-        let transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
+        if let Some(stats) = socket_stats {
+            transport = transport.with_socket_stats(stats);
+        }
         // `accept` awaits the peer's transport parameters so `protocol()` is resolved.
         Session::accept(transport, session_config).await
+    }
+}
+
+/// The kernel's view of `stream`, when this platform exposes one.
+fn socket_stats(stream: &TcpStream) -> Option<crate::SharedSocketStats> {
+    #[cfg(unix)]
+    {
+        crate::TcpStats::new(stream)
+            .ok()
+            .map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+        None
     }
 }

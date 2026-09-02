@@ -116,6 +116,19 @@ impl Priorities {
         std::mem::take(&mut self.pending)
     }
 
+    /// The send order `id` is registered at.
+    #[cfg(test)]
+    pub fn order(&self, id: StreamId) -> Option<i32> {
+        self.streams.get(&id).copied()
+    }
+
+    /// The urgency currently assigned to `id`, if it is registered.
+    #[cfg(test)]
+    pub fn urgency(&self, id: StreamId) -> Option<u8> {
+        let order = self.streams.get(&id)?;
+        Some(self.levels.get(order)?.band)
+    }
+
     /// Requeue updates the driver couldn't apply yet, for the next attempt.
     ///
     /// A stream registers here as soon as it is opened, but quiche only learns of

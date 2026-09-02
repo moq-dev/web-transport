@@ -8,6 +8,7 @@ use std::{
 
 use crate::config::Config;
 use crate::credit::Credit;
+use crate::rtt::{Rtt, SessionStats};
 use crate::sched::PriorityQueue;
 use crate::transport::{Reader, Transport, Writer};
 use crate::{
@@ -137,6 +138,15 @@ pub struct Session {
     // handed to every `SendStream` we open so it can size its frames. Seeded with
     // the draft-01 default until the peer's parameters arrive.
     record_limit: Arc<AtomicU64>,
+
+    // Round-trip time measured from QX_PING exchanges, reported by `stats()` when
+    // the transport underneath has nothing better.
+    rtt: Arc<Rtt>,
+
+    // The transport's own view of the connection, when it has one. Preferred over
+    // `rtt`: the kernel's estimate needs no round trip of ours, so it is available
+    // from the first moment rather than one probe interval in.
+    socket_stats: Option<crate::SharedSocketStats>,
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
@@ -275,6 +285,9 @@ struct SessionState<R: Reader> {
     // requests we've sent, bounding the sequence a received *response* may echo.
     last_ping_recv: Option<u64>,
     pings_sent: Arc<AtomicU64>,
+
+    // Matches QX_PING responses back to the requests the writer stamped.
+    rtt: Arc<Rtt>,
 }
 
 /// Pick the next outbound frame in strict priority order: control (lossless,
@@ -373,6 +386,10 @@ struct WriterState<W: Writer> {
     // which our last send landed — published for keep-alive and idle scheduling.
     base: tokio::time::Instant,
     last_send_at: Arc<AtomicU64>,
+
+    // Stamped when a QX_PING request reaches the wire. The timer allocates the
+    // sequence, but only the writer knows when it actually left.
+    rtt: Arc<Rtt>,
 }
 
 /// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
@@ -485,6 +502,12 @@ impl<W: Writer> WriterState<W> {
             Frame::Stream(stream) if !stream.fin => Some((stream.id, stream.data.len() as u64)),
             _ => None,
         };
+        // Time the round trip from here, not from where the timer enqueued it: the
+        // control lane's queueing delay is ours, not the peer's.
+        let transmitted_ping = match &frame {
+            Frame::Ping(ping) if !ping.response => Some(ping.sequence),
+            _ => None,
+        };
 
         match &mut frame {
             Frame::ResetStream(reset) => {
@@ -527,11 +550,13 @@ impl<W: Writer> WriterState<W> {
                 send.sent_offset += len;
             }
         }
+        let now = tokio::time::Instant::now();
+        if let Some(sequence) = transmitted_ping {
+            self.rtt.sent(sequence, now);
+        }
         // Publish send progress for the timer's keep-alive and idle scheduling.
-        self.last_send_at.store(
-            millis_since(self.base, tokio::time::Instant::now()),
-            Ordering::Release,
-        );
+        self.last_send_at
+            .store(millis_since(self.base, now), Ordering::Release);
         Ok(())
     }
 }
@@ -582,6 +607,7 @@ mod writer_final_size_tests {
             closed: watch::Sender::new(None),
             base: tokio::time::Instant::now(),
             last_send_at: Arc::new(AtomicU64::new(0)),
+            rtt: Arc::new(Rtt::default()),
         };
 
         writer
@@ -695,6 +721,9 @@ struct TimerState {
     // Published for the reader task, which rejects (draft-02) a QX_PING response
     // echoing a sequence we never sent.
     pings_sent: Arc<AtomicU64>,
+
+    // Cadence for RTT-measuring pings, or zero to send only keep-alives.
+    rtt_interval: std::time::Duration,
 }
 
 /// Decides which of the reader's and writer's clocks currently count as "activity"
@@ -746,6 +775,18 @@ impl IdleActivity {
     }
 }
 
+/// The RTT probe cadence for a configured interval: `None` when disabled.
+///
+/// Clamped to a whole millisecond because the timer stores its last-ping instant
+/// as millis since `base` (see [`millis_since`]). A shorter interval would put the
+/// reconstructed deadline at or before `now` on every wake-up, so `sleep_until`
+/// would return immediately and the loop would spin, flooding the control lane
+/// with pings. The keep-alive cadence is clamped for the same reason.
+fn rtt_cadence(interval: std::time::Duration) -> Option<std::time::Duration> {
+    (interval != std::time::Duration::ZERO)
+        .then(|| interval.max(std::time::Duration::from_millis(1)))
+}
+
 impl TimerState {
     /// Read both clocks and fold them into `activity`, returning the millis of the
     /// newest activity that counts toward the idle deadline.
@@ -775,13 +816,16 @@ impl TimerState {
         // establishment was signalled. 0 = disabled (both sides opted out), leaving
         // the timer with nothing to do.
         let idle_ms = self.idle_timeout_ms.load(Ordering::Acquire);
-        if idle_ms == 0 {
-            return;
-        }
-        let idle = std::time::Duration::from_millis(idle_ms);
+        let idle = (idle_ms != 0).then(|| std::time::Duration::from_millis(idle_ms));
         // Keep-alive cadence: a third of the idle window, clamped so a tiny timeout
         // doesn't yield a zero-duration interval.
-        let ping_every = std::time::Duration::from_millis((idle_ms / 3).max(1));
+        let keepalive_every = idle.map(|_| std::time::Duration::from_millis((idle_ms / 3).max(1)));
+        // RTT cadence, independent of the idle timeout: a peer may disable the
+        // timeout and still want latency reported.
+        let rtt_every = rtt_cadence(self.rtt_interval);
+        if idle.is_none() && rtt_every.is_none() {
+            return;
+        }
 
         // When we began deferring the idle close for backpressure, or `None` when
         // not deferring. Bounds the deferral to one extra idle window.
@@ -794,18 +838,31 @@ impl TimerState {
 
         loop {
             let last_activity = instant_at(self.base, self.observe_activity(&mut activity));
+            // Keep-alive is activity-gated: only silence on send makes one due.
             let ping_ref = instant_at(
                 self.base,
                 self.last_send_at.load(Ordering::Acquire).max(last_ping_ms),
             );
+            // RTT probing is not gated that way. An application that is actively
+            // sending is exactly when latency matters, and it is also when the
+            // keep-alive never fires, so measure off the last ping alone.
+            let rtt_ref = instant_at(self.base, last_ping_ms);
 
             // While deferring, wait out the remaining grace rather than the (stale)
             // idle deadline, so we don't busy-spin on an already-elapsed instant.
-            let idle_wake = match deferred_since {
-                Some(since) => since + idle,
-                None => last_activity + idle,
-            };
-            let wake = idle_wake.min(ping_ref + ping_every);
+            let deadlines = [
+                idle.map(|idle| match deferred_since {
+                    Some(since) => since + idle,
+                    None => last_activity + idle,
+                }),
+                keepalive_every.map(|every| ping_ref + every),
+                rtt_every.map(|every| rtt_ref + every),
+            ];
+            let wake = deadlines
+                .into_iter()
+                .flatten()
+                .min()
+                .expect("at least one deadline is armed");
 
             tokio::select! {
                 biased;
@@ -819,7 +876,9 @@ impl TimerState {
             // Skip the actual enqueue while the writer is wedged — a ping can't get
             // out anyway, and we mustn't pile them behind a stalled socket — but
             // still advance the marker so we don't spin.
-            if now >= ping_ref + ping_every {
+            let ping_due = keepalive_every.is_some_and(|every| now >= ping_ref + every)
+                || rtt_every.is_some_and(|every| now >= rtt_ref + every);
+            if ping_due {
                 if !self.writer_backpressured.load(Ordering::Acquire) {
                     let ping = Frame::Ping(crate::Ping {
                         sequence: next_ping_seq,
@@ -839,6 +898,9 @@ impl TimerState {
             // Idle close: due once a full window has passed with no qualifying
             // activity. Re-read the clocks; the ping we may have just enqueued does
             // not itself buy another window (see [`IdleActivity`]).
+            let Some(idle) = idle else {
+                continue; // RTT probing only; nothing to close on
+            };
             let last_activity = instant_at(self.base, self.observe_activity(&mut activity));
             if now < last_activity + idle {
                 deferred_since = None; // qualifying activity progressed — not idle
@@ -1315,7 +1377,7 @@ impl<R: Reader> SessionState<R> {
             | Frame::StreamDataBlocked { .. }
             | Frame::StreamsBlockedBidi(_)
             | Frame::StreamsBlockedUni(_) => {}
-            // QX_PING: respond to requests, ignore responses.
+            // QX_PING: respond to requests, measure the round trip from responses.
             Frame::Ping(ping) => {
                 // Draft-02 tightens the sequence-number rules.
                 if self.config.version == Version::QMux02 {
@@ -1336,7 +1398,10 @@ impl<R: Reader> SessionState<R> {
                         self.last_ping_recv = Some(ping.sequence);
                     }
                 }
-                if !ping.response {
+                if ping.response {
+                    self.rtt
+                        .received(ping.sequence, tokio::time::Instant::now());
+                } else {
                     let response = Frame::Ping(crate::Ping {
                         sequence: ping.sequence,
                         response: true,
@@ -1597,6 +1662,9 @@ impl Session {
         // Count of keep-alive pings the timer has sent; the reader consults it to
         // validate draft-02 QX_PING responses. Shared between the two tasks.
         let pings_sent = Arc::new(AtomicU64::new(0));
+        // Round-trip samples from those pings: the writer stamps each request as it
+        // lands, the reader matches the responses, `stats()` reads the estimate.
+        let rtt = Arc::new(Rtt::default());
 
         // Last-activity clocks for the timer task. `base` is the shared origin; the
         // reader/writer publish their progress as millis since it (see
@@ -1623,6 +1691,9 @@ impl Session {
         // backpressure must never stall reads. The writer is the sole producer on
         // the wire, pulling the outbound queues in priority order and sharing the
         // stream maps + scalars above with the reader (no message-passing handoff).
+        // Read before the split: the halves go to separate tasks, and the stats
+        // source belongs to neither.
+        let socket_stats = transport.socket_stats();
         let (writer_half, reader_half) = transport.split();
         let mut writer = WriterState {
             writer: writer_half,
@@ -1636,6 +1707,7 @@ impl Session {
             closed: closed.clone(),
             base,
             last_send_at: last_send_at.clone(),
+            rtt: rtt.clone(),
         };
         tokio::spawn(async move { writer.run().await });
 
@@ -1712,6 +1784,7 @@ impl Session {
             idle_timeout_ms: idle_timeout_ms.clone(),
             last_ping_recv: None,
             pings_sent: pings_sent.clone(),
+            rtt: rtt.clone(),
         };
 
         // Timer task: owns the record-framed-draft idle timeout + keep-alive ping,
@@ -1730,6 +1803,7 @@ impl Session {
                 closed: closed.clone(),
                 established: established_rx.clone(),
                 pings_sent: pings_sent.clone(),
+                rtt_interval: config.rtt_interval,
             };
             tokio::spawn(timer.run());
         }
@@ -1799,6 +1873,8 @@ impl Session {
             datagram_max_size,
             record_limit,
             outbound_datagram: outbound_datagram_tx,
+            rtt,
+            socket_stats,
             _guard: guard,
         }
     }
@@ -1808,6 +1884,16 @@ impl generic::Session for Session {
     type SendStream = SendStream;
     type RecvStream = RecvStream;
     type Error = Error;
+
+    fn stats(&self) -> impl generic::Stats {
+        let socket = self.socket_stats.as_ref();
+        SessionStats {
+            // Fall back to our own QX_PING measurement only when the transport
+            // can't answer; a TCP socket already knows before we've pinged once.
+            rtt: socket.and_then(|s| s.rtt()).or_else(|| self.rtt.get()),
+            estimated_send_rate: socket.and_then(|s| s.estimated_send_rate()),
+        }
+    }
 
     async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
         self.accept_uni.recv().await.ok_or(Error::Closed)
@@ -2532,8 +2618,31 @@ mod timer_tests {
 
     use tokio::sync::{mpsc, watch};
 
-    use super::TimerState;
+    use super::{rtt_cadence, TimerState};
     use crate::Error;
+
+    /// The probe cadence must never be sub-millisecond.
+    ///
+    /// The timer reconstructs its last-ping instant from a millisecond counter, so
+    /// a shorter interval leaves the deadline at or before `now` on every wake-up:
+    /// the loop stops sleeping and floods the control lane with pings. The
+    /// keep-alive cadence is clamped for exactly this reason.
+    #[test]
+    fn rtt_cadence_is_clamped_to_a_whole_milli() {
+        assert_eq!(rtt_cadence(Duration::ZERO), None, "zero disables probing");
+        for tiny in [Duration::from_nanos(1), Duration::from_micros(500)] {
+            assert_eq!(
+                rtt_cadence(tiny),
+                Some(Duration::from_millis(1)),
+                "{tiny:?} must not yield a sub-milli cadence"
+            );
+        }
+        assert_eq!(
+            rtt_cadence(Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "a sane interval passes through"
+        );
+    }
 
     /// Handles for driving a `TimerState` in isolation, without a real transport.
     struct Harness {
@@ -2569,6 +2678,7 @@ mod timer_tests {
             closed: closed.clone(),
             established,
             pings_sent: Arc::new(AtomicU64::new(0)),
+            rtt_interval: std::time::Duration::ZERO,
         };
         tokio::spawn(timer.run());
 

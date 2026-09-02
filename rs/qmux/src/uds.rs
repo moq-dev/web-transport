@@ -81,5 +81,7 @@ async fn finish(
     // `build_stream_session` awaits the peer's transport parameters before
     // returning, so `protocol()` is resolved on the session we hand back
     // (bounded by the config's handshake timeout).
-    build_stream_session(stream, config, is_server).await
+    // A Unix socket has no TCP_INFO to read; loopback latency is negligible
+    // anyway, and QX_PING still covers the round trip.
+    build_stream_session(stream, config, is_server, None).await
 }

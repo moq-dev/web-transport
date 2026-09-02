@@ -26,6 +26,15 @@ pub trait Transport: Send + 'static {
 
     /// Split into send and receive halves.
     fn split(self) -> (Self::Writer, Self::Reader);
+
+    /// Statistics for the connection underneath, if it exposes any.
+    ///
+    /// Read before the split, since the halves are handed to separate tasks. A
+    /// transport that returns `None` leaves the session reporting only what it can
+    /// measure itself, i.e. the `QX_PING` round trip.
+    fn socket_stats(&self) -> Option<crate::SharedSocketStats> {
+        None
+    }
 }
 
 /// The send half of a [`Transport`].
@@ -100,6 +109,7 @@ mod stream_transport {
     pub struct Stream<T> {
         writer: StreamWriter<T>,
         reader: StreamReader,
+        socket_stats: Option<crate::SharedSocketStats>,
     }
 
     /// The send half of a byte-stream [`Stream`].
@@ -137,7 +147,18 @@ mod stream_transport {
                     version,
                 },
                 reader: StreamReader { rx, reader_task },
+                socket_stats: None,
             }
+        }
+
+        /// Report statistics for the connection underneath this stream.
+        ///
+        /// `Stream` is generic over the byte stream, so it can't discover the socket
+        /// on its own; the builder that knows the concrete type attaches it. See
+        /// [`TcpStats`](crate::TcpStats).
+        pub fn with_socket_stats(mut self, stats: crate::SharedSocketStats) -> Self {
+            self.socket_stats = Some(stats);
+            self
         }
     }
 
@@ -147,6 +168,10 @@ mod stream_transport {
 
         fn split(self) -> (StreamWriter<T>, StreamReader) {
             (self.writer, self.reader)
+        }
+
+        fn socket_stats(&self) -> Option<crate::SharedSocketStats> {
+            self.socket_stats.clone()
         }
     }
 
@@ -591,13 +616,17 @@ mod stream_session {
         stream: T,
         config: Config,
         is_server: bool,
+        socket_stats: Option<crate::SharedSocketStats>,
     ) -> Result<Session, Error> {
         if let Protocol::Negotiate(protocols) = &config.protocol {
             for protocol in protocols {
                 validate_protocol(protocol)?;
             }
         }
-        let transport = Stream::new(stream, config.version, config.max_record_size);
+        let mut transport = Stream::new(stream, config.version, config.max_record_size);
+        if let Some(stats) = socket_stats {
+            transport = transport.with_socket_stats(stats);
+        }
         if is_server {
             Session::accept(transport, config).await
         } else {
@@ -657,6 +686,7 @@ mod ws_transport {
         keep_alive: Option<KeepAlive>,
         /// Largest inbound message we accept, or `None` when nothing bounds it.
         recv_limit: Option<usize>,
+        socket_stats: Option<crate::SharedSocketStats>,
     }
 
     impl<T> WsTransport<T> {
@@ -676,11 +706,17 @@ mod ws_transport {
                 ws,
                 keep_alive: None,
                 recv_limit,
+                socket_stats: None,
             }
         }
 
         pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
             self.keep_alive = Some(keep_alive);
+            self
+        }
+
+        pub fn with_socket_stats(mut self, stats: crate::SharedSocketStats) -> Self {
+            self.socket_stats = Some(stats);
             self
         }
     }
@@ -757,6 +793,10 @@ mod ws_transport {
     impl<T: WsStream> Transport for WsTransport<T> {
         type Writer = WsWriter<T>;
         type Reader = WsReader;
+
+        fn socket_stats(&self) -> Option<crate::SharedSocketStats> {
+            self.socket_stats.clone()
+        }
 
         fn split(self) -> (WsWriter<T>, WsReader) {
             use futures::StreamExt;

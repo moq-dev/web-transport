@@ -3,6 +3,15 @@
 //! This crate wraps the WebTransport API and provides ergonomic Rust bindings.
 //! Some liberties have been taken to make the API more Rust-like and closer to native.
 //!
+//! # Poll and async
+//!
+//! The browser API is a set of promises, but the surface here is a state machine:
+//! every operation is a `poll_*` method that a caller steps from its own loop, with
+//! the `async` methods as thin wrappers over them. That is what implements
+//! [`web_transport_trait::poll`], so a sans-I/O caller needs no adapter, and it is
+//! what makes an abandoned operation safe — the promise stays subscribed, so a chunk
+//! or an accepted stream is never dropped on the floor between polls.
+//!
 //! # Requirements
 //!
 //! `web-sys` still gates the WebTransport bindings behind `--cfg=web_sys_unstable_apis`,
@@ -12,7 +21,11 @@
 //! ```toml
 //! [build]
 //! rustflags = ["--cfg=web_sys_unstable_apis"]
+//! rustdocflags = ["--cfg=web_sys_unstable_apis"]
 //! ```
+//!
+//! `rustdocflags` is separate because rustdoc does not inherit `rustflags`; without it
+//! `cargo doc` and doctests fail even though `cargo build` succeeds.
 
 #[cfg(not(web_sys_unstable_apis))]
 compile_error!(
@@ -20,9 +33,12 @@ compile_error!(
      WebTransport bindings behind it. This flag cannot be enabled by a dependency; add it to \
      your own build, for example in `.cargo/config.toml`:\n\n\
      \x20   [build]\n\
-     \x20   rustflags = [\"--cfg=web_sys_unstable_apis\"]\n\n\
-     or set `RUSTFLAGS=\"--cfg=web_sys_unstable_apis\"` in the environment. Note that RUSTFLAGS \
-     overrides `.cargo/config.toml`, so only one of the two takes effect."
+     \x20   rustflags = [\"--cfg=web_sys_unstable_apis\"]\n\
+     \x20   rustdocflags = [\"--cfg=web_sys_unstable_apis\"]\n\n\
+     `rustdocflags` is required separately because rustdoc does not inherit `rustflags`; if you \
+     are seeing this from `cargo doc` or a doctest, that is the missing piece. Alternatively set \
+     `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment, but note that both replace `.cargo/config.toml` \
+     rather than extending it, so only one of the two takes effect."
 );
 
 // Gated so missing web-sys bindings don't bury the error above.
@@ -31,19 +47,26 @@ mod client;
 #[cfg(web_sys_unstable_apis)]
 mod error;
 #[cfg(web_sys_unstable_apis)]
+mod js;
+#[cfg(web_sys_unstable_apis)]
 mod recv;
 #[cfg(web_sys_unstable_apis)]
 mod send;
 #[cfg(web_sys_unstable_apis)]
 mod session;
+#[cfg(all(web_sys_unstable_apis, target_family = "wasm"))]
+mod traits;
 
 #[cfg(web_sys_unstable_apis)]
 pub use client::*;
 #[cfg(web_sys_unstable_apis)]
-pub use error::*;
+pub use error::Error;
 #[cfg(web_sys_unstable_apis)]
 pub use recv::*;
 #[cfg(web_sys_unstable_apis)]
 pub use send::*;
 #[cfg(web_sys_unstable_apis)]
 pub use session::*;
+
+/// The traits this crate implements, re-exported to simplify `Cargo.toml`.
+pub use web_transport_trait as generic;

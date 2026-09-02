@@ -1,3 +1,13 @@
+# rustdoc does not inherit `rustflags`, so the flag has to be repeated under
+# `rustdocflags` or `cargo doc` and doctests trip the `compile_error!` in
+# web-transport-wasm. This has to live in `[build]`, not the `[target]` table
+# below: newer cargo accepts `rustdocflags` there, but the toolchain pinned by
+# flake.nix (1.94) silently ignores it ("unused key"), so the flag would reach
+# rustdoc locally and not in CI. `RUSTFLAGS`/`RUSTDOCFLAGS` in the environment
+# replace these rather than extend them.
+[build]
+rustdocflags = ["--cfg=web_sys_unstable_apis"]
+
 [target.'cfg(all())']
 rustflags = ["--cfg=web_sys_unstable_apis"]
 

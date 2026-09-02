@@ -7,27 +7,41 @@
 //! that finish first must be the ones that asked to.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Barrier};
 use url::Url;
 use web_transport_quiche::{ClientBuilder, ServerBuilder, Settings};
 
-/// Enough streams that the scheduler has real choices to make, few enough that
-/// the whole payload fits inside the default connection flow-control window.
+/// Enough streams that the scheduler has real choices to make.
 const STREAMS: usize = 32;
 
-/// Big enough that a stream can't be drained in a single congestion window, so
-/// the scheduler has to keep choosing between them.
+/// Payload per stream. The total dwarfs [`WINDOW`], so the sender is choosing
+/// between backlogged streams for essentially the whole test.
 const PAYLOAD: usize = 256 * 1024;
 
-/// How many completions to inspect, and the band they must fall in. Strict
-/// urgency ordering makes these exactly the top four; the slack absorbs
-/// scheduling noise while staying far out of reach of an unprioritized run.
-const CHECKED: usize = 4;
-const TOP: usize = 8;
+/// Payload total stays under the default connection flow-control window (10MB) on
+/// purpose: every stream can then buffer in full, so transmission order is quiche's
+/// scheduling decision rather than a race for scarce send credit.
+
+/// The streams are split into two tiers of equal size, and the first [`CHECKED`]
+/// completions must all come from the urgent one.
+///
+/// Deliberately a tier split rather than 32 distinct priorities with a strict
+/// ordering assertion. Ranking decides which *urgency band* a stream lands in, but
+/// the driver still hands quiche send capacity in its own order, so among streams
+/// a band apart the finishing order is not exactly the priority order. Comparing
+/// tiers tests the guarantee the ranking actually makes. It is also the stronger
+/// assertion statistically: ignoring priority entirely would put a stream in the
+/// urgent tier about half the time, so passing by luck runs at 2^-CHECKED.
+const CHECKED: usize = 8;
+
+/// Send order for the urgent tier — the upper half of the tags. Far from the other
+/// tier's 0 to show the value is ranked, not truncated to a `u8`.
+const URGENT: i32 = 1_000_000;
 
 fn make_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let CertifiedKey { cert, signing_key } =
@@ -55,6 +69,11 @@ fn init_tracing() {
 /// depending on the order the streams arrive in.
 fn tag(stream: usize) -> u8 {
     stream as u8
+}
+
+/// The upper half of the streams are the urgent tier.
+fn is_urgent(stream: usize) -> bool {
+    stream >= STREAMS / 2
 }
 
 /// Accept `STREAMS` unidirectional streams, reading each to EOF and reporting its
@@ -108,8 +127,8 @@ async fn spawn_server() -> Result<(SocketAddr, mpsc::UnboundedReceiver<u8>)> {
     Ok((addr, finished))
 }
 
-/// Streams that asked to go first do, even though quiche only has 256 urgencies
-/// to spend and the send order is an `i32`.
+/// Streams that asked to go first do, even though quiche only has 256 urgencies to
+/// spend and the send order is an `i32`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn higher_priority_finishes_first() -> Result<()> {
     init_tracing();
@@ -128,16 +147,28 @@ async fn higher_priority_finishes_first() -> Result<()> {
         .await
         .context("client handshake")?;
 
-    // Open every stream and queue its payload before any of them can drain, so the
-    // scheduler is choosing between all of them rather than servicing whichever
-    // happened to be ready. The send orders are spread far apart to make the point
-    // that they are ranked, not truncated to a `u8`.
-    let mut writers = Vec::with_capacity(STREAMS);
+    // Open and rank every stream *before* any of them writes a byte. Opening is
+    // sequential (`open_uni` awaits), so a writer spawned inside the open loop would
+    // start draining while later streams don't exist yet — the first ones opened
+    // would then win on a head start rather than on priority, whatever the ranking
+    // said. The barrier below puts every stream on the same starting line.
+    //
+    // The urgent tier is the *upper* half of the tags, so it is also the half opened
+    // last: a backend ignoring priority drains roughly in stream-ID order, which is
+    // the opposite of what's asserted below, so this cannot pass by accident.
+    let mut streams = Vec::with_capacity(STREAMS);
     for stream in 0..STREAMS {
         let mut send = session.open_uni().await.context("open uni")?;
-        send.set_priority((STREAMS - stream) as i32 * 1_000_000);
+        send.set_priority(if is_urgent(stream) { URGENT } else { 0 });
+        streams.push(send);
+    }
 
+    let start = Arc::new(Barrier::new(STREAMS));
+    let mut writers = Vec::with_capacity(STREAMS);
+    for (stream, mut send) in streams.into_iter().enumerate() {
+        let start = start.clone();
         writers.push(tokio::spawn(async move {
+            start.wait().await;
             send.write_all(&vec![tag(stream); PAYLOAD]).await?;
             send.finish()?;
             send.closed().await?;
@@ -156,8 +187,8 @@ async fn higher_priority_finishes_first() -> Result<()> {
 
     for tag in &order {
         assert!(
-            (*tag as usize) < TOP,
-            "stream {tag} finished in the first {CHECKED} despite ranking below the top {TOP}: {order:?}"
+            is_urgent(*tag as usize),
+            "stream {tag} finished in the first {CHECKED} despite being in the low-priority tier: {order:?}"
         );
     }
 
