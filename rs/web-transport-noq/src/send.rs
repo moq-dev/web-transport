@@ -152,8 +152,8 @@ impl tokio::io::AsyncWrite for SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = WriteError;
 
-    fn set_priority(&mut self, order: u8) {
-        Self::set_priority(self, order.into()).ok();
+    fn set_priority(&mut self, order: i32) {
+        Self::set_priority(self, order).ok();
     }
 
     fn reset(&mut self, code: u32) {

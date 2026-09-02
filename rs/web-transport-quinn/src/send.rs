@@ -157,8 +157,8 @@ impl tokio::io::AsyncWrite for SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = WriteError;
 
-    fn set_priority(&mut self, order: u8) {
-        Self::set_priority(self, order.into()).ok();
+    fn set_priority(&mut self, order: i32) {
+        Self::set_priority(self, order).ok();
     }
 
     fn reset(&mut self, code: u32) {
@@ -214,8 +214,8 @@ impl web_transport_trait::poll::SendStream for SendStream {
     // faster but loses data: the chunk would be gone from `buf` before Quinn
     // accepted it, a silent hole in the stream if the write does not complete.
 
-    fn set_priority(&mut self, order: u8) {
-        Self::set_priority(self, order.into()).ok();
+    fn set_priority(&mut self, order: i32) {
+        Self::set_priority(self, order).ok();
     }
 
     fn reset(&mut self, code: u32) {

@@ -19,13 +19,8 @@ use super::{Lock, StreamError, StreamId};
 // "send" in ascii; if you see this then call finish().await or close(code)
 const DROP_CODE: u64 = 0x73656E64;
 
-/// The priority every stream starts at.
-const DEFAULT_PRIORITY: u8 = 0;
-
-/// quiche schedules lower values first, so flip our higher-is-first priority to match.
-const fn quiche_urgency(priority: u8) -> u8 {
-    u8::MAX - priority
-}
+/// The send order every stream starts at.
+pub const DEFAULT_PRIORITY: i32 = 0;
 
 // TODO Move a lot of this into a state machine enum.
 pub(super) struct SendState {
@@ -53,9 +48,6 @@ pub(super) struct SendState {
     // but the code is gone. Terminal exactly like `stop`, with nothing to report.
     gone: bool,
 
-    // pending SET_PRIORITY, higher is sent first
-    priority: Option<u8>,
-
     // No more progress can be made on the stream.
     closed: bool,
 }
@@ -71,9 +63,6 @@ impl SendState {
             reset: None,
             stop: None,
             gone: false,
-            // Pin every stream to the default rather than inheriting quiche's, so that a
-            // stream explicitly assigned a low priority can't be outranked by an untouched one.
-            priority: Some(DEFAULT_PRIORITY),
             closed: false,
         }
     }
@@ -200,11 +189,6 @@ impl SendState {
             return Ok(self.blocked.take());
         }
 
-        if let Some(priority) = self.priority.take() {
-            tracing::trace!(stream_id = ?self.id, priority, "updating STREAM");
-            qconn.stream_priority(self.id.into(), quiche_urgency(priority), true)?;
-        }
-
         while let Some(mut chunk) = self.queued.pop_front() {
             let n = match qconn.stream_send(self.id.into(), &chunk, false) {
                 Ok(n) => n,
@@ -300,17 +284,26 @@ impl SendStream {
 
     #[cfg(test)]
     pub(crate) fn new_test() -> Self {
-        let id = StreamId::CLIENT_UNI;
-        Self::new(
-            id,
-            Lock::new(SendState::new(id)),
-            Lock::new(DriverState::new(false)),
-        )
+        Self::new_test_on(&Lock::new(DriverState::new(false)), StreamId::CLIENT_UNI)
+    }
+
+    /// A stream registered on an existing driver, so several can be ranked against
+    /// each other the way one connection's streams are. Ranking is relative, so a
+    /// stream with a driver to itself has nothing to be ordered against.
+    #[cfg(test)]
+    pub(super) fn new_test_on(driver: &Lock<DriverState>, id: StreamId) -> Self {
+        driver.lock().register_send(id);
+        Self::new(id, Lock::new(SendState::new(id)), driver.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn priority(&self) -> Option<u8> {
-        self.state.lock().priority
+    pub(crate) fn priority(&self) -> Option<i32> {
+        self.driver.lock().priority_of(self.id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn urgency(&self) -> Option<u8> {
+        self.driver.lock().urgency_of(self.id)
     }
 
     /// Returns the QUIC stream ID.
@@ -484,14 +477,19 @@ impl SendStream {
 
     /// Set the priority of this stream.
     ///
-    /// Streams with a higher priority are sent first, but are not guaranteed to arrive first.
-    /// Defaults to 0.
+    /// Streams with a **higher** value are sent first, but are not guaranteed to
+    /// arrive first. Defaults to [`DEFAULT_PRIORITY`]. This matches the W3C
+    /// WebTransport `sendOrder` convention and the other `web-transport` backends.
     ///
-    /// Note that this is the opposite of quiche's urgency, which is inverted internally.
-    pub fn set_priority(&mut self, priority: u8) {
-        self.state.lock().priority = Some(priority);
-
-        self.notify();
+    /// quiche schedules by an 8-bit urgency, so the `i32` is a *relative* order
+    /// rather than a value quiche sees: the connection ranks its send streams and
+    /// gives the 256 highest-priority levels an urgency each. Streams past that
+    /// share the last one, as do streams with equal priority (which round-robin).
+    pub fn set_priority(&mut self, order: i32) {
+        let waker = self.driver.lock().set_priority(self.id, order);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -562,16 +560,24 @@ mod tests {
 
     /// The urgency handed to `quiche::Connection::stream_priority`.
     fn urgency(stream: &SendStream) -> u8 {
-        quiche_urgency(stream.priority().expect("priority is set on construction"))
+        stream.urgency().expect("stream is ranked on construction")
+    }
+
+    /// Streams have to share a driver to be ranked against each other, since the
+    /// ranking is connection-wide.
+    fn connection<const N: usize>(orders: [i32; N]) -> [SendStream; N] {
+        let driver = Lock::new(DriverState::new(false));
+        std::array::from_fn(|i| {
+            // Distinct client-uni ids: 2, 6, 10, ...
+            let mut stream = SendStream::new_test_on(&driver, StreamId::from(2 + i as u64 * 4));
+            stream.set_priority(orders[i]);
+            stream
+        })
     }
 
     #[test]
     fn higher_priority_is_sent_first() {
-        let mut low = SendStream::new_test();
-        let mut high = SendStream::new_test();
-
-        low.set_priority(1);
-        high.set_priority(2);
+        let [low, high] = connection([1, 2]);
 
         // quiche sends lower urgencies first.
         assert!(urgency(&high) < urgency(&low));
@@ -579,10 +585,12 @@ mod tests {
 
     #[test]
     fn untouched_stream_is_outranked_by_any_promotion() {
-        // quiche's own default urgency is 127, which would outrank anything below priority 128.
-        for priority in [1, 55, 100, 128, 200, 255] {
-            let untouched = SendStream::new_test();
-            let mut promoted = SendStream::new_test();
+        // quiche's own default urgency is 127, which would outrank anything below
+        // priority 128 if the stream were left to inherit it.
+        for priority in [1, 55, 100, 128, 200, 255, i32::MAX] {
+            let driver = Lock::new(DriverState::new(false));
+            let untouched = SendStream::new_test_on(&driver, StreamId::CLIENT_UNI);
+            let mut promoted = SendStream::new_test_on(&driver, StreamId::from(6));
 
             promoted.set_priority(priority);
 
@@ -593,13 +601,41 @@ mod tests {
         }
     }
 
+    /// The mirror of the above, and the reason the `i32` is signed: a stream can ask
+    /// to go *behind* everything that never set a priority.
+    #[test]
+    fn a_demoted_stream_falls_behind_an_untouched_one() {
+        for priority in [-1, -55, -1000, i32::MIN] {
+            let driver = Lock::new(DriverState::new(false));
+            let untouched = SendStream::new_test_on(&driver, StreamId::CLIENT_UNI);
+            let mut demoted = SendStream::new_test_on(&driver, StreamId::from(6));
+
+            demoted.set_priority(priority);
+
+            assert!(
+                urgency(&demoted) > urgency(&untouched),
+                "priority {priority} should fall behind an untouched stream"
+            );
+        }
+    }
+
     #[test]
     fn explicit_default_matches_untouched() {
-        let untouched = SendStream::new_test();
-        let mut explicit = SendStream::new_test();
+        let driver = Lock::new(DriverState::new(false));
+        let untouched = SendStream::new_test_on(&driver, StreamId::CLIENT_UNI);
+        let mut explicit = SendStream::new_test_on(&driver, StreamId::from(6));
 
         explicit.set_priority(DEFAULT_PRIORITY);
 
         assert_eq!(urgency(&explicit), urgency(&untouched));
+    }
+
+    /// Equal priorities share a band so quiche round-robins them, rather than
+    /// inventing a strict order between streams the caller called equal.
+    #[test]
+    fn equal_priorities_share_an_urgency() {
+        let [a, b] = connection([7, 7]);
+
+        assert_eq!(urgency(&a), urgency(&b));
     }
 }

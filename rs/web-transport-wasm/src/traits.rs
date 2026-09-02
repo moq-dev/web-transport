@@ -160,8 +160,8 @@ impl web_transport_trait::poll::SendStream for SendStream {
         SendStream::poll_write(self, cx, buf)
     }
 
-    fn set_priority(&mut self, order: u8) {
-        SendStream::set_priority(self, order.into())
+    fn set_priority(&mut self, order: i32) {
+        SendStream::set_priority(self, order)
     }
 
     fn finish(&mut self) -> Result<(), Error> {
@@ -184,8 +184,8 @@ impl web_transport_trait::SendStream for SendStream {
         poll_fn(|cx| SendStream::poll_write(self, cx, buf)).await
     }
 
-    fn set_priority(&mut self, order: u8) {
-        SendStream::set_priority(self, order.into())
+    fn set_priority(&mut self, order: i32) {
+        SendStream::set_priority(self, order)
     }
 
     fn finish(&mut self) -> Result<(), Error> {

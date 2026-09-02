@@ -2143,7 +2143,7 @@ pub struct SendStream {
     offset: u64,
     /// Scheduling priority (higher = sent first). Threaded into the queue on
     /// every `push` and relayed to the queue on `set_priority`.
-    priority: u8,
+    priority: i32,
     closed: Option<Error>,
     fin: bool,
 
@@ -2338,7 +2338,7 @@ impl generic::SendStream for SendStream {
     /// Re-prioritization is retroactive: already-queued frames for this stream
     /// move to the new band on the next scheduling decision (the bytes stay put,
     /// preserving per-stream order).
-    fn set_priority(&mut self, order: u8) {
+    fn set_priority(&mut self, order: i32) {
         self.priority = order;
         self.outbound.set_priority(self.id, order);
     }

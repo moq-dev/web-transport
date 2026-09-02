@@ -225,7 +225,7 @@ impl SendStream {
 
     /// Set the stream's priority.
     ///
-    /// Streams with lower values will be sent first, but are not guaranteed to arrive first.
+    /// Streams with higher values will be sent first, but are not guaranteed to arrive first.
     pub fn set_priority(&mut self, order: i32) {
         self.inner.set_priority(order).ok();
     }
