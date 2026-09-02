@@ -19,13 +19,12 @@ use web_transport_quiche::{ClientBuilder, ServerBuilder, Settings};
 /// Enough streams that the scheduler has real choices to make.
 const STREAMS: usize = 32;
 
-/// Payload per stream. The total dwarfs [`WINDOW`], so the sender is choosing
-/// between backlogged streams for essentially the whole test.
-const PAYLOAD: usize = 256 * 1024;
-
-/// Payload total stays under the default connection flow-control window (10MB) on
+/// Payload per stream.
+///
+/// The total stays under the default connection flow-control window (10MB) on
 /// purpose: every stream can then buffer in full, so transmission order is quiche's
 /// scheduling decision rather than a race for scarce send credit.
+const PAYLOAD: usize = 256 * 1024;
 
 /// The streams are split into two tiers of equal size, and the first [`CHECKED`]
 /// completions must all come from the urgent one.

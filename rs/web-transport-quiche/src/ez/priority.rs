@@ -336,8 +336,15 @@ mod tests {
 
         p.set(sid(0), i32::MAX);
 
-        assert!(p.take().is_empty(), "a retired stream must not queue an update");
-        assert_eq!(p.order(sid(0)), None, "a retired stream must stay unregistered");
+        assert!(
+            p.take().is_empty(),
+            "a retired stream must not queue an update"
+        );
+        assert_eq!(
+            p.order(sid(0)),
+            None,
+            "a retired stream must stay unregistered"
+        );
         assert_eq!(
             p.urgency(sid(4)),
             Some(0),
