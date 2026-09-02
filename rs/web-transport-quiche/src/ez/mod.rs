@@ -16,6 +16,7 @@ mod client;
 mod connection;
 mod driver;
 mod lock;
+mod priority;
 mod recv;
 mod send;
 mod server;
@@ -32,6 +33,7 @@ pub use stream::*;
 
 use driver::*;
 use lock::*;
+use priority::*;
 
 pub use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 pub use tls::{CertResolver, CertifiedKey, ClientAuth};

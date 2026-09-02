@@ -63,8 +63,10 @@ impl SendStream {
 
     /// Set the priority of this stream.
     ///
-    /// Lower priority values are sent first. Defaults to 0.
-    pub fn set_priority(&mut self, order: u8) {
+    /// Streams with **higher** values are sent first, but are not guaranteed to
+    /// arrive first. Defaults to 0. See [`ez::SendStream::set_priority`] for how the
+    /// `i32` is mapped onto quiche's 8-bit stream urgency.
+    pub fn set_priority(&mut self, order: i32) {
         self.inner.set_priority(order)
     }
 
@@ -123,7 +125,7 @@ impl web_transport_trait::SendStream for SendStream {
         self.write(buf).await
     }
 
-    fn set_priority(&mut self, order: u8) {
+    fn set_priority(&mut self, order: i32) {
         self.set_priority(order)
     }
 
@@ -161,7 +163,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
             .map_err(Into::into)
     }
 
-    fn set_priority(&mut self, order: u8) {
+    fn set_priority(&mut self, order: i32) {
         self.set_priority(order)
     }
 

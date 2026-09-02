@@ -20,7 +20,8 @@ use tokio_quiche::{
 use crate::ez::Lock;
 
 use super::{
-    ConnectionClosed, ConnectionError, ConnectionStats, Metrics, RecvState, SendState, StreamId,
+    ConnectionClosed, ConnectionError, ConnectionStats, Metrics, Priorities, RecvState, SendState,
+    StreamId,
 };
 
 // "drop" in ascii; if you see this then close(code)
@@ -44,6 +45,11 @@ pub(super) struct DriverState {
 
     bi: DriverOpen<(Lock<SendState>, Lock<RecvState>)>,
     uni: DriverOpen<Lock<SendState>>,
+
+    /// Ranks every open send stream, turning the application's `i32` send order
+    /// into the `u8` urgency quiche schedules by. Connection-wide because the
+    /// ranking is relative: one stream moving can shift the rest.
+    priority: Priorities,
 
     close_requested: ConnectionClosed,
     closed: ConnectionClosed,
@@ -113,6 +119,7 @@ impl DriverState {
             closed: ConnectionClosed::default(),
             bi: DriverOpen::new(next_bi),
             uni: DriverOpen::new(next_uni),
+            priority: Priorities::default(),
             established: false,
             alpn: None,
             server_name: None,
@@ -219,6 +226,15 @@ impl DriverState {
         self.waker.take()
     }
 
+    /// Change a stream's send order, where higher values are sent first.
+    ///
+    /// The new urgency reaches quiche via the driver, so wake it.
+    #[must_use = "wake the driver"]
+    pub fn set_priority(&mut self, stream_id: StreamId, order: i32) -> Option<Waker> {
+        self.priority.set(stream_id, order);
+        self.waker.take()
+    }
+
     #[must_use = "wake the driver"]
     pub fn recv(&mut self, stream_id: StreamId) -> Option<Waker> {
         if !self.recv.insert(stream_id) {
@@ -247,6 +263,7 @@ impl DriverState {
         let send = Lock::new(SendState::new(id));
         let recv = Lock::new(RecvState::new(id));
         self.bi.create.push((id, (send.clone(), recv.clone())));
+        self.priority.insert(id);
 
         let wakeup = self.waker.take();
         Poll::Ready(Ok((wakeup, id, send, recv)))
@@ -263,6 +280,7 @@ impl DriverState {
         send: Lock<SendState>,
         recv: Lock<RecvState>,
     ) -> WaiterList {
+        self.priority.insert(id);
         self.accept_bi.push_back((id, send, recv));
         self.accept_bi_waiters.take()
     }
@@ -346,6 +364,7 @@ impl DriverState {
 
         let send = Lock::new(SendState::new(id));
         self.uni.create.push((id, send.clone()));
+        self.priority.insert(id);
 
         let wakeup = self.waker.take();
         Poll::Ready(Ok((wakeup, id, send)))
@@ -580,6 +599,7 @@ impl Driver {
 
                     if closed {
                         entry.remove();
+                        self.state.lock().priority.remove(stream_id);
                     }
 
                     if let Some(waker) = waker {
@@ -698,6 +718,10 @@ impl Driver {
 
         uni_waiters.unwrap_or_default().wake();
 
+        // Before the flushes, so a stream created above sends its first bytes at
+        // the urgency it was opened with rather than quiche's default.
+        self.apply_priorities(qconn)?;
+
         for stream_id in recv {
             self.flush_recv(qconn, stream_id)?;
         }
@@ -705,6 +729,9 @@ impl Driver {
         for stream_id in send {
             self.flush_send(qconn, stream_id)?;
         }
+
+        // A flush can close a stream, which promotes whatever it was holding back.
+        self.apply_priorities(qconn)?;
 
         // Returning Ready hands control back to the io loop, which flushes the
         // scheduled PING to the socket.
@@ -757,6 +784,7 @@ impl Driver {
 
             if closed {
                 entry.remove();
+                self.state.lock().priority.remove(stream_id);
             }
 
             if let Some(waker) = waker {
@@ -764,6 +792,42 @@ impl Driver {
             }
         } else {
             tracing::warn!(?stream_id, "wakeup for closed stream");
+        }
+
+        Ok(())
+    }
+
+    /// Hand quiche the urgency changes the priority ranking has accumulated.
+    ///
+    /// Ranks are connection-wide, so a single `set_priority` (or a stream closing)
+    /// can move several streams. They're collected in `DriverState` and applied
+    /// here because this is the only place holding the quiche connection.
+    fn apply_priorities(&mut self, qconn: &mut QuicheConnection) -> Result<(), ConnectionError> {
+        let pending = self.state.lock().priority.take();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut deferred = Vec::new();
+
+        for (stream_id, urgency) in pending {
+            // The ranking knows about a stream from the moment it's opened, which is
+            // a pass earlier than quiche does. Hold the urgency until the stream is
+            // actually there rather than asking quiche to conjure it.
+            if !self.send.contains_key(&stream_id) {
+                deferred.push((stream_id, urgency));
+                continue;
+            }
+
+            tracing::trace!(?stream_id, urgency, "updating stream priority");
+
+            // `incremental` so streams sharing an urgency round-robin, matching how
+            // quinn and qmux treat equal priorities.
+            qconn.stream_priority(stream_id.into(), urgency, true)?;
+        }
+
+        if !deferred.is_empty() {
+            self.state.lock().priority.defer(deferred);
         }
 
         Ok(())
@@ -838,6 +902,13 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         if let Err(e) = self.write(qconn) {
+            self.abort(e);
+            return Ok(());
+        }
+
+        // `write` can close streams, and this runs on iterations where `poll` never
+        // does, so the ranking is settled here too before any packet leaves.
+        if let Err(e) = self.apply_priorities(qconn) {
             self.abort(e);
             return Ok(());
         }

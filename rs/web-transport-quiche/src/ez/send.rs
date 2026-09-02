@@ -41,9 +41,6 @@ pub(super) struct SendState {
     // received
     stop: Option<u64>,
 
-    // received SET_PRIORITY
-    priority: Option<u8>,
-
     // No more progress can be made on the stream.
     closed: bool,
 }
@@ -58,7 +55,6 @@ impl SendState {
             fin: false,
             reset: None,
             stop: None,
-            priority: None,
             closed: false,
         }
     }
@@ -143,11 +139,6 @@ impl SendState {
 
         if self.stop.take().is_some() {
             return Ok(self.blocked.take());
-        }
-
-        if let Some(priority) = self.priority.take() {
-            tracing::trace!(stream_id = ?self.id, priority, "updating STREAM");
-            qconn.stream_priority(self.id.into(), priority, true)?;
         }
 
         while let Some(mut chunk) = self.queued.pop_front() {
@@ -408,11 +399,15 @@ impl SendStream {
 
     /// Set the priority of this stream.
     ///
-    /// Lower priority values are sent first. Defaults to 0.
-    pub fn set_priority(&mut self, priority: u8) {
-        self.state.lock().priority = Some(priority);
-
-        let waker = self.driver.lock().send(self.id);
+    /// Streams with **higher** values are sent first, but are not guaranteed to
+    /// arrive first. Defaults to 0.
+    ///
+    /// quiche schedules by an 8-bit urgency, so the `i32` is a *relative* order
+    /// rather than a value quiche sees: the connection ranks its send streams and
+    /// gives the 256 highest-priority levels an urgency each. Streams past that
+    /// share the last one, as do streams with equal priority (which round-robin).
+    pub fn set_priority(&mut self, order: i32) {
+        let waker = self.driver.lock().set_priority(self.id, order);
         if let Some(waker) = waker {
             waker.wake();
         }

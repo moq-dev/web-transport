@@ -70,7 +70,7 @@ impl SendStream for DripSend {
         }
     }
 
-    fn set_priority(&mut self, _order: u8) {}
+    fn set_priority(&mut self, _order: i32) {}
 
     fn finish(&mut self) -> Result<(), TestError> {
         Ok(())

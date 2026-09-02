@@ -2,7 +2,7 @@
 //!
 //! Replaces the bounded `mpsc` data channel the session used to interleave
 //! STREAM frames purely by arrival order. Frames are bucketed by stream
-//! priority (a `u8`, higher = sent first, matching the W3C `sendOrder`
+//! priority (an `i32`, higher = sent first, matching the W3C `sendOrder`
 //! convention) so a high-priority stream can jump ahead of a low-priority
 //! backlog. Re-prioritization is retroactive and cheap: only the stream's
 //! scheduling pointer moves between bands, never its queued frames, so the
@@ -24,7 +24,7 @@ use crate::{Error, Frame, StreamId};
 
 /// Per-stream FIFO of pending frames plus the stream's current priority band.
 struct StreamSlot {
-    priority: u8,
+    priority: i32,
     frames: VecDeque<Frame>,
 }
 
@@ -32,7 +32,7 @@ struct Inner {
     /// Ready streams bucketed by priority. The MAX key is served first.
     /// A `StreamId` appears in at most one band at a time, and only while its
     /// slot has at least one queued frame.
-    bands: BTreeMap<u8, VecDeque<StreamId>>,
+    bands: BTreeMap<i32, VecDeque<StreamId>>,
     /// Per-stream queued frames + current priority.
     streams: HashMap<StreamId, StreamSlot>,
     /// Total queued frames across all streams (the capacity bound).
@@ -45,7 +45,7 @@ impl Inner {
     /// Schedule `id` in `band` if it isn't already scheduled somewhere.
     ///
     /// Caller guarantees the slot exists and has at least one frame.
-    fn arm(&mut self, id: StreamId, band: u8) {
+    fn arm(&mut self, id: StreamId, band: i32) {
         // A StreamId lives in at most one band. The slot's `priority` is the
         // single source of truth for which band it would be in, so checking the
         // band's queue for membership is unnecessary as long as callers only arm
@@ -126,7 +126,7 @@ impl PriorityQueue {
     /// otherwise have to either block (impossible from a sync caller) or be
     /// detached to a task (racing reset/teardown). The frame still lands in the
     /// stream's band, after its data. Fails only if the queue is closed.
-    pub fn push_now(&self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
+    pub fn push_now(&self, priority: i32, id: StreamId, frame: Frame) -> Result<(), Error> {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(Error::Closed);
@@ -135,7 +135,7 @@ impl PriorityQueue {
         Ok(())
     }
 
-    fn push_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
+    fn push_locked(&self, inner: &mut Inner, priority: i32, id: StreamId, frame: Frame) {
         self.enqueue_locked(inner, priority, id, frame);
         inner.len += 1;
     }
@@ -143,7 +143,7 @@ impl PriorityQueue {
     /// Append `frame` to `id`'s FIFO without touching `len`. Callers own the
     /// capacity accounting: `push_now` bumps it after the fact, while a
     /// [`Permit`] already reserved its slot in `reserve`.
-    fn enqueue_locked(&self, inner: &mut Inner, priority: u8, id: StreamId, frame: Frame) {
+    fn enqueue_locked(&self, inner: &mut Inner, priority: i32, id: StreamId, frame: Frame) {
         match inner.streams.get_mut(&id) {
             Some(slot) => {
                 // Already scheduled (its band points at `id`); just append.
@@ -214,7 +214,7 @@ impl PriorityQueue {
     /// Retroactively re-prioritize a stream. Frames don't move — only the
     /// scheduling pointer relocates from the old band to `new`. No-op if the
     /// stream has no queued frames.
-    pub fn set_priority(&self, id: StreamId, new: u8) {
+    pub fn set_priority(&self, id: StreamId, new: i32) {
         let mut inner = self.inner.lock().unwrap();
         let old = match inner.streams.get(&id) {
             Some(slot) => slot.priority,
@@ -312,7 +312,7 @@ impl Permit {
     /// Fails if the queue closed while the permit was outstanding: the consumer
     /// has already stopped popping, so enqueuing here would strand the frame and
     /// report success for data that will never be sent.
-    pub fn send(mut self, priority: u8, id: StreamId, frame: Frame) -> Result<(), Error> {
+    pub fn send(mut self, priority: i32, id: StreamId, frame: Frame) -> Result<(), Error> {
         let mut inner = self.queue.inner.lock().unwrap();
         if inner.closed {
             // Release the lock before returning: `self` still counts as armed, so
@@ -379,7 +379,7 @@ mod tests {
     /// capacity, not the cancellation split, so they read better without it.
     async fn push(
         q: &PriorityQueue,
-        priority: u8,
+        priority: i32,
         id: StreamId,
         frame: Frame,
     ) -> Result<(), Error> {

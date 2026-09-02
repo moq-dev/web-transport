@@ -103,7 +103,7 @@ impl Inbox {
 /// `!Send`: holds an [`Rc`].
 struct LocalSend {
     buf: Shared,
-    priority: u8,
+    priority: i32,
 }
 
 impl SendStream for LocalSend {
@@ -119,7 +119,7 @@ impl SendStream for LocalSend {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn set_priority(&mut self, order: u8) {
+    fn set_priority(&mut self, order: i32) {
         self.priority = order;
     }
 

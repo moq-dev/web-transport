@@ -199,7 +199,12 @@ pub trait SendStream {
     /// Streams with higher values will be sent first, but are not guaranteed to
     /// arrive first. This matches the W3C WebTransport `sendOrder` convention (and
     /// quinn's scheduler).
-    fn set_priority(&mut self, order: u8);
+    ///
+    /// The full `i32` range is available so callers can bit-pack a composite ordering
+    /// (for example a track priority in the high bits and a sequence number in the low
+    /// bits) into a single value. Backends that cannot express that many distinct
+    /// levels approximate it, so treat the ordering as best-effort.
+    fn set_priority(&mut self, order: i32);
 
     /// Mark the stream as finished, erroring on any future writes.
     ///
