@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.12.1...web-transport-quinn-v0.12.2) - 2026-09-04
+
+### Fixed
+
+- *(web-transport-quinn)* prefer the controller's pacing rate for estimated_send_rate ([#385](https://github.com/moq-dev/web-transport/pull/385))
+
+### Other
+
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+
 ## [0.12.1](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.12.0...web-transport-quinn-v0.12.1) - 2026-08-20
 
 ### Other

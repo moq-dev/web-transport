@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.3.0...web-transport-noq-v0.3.1) - 2026-09-04
+
+### Other
+
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+
 ## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.2.1...web-transport-noq-v0.3.0) - 2026-08-06
 
 ### Fixed

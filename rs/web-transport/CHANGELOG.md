@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1](https://github.com/moq-dev/web-transport/compare/web-transport-v0.12.0...web-transport-v0.12.1) - 2026-09-04
+
+### Other
+
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+
 ## [0.12.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.11.0...web-transport-v0.12.0) - 2026-08-20
 
 ### Fixed

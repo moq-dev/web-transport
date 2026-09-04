@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.7.0...web-transport-quiche-v0.7.1) - 2026-09-04
+
+### Fixed
+
+- *(web-transport-quiche)* don't rank a send half the peer already stopped ([#391](https://github.com/moq-dev/web-transport/pull/391))
+
+### Other
+
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+
 ## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.6.0...web-transport-quiche-v0.7.0) - 2026-08-20
 
 ### Fixed

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.1...qmux-v0.5.2) - 2026-09-04
+
+### Other
+
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+
 ## [0.5.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.0...qmux-v0.5.1) - 2026-08-20
 
 ### Added
