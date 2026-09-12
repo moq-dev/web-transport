@@ -26,10 +26,10 @@
 		"release": "bun ../common/release.ts"
 	},
 	"devDependencies": {
-		"@types/bun": "^1.4.0",
-		"@types/node": "^26.4.0",
+		"@types/bun": "^1.4.1",
+		"@types/node": "^26.4.1",
 		"rimraf": "^6.1.3",
-		"tsx": "^4.23.12",
+		"tsx": "^4.23.13",
 		"typescript": "7.0.2"
 	},
 	"keywords": [
