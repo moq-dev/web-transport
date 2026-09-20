@@ -290,6 +290,15 @@ struct SessionState<R: Reader> {
     rtt: Arc<Rtt>,
 }
 
+/// Upper bounds on one writer batch (see [`WriterState::transmit_batch`]). The
+/// byte cap stays under tungstenite's 128 KiB write buffer so a batch leaves in
+/// a single write; the frame cap bounds a batch of tiny control frames.
+const BATCH_MAX_BYTES: usize = 64 * 1024;
+const BATCH_MAX_FRAMES: usize = 256;
+/// A batch this small is likely a frame header whose payload is still being
+/// queued, so the writer yields once before flushing it.
+const BATCH_YIELD_BELOW_BYTES: usize = 128;
+
 /// Pick the next outbound frame in strict priority order: control (lossless,
 /// e.g. RESET/STOP/CLOSE/window updates) first, then datagrams (low-latency but
 /// droppable), then bulk stream data scheduled by [`PriorityQueue`]. Returns
@@ -375,9 +384,9 @@ struct WriterState<W: Writer> {
     streams: Arc<Mutex<Streams>>,
     record_limit: Arc<AtomicU64>,
 
-    // Set while a `send` is in flight so the timer can tell a wedged-on-
-    // backpressure connection (peer alive, its recv window full) apart from a
-    // genuinely dead one, and not idle-close the former. See `transmit`.
+    // Set while a `feed` or `flush` is in flight so the timer can tell a
+    // wedged-on-backpressure connection (peer alive, its recv window full) apart
+    // from a genuinely dead one, and not idle-close the former. See `transmit`.
     writer_backpressured: Arc<AtomicBool>,
 
     closed: watch::Sender<Option<Error>>,
@@ -390,6 +399,9 @@ struct WriterState<W: Writer> {
     // Stamped when a QX_PING request reaches the wire. The timer allocates the
     // sequence, but only the writer knows when it actually left.
     rtt: Arc<Rtt>,
+
+    // Signals for FINs fed since the last flush, sent `Finished` once it lands.
+    finished: Vec<mpsc::UnboundedSender<SendSignal>>,
 }
 
 /// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
@@ -450,10 +462,15 @@ impl<W: Writer> WriterState<W> {
                     // mid-frame), so the transport is at a frame boundary: best-effort
                     // flush of any queued control frames (e.g. a ConnectionClose)
                     // before we stop.
+                    let mut flushable = true;
                     while let Ok(frame) = self.control.try_recv() {
                         if self.transmit(frame).await.is_err() {
+                            flushable = false;
                             break;
                         }
+                    }
+                    if flushable {
+                        let _ = self.flush().await;
                     }
                     break;
                 }
@@ -482,7 +499,7 @@ impl<W: Writer> WriterState<W> {
     ) -> Transmitted {
         tokio::select! {
             biased;
-            result = self.transmit(frame) => match result {
+            result = self.transmit_batch(frame) => match result {
                 Ok(()) => Transmitted::Ok,
                 Err(err) => Transmitted::Failed(err),
             },
@@ -494,10 +511,76 @@ impl<W: Writer> WriterState<W> {
         }
     }
 
+    /// Feed `first` plus every frame that is already queued behind it, then flush
+    /// the transport once. A fan-out server writes several tiny frames per media
+    /// frame (e.g. moq-lite's timestamp and size varints, then the payload); one
+    /// write per frame costs a syscall, a TCP segment and an ACK each.
+    ///
+    /// Nothing waits for more data, so batching adds no latency, with one
+    /// exception: if a batch of stream data is still only a few bytes and the
+    /// queues are empty, yield once so a producer mid-way through a frame can queue
+    /// the rest. Control frames never wait: a CONNECTION_CLOSE must reach the wire
+    /// before teardown wins the race in `transmit_or_teardown`. The batch is
+    /// bounded so one busy session can't hog its worker thread.
+    async fn transmit_batch(&mut self, first: Frame) -> Result<(), Error> {
+        let may_yield = matches!(&first, Frame::Stream(stream) if !stream.fin);
+        let mut bytes = self.transmit(first).await?;
+        let mut frames = 1;
+        let mut yielded = !may_yield;
+        while bytes < BATCH_MAX_BYTES && frames < BATCH_MAX_FRAMES {
+            let frame = match self.try_next_outbound() {
+                Some(frame) => frame,
+                None if !yielded && bytes < BATCH_YIELD_BELOW_BYTES => {
+                    yielded = true;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                None => break,
+            };
+            bytes += self.transmit(frame).await?;
+            frames += 1;
+        }
+        self.flush().await
+    }
+
+    /// Non-blocking [`next_outbound`], in the same priority order.
+    fn try_next_outbound(&mut self) -> Option<Frame> {
+        if let Ok(frame) = self.control.try_recv() {
+            return Some(frame);
+        }
+        if let Ok(payload) = self.datagrams.try_recv() {
+            return Some(Frame::Datagram(payload.into()));
+        }
+        self.outbound.try_pop()
+    }
+
+    /// Flush everything fed so far, then report the fed FINs as finished and
+    /// publish send progress.
+    async fn flush(&mut self) -> Result<(), Error> {
+        // Taken up front so a failed or abandoned flush drops them, which
+        // `closed()` reports as a connection error.
+        let finished = std::mem::take(&mut self.finished);
+        // A flush stuck on a full peer window proves the peer is alive; see the
+        // matching flag in `transmit`.
+        self.writer_backpressured.store(true, Ordering::Release);
+        let result = self.writer.flush().await;
+        self.writer_backpressured.store(false, Ordering::Release);
+        result?;
+        for finished in finished {
+            finished.send(SendSignal::Finished).ok();
+        }
+        // Publish send progress for the timer's keep-alive and idle scheduling.
+        let now = tokio::time::Instant::now();
+        self.last_send_at
+            .store(millis_since(self.base, now), Ordering::Release);
+        Ok(())
+    }
+
     /// Retire the stream a terminal frame closes, encode the frame (validating its
-    /// size for QMux01), and write it. The `streams` lock is only held for the
-    /// synchronous retirement, never across the `send` await.
-    async fn transmit(&mut self, mut frame: Frame) -> Result<(), Error> {
+    /// size for QMux01), and feed it to the transport. The caller must
+    /// [`flush`](Self::flush) afterwards. Returns the encoded size. The `streams`
+    /// lock is only held for the synchronous retirement, never across the await.
+    async fn transmit(&mut self, mut frame: Frame) -> Result<usize, Error> {
         let transmitted_stream = match &frame {
             Frame::Stream(stream) if !stream.fin => Some((stream.id, stream.data.len() as u64)),
             _ => None,
@@ -509,8 +592,8 @@ impl<W: Writer> WriterState<W> {
             _ => None,
         };
 
-        // Held until the FIN is on the transport: a failed or abandoned write drops
-        // it instead, which `closed()` reports as a connection error.
+        // Held until the FIN is flushed: a failed or abandoned write drops it
+        // instead, which `closed()` reports as a connection error.
         let mut finished = None;
         match &mut frame {
             Frame::ResetStream(reset) => {
@@ -546,30 +629,30 @@ impl<W: Writer> WriterState<W> {
             }
         }
         // Flag the in-flight write so the timer won't idle-close a connection
-        // that's merely backpressured: a `send` stuck here proves the peer is
+        // that's merely backpressured: a write stuck here proves the peer is
         // still there (its receive window is just full). Cleared as soon as the
         // write lands. Only the session idle timeout consults this — a WebSocket
-        // transport's own keep-alive deadline is independent.
+        // transport's own keep-alive deadline is independent. A `feed` only
+        // blocks once the transport's buffer is full.
+        let len = bytes.len();
         self.writer_backpressured.store(true, Ordering::Release);
-        let result = self.writer.send(bytes).await;
+        let result = self.writer.feed(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
-        if let Some(finished) = finished {
-            finished.send(SendSignal::Finished).ok();
-        }
+        // Signalled by `flush`, once the FIN is actually on the transport.
+        self.finished.extend(finished);
+        // Counted once fed: the batch is flushed before any later frame, so a
+        // RESET_STREAM's final size still matches what the peer receives.
         if let Some((id, len)) = transmitted_stream {
             if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
                 send.sent_offset += len;
             }
         }
-        let now = tokio::time::Instant::now();
+        // Stamped when fed; the flush follows within the same batch.
         if let Some(sequence) = transmitted_ping {
-            self.rtt.sent(sequence, now);
+            self.rtt.sent(sequence, tokio::time::Instant::now());
         }
-        // Publish send progress for the timer's keep-alive and idle scheduling.
-        self.last_send_at
-            .store(millis_since(self.base, now), Ordering::Release);
-        Ok(())
+        Ok(len)
     }
 }
 
@@ -653,6 +736,40 @@ mod writer_final_size_tests {
         }
     }
 
+    /// Records each fed message and how many had been fed at every flush. With
+    /// `fail_flush`, every flush errors after the feeds succeeded.
+    #[derive(Default)]
+    struct BatchWriter {
+        fed: Arc<Mutex<Vec<Bytes>>>,
+        flushes: Arc<Mutex<Vec<usize>>>,
+        fail_flush: bool,
+    }
+
+    impl Writer for BatchWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.feed(data).await?;
+            self.flush().await
+        }
+
+        async fn feed(&mut self, data: Bytes) -> Result<(), Error> {
+            self.fed.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            if self.fail_flush {
+                return Err(Error::Closed);
+            }
+            let fed = self.fed.lock().unwrap().len();
+            self.flushes.lock().unwrap().push(fed);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
     fn writer_state<W: Writer>(writer: W, streams: Arc<Mutex<Streams>>) -> WriterState<W> {
         let (_control_tx, control) = mpsc::unbounded_channel();
         let (_datagram_tx, datagrams) = mpsc::channel(1);
@@ -669,6 +786,7 @@ mod writer_final_size_tests {
             base: tokio::time::Instant::now(),
             last_send_at: Arc::new(AtomicU64::new(0)),
             rtt: Arc::new(Rtt::default()),
+            finished: Vec::new(),
         }
     }
 
@@ -689,7 +807,7 @@ mod writer_final_size_tests {
 
         let mut writer = writer_state(writer, streams);
         let result = writer
-            .transmit(
+            .transmit_batch(
                 Stream {
                     id,
                     offset: 0,
@@ -719,6 +837,83 @@ mod writer_final_size_tests {
             signal.is_none(),
             "closed() must not succeed for an unsent FIN"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_fin_flush_does_not_signal_finished() {
+        let writer = BatchWriter {
+            fail_flush: true,
+            ..Default::default()
+        };
+        let fed = writer.fed.clone();
+        let (result, signal) = transmit_fin(writer).await;
+        assert!(result.is_err());
+        assert_eq!(fed.lock().unwrap().len(), 1);
+        assert!(
+            signal.is_none(),
+            "closed() must not succeed for an unflushed FIN"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_frames_are_fed_then_flushed_once() {
+        let streams = Arc::new(Mutex::new(Streams::default()));
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let (signal, _signal_rx) = mpsc::unbounded_channel();
+        streams.lock().unwrap().send.insert(
+            id,
+            SendState {
+                inbound_signal: signal,
+                sent_offset: 0,
+                stream_credit: None,
+            },
+        );
+
+        let outbound = PriorityQueue::new(16);
+        // A media frame as moq-lite writes it: timestamp, size, payload.
+        let chunks: [&'static [u8]; 3] = [b"\x01", b"\x05", b"hello"];
+        let mut offset = 0;
+        for chunk in chunks {
+            let frame = Stream {
+                id,
+                offset,
+                data: Bytes::from_static(chunk),
+                fin: false,
+            };
+            offset += chunk.len() as u64;
+            outbound
+                .reserve()
+                .await
+                .unwrap()
+                .send(0, id, frame.into())
+                .unwrap();
+        }
+
+        let batch = BatchWriter::default();
+        let (fed, flushes) = (batch.fed.clone(), batch.flushes.clone());
+        let mut writer = writer_state(batch, streams.clone());
+        writer.outbound = outbound;
+
+        let first = writer.try_next_outbound().unwrap();
+        writer.transmit_batch(first).await.unwrap();
+
+        assert_eq!(*flushes.lock().unwrap(), vec![3]);
+        let payloads: Vec<Bytes> = fed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|wire| {
+                match Frame::decode(wire.clone(), Version::QMux01)
+                    .unwrap()
+                    .unwrap()
+                {
+                    Frame::Stream(stream) => stream.data,
+                    other => panic!("expected STREAM, got {other:?}"),
+                }
+            })
+            .collect();
+        assert_eq!(payloads, chunks.map(Bytes::from_static));
+        assert_eq!(streams.lock().unwrap().send[&id].sent_offset, 7);
     }
 
     #[tokio::test]
@@ -1817,6 +2012,7 @@ impl Session {
             base,
             last_send_at: last_send_at.clone(),
             rtt: rtt.clone(),
+            finished: Vec::new(),
         };
         tokio::spawn(async move { writer.run().await });
 
