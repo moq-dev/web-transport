@@ -29,7 +29,7 @@ This project is broken up into quite a few different crates:
 
 -   [web-transport](web-transport) provides a generic interface, delegating to [web-transport-quinn](web-transport-quinn) or [web-transport-wasm](web-transport-wasm) depending on the platform.
 -   [web-transport-quinn](web-transport-quinn) mirrors the [Quinn API](https://docs.rs/quinn/latest/quinn/index.html), abstracting away the HTTP/3 setup.
--   [web-transport-noq](web-transport-noq) mirrors the [Noq API](https://docs.rs/noq/latest/noq/index.html), a Quinn fork with the same surface area.
+-   [web-transport-noq](web-transport-noq) mirrors the [Noq API](https://docs.rs/moq-noq/latest/moq_noq/index.html) via [moq-noq](https://github.com/moq-dev/noq), the MoQ fork of Noq (itself a Quinn fork) with the same surface area.
 -   [web-transport-wasm](web-transport-wasm) wraps the [browser API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API)
 -   [web-transport-ffi](rs/web-transport-ffi) exposes the WebTransport client/server through [UniFFI](https://mozilla.github.io/uniffi-rs/) for Python, Kotlin, and Swift.
 - [qmux](qmux) implements QMux (draft-ietf-quic-qmux) over TCP/TLS/WebSocket, with backwards compatibility for the legacy WebTransport-over-WebSocket wire format.

@@ -1,6 +1,6 @@
 [package]
 name = "web-transport-noq"
-description = "WebTransport library for Noq (a Quinn fork)"
+description = "WebTransport library for moq-noq (the MoQ fork of Noq, a Quinn fork)"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
@@ -27,7 +27,7 @@ bytes = "1"
 futures = "0.3"
 http = "1"
 kio = "0.5.4"
-noq = { version = "1", default-features = false, features = [
+noq = { package = "moq-noq", version = "1.3", default-features = false, features = [
     "tracing-log",
     "platform-verifier",
     "runtime-tokio",

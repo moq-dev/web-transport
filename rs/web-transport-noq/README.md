@@ -3,7 +3,7 @@
 [![discord](https://img.shields.io/discord/1124083992740761730)](https://discord.gg/FCYF3p99mr)
 
 # web-transport-noq
-A wrapper around the Noq API (a Quinn fork), abstracting away the annoying HTTP/3 internals.
+A wrapper around the Noq API via [moq-noq](https://github.com/moq-dev/noq), the MoQ fork of Noq (a Quinn fork), abstracting away the annoying HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
 ## WebTransport
@@ -52,7 +52,7 @@ See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/b
 ```
 
 ## API
-The `web-transport-noq` API is almost identical to the Noq API, except that [Connection](https://docs.rs/noq/latest/noq/struct.Connection.html) is called [Session](https://docs.rs/web-transport-noq/latest/web_transport_noq/struct.Session.html).
+The `web-transport-noq` API is almost identical to the Noq API, except that [Connection](https://docs.rs/moq-noq/latest/moq_noq/struct.Connection.html) is called [Session](https://docs.rs/web-transport-noq/latest/web_transport_noq/struct.Session.html).
 
 When possible, `Deref` is used to expose the underlying Noq API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
