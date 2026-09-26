@@ -519,7 +519,9 @@ impl<W: Writer> WriterState<W> {
                 }
             }
             Frame::Stream(stream) if stream.fin => {
-                self.streams.lock().unwrap().send.remove(&stream.id);
+                if let Some(send) = self.streams.lock().unwrap().send.remove(&stream.id) {
+                    send.inbound_signal.send(SendSignal::Finished).ok();
+                }
             }
             Frame::StopSending(stop) => {
                 self.streams.lock().unwrap().recv.remove(&stop.id);
@@ -587,7 +589,7 @@ mod writer_final_size_tests {
         streams.lock().unwrap().send.insert(
             id,
             SendState {
-                inbound_stopped: stopped,
+                inbound_signal: stopped,
                 sent_offset: 0,
                 stream_credit: None,
             },
@@ -660,7 +662,7 @@ mod writer_final_size_tests {
             )),
             outbound,
             outbound_priority: priority,
-            inbound_stopped: stopped_rx,
+            inbound_signal: stopped_rx,
             offset: 0,
             priority: 0,
             closed: None,
@@ -1144,7 +1146,7 @@ impl<R: Reader> SessionState<R> {
                     StreamDir::Bi => {
                         let (tx, rx) = mpsc::unbounded_channel();
                         let send_backend = SendState {
-                            inbound_stopped: tx,
+                            inbound_signal: tx,
                             sent_offset: 0,
                             stream_credit: if self.config.version.is_qmux() {
                                 // Peer opened this bidi stream, so our send limit
@@ -1163,7 +1165,7 @@ impl<R: Reader> SessionState<R> {
                             record_limit: self.record_limit.clone(),
                             outbound: self.outbound.clone(),
                             outbound_priority: self.control.clone(),
-                            inbound_stopped: rx,
+                            inbound_signal: rx,
                             offset: 0,
                             priority: 0,
                             closed: None,
@@ -1331,7 +1333,7 @@ impl<R: Reader> SessionState<R> {
                 }
 
                 if let Some(send) = self.streams.lock().unwrap().send.get(&stop.id) {
-                    send.inbound_stopped.send(stop).ok();
+                    send.inbound_signal.send(SendSignal::Stopped(stop)).ok();
                 }
             }
             // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
@@ -1918,7 +1920,7 @@ impl generic::Session for Session {
         };
 
         let send_backend = SendState {
-            inbound_stopped: tx,
+            inbound_signal: tx,
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1928,7 +1930,7 @@ impl generic::Session for Session {
             record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            inbound_signal: rx,
             offset: 0,
             priority: 0,
             closed: None,
@@ -1975,7 +1977,7 @@ impl generic::Session for Session {
         };
 
         let send_backend = SendState {
-            inbound_stopped: tx,
+            inbound_signal: tx,
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1985,7 +1987,7 @@ impl generic::Session for Session {
             record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            inbound_signal: rx,
             offset: 0,
             priority: 0,
             closed: None,
@@ -2119,8 +2121,17 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
     server.iter().find(|p| client.contains(p)).cloned()
 }
 
+/// What the backend tells a [`SendStream`] about its stream.
+enum SendSignal {
+    /// The peer sent STOP_SENDING.
+    Stopped(StopSending),
+    /// The writer put our FIN on the transport and retired the stream. A reliable
+    /// transport has no acknowledgement to wait for, so this is as done as it gets.
+    Finished,
+}
+
 struct SendState {
-    inbound_stopped: mpsc::UnboundedSender<StopSending>,
+    inbound_signal: mpsc::UnboundedSender<SendSignal>,
     /// Bytes that the writer has successfully put on the transport.
     sent_offset: u64,
     stream_credit: Option<Credit>,
@@ -2138,7 +2149,7 @@ pub struct SendStream {
 
     outbound: PriorityQueue,                         // STREAM
     outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
-    inbound_stopped: mpsc::UnboundedReceiver<StopSending>,
+    inbound_signal: mpsc::UnboundedReceiver<SendSignal>,
 
     offset: u64,
     /// Scheduling priority (higher = sent first). Threaded into the queue on
@@ -2224,7 +2235,7 @@ impl SendStream {
                         // Release and retry the full loop to coordinate with conn credit
                         stream_credit.release(claimed);
                     }
-                    Some(stop) = self.inbound_stopped.recv() => {
+                    Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => {
                         return Err(self.recv_stop(stop.code));
                     }
                 }
@@ -2240,7 +2251,7 @@ impl SendStream {
                         let claimed = result?;
                         conn_credit.release(claimed); // Release, retry full loop
                     }
-                    Some(stop) = self.inbound_stopped.recv() => {
+                    Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => {
                         return Err(self.recv_stop(stop.code));
                     }
                 }
@@ -2308,7 +2319,7 @@ impl generic::SendStream for SendStream {
             // `buf` but never queued, a silent hole the peer decodes as garbage.
             let permit = tokio::select! {
                 result = self.outbound.reserve() => result?,
-                Some(stop) = self.inbound_stopped.recv() => return Err(self.recv_stop(stop.code)),
+                Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => return Err(self.recv_stop(stop.code)),
             };
 
             let allowed = self.claim_credit(chunk_len).await?;
@@ -2393,8 +2404,9 @@ impl generic::SendStream for SendStream {
             return Err(error.clone());
         }
 
-        match self.inbound_stopped.recv().await {
-            Some(stop) => Err(self.recv_stop(stop.code)),
+        match self.inbound_signal.recv().await {
+            Some(SendSignal::Stopped(stop)) => Err(self.recv_stop(stop.code)),
+            Some(SendSignal::Finished) => Ok(()),
             None => Err(Error::Closed),
         }
     }
@@ -2865,7 +2877,7 @@ mod send_offset_tests {
             )),
             outbound: outbound.clone(),
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            inbound_signal: stop_rx,
             offset: 0,
             priority: 0,
             closed: None,
@@ -2929,7 +2941,7 @@ mod write_cancel_tests {
             )),
             outbound,
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            inbound_signal: stop_rx,
             offset: 0,
             priority: 0,
             closed: None,

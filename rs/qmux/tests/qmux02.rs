@@ -126,3 +126,38 @@ async fn qmux02_ping_keeps_idle_session_alive() {
 
     client.close(0, "done");
 }
+
+/// A reliable transport has no FIN acknowledgement, so a finished send stream is
+/// closed once its FIN is on the wire. `closed()` reports that as success, not as
+/// a connection error, while the session is still up.
+#[tokio::test]
+async fn finished_send_stream_closes_cleanly() {
+    use qmux::transport::Stream;
+    use qmux::{Config, Session};
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let config = Config::new(Version::QMux02);
+    let ta = Stream::new(a, config.version, config.max_record_size);
+    let tb = Stream::new(b, config.version, config.max_record_size);
+    let (client, server) = tokio::join!(
+        Session::connect(ta, config.clone()),
+        Session::accept(tb, config),
+    );
+    let (client, server) = (client.unwrap(), server.unwrap());
+
+    let mut send = client.open_uni().await.unwrap();
+    send.write(b"goaway").await.unwrap();
+    send.finish().unwrap();
+
+    let mut recv = server.accept_uni().await.unwrap();
+    assert_eq!(recv.read_all().await.unwrap().as_ref(), b"goaway");
+
+    // Both sessions stay open: the stream alone is closed.
+    tokio::time::timeout(Duration::from_secs(1), send.closed())
+        .await
+        .expect("closed() never resolved after the FIN")
+        .expect("a finished stream is not a connection error");
+
+    client.close(0, "done");
+    server.close(0, "done");
+}
