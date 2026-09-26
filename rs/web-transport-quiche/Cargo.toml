@@ -21,7 +21,7 @@ all-features = true
 keylog = ["tokio-quiche/capture_keylogs"]
 
 [dependencies]
-boring = "4"
+boring = "5"
 bytes = "1"
 flume = "0.12"
 futures = "0.3"
@@ -38,7 +38,7 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 
-tokio-quiche = "0.19"
+tokio-quiche = "0.20"
 tracing = "0.1"
 url = "2"
 web-transport-proto = { workspace = true }
