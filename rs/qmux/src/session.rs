@@ -509,6 +509,9 @@ impl<W: Writer> WriterState<W> {
             _ => None,
         };
 
+        // Held until the FIN is on the transport: a failed or abandoned write drops
+        // it instead, which `closed()` reports as a connection error.
+        let mut finished = None;
         match &mut frame {
             Frame::ResetStream(reset) => {
                 // The frontend offset includes frames that may still be queued.
@@ -519,7 +522,13 @@ impl<W: Writer> WriterState<W> {
                 }
             }
             Frame::Stream(stream) if stream.fin => {
-                self.streams.lock().unwrap().send.remove(&stream.id);
+                finished = self
+                    .streams
+                    .lock()
+                    .unwrap()
+                    .send
+                    .remove(&stream.id)
+                    .map(|send| send.inbound_signal);
             }
             Frame::StopSending(stop) => {
                 self.streams.lock().unwrap().recv.remove(&stop.id);
@@ -545,6 +554,9 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
+        if let Some(finished) = finished {
+            finished.send(SendSignal::Finished).ok();
+        }
         if let Some((id, len)) = transmitted_stream {
             if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
                 send.sent_offset += len;
@@ -587,28 +599,13 @@ mod writer_final_size_tests {
         streams.lock().unwrap().send.insert(
             id,
             SendState {
-                inbound_stopped: stopped,
+                inbound_signal: stopped,
                 sent_offset: 0,
                 stream_credit: None,
             },
         );
 
-        let (_control_tx, control) = mpsc::unbounded_channel();
-        let (_datagram_tx, datagrams) = mpsc::channel(1);
-        let mut writer = WriterState {
-            writer: CaptureWriter(sent.clone()),
-            version: Version::QMux01,
-            control,
-            datagrams,
-            outbound: PriorityQueue::new(1),
-            streams,
-            record_limit: Arc::new(AtomicU64::new(u64::MAX)),
-            writer_backpressured: Arc::new(AtomicBool::new(false)),
-            closed: watch::Sender::new(None),
-            base: tokio::time::Instant::now(),
-            last_send_at: Arc::new(AtomicU64::new(0)),
-            rtt: Arc::new(Rtt::default()),
-        };
+        let mut writer = writer_state(CaptureWriter(sent.clone()), streams);
 
         writer
             .transmit(
@@ -644,6 +641,86 @@ mod writer_final_size_tests {
         assert_eq!(reset.final_size, 3);
     }
 
+    struct FailingWriter;
+
+    impl Writer for FailingWriter {
+        async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
+            Err(Error::Closed)
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn writer_state<W: Writer>(writer: W, streams: Arc<Mutex<Streams>>) -> WriterState<W> {
+        let (_control_tx, control) = mpsc::unbounded_channel();
+        let (_datagram_tx, datagrams) = mpsc::channel(1);
+        WriterState {
+            writer,
+            version: Version::QMux01,
+            control,
+            datagrams,
+            outbound: PriorityQueue::new(1),
+            streams,
+            record_limit: Arc::new(AtomicU64::new(u64::MAX)),
+            writer_backpressured: Arc::new(AtomicBool::new(false)),
+            closed: watch::Sender::new(None),
+            base: tokio::time::Instant::now(),
+            last_send_at: Arc::new(AtomicU64::new(0)),
+            rtt: Arc::new(Rtt::default()),
+        }
+    }
+
+    /// Transmit a FIN for a registered stream, returning the write result and the
+    /// signal its `SendStream` would observe.
+    async fn transmit_fin<W: Writer>(writer: W) -> (Result<(), Error>, Option<SendSignal>) {
+        let streams = Arc::new(Mutex::new(Streams::default()));
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let (signal, mut signal_rx) = mpsc::unbounded_channel();
+        streams.lock().unwrap().send.insert(
+            id,
+            SendState {
+                inbound_signal: signal,
+                sent_offset: 0,
+                stream_credit: None,
+            },
+        );
+
+        let mut writer = writer_state(writer, streams);
+        let result = writer
+            .transmit(
+                Stream {
+                    id,
+                    offset: 0,
+                    data: Bytes::new(),
+                    fin: true,
+                }
+                .into(),
+            )
+            .await;
+        (result, signal_rx.try_recv().ok())
+    }
+
+    #[tokio::test]
+    async fn fin_signals_finished_after_write() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (result, signal) = transmit_fin(CaptureWriter(sent.clone())).await;
+        result.unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(matches!(signal, Some(SendSignal::Finished)));
+    }
+
+    #[tokio::test]
+    async fn failed_fin_write_does_not_signal_finished() {
+        let (result, signal) = transmit_fin(FailingWriter).await;
+        assert!(result.is_err());
+        assert!(
+            signal.is_none(),
+            "closed() must not succeed for an unsent FIN"
+        );
+    }
+
     #[tokio::test]
     async fn reset_returns_credit_reserved_for_dropped_frames() {
         let id = StreamId::new(0, StreamDir::Uni, false);
@@ -660,11 +737,12 @@ mod writer_final_size_tests {
             )),
             outbound,
             outbound_priority: priority,
-            inbound_stopped: stopped_rx,
+            inbound_signal: stopped_rx,
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit: Some(stream_credit.clone()),
             conn_credit: Some(conn_credit.clone()),
         };
@@ -1144,7 +1222,7 @@ impl<R: Reader> SessionState<R> {
                     StreamDir::Bi => {
                         let (tx, rx) = mpsc::unbounded_channel();
                         let send_backend = SendState {
-                            inbound_stopped: tx,
+                            inbound_signal: tx,
                             sent_offset: 0,
                             stream_credit: if self.config.version.is_qmux() {
                                 // Peer opened this bidi stream, so our send limit
@@ -1163,11 +1241,12 @@ impl<R: Reader> SessionState<R> {
                             record_limit: self.record_limit.clone(),
                             outbound: self.outbound.clone(),
                             outbound_priority: self.control.clone(),
-                            inbound_stopped: rx,
+                            inbound_signal: rx,
                             offset: 0,
                             priority: 0,
                             closed: None,
                             fin: false,
+                            finished: false,
                             stream_credit: send_backend.stream_credit.clone(),
                             conn_credit: if self.config.version.is_qmux() {
                                 Some(self.conn_send_credit.clone())
@@ -1331,7 +1410,7 @@ impl<R: Reader> SessionState<R> {
                 }
 
                 if let Some(send) = self.streams.lock().unwrap().send.get(&stop.id) {
-                    send.inbound_stopped.send(stop).ok();
+                    send.inbound_signal.send(SendSignal::Stopped(stop)).ok();
                 }
             }
             // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
@@ -1918,7 +1997,7 @@ impl generic::Session for Session {
         };
 
         let send_backend = SendState {
-            inbound_stopped: tx,
+            inbound_signal: tx,
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1928,11 +2007,12 @@ impl generic::Session for Session {
             record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            inbound_signal: rx,
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
@@ -1975,7 +2055,7 @@ impl generic::Session for Session {
         };
 
         let send_backend = SendState {
-            inbound_stopped: tx,
+            inbound_signal: tx,
             sent_offset: 0,
             stream_credit: stream_credit.clone(),
         };
@@ -1985,11 +2065,12 @@ impl generic::Session for Session {
             record_limit: self.record_limit.clone(),
             outbound: self.outbound.clone(),
             outbound_priority: self.outbound_priority.clone(),
-            inbound_stopped: rx,
+            inbound_signal: rx,
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
@@ -2119,8 +2200,17 @@ fn negotiate_protocol(is_server: bool, ours: &[String], peers: &[String]) -> Opt
     server.iter().find(|p| client.contains(p)).cloned()
 }
 
+/// What the backend tells a [`SendStream`] about its stream.
+enum SendSignal {
+    /// The peer sent STOP_SENDING.
+    Stopped(StopSending),
+    /// The writer put our FIN on the transport and retired the stream. A reliable
+    /// transport has no acknowledgement to wait for, so this is as done as it gets.
+    Finished,
+}
+
 struct SendState {
-    inbound_stopped: mpsc::UnboundedSender<StopSending>,
+    inbound_signal: mpsc::UnboundedSender<SendSignal>,
     /// Bytes that the writer has successfully put on the transport.
     sent_offset: u64,
     stream_credit: Option<Credit>,
@@ -2138,7 +2228,7 @@ pub struct SendStream {
 
     outbound: PriorityQueue,                         // STREAM
     outbound_priority: mpsc::UnboundedSender<Frame>, // RESET_STREAM
-    inbound_stopped: mpsc::UnboundedReceiver<StopSending>,
+    inbound_signal: mpsc::UnboundedReceiver<SendSignal>,
 
     offset: u64,
     /// Scheduling priority (higher = sent first). Threaded into the queue on
@@ -2146,6 +2236,8 @@ pub struct SendStream {
     priority: i32,
     closed: Option<Error>,
     fin: bool,
+    /// The writer put our FIN on the transport; `closed()` resolves `Ok` from then on.
+    finished: bool,
 
     // Flow control (None for WebTransport version)
     stream_credit: Option<Credit>,
@@ -2224,7 +2316,7 @@ impl SendStream {
                         // Release and retry the full loop to coordinate with conn credit
                         stream_credit.release(claimed);
                     }
-                    Some(stop) = self.inbound_stopped.recv() => {
+                    Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => {
                         return Err(self.recv_stop(stop.code));
                     }
                 }
@@ -2240,7 +2332,7 @@ impl SendStream {
                         let claimed = result?;
                         conn_credit.release(claimed); // Release, retry full loop
                     }
-                    Some(stop) = self.inbound_stopped.recv() => {
+                    Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => {
                         return Err(self.recv_stop(stop.code));
                     }
                 }
@@ -2308,7 +2400,7 @@ impl generic::SendStream for SendStream {
             // `buf` but never queued, a silent hole the peer decodes as garbage.
             let permit = tokio::select! {
                 result = self.outbound.reserve() => result?,
-                Some(stop) = self.inbound_stopped.recv() => return Err(self.recv_stop(stop.code)),
+                Some(SendSignal::Stopped(stop)) = self.inbound_signal.recv() => return Err(self.recv_stop(stop.code)),
             };
 
             let allowed = self.claim_credit(chunk_len).await?;
@@ -2392,9 +2484,16 @@ impl generic::SendStream for SendStream {
         if let Some(error) = &self.closed {
             return Err(error.clone());
         }
+        if self.finished {
+            return Ok(());
+        }
 
-        match self.inbound_stopped.recv().await {
-            Some(stop) => Err(self.recv_stop(stop.code)),
+        match self.inbound_signal.recv().await {
+            Some(SendSignal::Stopped(stop)) => Err(self.recv_stop(stop.code)),
+            Some(SendSignal::Finished) => {
+                self.finished = true;
+                Ok(())
+            }
             None => Err(Error::Closed),
         }
     }
@@ -2865,11 +2964,12 @@ mod send_offset_tests {
             )),
             outbound: outbound.clone(),
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            inbound_signal: stop_rx,
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit: None,
             conn_credit: None,
         };
@@ -2929,11 +3029,12 @@ mod write_cancel_tests {
             )),
             outbound,
             outbound_priority: control,
-            inbound_stopped: stop_rx,
+            inbound_signal: stop_rx,
             offset: 0,
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit,
         }
