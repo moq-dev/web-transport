@@ -12,7 +12,6 @@ use std::{
 
 use kio::{Waiter, WaiterList};
 use tokio_quiche::{
-    buf_factory::BufFactory,
     quic::{HandshakeInfo, QuicheConnection},
     quiche,
 };
@@ -434,8 +433,6 @@ pub(super) struct Driver {
     send: HashMap<StreamId, Lock<SendState>>,
     recv: HashMap<StreamId, Lock<RecvState>>,
 
-    buf: Vec<u8>,
-
     // Datagrams. Only the outbound half is a channel now; inbound datagrams and
     // accepted streams are queued in `DriverState` so they can be polled.
     dgram_out: flume::Receiver<Bytes>,
@@ -457,7 +454,6 @@ impl Driver {
             state,
             send: HashMap::new(),
             recv: HashMap::new(),
-            buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
             dgram_out,
             dgram_max,
             keep_alive: keep_alive.map(KeepAlive::new),
@@ -886,10 +882,6 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         true
     }
 
-    fn buffer(&mut self) -> &mut [u8] {
-        &mut self.buf
-    }
-
     async fn wait_for_data(
         &mut self,
         qconn: &mut QuicheConnection,
@@ -911,9 +903,10 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
         // The channel is bounded — if the application can't keep up we drop
         // the new datagram (consistent with the unreliable contract).
         loop {
-            match qconn.dgram_recv(&mut self.buf) {
-                Ok(len) => {
-                    let buf = Bytes::copy_from_slice(&self.buf[..len]);
+            match qconn.dgram_recv_buf() {
+                Ok(dgram) => {
+                    let (data, start) = dgram.into_parts();
+                    let buf = Bytes::from(data).slice(start..);
                     let mut waiters = self.state.lock().push_dgram_in(buf);
 
                     waiters.wake();
