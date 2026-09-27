@@ -742,6 +742,7 @@ mod writer_final_size_tests {
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit: Some(stream_credit.clone()),
             conn_credit: Some(conn_credit.clone()),
         };
@@ -1245,6 +1246,7 @@ impl<R: Reader> SessionState<R> {
                             priority: 0,
                             closed: None,
                             fin: false,
+                            finished: false,
                             stream_credit: send_backend.stream_credit.clone(),
                             conn_credit: if self.config.version.is_qmux() {
                                 Some(self.conn_send_credit.clone())
@@ -2010,6 +2012,7 @@ impl generic::Session for Session {
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
@@ -2067,6 +2070,7 @@ impl generic::Session for Session {
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit: if self.config.version.is_qmux() {
                 Some(self.conn_send_credit.clone())
@@ -2232,6 +2236,8 @@ pub struct SendStream {
     priority: i32,
     closed: Option<Error>,
     fin: bool,
+    /// The writer put our FIN on the transport; `closed()` resolves `Ok` from then on.
+    finished: bool,
 
     // Flow control (None for WebTransport version)
     stream_credit: Option<Credit>,
@@ -2478,10 +2484,16 @@ impl generic::SendStream for SendStream {
         if let Some(error) = &self.closed {
             return Err(error.clone());
         }
+        if self.finished {
+            return Ok(());
+        }
 
         match self.inbound_signal.recv().await {
             Some(SendSignal::Stopped(stop)) => Err(self.recv_stop(stop.code)),
-            Some(SendSignal::Finished) => Ok(()),
+            Some(SendSignal::Finished) => {
+                self.finished = true;
+                Ok(())
+            }
             None => Err(Error::Closed),
         }
     }
@@ -2957,6 +2969,7 @@ mod send_offset_tests {
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit: None,
             conn_credit: None,
         };
@@ -3021,6 +3034,7 @@ mod write_cancel_tests {
             priority: 0,
             closed: None,
             fin: false,
+            finished: false,
             stream_credit,
             conn_credit,
         }

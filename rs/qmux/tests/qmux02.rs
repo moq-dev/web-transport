@@ -157,6 +157,10 @@ async fn finished_send_stream_closes_cleanly() {
         .await
         .expect("closed() never resolved after the FIN")
         .expect("a finished stream is not a connection error");
+    // The stream stays closed cleanly on later calls.
+    send.closed()
+        .await
+        .expect("a finished stream stays closed cleanly");
 
     client.close(0, "done");
     server.close(0, "done");
