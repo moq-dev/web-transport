@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.0...web-transport-quiche-v0.8.1) - 2026-09-27
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 4 updates ([#400](https://github.com/moq-dev/web-transport/pull/400))
+
 ## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.6.0...web-transport-quiche-v0.7.0) - 2026-08-20
 
 ### Fixed
