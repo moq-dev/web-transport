@@ -42,6 +42,20 @@ pub trait Writer: Send + 'static {
     /// Send a single complete message.
     fn send(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
+    /// Queue a single complete message without flushing it. The session's writer
+    /// feeds every frame that is already queued and then calls [`Writer::flush`]
+    /// once, so a burst of small frames reaches the socket in one write instead of
+    /// one write (and one TCP segment) each. The default sends immediately.
+    fn feed(&mut self, data: Bytes) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        self.send(data)
+    }
+
+    /// Write out everything queued by [`Writer::feed`]. The default has nothing to
+    /// flush because the default `feed` already sent.
+    fn flush(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send {
+        std::future::ready(Ok(()))
+    }
+
     /// Gracefully close the transport.
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
@@ -185,15 +199,25 @@ mod stream_transport {
 
     impl<T: AsyncWrite + Send + 'static> Writer for StreamWriter<T> {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.feed(data).await?;
+            self.flush().await
+        }
+
+        async fn feed(&mut self, data: Bytes) -> Result<(), Error> {
             // Record-framed drafts (QMux01+) travel inside size-prefixed records
             // on byte streams. (Records are implicit on WebSocket, where the
-            // message boundary delimits them.)
+            // message boundary delimits them.) Left in the BufWriter, which only
+            // writes to the socket when full; `flush` sends the rest.
             if self.version.uses_records() {
                 let mut size_buf = BytesMut::with_capacity(8);
                 VarInt::try_from(data.len())?.encode(&mut size_buf);
                 self.writer.write_all(&size_buf).await?;
             }
             self.writer.write_all(&data).await?;
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
             self.writer.flush().await?;
             Ok(())
         }
@@ -820,6 +844,25 @@ mod ws_transport {
                 .send(Message::Binary(data))
                 .await
                 .map_err(|_| Error::Closed)?;
+            Ok(())
+        }
+
+        async fn feed(&mut self, data: Bytes) -> Result<(), Error> {
+            use futures::SinkExt;
+            // Still one WebSocket message per frame (the message boundary is the
+            // record boundary), but tungstenite only appends it to its write
+            // buffer. The socket write happens on `flush`, or early once the
+            // buffer passes `write_buffer_size` (128 KiB by default).
+            self.sink
+                .feed(Message::Binary(data))
+                .await
+                .map_err(|_| Error::Closed)?;
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), Error> {
+            use futures::SinkExt;
+            self.sink.flush().await.map_err(|_| Error::Closed)?;
             Ok(())
         }
 

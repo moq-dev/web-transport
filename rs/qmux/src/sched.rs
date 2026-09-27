@@ -178,6 +178,13 @@ impl PriorityQueue {
         }
     }
 
+    /// Pop the next frame if one is queued right now, without waiting. Used by the
+    /// writer to drain a batch before flushing the transport once.
+    pub fn try_pop(&self) -> Option<Frame> {
+        let mut inner = self.inner.lock().unwrap();
+        self.pop_locked(&mut inner)
+    }
+
     fn pop_locked(&self, inner: &mut Inner) -> Option<Frame> {
         // Highest band first.
         let (&band, queue) = inner.bands.iter_mut().next_back()?;
