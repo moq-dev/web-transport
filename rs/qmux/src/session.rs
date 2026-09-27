@@ -1561,8 +1561,34 @@ impl<R: Reader> SessionState<R> {
 }
 
 impl Session {
-    /// The recorded close reason, for an operation that failed because the session closed.
-    fn close_reason(&self) -> Error {
+    /// Wait for the session's close reason.
+    ///
+    /// Operations that fail because the session closed report this. Teardown
+    /// closes the channels and stream credits before it records the reason, so
+    /// a woken caller waits for it instead of reading an empty slot.
+    async fn close_reason(&self) -> Error {
+        let mut closed = self.closed.subscribe();
+        closed
+            .wait_for(|err| err.is_some())
+            .await
+            .map(|e| e.clone().unwrap_or(Error::Closed))
+            .unwrap_or(Error::Closed)
+    }
+
+    /// Close the session with `err` and send `frame` to the peer, unless the
+    /// session already has a close reason. Returns the close reason that won.
+    ///
+    /// The frame is queued under the slot's lock, before the writer can see the
+    /// close and stop.
+    fn close_with(&self, frame: Frame, err: Error) -> Error {
+        self.closed.send_if_modified(|slot| {
+            if slot.is_some() {
+                return false;
+            }
+            let _ = self.outbound_priority.send(frame);
+            *slot = Some(err);
+            true
+        });
         self.closed.borrow().clone().unwrap_or(Error::Closed)
     }
 
@@ -1601,7 +1627,7 @@ impl Session {
             return Ok(());
         }
 
-        let wait = established.wait_for(|&done| done);
+        let wait = async { established.wait_for(|&done| done).await.is_ok() };
         let timeout = self.config.handshake_timeout;
         // A zero timeout disables the bound (wait indefinitely).
         let outcome = if timeout.is_zero() {
@@ -1612,23 +1638,20 @@ impl Session {
 
         match outcome {
             // Established.
-            Some(Ok(_)) => Ok(()),
+            Some(true) => Ok(()),
             // The backend task ended before establishing — surface the close reason.
-            Some(Err(_)) => Err(self.close_reason()),
+            Some(false) => Err(self.close_reason().await),
             // Timed out waiting for the peer's parameters: abort the half-open
             // handshake, notifying the peer, and fail rather than hang.
+            // If the session closed first, report that reason instead.
             None => {
                 // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
                 // rather than seeing a graceful close.
-                let _ = self.outbound_priority.send(
-                    ConnectionClose {
-                        code: VarInt::from(0u32),
-                        reason: "handshake timeout".to_string(),
-                    }
-                    .into(),
-                );
-                note_closed(&self.closed, Error::HandshakeTimeout);
-                Err(Error::HandshakeTimeout)
+                let frame = ConnectionClose {
+                    code: VarInt::from(0u32),
+                    reason: "handshake timeout".to_string(),
+                };
+                Err(self.close_with(frame.into(), Error::HandshakeTimeout))
             }
         }
     }
@@ -1848,6 +1871,7 @@ impl Session {
                     credit.close();
                 }
             }
+            // Recorded last, so a `closed()` waiter sees every credit closed.
             // The reader often fails (EOF, WebSocket Close) right after an
             // APPLICATION_CLOSE, so keep the reason recorded first.
             note_closed(&backend.closed, err);
@@ -1900,26 +1924,24 @@ impl generic::Session for Session {
     }
 
     async fn accept_uni(&self) -> Result<Self::RecvStream, Self::Error> {
-        self.accept_uni
-            .recv()
-            .await
-            .ok_or_else(|| self.close_reason())
+        match self.accept_uni.recv().await {
+            Some(item) => Ok(item),
+            None => Err(self.close_reason().await),
+        }
     }
 
     async fn accept_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
-        self.accept_bi
-            .recv()
-            .await
-            .ok_or_else(|| self.close_reason())
+        match self.accept_bi.recv().await {
+            Some(item) => Ok(item),
+            None => Err(self.close_reason().await),
+        }
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
         // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
-        let index = self
-            .open_uni_credit
-            .claim_index()
-            .await
-            .map_err(|_| self.close_reason())?;
+        let Ok(index) = self.open_uni_credit.claim_index().await else {
+            return Err(self.close_reason().await);
+        };
         let id = StreamId::new(index, StreamDir::Uni, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1975,11 +1997,9 @@ impl generic::Session for Session {
 
     async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
         // Wait for stream count credit (blocks until peer's MAX_STREAMS allows it)
-        let index = self
-            .open_bi_credit
-            .claim_index()
-            .await
-            .map_err(|_| self.close_reason())?;
+        let Ok(index) = self.open_bi_credit.claim_index().await else {
+            return Err(self.close_reason().await);
+        };
         let id = StreamId::new(index, StreamDir::Bi, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2061,33 +2081,21 @@ impl generic::Session for Session {
 
     fn close(&self, code: u32, reason: &str) {
         // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
-        // session close carrying our code/reason.
-        // A no-op once the session has a close reason. The frame is queued under
-        // the slot's lock, before the writer can see the close and stop.
-        self.closed.send_if_modified(|slot| {
-            if slot.is_some() {
-                return false;
-            }
-            let frame = ApplicationClose {
-                code: VarInt::from(code),
-                reason: reason.to_string(),
-            };
-            let _ = self.outbound_priority.send(frame.into());
-            *slot = Some(Error::ConnectionClosed {
-                code: VarInt::from(code),
-                reason: reason.to_string(),
-            });
-            true
-        });
+        // session close carrying our code/reason. A no-op once the session has a
+        // close reason.
+        let frame = ApplicationClose {
+            code: VarInt::from(code),
+            reason: reason.to_string(),
+        };
+        let err = Error::ConnectionClosed {
+            code: VarInt::from(code),
+            reason: reason.to_string(),
+        };
+        self.close_with(frame.into(), err);
     }
 
     async fn closed(&self) -> Self::Error {
-        let mut closed = self.closed.subscribe();
-        closed
-            .wait_for(|err| err.is_some())
-            .await
-            .map(|e| e.clone().unwrap_or(Error::Closed))
-            .unwrap_or(Error::Closed)
+        self.close_reason().await
     }
 
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
@@ -2117,10 +2125,10 @@ impl generic::Session for Session {
     }
 
     async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
-        self.recv_datagram
-            .recv()
-            .await
-            .ok_or_else(|| self.close_reason())
+        match self.recv_datagram.recv().await {
+            Some(item) => Ok(item),
+            None => Err(self.close_reason().await),
+        }
     }
 
     fn protocol(&self) -> Option<&str> {
@@ -3709,11 +3717,16 @@ mod datagram_recv_tests {
     /// arbitrary records. The raw peer sends its `TRANSPORT_PARAMETERS` first, as a
     /// real QMux01 client would, so the server reaches "established".
     async fn raw_peer(server_cfg: Config) -> (Session, DuplexStream) {
+        raw_peer_with(server_cfg, Config::new(Version::QMux01)).await
+    }
+
+    /// [`raw_peer`], with the raw peer advertising `client_cfg`'s parameters.
+    async fn raw_peer_with(server_cfg: Config, client_cfg: Config) -> (Session, DuplexStream) {
         let (server_io, mut raw) = tokio::io::duplex(1024 * 1024);
         let transport = Stream::new(server_io, Version::QMux01, server_cfg.max_record_size);
         let accept = tokio::spawn(Session::accept(transport, server_cfg));
 
-        let client_params = Config::new(Version::QMux01).to_transport_params();
+        let client_params = client_cfg.to_transport_params();
         let params = Frame::TransportParameters(client_params)
             .encode(Version::QMux01)
             .unwrap();
@@ -3902,6 +3915,45 @@ mod datagram_recv_tests {
         assert_closed_with(server.accept_bi().await.err().unwrap(), 42);
         assert_closed_with(server.open_uni().await.err().unwrap(), 42);
         assert_closed_with(server.recv_datagram().await.err().unwrap(), 42);
+    }
+
+    /// An `open_uni` or `open_bi` already blocked on stream credit reports the
+    /// backend's error, not a bare `Closed`. Teardown wakes it by closing the
+    /// credit before it records the error, possibly on another worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_open_reports_close_reason() {
+        let mut server_cfg = Config::new(Version::QMux01);
+        server_cfg.max_datagram_frame_size = 0;
+        let mut client_cfg = Config::new(Version::QMux01);
+        client_cfg.max_streams_uni = 0;
+        client_cfg.max_streams_bidi = 0;
+        let (server, mut raw) = raw_peer_with(server_cfg, client_cfg).await;
+
+        let open_uni = server.open_uni();
+        let open_bi = server.open_bi();
+        tokio::pin!(open_uni, open_bi);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(open_uni.as_mut(), cx).is_pending());
+            assert!(std::future::Future::poll(open_bi.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // An unnegotiated DATAGRAM fails the backend with `DatagramsUnsupported`.
+        let datagram = Frame::Datagram(Bytes::from_static(b"hi").into())
+            .encode(Version::QMux01)
+            .unwrap();
+        raw.write_all(&record(datagram)).await.unwrap();
+        raw.flush().await.unwrap();
+
+        assert!(matches!(
+            open_uni.await.err().unwrap(),
+            Error::DatagramsUnsupported
+        ));
+        assert!(matches!(
+            open_bi.await.err().unwrap(),
+            Error::DatagramsUnsupported
+        ));
     }
 
     /// A local `close()` wins over a peer close that arrives after it.
