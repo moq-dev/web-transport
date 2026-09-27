@@ -509,6 +509,9 @@ impl<W: Writer> WriterState<W> {
             _ => None,
         };
 
+        // Held until the FIN is on the transport: a failed or abandoned write drops
+        // it instead, which `closed()` reports as a connection error.
+        let mut finished = None;
         match &mut frame {
             Frame::ResetStream(reset) => {
                 // The frontend offset includes frames that may still be queued.
@@ -519,9 +522,13 @@ impl<W: Writer> WriterState<W> {
                 }
             }
             Frame::Stream(stream) if stream.fin => {
-                if let Some(send) = self.streams.lock().unwrap().send.remove(&stream.id) {
-                    send.inbound_signal.send(SendSignal::Finished).ok();
-                }
+                finished = self
+                    .streams
+                    .lock()
+                    .unwrap()
+                    .send
+                    .remove(&stream.id)
+                    .map(|send| send.inbound_signal);
             }
             Frame::StopSending(stop) => {
                 self.streams.lock().unwrap().recv.remove(&stop.id);
@@ -547,6 +554,9 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
+        if let Some(finished) = finished {
+            finished.send(SendSignal::Finished).ok();
+        }
         if let Some((id, len)) = transmitted_stream {
             if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
                 send.sent_offset += len;
@@ -595,22 +605,7 @@ mod writer_final_size_tests {
             },
         );
 
-        let (_control_tx, control) = mpsc::unbounded_channel();
-        let (_datagram_tx, datagrams) = mpsc::channel(1);
-        let mut writer = WriterState {
-            writer: CaptureWriter(sent.clone()),
-            version: Version::QMux01,
-            control,
-            datagrams,
-            outbound: PriorityQueue::new(1),
-            streams,
-            record_limit: Arc::new(AtomicU64::new(u64::MAX)),
-            writer_backpressured: Arc::new(AtomicBool::new(false)),
-            closed: watch::Sender::new(None),
-            base: tokio::time::Instant::now(),
-            last_send_at: Arc::new(AtomicU64::new(0)),
-            rtt: Arc::new(Rtt::default()),
-        };
+        let mut writer = writer_state(CaptureWriter(sent.clone()), streams);
 
         writer
             .transmit(
@@ -644,6 +639,86 @@ mod writer_final_size_tests {
             panic!("expected RESET_STREAM");
         };
         assert_eq!(reset.final_size, 3);
+    }
+
+    struct FailingWriter;
+
+    impl Writer for FailingWriter {
+        async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
+            Err(Error::Closed)
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn writer_state<W: Writer>(writer: W, streams: Arc<Mutex<Streams>>) -> WriterState<W> {
+        let (_control_tx, control) = mpsc::unbounded_channel();
+        let (_datagram_tx, datagrams) = mpsc::channel(1);
+        WriterState {
+            writer,
+            version: Version::QMux01,
+            control,
+            datagrams,
+            outbound: PriorityQueue::new(1),
+            streams,
+            record_limit: Arc::new(AtomicU64::new(u64::MAX)),
+            writer_backpressured: Arc::new(AtomicBool::new(false)),
+            closed: watch::Sender::new(None),
+            base: tokio::time::Instant::now(),
+            last_send_at: Arc::new(AtomicU64::new(0)),
+            rtt: Arc::new(Rtt::default()),
+        }
+    }
+
+    /// Transmit a FIN for a registered stream, returning the write result and the
+    /// signal its `SendStream` would observe.
+    async fn transmit_fin<W: Writer>(writer: W) -> (Result<(), Error>, Option<SendSignal>) {
+        let streams = Arc::new(Mutex::new(Streams::default()));
+        let id = StreamId::new(0, StreamDir::Uni, false);
+        let (signal, mut signal_rx) = mpsc::unbounded_channel();
+        streams.lock().unwrap().send.insert(
+            id,
+            SendState {
+                inbound_signal: signal,
+                sent_offset: 0,
+                stream_credit: None,
+            },
+        );
+
+        let mut writer = writer_state(writer, streams);
+        let result = writer
+            .transmit(
+                Stream {
+                    id,
+                    offset: 0,
+                    data: Bytes::new(),
+                    fin: true,
+                }
+                .into(),
+            )
+            .await;
+        (result, signal_rx.try_recv().ok())
+    }
+
+    #[tokio::test]
+    async fn fin_signals_finished_after_write() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (result, signal) = transmit_fin(CaptureWriter(sent.clone())).await;
+        result.unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(matches!(signal, Some(SendSignal::Finished)));
+    }
+
+    #[tokio::test]
+    async fn failed_fin_write_does_not_signal_finished() {
+        let (result, signal) = transmit_fin(FailingWriter).await;
+        assert!(result.is_err());
+        assert!(
+            signal.is_none(),
+            "closed() must not succeed for an unsent FIN"
+        );
     }
 
     #[tokio::test]
