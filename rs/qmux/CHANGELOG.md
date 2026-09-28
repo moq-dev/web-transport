@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.0...qmux-v0.6.1) - 2026-09-27
+
+### Fixed
+
+- *(qmux)* keep the first close reason ([#399](https://github.com/moq-dev/web-transport/pull/399))
+- *(qmux)* report a finished send stream as closed cleanly ([#402](https://github.com/moq-dev/web-transport/pull/402))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 4 updates ([#400](https://github.com/moq-dev/web-transport/pull/400))
+- *(qmux)* batch writer frames, flushing the transport once ([#397](https://github.com/moq-dev/web-transport/pull/397))
+
 ## [0.5.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.0...qmux-v0.5.1) - 2026-08-20
 
 ### Added
