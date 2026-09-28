@@ -536,8 +536,7 @@ impl H3SessionAccept {
             let (typ, recv) = match self.pending_uni.poll_next(cx) {
                 Poll::Ready(Some(Ok(res))) => res,
                 Poll::Ready(Some(Err(err))) => {
-                    // Ignore the error, the stream was probably reset early.
-                    tracing::warn!("failed to decode unidirectional stream: {err:?}");
+                    log_header_error(err, "unidirectional");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => return Poll::Pending,
@@ -569,16 +568,11 @@ impl H3SessionAccept {
         expected_session: VarInt,
     ) -> Result<(StreamUni, endpoint::RecvStream), SessionError> {
         // Read the VarInt at the start of the stream.
-        let typ = VarInt::read(&mut recv)
-            .await
-            .map_err(|_| WebTransportError::UnknownSession)?;
-        let typ = StreamUni(typ);
+        let typ = StreamUni(read_varint(&mut recv).await?);
 
         if typ == StreamUni::WEBTRANSPORT {
             // Read the session_id and validate it
-            let session_id = VarInt::read(&mut recv)
-                .await
-                .map_err(|_| WebTransportError::UnknownSession)?;
+            let session_id = read_varint(&mut recv).await?;
             if session_id != expected_session {
                 return Err(WebTransportError::UnknownSession.into());
             }
@@ -623,8 +617,7 @@ impl H3SessionAccept {
             let res = match self.pending_bi.poll_next(cx) {
                 Poll::Ready(Some(Ok(res))) => res,
                 Poll::Ready(Some(Err(err))) => {
-                    // Ignore the error, the stream was probably reset early.
-                    tracing::warn!("failed to decode bidirectional stream: {err:?}");
+                    log_header_error(err, "bidirectional");
                     continue;
                 }
                 Poll::Ready(None) | Poll::Pending => return Poll::Pending,
@@ -647,23 +640,46 @@ impl H3SessionAccept {
         mut recv: endpoint::RecvStream,
         expected_session: VarInt,
     ) -> Result<Option<(endpoint::SendStream, endpoint::RecvStream)>, SessionError> {
-        let typ = VarInt::read(&mut recv)
-            .await
-            .map_err(|_| WebTransportError::UnknownSession)?;
+        let typ = read_varint(&mut recv).await?;
         if Frame(typ) != Frame::WEBTRANSPORT {
             tracing::debug!("ignoring unknown bidirectional stream: {typ:?}");
             return Ok(None);
         }
 
         // Read the session ID and validate it.
-        let session_id = VarInt::read(&mut recv)
-            .await
-            .map_err(|_| WebTransportError::UnknownSession)?;
+        let session_id = read_varint(&mut recv).await?;
         if session_id != expected_session {
             return Err(WebTransportError::UnknownSession.into());
         }
 
         Ok(Some((send, recv)))
+    }
+}
+
+// Read a stream header VarInt, keeping the read's real cause. `VarInt::read` reports any
+// failure as a truncation, which would hide a stream the peer reset before its header
+// arrived.
+async fn read_varint(recv: &mut endpoint::RecvStream) -> Result<VarInt, WebTransportError> {
+    let mut buf = [0u8; 8];
+    recv.read_exact(&mut buf[..1]).await?;
+
+    // The first two bits encode the length.
+    let size = 1 << (buf[0] >> 6);
+    recv.read_exact(&mut buf[1..size]).await?;
+
+    Ok(VarInt::decode(&mut &buf[..size]).expect("a complete varint"))
+}
+
+// Without reliable reset, a stream the peer resets early loses its header with it, which
+// is routine for some applications. Anything else is a misbehaving peer.
+fn log_header_error(err: SessionError, direction: &'static str) {
+    match err {
+        SessionError::WebTransportError(WebTransportError::ReadError(
+            endpoint::ReadExactError::ReadError(
+                endpoint::ReadError::Reset(_) | endpoint::ReadError::ConnectionLost(_),
+            ),
+        )) => tracing::debug!(?err, direction, "stream closed before its header"),
+        _ => tracing::warn!(?err, direction, "failed to decode stream header"),
     }
 }
 
@@ -768,5 +784,102 @@ impl web_transport_trait::Stats for SessionStats {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::{Endpoint, endpoint::presets};
+
+    use super::*;
+
+    const ALPN: &[u8] = b"test";
+    const SESSION: VarInt = VarInt::from_u32(0);
+
+    /// A connected client and server connection, plus the endpoints that drive them.
+    async fn pair() -> (Connection, Connection, [Endpoint; 2]) {
+        let client = Endpoint::bind(presets::Minimal).await.unwrap();
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+
+        let accept = async { server.accept().await.unwrap().await.unwrap() };
+        let (client_conn, server_conn) = tokio::join!(
+            async { client.connect(server.addr(), ALPN).await.unwrap() },
+            accept
+        );
+
+        (client_conn, server_conn, [client, server])
+    }
+
+    fn assert_reset(err: SessionError) {
+        assert!(
+            matches!(
+                &err,
+                SessionError::WebTransportError(WebTransportError::ReadError(
+                    endpoint::ReadExactError::ReadError(endpoint::ReadError::Reset(code))
+                )) if code.into_inner() == 7
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A uni stream reset before its header arrived reports the reset, not a foreign session.
+    #[tokio::test]
+    async fn uni_reset_before_header() {
+        let (client, server, _endpoints) = pair().await;
+
+        // The stream type alone, so the reset also cuts off the session ID.
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(&[0x40, 0x54]).await.unwrap();
+        send.reset(7u32.into()).unwrap();
+
+        let recv = server.accept_uni().await.unwrap();
+        let err = H3SessionAccept::decode_uni(recv, SESSION)
+            .await
+            .err()
+            .unwrap();
+        assert_reset(err);
+    }
+
+    /// A bi stream reset before its header arrived reports the reset, not a foreign session.
+    #[tokio::test]
+    async fn bi_reset_before_header() {
+        let (client, server, _endpoints) = pair().await;
+
+        let (mut send, _recv) = client.open_bi().await.unwrap();
+        send.reset(7u32.into()).unwrap();
+
+        let (send, recv) = server.accept_bi().await.unwrap();
+        let err = H3SessionAccept::decode_bi(send, recv, SESSION)
+            .await
+            .err()
+            .unwrap();
+        assert_reset(err);
+    }
+
+    /// A stream that names another session is still reported as `UnknownSession`.
+    #[tokio::test]
+    async fn uni_other_session() {
+        let (client, server, _endpoints) = pair().await;
+
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(&[0x40, 0x54, 0x04]).await.unwrap();
+        send.finish().unwrap();
+
+        let recv = server.accept_uni().await.unwrap();
+        let err = H3SessionAccept::decode_uni(recv, SESSION)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                SessionError::WebTransportError(WebTransportError::UnknownSession)
+            ),
+            "{err:?}"
+        );
     }
 }
