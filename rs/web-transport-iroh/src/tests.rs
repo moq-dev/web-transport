@@ -10,7 +10,7 @@ use std::{
 
 use iroh::{
     Endpoint,
-    endpoint::{ConnectionError, presets},
+    endpoint::{ConnectionError, ReadError, VarInt, presets},
 };
 use n0_tracing_test::traced_test;
 use tokio::time::timeout;
@@ -424,5 +424,88 @@ async fn abandoned_accepters_release_their_wakers() -> n0_error::Result<()> {
         .expect("server task timed out")
         .unwrap();
 
+    Ok(())
+}
+
+/// A raw QUIC session sends RESET_STREAM and STOP_SENDING codes as is, so a plain QUIC
+/// peer agrees on them, and still reads the HTTP/3-mapped codes an older raw peer sends.
+#[tokio::test]
+#[traced_test]
+async fn raw_stream_codes() -> n0_error::Result<()> {
+    use web_transport_trait::Error as _;
+
+    const ALPN: &str = "moql";
+    const CODE: u32 = 5;
+
+    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Client::new(client);
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = server.addr();
+
+    let (session, plain) = tokio::join!(
+        async {
+            client
+                .connect_quic(server_addr, ALPN.as_bytes())
+                .await
+                .unwrap()
+        },
+        async { server.accept().await.unwrap().await.unwrap() },
+    );
+    let legacy = VarInt::try_from(web_transport_proto::error_to_http3(CODE)).unwrap();
+
+    timeout(Duration::from_secs(10), async {
+        // Our reset and stop reach the plain peer as is.
+        let mut send = session.open_uni().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let mut recv = plain.accept_uni().await.unwrap();
+        recv.read_exact(&mut [0u8; 1]).await.unwrap();
+        send.reset(CODE).unwrap();
+        let err = recv.read(&mut [0u8; 1]).await.unwrap_err();
+        assert!(
+            matches!(err, ReadError::Reset(code) if code == CODE.into()),
+            "{err:?}"
+        );
+
+        let mut send = plain.open_uni().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        recv.read_exact(&mut [0u8; 1]).await.unwrap();
+        recv.stop(CODE).unwrap();
+        assert_eq!(send.stopped().await.unwrap(), Some(CODE.into()));
+
+        // The plain peer's codes, and a legacy peer's mapped ones, read back as the code.
+        for code in [CODE.into(), legacy] {
+            let mut send = plain.open_uni().await.unwrap();
+            send.write_all(b"x").await.unwrap();
+            let mut recv = session.accept_uni().await.unwrap();
+            recv.read_exact(&mut [0u8; 1]).await.unwrap();
+            send.reset(code).unwrap();
+            let err = recv.read(&mut [0u8; 1]).await.unwrap_err();
+            assert_eq!(err.stream_error(), Some(CODE), "{err}");
+
+            let mut send = session.open_uni().await.unwrap();
+            send.write_all(b"x").await.unwrap();
+            let mut recv = plain.accept_uni().await.unwrap();
+            recv.read_exact(&mut [0u8; 1]).await.unwrap();
+            recv.stop(code).unwrap();
+            let err = loop {
+                if let Err(err) = send.write(&[0u8; 1024]).await {
+                    break err;
+                }
+            };
+            assert_eq!(err.stream_error(), Some(CODE), "{err}");
+            assert_eq!(send.stopped().await.unwrap(), Some(CODE));
+        }
+    })
+    .await
+    .expect("timed out");
+
+    session.close(0, b"");
+    client.close().await;
+    server.close().await;
     Ok(())
 }

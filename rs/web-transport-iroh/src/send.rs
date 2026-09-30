@@ -7,7 +7,10 @@ use std::{
 use bytes::{Buf, Bytes};
 use iroh::endpoint;
 
-use crate::{ClosedStream, SessionError, WriteError};
+use crate::{
+    ClosedStream, SessionError, WriteError,
+    error::{decode_stream_code, encode_stream_code},
+};
 
 /// A stream that can be used to send bytes. See [`iroh::endpoint::SendStream`].
 ///
@@ -16,18 +19,31 @@ use crate::{ClosedStream, SessionError, WriteError};
 #[derive(Debug)]
 pub struct SendStream {
     stream: endpoint::SendStream,
+    // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
+    raw: bool,
 }
 
 impl SendStream {
-    pub(crate) fn new(stream: endpoint::SendStream) -> Self {
-        Self { stream }
+    pub(crate) fn new(stream: endpoint::SendStream, raw: bool) -> Self {
+        Self { stream, raw }
+    }
+
+    /// Decode the peer's stop code with the session's code space.
+    fn map_error(&self, e: endpoint::WriteError) -> WriteError {
+        match e {
+            endpoint::WriteError::Stopped(code) => match decode_stream_code(code, self.raw) {
+                Some(code) => WriteError::Stopped(code),
+                None => WriteError::InvalidStopped(code),
+            },
+            e => e.into(),
+        }
     }
 
     /// Abruptly reset the stream with the provided error code. See [`iroh::endpoint::SendStream::reset`].
     /// This is a u32 with WebTransport because we share the error space with HTTP/3.
+    /// A raw QUIC session sends the code as is.
     pub fn reset(&mut self, code: u32) -> Result<(), ClosedStream> {
-        let code = web_transport_proto::error_to_http3(code);
-        let code = endpoint::VarInt::try_from(code).unwrap();
+        let code = encode_stream_code(code, self.raw);
         self.stream.reset(code).map_err(Into::into)
     }
 
@@ -37,7 +53,7 @@ impl SendStream {
     /// Also unlike Quinn, this returns a SessionError, not a StoppedError, because 0-RTT is not supported.
     pub async fn stopped(&mut self) -> Result<Option<u32>, SessionError> {
         match self.stream.stopped().await {
-            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
+            Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Ok(None) => Ok(None),
             Err(endpoint::StoppedError::ConnectionLost(e)) => Err(e.into()),
             Err(endpoint::StoppedError::ZeroRttRejected) => {
@@ -50,12 +66,15 @@ impl SendStream {
 
     /// Write some data to the stream, returning the size written. See [`iroh::endpoint::SendStream::write`].
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
-        self.stream.write(buf).await.map_err(Into::into)
+        self.stream.write(buf).await.map_err(|e| self.map_error(e))
     }
 
     /// Write all of the data to the stream. See [`iroh::endpoint::SendStream::write_all`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
-        self.stream.write_all(buf).await.map_err(Into::into)
+        self.stream
+            .write_all(buf)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write chunks of data to the stream, returning the number of bytes written.
@@ -68,17 +87,23 @@ impl SendStream {
         self.stream
             .write_many_chunks(bufs)
             .await
-            .map_err(Into::into)
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write a chunk of data to the stream. See [`iroh::endpoint::SendStream::write_chunk`].
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
-        self.stream.write_chunk(buf).await.map_err(Into::into)
+        self.stream
+            .write_chunk(buf)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write all of the chunks of data to the stream. See [`iroh::endpoint::SendStream::write_all_chunks`].
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        self.stream.write_all_chunks(bufs).await.map_err(Into::into)
+        self.stream
+            .write_all_chunks(bufs)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Mark the stream as finished, such that no more data can be written. See [`iroh::endpoint::SendStream::finish`].

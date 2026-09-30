@@ -123,7 +123,7 @@ impl Session {
             self.conn
                 .accept_uni()
                 .await
-                .map(RecvStream::new)
+                .map(|recv| RecvStream::new(recv, true))
                 .map_err(Into::into)
         }
     }
@@ -136,7 +136,7 @@ impl Session {
             self.conn
                 .accept_bi()
                 .await
-                .map(|(send, recv)| (SendStream::new(send), RecvStream::new(recv)))
+                .map(|(send, recv)| (SendStream::new(send, true), RecvStream::new(recv, true)))
                 .map_err(Into::into)
         }
     }
@@ -149,7 +149,7 @@ impl Session {
             write_full_with_max_prio(&mut send, &h3.header_uni).await?;
         }
 
-        Ok(SendStream::new(send))
+        Ok(SendStream::new(send, self.h3.is_none()))
     }
 
     /// Open a new bidirectional stream. See [`iroh::endpoint::Connection::open_bi`].
@@ -160,7 +160,8 @@ impl Session {
             write_full_with_max_prio(&mut send, &h3.header_bi).await?;
         }
 
-        Ok((SendStream::new(send), RecvStream::new(recv)))
+        let raw = self.h3.is_none();
+        Ok((SendStream::new(send, raw), RecvStream::new(recv, raw)))
     }
 
     /// Asynchronously receives an application datagram from the remote peer.
@@ -545,7 +546,7 @@ impl H3SessionAccept {
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
-                    let recv = RecvStream::new(recv);
+                    let recv = RecvStream::new(recv, false);
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -625,8 +626,8 @@ impl H3SessionAccept {
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
-                let send = SendStream::new(send);
-                let recv = RecvStream::new(recv);
+                let send = SendStream::new(send, false);
+                let recv = RecvStream::new(recv, false);
                 return Poll::Ready(Ok((send, recv)));
             }
 

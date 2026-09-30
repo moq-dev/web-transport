@@ -51,6 +51,27 @@ pub enum SessionError {
     SendDatagramError(#[error(source, from, std_err)] endpoint::SendDatagramError),
 }
 
+/// The QUIC code to reset or stop a stream with. Raw QUIC sends the code as is, while
+/// HTTP/3 maps it into its own code space.
+pub(crate) fn encode_stream_code(code: u32, raw: bool) -> endpoint::VarInt {
+    if raw {
+        return code.into();
+    }
+    endpoint::VarInt::try_from(web_transport_proto::error_to_http3(code)).unwrap()
+}
+
+/// Decode the peer's QUIC code for a stream reset or stop, or None if it is not one.
+pub(crate) fn decode_stream_code(code: endpoint::VarInt, raw: bool) -> Option<u32> {
+    let code = code.into_inner();
+    // An older raw peer maps its codes into the HTTP/3 range too. No u32 reaches that
+    // range, so the mapped form cannot be mistaken for a raw code.
+    match web_transport_proto::error_from_http3(code) {
+        Some(code) => Some(code),
+        None if raw => u32::try_from(code).ok(),
+        None => None,
+    }
+}
+
 /// An error that can occur when reading/writing the WebTransport stream header.
 #[stack_error(derive, from_sources)]
 #[derive(Clone)]
