@@ -235,3 +235,64 @@ async fn raw_session_streams_omit_webtransport_header() -> Result<()> {
 
     Ok(())
 }
+
+/// A raw session sends RESET_STREAM and STOP_SENDING codes as is, so a plain QUIC
+/// peer agrees on them, and still reads the HTTP/3-mapped codes an older raw peer sends.
+#[tokio::test]
+async fn raw_session_stream_codes_are_not_mapped() -> Result<()> {
+    use web_transport_trait::Error as _;
+
+    const CODE: u32 = 5;
+
+    let (client_conn, plain) = connect_raw().await?;
+    let session = Session::raw(client_conn);
+    let legacy = quinn::VarInt::try_from(web_transport_proto::error_to_http3(CODE))?;
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        // Our reset and stop reach the plain peer as is.
+        let mut send = session.open_uni().await?;
+        send.write_all(b"x").await?;
+        let mut recv = plain.accept_uni().await?;
+        recv.read_exact(&mut [0u8; 1]).await?;
+        send.reset(CODE)?;
+        let err = recv.read(&mut [0u8; 1]).await.unwrap_err();
+        assert!(
+            matches!(err, quinn::ReadError::Reset(code) if code == CODE.into()),
+            "{err:?}"
+        );
+
+        let mut send = plain.open_uni().await?;
+        send.write_all(b"x").await?;
+        let mut recv = session.accept_uni().await?;
+        recv.read_exact(&mut [0u8; 1]).await?;
+        recv.stop(CODE)?;
+        assert_eq!(send.stopped().await?, Some(CODE.into()));
+
+        // The plain peer's codes, and a legacy peer's mapped ones, read back as the code.
+        for code in [CODE.into(), legacy] {
+            let mut send = plain.open_uni().await?;
+            send.write_all(b"x").await?;
+            let mut recv = session.accept_uni().await?;
+            recv.read_exact(&mut [0u8; 1]).await?;
+            send.reset(code)?;
+            let err = recv.read(&mut [0u8; 1]).await.unwrap_err();
+            assert_eq!(err.stream_error(), Some(CODE), "{err}");
+
+            let mut send = session.open_uni().await?;
+            send.write_all(b"x").await?;
+            let mut recv = plain.accept_uni().await?;
+            recv.read_exact(&mut [0u8; 1]).await?;
+            recv.stop(code)?;
+            let err = loop {
+                if let Err(err) = send.write(&[0u8; 1024]).await {
+                    break err;
+                }
+            };
+            assert_eq!(err.stream_error(), Some(CODE), "{err}");
+            assert_eq!(send.stopped().await?, Some(CODE));
+        }
+
+        anyhow::Ok(())
+    })
+    .await?
+}
