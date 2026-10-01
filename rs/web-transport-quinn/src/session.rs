@@ -396,7 +396,10 @@ impl Session {
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
-        // this is a no-op.
+        // this is a no-op. A raw peer close that already arrived is latched first.
+        if let Some(err) = self.conn.close_reason() {
+            self.map_error(err);
+        }
         let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
         if self.error.set(err).is_err() {
             return;

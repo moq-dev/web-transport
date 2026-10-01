@@ -279,3 +279,19 @@ async fn raw_peer_close_code_is_reported_by_session_and_streams() -> Result<()> 
     assert_eq!(stopped.session_error(), closed.session_error());
     Ok(())
 }
+
+#[tokio::test]
+async fn raw_peer_close_survives_local_close() -> Result<()> {
+    use web_transport_trait::Error as _;
+    let (client, peer) = connect_raw().await?;
+    let session = Session::raw(client.clone());
+    peer.close(4075u32.into(), b"application close");
+    // Wait on the quinn connection so the session never observes the close first.
+    client.closed().await;
+    session.close(1, b"cleanup");
+    assert_eq!(
+        session.close_reason().unwrap().session_error(),
+        Some((4075, "application close".into()))
+    );
+    Ok(())
+}

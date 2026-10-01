@@ -105,11 +105,17 @@ impl CloseReason {
         if self.raw {
             if let Some(quinn::ConnectionError::ApplicationClosed(close)) = connection {
                 if let Ok(code) = u32::try_from(close.error_code.into_inner()) {
-                    return WebTransportError::Closed(
-                        code,
-                        String::from_utf8_lossy(&close.reason).into_owned(),
-                    )
-                    .into();
+                    // Raw sessions have no capsule task, so latch the peer close here.
+                    return self
+                        .reason
+                        .get_or_init(|| {
+                            WebTransportError::Closed(
+                                code,
+                                String::from_utf8_lossy(&close.reason).into_owned(),
+                            )
+                            .into()
+                        })
+                        .clone();
                 }
             }
         }
@@ -369,6 +375,11 @@ mod tests {
             raw.map(peer_close(4075)).session_error(),
             Some((4075, "peer closed".into()))
         );
+        assert!(raw
+            .set(quinn::ConnectionError::LocallyClosed.into())
+            .is_err());
+
+        let raw = CloseReason::new(true);
         assert_eq!(
             raw.map(peer_close(u32::MAX as u64 + 1)).session_error(),
             None
