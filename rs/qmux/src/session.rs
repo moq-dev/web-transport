@@ -1006,33 +1006,19 @@ impl<R: Reader> SessionState<R> {
                     return Err(Error::InvalidStreamId);
                 }
 
-                // Ignore a post-terminal frame on a retired peer-initiated stream
-                // before consuming connection credit — otherwise a flood of
-                // duplicate/late frames would drain conn flow-control that's never
-                // replenished (they're not delivered). `is_closed` distinguishes a
-                // retired id from one merely implicitly opened (a higher index
-                // arrived first); a live stream is delivered by the fast path below,
-                // so exclude it. Only QMux tracks this (MAX_STREAMS bounds the holes).
-                let live = self.streams.lock().unwrap().recv.contains_key(&stream.id);
-                if self.config.version.is_qmux()
-                    && stream.id.server_initiated() != self.is_server
-                    && !live
-                    && self.recv_open(stream.id.dir()).is_closed(stream.id.index())
-                {
-                    return Ok(());
-                }
-
-                // Connection-level flow control.
                 let data_len = stream.data.len() as u64;
-                if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
-                    return Err(Error::FlowControlError);
-                }
 
-                // Fast path: an existing stream. Check its window and deliver under
-                // a brief lock (never held across an await).
+                // Fast path: an existing stream. Look it up once and deliver under
+                // that lock (never held across an await). The writer task removes
+                // the entry concurrently when a dropped `RecvStream` queues
+                // STOP_SENDING, so a separate existence check can go stale and
+                // resurrect the stream below.
                 {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.get_mut(&stream.id) {
+                        if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
+                            return Err(Error::FlowControlError);
+                        }
                         if data_len > 0 && !recv.recv_credit.receive(data_len) {
                             return Err(Error::FlowControlError);
                         }
@@ -1052,6 +1038,24 @@ impl<R: Reader> SessionState<R> {
                         }
                         return Ok(());
                     }
+                }
+
+                // Ignore a post-terminal frame on a retired peer-initiated stream
+                // before consuming connection credit — otherwise a flood of
+                // duplicate/late frames would drain conn flow-control that's never
+                // replenished (they're not delivered). `is_closed` distinguishes a
+                // retired id from one merely implicitly opened (a higher index
+                // arrived first). Only QMux tracks this (MAX_STREAMS bounds the holes).
+                if self.config.version.is_qmux()
+                    && stream.id.server_initiated() != self.is_server
+                    && self.recv_open(stream.id.dir()).is_closed(stream.id.index())
+                {
+                    return Ok(());
+                }
+
+                // Connection-level flow control.
+                if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
+                    return Err(Error::FlowControlError);
                 }
 
                 // A frame on one of our own (already-retired) streams: ignore it.
@@ -1219,25 +1223,48 @@ impl<R: Reader> SessionState<R> {
 
                 let reset_id = reset.id;
                 let peer_initiated = reset_id.server_initiated() != self.is_server;
-                let live = self.streams.lock().unwrap().recv.contains_key(&reset_id);
 
-                if !live {
-                    // A terminal peer-initiated stream stays terminal. In
-                    // particular, a duplicate RESET must not consume its final
-                    // size twice. A locally-created receive half that is absent is
-                    // likewise already closed.
-                    if !peer_initiated {
-                        return Ok(());
-                    }
-                    if self.config.version.is_qmux()
-                        && self.recv_open(reset_id.dir()).is_closed(reset_id.index())
-                    {
-                        return Ok(());
-                    }
+                // Take the entry in one lookup. The writer task removes it
+                // concurrently when a dropped `RecvStream` queues STOP_SENDING, so a
+                // separate existence check can go stale before the entry is used.
+                let live = self.streams.lock().unwrap().recv.remove(&reset_id);
 
-                    // RESET_STREAM can be the first frame for a peer-initiated
-                    // stream and therefore implicitly opens its index.
-                    if self.config.version.is_qmux() {
+                if !self.config.version.is_qmux() {
+                    if let Some(recv) = live {
+                        recv.inbound_reset.send(reset).ok();
+                    }
+                    return Ok(());
+                }
+
+                let gap = match &live {
+                    Some(recv) => {
+                        // Drafts through -02 were emitted by implementations that
+                        // incorrectly used zero here. Preserve compatibility by never
+                        // letting that value reduce bytes already received; strict
+                        // FINAL_SIZE_ERROR validation begins with draft-03.
+                        // TODO(qmux-03): Once draft-03 is implemented, reject
+                        // reset.final_size < received (and conflicting terminal final
+                        // sizes) with FINAL_SIZE_ERROR instead of taking the maximum.
+                        let final_size = reset.final_size.max(recv.recv_offset);
+                        let gap = final_size - recv.recv_offset;
+                        if !recv.recv_credit.receive(gap) {
+                            return Err(Error::FlowControlError);
+                        }
+                        gap
+                    }
+                    None => {
+                        // A terminal peer-initiated stream stays terminal. In
+                        // particular, a duplicate RESET must not consume its final
+                        // size twice. A locally-created receive half that is absent
+                        // is likewise already closed.
+                        if !peer_initiated
+                            || self.recv_open(reset_id.dir()).is_closed(reset_id.index())
+                        {
+                            return Ok(());
+                        }
+
+                        // RESET_STREAM can be the first frame for a peer-initiated
+                        // stream and therefore implicitly opens its index.
                         let credit = match reset_id.dir() {
                             StreamDir::Bi => &self.recv_bi_credit,
                             StreamDir::Uni => &self.recv_uni_credit,
@@ -1245,83 +1272,54 @@ impl<R: Reader> SessionState<R> {
                         if !credit.receive_up_to(reset_id.index() + 1) {
                             return Err(Error::StreamLimitExceeded);
                         }
-                    }
-                }
 
-                if self.config.version.is_qmux() {
-                    let received = self
-                        .streams
-                        .lock()
-                        .unwrap()
-                        .recv
-                        .get(&reset_id)
-                        .map_or(0, |recv| recv.recv_offset);
-
-                    // Drafts through -02 were emitted by implementations that
-                    // incorrectly used zero here. Preserve compatibility by never
-                    // letting that value reduce bytes already received; strict
-                    // FINAL_SIZE_ERROR validation begins with draft-03.
-                    // TODO(qmux-03): Once draft-03 is implemented, reject
-                    // reset.final_size < received (and conflicting terminal final
-                    // sizes) with FINAL_SIZE_ERROR instead of taking the maximum.
-                    let final_size = reset.final_size.max(received);
-                    let gap = final_size - received;
-
-                    let stream_ok = if live {
-                        let mut streams = self.streams.lock().unwrap();
-                        let recv = streams.recv.get_mut(&reset_id).expect("live recv stream");
-                        let ok = recv.recv_credit.receive(gap);
-                        if ok {
-                            recv.recv_offset = final_size;
-                        }
-                        ok
-                    } else {
                         let recv_max = match reset_id.dir() {
                             StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
                             StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
                         };
-                        final_size <= recv_max
-                    };
-                    if !stream_ok || !self.conn_recv_credit.receive(gap) {
-                        return Err(Error::FlowControlError);
-                    }
-                    // The gap consumes connection flow control, but no bytes in
-                    // it can ever occupy receive memory. Make it immediately
-                    // eligible to replenish the connection window.
-                    if let Some(new_max) = self.conn_recv_credit.consume(gap) {
-                        self.control.send(Frame::MaxData(new_max)).ok();
-                    }
-                }
-
-                // Live stream: deliver the reset and drop it (it was recorded in
-                // `recv_open` at creation, so it now reads as closed).
-                let delivered = {
-                    let mut streams = self.streams.lock().unwrap();
-                    if let Some(recv) = streams.recv.remove(&reset_id) {
-                        recv.inbound_reset.send(reset).ok();
-                        true
-                    } else {
-                        false
+                        if reset.final_size > recv_max {
+                            return Err(Error::FlowControlError);
+                        }
+                        reset.final_size
                     }
                 };
-                if !delivered && self.config.version.is_qmux() && peer_initiated {
-                    match reset_id.dir() {
-                        StreamDir::Bi => &mut self.recv_open_bi,
-                        StreamDir::Uni => &mut self.recv_open_uni,
-                    }
-                    .record(reset_id.index());
 
-                    // No frontend exists to replenish MAX_STREAMS on Drop.
-                    let credit = match reset_id.dir() {
-                        StreamDir::Bi => &self.recv_bi_credit,
-                        StreamDir::Uni => &self.recv_uni_credit,
-                    };
-                    if let Some(new_max) = credit.consume(1) {
-                        let frame = match reset_id.dir() {
-                            StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                            StreamDir::Uni => Frame::MaxStreamsUni(new_max),
+                if !self.conn_recv_credit.receive(gap) {
+                    return Err(Error::FlowControlError);
+                }
+                // The gap consumes connection flow control, but no bytes in it can
+                // ever occupy receive memory. Make it immediately eligible to
+                // replenish the connection window.
+                if let Some(new_max) = self.conn_recv_credit.consume(gap) {
+                    self.control.send(Frame::MaxData(new_max)).ok();
+                }
+
+                match live {
+                    // Deliver the reset. The id was recorded in `recv_open` at
+                    // creation, so it already reads as closed.
+                    Some(recv) => {
+                        recv.inbound_reset.send(reset).ok();
+                    }
+                    // Reset-first stream: retire the id, and replenish MAX_STREAMS
+                    // since no frontend exists to do it on Drop.
+                    None => {
+                        match reset_id.dir() {
+                            StreamDir::Bi => &mut self.recv_open_bi,
+                            StreamDir::Uni => &mut self.recv_open_uni,
+                        }
+                        .record(reset_id.index());
+
+                        let credit = match reset_id.dir() {
+                            StreamDir::Bi => &self.recv_bi_credit,
+                            StreamDir::Uni => &self.recv_uni_credit,
                         };
-                        self.control.send(frame).ok();
+                        if let Some(new_max) = credit.consume(1) {
+                            let frame = match reset_id.dir() {
+                                StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
+                                StreamDir::Uni => Frame::MaxStreamsUni(new_max),
+                            };
+                            self.control.send(frame).ok();
+                        }
                     }
                 }
             }
@@ -3366,6 +3364,55 @@ mod recv_open_tests {
 
         // Reads resume at offset 2, in order, with nothing dropped.
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"lloworld!");
+    }
+
+    /// Streams raced against a dropped `RecvStream`: dropping it queues
+    /// STOP_SENDING, and the writer task removes the receive entry while the
+    /// reader handles the peer's next frame on that stream. Enough iterations
+    /// to land the removal mid-frame; a single lookup makes the race benign.
+    const RACE_ITERATIONS: u64 = 10_000;
+
+    fn race_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
+        let mut config = Config::new(Version::QMux01);
+        config.max_streams_uni = RACE_ITERATIONS;
+        scripted_session_with_config(config)
+    }
+
+    /// A RESET_STREAM whose entry vanishes mid-handling is a no-op, not a
+    /// reader panic that wedges the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reset_racing_stop_sending_is_a_noop() {
+        let (session, tx) = race_session();
+        for i in 0..RACE_ITERATIONS {
+            tx.send(uni_stream(i, b"x", false)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("reader stalled after a racing reset")
+                .expect("accept_uni failed");
+            tx.send(uni_reset(i, 5)).unwrap();
+            drop(recv);
+        }
+    }
+
+    /// A STREAM frame whose entry vanishes mid-handling must not resurrect the
+    /// stream as a new accepted one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_racing_stop_sending_is_not_resurrected() {
+        let (session, tx) = race_session();
+        for i in 0..RACE_ITERATIONS {
+            tx.send(uni_stream(i, b"x", false)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("accept_uni timed out")
+                .expect("accept_uni failed");
+            assert_eq!(
+                recv.id,
+                StreamId::new(i, StreamDir::Uni, true),
+                "a stopped stream was resurrected"
+            );
+            tx.send(uni_stream(i, b"y", false)).unwrap();
+            drop(recv);
+        }
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a
