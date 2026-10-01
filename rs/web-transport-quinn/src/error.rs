@@ -70,14 +70,22 @@ impl From<quinn::ConnectionError> for SessionError {
 /// The session's first close reason and its application-code space.
 #[derive(Debug)]
 pub(crate) struct CloseReason {
-    raw: bool,
+    // The raw QUIC connection, whose application codes bypass the HTTP/3 mapping.
+    raw: Option<quinn::Connection>,
     reason: OnceLock<SessionError>,
 }
 
 impl CloseReason {
-    pub(crate) fn new(raw: bool) -> Self {
+    pub(crate) fn http3() -> Self {
         Self {
-            raw,
+            raw: None,
+            reason: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn raw(conn: quinn::Connection) -> Self {
+        Self {
+            raw: Some(conn),
             reason: OnceLock::new(),
         }
     }
@@ -91,35 +99,37 @@ impl CloseReason {
     }
 
     pub(crate) fn map(&self, err: SessionError) -> SessionError {
-        let connection = match &err {
-            SessionError::ConnectionError(connection)
-            | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(
-                connection,
-            )) => Some(connection),
-            SessionError::WebTransportError(WebTransportError::Closed(..)) => None,
-            _ => return err,
-        };
+        if !matches!(
+            &err,
+            SessionError::ConnectionError(_)
+                | SessionError::WebTransportError(WebTransportError::Closed(..))
+                | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(_))
+        ) {
+            return err;
+        }
         if let Some(reason) = self.get() {
             return reason.clone();
         }
-        if self.raw {
-            if let Some(quinn::ConnectionError::ApplicationClosed(close)) = connection {
-                if let Ok(code) = u32::try_from(close.error_code.into_inner()) {
-                    // Raw sessions have no capsule task, so latch the peer close here.
-                    return self
-                        .reason
-                        .get_or_init(|| {
-                            WebTransportError::Closed(
-                                code,
-                                String::from_utf8_lossy(&close.reason).into_owned(),
-                            )
-                            .into()
-                        })
-                        .clone();
+
+        // `err` was already decoded as HTTP/3, so a raw session decodes the connection's own reason.
+        // Raw sessions have no capsule task, so the peer close is latched here.
+        let Some(quinn::ConnectionError::ApplicationClosed(close)) =
+            self.raw.as_ref().and_then(|conn| conn.close_reason())
+        else {
+            return err;
+        };
+        self.reason
+            .get_or_init(|| match u32::try_from(close.error_code.into_inner()) {
+                Ok(code) => WebTransportError::Closed(
+                    code,
+                    String::from_utf8_lossy(&close.reason).into_owned(),
+                )
+                .into(),
+                Err(_) => {
+                    SessionError::ConnectionError(quinn::ConnectionError::ApplicationClosed(close))
                 }
-            }
-        }
-        err
+            })
+            .clone()
     }
 }
 
@@ -369,26 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_close_uses_the_application_code_space() {
-        let raw = CloseReason::new(true);
-        assert_eq!(
-            raw.map(peer_close(4075)).session_error(),
-            Some((4075, "peer closed".into()))
-        );
-        assert!(raw
-            .set(quinn::ConnectionError::LocallyClosed.into())
-            .is_err());
-
-        let raw = CloseReason::new(true);
-        assert_eq!(
-            raw.map(peer_close(u32::MAX as u64 + 1)).session_error(),
-            None
-        );
-    }
-
-    #[test]
     fn http3_close_keeps_its_code_space() {
-        let h3 = CloseReason::new(false);
+        let h3 = CloseReason::http3();
         assert_eq!(h3.map(peer_close(4075)).session_error(), None);
         assert_eq!(
             h3.map(peer_close(web_transport_proto::error_to_http3(4075)))

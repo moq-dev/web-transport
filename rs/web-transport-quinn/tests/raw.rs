@@ -295,3 +295,20 @@ async fn raw_peer_close_survives_local_close() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn raw_peer_close_above_u32_is_not_a_session_error() -> Result<()> {
+    use web_transport_trait::Error as _;
+    // Includes a code that would decode as WebTransport code 7 under the HTTP/3 mapping.
+    for code in [u32::MAX as u64 + 1, web_transport_proto::error_to_http3(7)] {
+        let (client, peer) = connect_raw().await?;
+        let session = Session::raw(client);
+        peer.close(quinn::VarInt::from_u64(code)?, b"too big");
+        assert_eq!(
+            session.closed().await.session_error(),
+            None,
+            "code {code:#x}"
+        );
+    }
+    Ok(())
+}

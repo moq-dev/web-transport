@@ -142,7 +142,7 @@ impl Session {
         let mut header_datagram = Vec::new();
         session_id.encode(&mut header_datagram);
 
-        let error = Arc::new(CloseReason::new(false));
+        let error = Arc::new(CloseReason::http3());
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
@@ -538,6 +538,7 @@ impl Session {
     /// (from `into_0rtt`, say) is fine, it just has no ALPN to report until it is done.
     pub fn raw(conn: quinn::Connection) -> Self {
         Self {
+            error: Arc::new(CloseReason::raw(conn.clone())),
             conn,
             session_id: None,
             header_uni: Default::default(),
@@ -555,7 +556,6 @@ impl Session {
             parked_accept_bi: Default::default(),
             settings: None,
             connect_send: Arc::new(Mutex::new(None)),
-            error: Arc::new(CloseReason::new(true)),
             request: None,
             response: None,
             alpn: Default::default(),
