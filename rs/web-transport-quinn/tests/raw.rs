@@ -235,3 +235,47 @@ async fn raw_session_streams_omit_webtransport_header() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn raw_peer_close_code_is_reported_by_session_and_streams() -> Result<()> {
+    use web_transport_trait::Error as _;
+    let (client, peer) = connect_raw().await?;
+    let session = Session::raw(client);
+    let mut send = session.open_uni().await?;
+    send.write_all(b"hello").await?;
+    let mut peer_recv = peer.accept_uni().await?;
+    let mut hello = [0; 5];
+    peer_recv.read_exact(&mut hello).await?;
+    let mut peer_send = peer.open_uni().await?;
+    peer_send.write_all(b"hello").await?;
+    let mut recv = session.accept_uni().await?;
+    recv.read_exact(&mut hello).await?;
+    peer.close(4075u32.into(), b"application close");
+    let closed = session.closed().await;
+    assert_eq!(
+        closed.session_error(),
+        Some((4075, "application close".into()))
+    );
+    assert_eq!(
+        session.close_reason().unwrap().session_error(),
+        closed.session_error()
+    );
+    assert_eq!(
+        send.write_all(b"after close")
+            .await
+            .unwrap_err()
+            .session_error(),
+        closed.session_error()
+    );
+    assert_eq!(
+        recv.read(&mut hello).await.unwrap_err().session_error(),
+        closed.session_error()
+    );
+    let stopped = futures::future::poll_fn(|cx| {
+        web_transport_trait::poll::SendStream::poll_closed(&mut send, cx)
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.session_error(), closed.session_error());
+    Ok(())
+}

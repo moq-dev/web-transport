@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -64,6 +64,56 @@ impl From<quinn::ConnectionError> for SessionError {
             }
             _ => SessionError::ConnectionError(e),
         }
+    }
+}
+
+/// The session's first close reason and its application-code space.
+#[derive(Debug)]
+pub(crate) struct CloseReason {
+    raw: bool,
+    reason: OnceLock<SessionError>,
+}
+
+impl CloseReason {
+    pub(crate) fn new(raw: bool) -> Self {
+        Self {
+            raw,
+            reason: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&SessionError> {
+        self.reason.get()
+    }
+
+    pub(crate) fn set(&self, err: SessionError) -> Result<(), SessionError> {
+        self.reason.set(err)
+    }
+
+    pub(crate) fn map(&self, err: SessionError) -> SessionError {
+        let connection = match &err {
+            SessionError::ConnectionError(connection)
+            | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(
+                connection,
+            )) => Some(connection),
+            SessionError::WebTransportError(WebTransportError::Closed(..)) => None,
+            _ => return err,
+        };
+        if let Some(reason) = self.get() {
+            return reason.clone();
+        }
+        if self.raw {
+            if let Some(quinn::ConnectionError::ApplicationClosed(close)) = connection {
+                if let Ok(code) = u32::try_from(close.error_code.into_inner()) {
+                    return WebTransportError::Closed(
+                        code,
+                        String::from_utf8_lossy(&close.reason).into_owned(),
+                    )
+                    .into();
+                }
+            }
+        }
+        err
     }
 }
 
@@ -296,5 +346,43 @@ impl web_transport_trait::Error for ReadError {
             ReadError::Reset(code) => Some(*code),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use web_transport_trait::Error as _;
+
+    fn peer_close(code: u64) -> SessionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u64(code).unwrap(),
+            reason: b"peer closed".as_slice().into(),
+        })
+        .into()
+    }
+
+    #[test]
+    fn raw_close_uses_the_application_code_space() {
+        let raw = CloseReason::new(true);
+        assert_eq!(
+            raw.map(peer_close(4075)).session_error(),
+            Some((4075, "peer closed".into()))
+        );
+        assert_eq!(
+            raw.map(peer_close(u32::MAX as u64 + 1)).session_error(),
+            None
+        );
+    }
+
+    #[test]
+    fn http3_close_keeps_its_code_space() {
+        let h3 = CloseReason::new(false);
+        assert_eq!(h3.map(peer_close(4075)).session_error(), None);
+        assert_eq!(
+            h3.map(peer_close(web_transport_proto::error_to_http3(4075)))
+                .session_error(),
+            Some((4075, "peer closed".into()))
+        );
     }
 }
