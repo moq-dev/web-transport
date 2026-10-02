@@ -9,26 +9,39 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::{ReadError, ReadExactError, ReadToEndError, SessionError};
+use crate::{
+    error::{decode_stream_code, encode_stream_code},
+    ReadError, ReadExactError, ReadToEndError, SessionError,
+};
 
 /// A stream that can be used to recieve bytes. See [`quinn::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: quinn::RecvStream,
     error: Arc<CloseReason>,
+    // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
+    raw: bool,
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: quinn::RecvStream, error: Arc<CloseReason>) -> Self {
+    pub(crate) fn new(stream: quinn::RecvStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             inner: stream,
             error,
+            raw,
         }
     }
 
-    /// Replace connection-level errors with the stored session error if available.
-    fn map_error(&self, e: impl Into<ReadError>) -> ReadError {
-        let e = e.into();
+    /// Decode the peer's reset code, and replace connection-level errors with the stored
+    /// session error if available.
+    fn map_error(&self, e: quinn::ReadError) -> ReadError {
+        let e = match e {
+            quinn::ReadError::Reset(code) => match decode_stream_code(code, self.raw) {
+                Some(code) => ReadError::Reset(code),
+                None => ReadError::InvalidReset(code),
+            },
+            e => e.into(),
+        };
         if let Some(err) = self.error.get() {
             if matches!(&e, ReadError::SessionError(_) | ReadError::InvalidReset(_)) {
                 return ReadError::SessionError(err.clone());
@@ -42,9 +55,9 @@ impl RecvStream {
 
     /// Tell the other end to stop sending data with the given error code. See [`quinn::RecvStream::stop`].
     /// This is a u32 with WebTransport since it shares the error space with HTTP/3.
+    /// A raw QUIC session sends the code as is.
     pub fn stop(&mut self, code: u32) -> Result<(), quinn::ClosedStream> {
-        let code = web_transport_proto::error_to_http3(code);
-        let code = quinn::VarInt::try_from(code).unwrap();
+        let code = encode_stream_code(code, self.raw);
         self.inner.stop(code)
     }
 
@@ -100,7 +113,7 @@ impl RecvStream {
     pub async fn received_reset(&mut self) -> Result<Option<u32>, SessionError> {
         match self.inner.received_reset().await {
             Ok(None) => Ok(None),
-            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
+            Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Err(quinn::ResetError::ConnectionLost(conn_err)) => {
                 Err(self.error.map(conn_err.into()))
             }

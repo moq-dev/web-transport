@@ -8,7 +8,10 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::{ClosedStream, SessionError, WriteError};
+use crate::{
+    error::{decode_stream_code, encode_stream_code},
+    ClosedStream, SessionError, WriteError,
+};
 
 /// A stream that can be used to send bytes. See [`quinn::SendStream`].
 ///
@@ -19,22 +22,33 @@ pub struct SendStream {
     stream: quinn::SendStream,
     error: Arc<CloseReason>,
 
+    // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
+    raw: bool,
+
     // Retains the `stopped()` future across `poll_closed` calls.
     closed: crate::op::Op<Result<(), WriteError>>,
 }
 
 impl SendStream {
-    pub(crate) fn new(stream: quinn::SendStream, error: Arc<CloseReason>) -> Self {
+    pub(crate) fn new(stream: quinn::SendStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             stream,
             error,
+            raw,
             closed: Default::default(),
         }
     }
 
-    /// Replace connection-level errors with the stored session error if available.
-    fn map_error(&self, e: impl Into<WriteError>) -> WriteError {
-        let e = e.into();
+    /// Decode the peer's stop code, and replace connection-level errors with the stored
+    /// session error if available.
+    fn map_error(&self, e: quinn::WriteError) -> WriteError {
+        let e = match e {
+            quinn::WriteError::Stopped(code) => match decode_stream_code(code, self.raw) {
+                Some(code) => WriteError::Stopped(code),
+                None => WriteError::InvalidStopped(code),
+            },
+            e => e.into(),
+        };
         if let Some(err) = self.error.get() {
             if matches!(
                 &e,
@@ -51,9 +65,9 @@ impl SendStream {
 
     /// Abruptly reset the stream with the provided error code. See [`quinn::SendStream::reset`].
     /// This is a u32 with WebTransport because we share the error space with HTTP/3.
+    /// A raw QUIC session sends the code as is.
     pub fn reset(&mut self, code: u32) -> Result<(), ClosedStream> {
-        let code = web_transport_proto::error_to_http3(code);
-        let code = quinn::VarInt::try_from(code).unwrap();
+        let code = encode_stream_code(code, self.raw);
         self.stream.reset(code).map_err(Into::into)
     }
 
@@ -63,7 +77,7 @@ impl SendStream {
     /// Also unlike Quinn, this returns a SessionError, not a StoppedError, because 0-RTT is not supported.
     pub async fn stopped(&self) -> Result<Option<u32>, SessionError> {
         match self.stream.stopped().await {
-            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
+            Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Ok(None) => Ok(None),
             Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
                 Err(self.error.map(conn_err.into()))
@@ -236,10 +250,11 @@ impl web_transport_trait::poll::SendStream for SendStream {
         // registration and we would never be woken.
         let stopped = self.stream.stopped();
         let error = self.error.clone();
+        let raw = self.raw;
 
         self.closed.poll(cx, move || async move {
             match stopped.await {
-                Ok(Some(code)) => match web_transport_proto::error_from_http3(code.into_inner()) {
+                Ok(Some(code)) => match decode_stream_code(code, raw) {
                     Some(code) => Err(WriteError::Stopped(code)),
                     None => Err(WriteError::InvalidStopped(code)),
                 },

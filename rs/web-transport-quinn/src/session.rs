@@ -267,7 +267,7 @@ impl Session {
                 .accept_uni()
                 .await
                 .map_err(|e| self.map_error(e))?;
-            Ok(RecvStream::new(recv, self.error.clone()))
+            Ok(RecvStream::new(recv, self.error.clone(), true))
         }
     }
 
@@ -280,8 +280,8 @@ impl Session {
         } else {
             let (send, recv) = self.conn.accept_bi().await.map_err(|e| self.map_error(e))?;
             Ok((
-                SendStream::new(send, self.error.clone()),
-                RecvStream::new(recv, self.error.clone()),
+                SendStream::new(send, self.error.clone(), true),
+                RecvStream::new(recv, self.error.clone(), true),
             ))
         }
     }
@@ -292,6 +292,7 @@ impl Session {
             self.conn.clone(),
             self.header_uni.clone(),
             self.error.clone(),
+            self.is_raw(),
         )
         .await
     }
@@ -302,6 +303,7 @@ impl Session {
             self.conn.clone(),
             self.header_bi.clone(),
             self.error.clone(),
+            self.is_raw(),
         )
         .await
     }
@@ -500,6 +502,11 @@ impl Session {
     /// Return why the session was closed, or None if it's not closed. See [`quinn::Connection::close_reason`].
     pub fn close_reason(&self) -> Option<SessionError> {
         self.conn.close_reason().map(|e| self.map_error(e))
+    }
+
+    /// Whether this is a raw QUIC session, with no HTTP/3 layer.
+    fn is_raw(&self) -> bool {
+        self.session_id.is_none()
     }
 
     /// Replace connection-level errors with the stored session error if available.
@@ -822,7 +829,7 @@ impl SessionAccept {
             // Decide if we keep looping based on the type.
             match typ {
                 StreamUni::WEBTRANSPORT => {
-                    let recv = RecvStream::new(recv, self.error.clone());
+                    let recv = RecvStream::new(recv, self.error.clone(), false);
                     return Poll::Ready(Ok(recv));
                 }
                 StreamUni::QPACK_DECODER => {
@@ -902,8 +909,8 @@ impl SessionAccept {
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
-                let send = SendStream::new(send, self.error.clone());
-                let recv = RecvStream::new(recv, self.error.clone());
+                let send = SendStream::new(send, self.error.clone(), false);
+                let recv = RecvStream::new(recv, self.error.clone(), false);
                 return Poll::Ready(Ok((send, recv)));
             }
 
@@ -1067,6 +1074,7 @@ impl Session {
         conn: quinn::Connection,
         header: Bytes,
         error: Arc<CloseReason>,
+        raw: bool,
     ) -> Result<SendStream, SessionError> {
         let mut send = conn
             .open_uni()
@@ -1081,13 +1089,14 @@ impl Session {
             .map_err(|e| Self::map_error_owned(&error, e))?;
         send.set_priority(0).ok();
 
-        Ok(SendStream::new(send, error))
+        Ok(SendStream::new(send, error, raw))
     }
 
     async fn open_bi_owned(
         conn: quinn::Connection,
         header: Bytes,
         error: Arc<CloseReason>,
+        raw: bool,
     ) -> Result<(SendStream, RecvStream), SessionError> {
         let (mut send, recv) = conn
             .open_bi()
@@ -1101,8 +1110,8 @@ impl Session {
         send.set_priority(0).ok();
 
         Ok((
-            SendStream::new(send, error.clone()),
-            RecvStream::new(recv, error),
+            SendStream::new(send, error.clone(), raw),
+            RecvStream::new(recv, error, raw),
         ))
     }
 
@@ -1194,7 +1203,7 @@ impl web_transport_trait::poll::Session for Session {
                 .accept_uni()
                 .await
                 .map_err(|e| Session::map_error_owned(&error, e))?;
-            Ok(RecvStream::new(recv, error))
+            Ok(RecvStream::new(recv, error, true))
         })
     }
 
@@ -1217,8 +1226,8 @@ impl web_transport_trait::poll::Session for Session {
                 .await
                 .map_err(|e| Session::map_error_owned(&error, e))?;
             Ok((
-                SendStream::new(send, error.clone()),
-                RecvStream::new(recv, error),
+                SendStream::new(send, error.clone(), true),
+                RecvStream::new(recv, error, true),
             ))
         })
     }
@@ -1227,9 +1236,10 @@ impl web_transport_trait::poll::Session for Session {
         let conn = self.conn.clone();
         let header = self.header_uni.clone();
         let error = self.error.clone();
+        let raw = self.is_raw();
 
         self.op_open_uni.poll(cx, move || async move {
-            Session::open_uni_owned(conn, header, error).await
+            Session::open_uni_owned(conn, header, error, raw).await
         })
     }
 
@@ -1240,9 +1250,10 @@ impl web_transport_trait::poll::Session for Session {
         let conn = self.conn.clone();
         let header = self.header_bi.clone();
         let error = self.error.clone();
+        let raw = self.is_raw();
 
         self.op_open_bi.poll(cx, move || async move {
-            Session::open_bi_owned(conn, header, error).await
+            Session::open_bi_owned(conn, header, error, raw).await
         })
     }
 
