@@ -2,4 +2,12 @@
 # and its auto-pushed tag (web-transport-ffi-v*) drives the downstream
 # release-py / release-kt / release-swift workflows that publish the
 # Python wheel, Maven artifact, and GitHub Release XCFramework asset.
-# All other crates use release-plz's defaults.
+# All other crates use release-plz's defaults, except as noted below.
+
+# crates.io still lists a yanked web-transport-wasm 0.10.0 from 2024, and
+# release-plz picks the highest published version as its baseline, yanked or
+# not. cargo-semver-checks then diffs against that unrelated API and reports a
+# breaking change on every release. Drop this once the crate passes 0.10.0.
+[[package]]
+name = "web-transport-wasm"
+semver_check = false
