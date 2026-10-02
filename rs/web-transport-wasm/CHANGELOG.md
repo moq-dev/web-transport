@@ -21,6 +21,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.1...web-transport-wasm-v0.9.0) - 2026-10-02
+
+### Added
+
+- *(wasm)* set waitUntilAvailable when opening streams ([#370](https://github.com/moq-dev/web-transport/pull/370))
+- *(wasm)* fail with a clear error when web_sys_unstable_apis is unset ([#336](https://github.com/moq-dev/web-transport/pull/336))
+- *(wasm)* advertise subprotocols for negotiation ([#253](https://github.com/moq-dev/web-transport/pull/253))
+
+### Fixed
+
+- *(wasm)* report None when no subprotocol was negotiated ([#381](https://github.com/moq-dev/web-transport/pull/381))
+- *(wasm)* resubscribe to ready instead of waiting on closed ([#374](https://github.com/moq-dev/web-transport/pull/374))
+- *(wasm)* set rustdocflags so cargo doc and doctests compile ([#373](https://github.com/moq-dev/web-transport/pull/373))
+- *(wasm)* send datagrams via createWritable(), not deprecated .writable ([#315](https://github.com/moq-dev/web-transport/pull/315))
+
+### Other
+
+- release ([#404](https://github.com/moq-dev/web-transport/pull/404))
+- release ([#363](https://github.com/moq-dev/web-transport/pull/363))
+- [**breaking**] bump web-transport-trait to 0.5 and its implementors ([#401](https://github.com/moq-dev/web-transport/pull/401))
+- Widen stream priority to i32, ranked onto quiche's urgency ([#390](https://github.com/moq-dev/web-transport/pull/390))
+- bump crate versions by hand ([#384](https://github.com/moq-dev/web-transport/pull/384))
+- *(wasm)* [**breaking**] implement the poll traits natively ([#369](https://github.com/moq-dev/web-transport/pull/369))
+- *(web-transport-proto)* release v0.6.1 ([#327](https://github.com/moq-dev/web-transport/pull/327))
+- release ([#276](https://github.com/moq-dev/web-transport/pull/276))
+- release ([#254](https://github.com/moq-dev/web-transport/pull/254))
+- release ([#208](https://github.com/moq-dev/web-transport/pull/208))
+- Fix server certificate hash handling in web-transport-wasm ([#225](https://github.com/moq-dev/web-transport/pull/225))
+- Split monorepo into rs/ and js/ top-level directories ([#202](https://github.com/moq-dev/web-transport/pull/202))
+
 ## [0.8.1](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.0...web-transport-wasm-v0.8.1) - 2026-10-02
 
 ### Other

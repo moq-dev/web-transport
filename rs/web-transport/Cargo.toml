@@ -21,4 +21,4 @@ url = "2"
 web-transport-quinn = { version = "0.13.1", path = "../web-transport-quinn" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-transport-wasm = { version = "0.8.1", path = "../web-transport-wasm" }
+web-transport-wasm = { version = "0.9.0", path = "../web-transport-wasm" }
