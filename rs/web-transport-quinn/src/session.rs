@@ -1,3 +1,4 @@
+use crate::error::CloseReason;
 use std::{
     fmt,
     future::Future,
@@ -82,7 +83,7 @@ pub struct Session {
     // Session error, set once by either local close() or the background task
     // when a remote CloseWebTransportSession capsule is received.
     // Uses OnceLock for set-once, first-writer-wins semantics with lock-free reads.
-    error: Arc<OnceLock<SessionError>>,
+    error: Arc<CloseReason>,
 
     // The request sent by the client, or None for a raw QUIC session.
     request: Option<ConnectRequest>,
@@ -141,7 +142,7 @@ impl Session {
         let mut header_datagram = Vec::new();
         session_id.encode(&mut header_datagram);
 
-        let error: Arc<OnceLock<SessionError>> = Arc::new(OnceLock::new());
+        let error = Arc::new(CloseReason::http3());
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
@@ -179,11 +180,7 @@ impl Session {
 
     // Read capsules from the CONNECT recv stream until it's closed,
     // then record the close error and tear down the connection.
-    async fn run_recv(
-        conn: quinn::Connection,
-        recv: quinn::RecvStream,
-        error: Arc<OnceLock<SessionError>>,
-    ) {
+    async fn run_recv(conn: quinn::Connection, recv: quinn::RecvStream, error: Arc<CloseReason>) {
         let close_info = Self::read_capsules(recv).await;
         let code = close_info.as_ref().map_or(0, |(c, _)| *c);
 
@@ -401,7 +398,10 @@ impl Session {
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
-        // this is a no-op.
+        // this is a no-op. A raw peer close that already arrived is latched first.
+        if let Some(err) = self.conn.close_reason() {
+            self.map_error(err);
+        }
         let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
         if self.error.set(err).is_err() {
             return;
@@ -515,27 +515,14 @@ impl Session {
     }
 
     // The owned-argument form, for futures that outlive the borrow that created them.
-    fn map_error_owned(error: &OnceLock<SessionError>, e: impl Into<SessionError>) -> SessionError {
+    fn map_error_owned(error: &CloseReason, e: impl Into<SessionError>) -> SessionError {
         map_error_with(error, e)
     }
 }
 
 /// Replace connection-level errors with the stored session error if available.
-fn map_error_with(stored: &OnceLock<SessionError>, e: impl Into<SessionError>) -> SessionError {
-    {
-        let e = e.into();
-        if let Some(err) = stored.get() {
-            if matches!(
-                &e,
-                SessionError::ConnectionError(_)
-                    | SessionError::WebTransportError(WebTransportError::Closed(..))
-                    | SessionError::SendDatagramError(quinn::SendDatagramError::ConnectionLost(_))
-            ) {
-                return err.clone();
-            }
-        }
-        e
-    }
+fn map_error_with(stored: &CloseReason, e: impl Into<SessionError>) -> SessionError {
+    stored.map(e.into())
 }
 
 impl Session {
@@ -558,6 +545,7 @@ impl Session {
     /// (from `into_0rtt`, say) is fine, it just has no ALPN to report until it is done.
     pub fn raw(conn: quinn::Connection) -> Self {
         Self {
+            error: Arc::new(CloseReason::raw(conn.clone())),
             conn,
             session_id: None,
             header_uni: Default::default(),
@@ -575,7 +563,6 @@ impl Session {
             parked_accept_bi: Default::default(),
             settings: None,
             connect_send: Arc::new(Mutex::new(None)),
-            error: Arc::new(OnceLock::new()),
             request: None,
             response: None,
             alpn: Default::default(),
@@ -721,7 +708,7 @@ pub struct SessionAccept {
     session_id: VarInt,
 
     // Shared session error for propagation to accepted streams.
-    error: Arc<OnceLock<SessionError>>,
+    error: Arc<CloseReason>,
 
     // We also need to keep a reference to the qpack streams if the endpoint (incorrectly) creates them.
     // Again, this is just so they don't get closed until we drop the session.
@@ -754,7 +741,7 @@ impl SessionAccept {
     pub(crate) fn new(
         conn: quinn::Connection,
         session_id: VarInt,
-        error: Arc<OnceLock<SessionError>>,
+        error: Arc<CloseReason>,
     ) -> Self {
         // Create a stream that just outputs new streams, so it's easy to call from poll.
         let accept_uni = Box::pin(futures::stream::unfold(conn.clone(), |conn| async {
@@ -1086,7 +1073,7 @@ impl Session {
     async fn open_uni_owned(
         conn: quinn::Connection,
         header: Bytes,
-        error: Arc<OnceLock<SessionError>>,
+        error: Arc<CloseReason>,
         raw: bool,
     ) -> Result<SendStream, SessionError> {
         let mut send = conn
@@ -1108,7 +1095,7 @@ impl Session {
     async fn open_bi_owned(
         conn: quinn::Connection,
         header: Bytes,
-        error: Arc<OnceLock<SessionError>>,
+        error: Arc<CloseReason>,
         raw: bool,
     ) -> Result<(SendStream, RecvStream), SessionError> {
         let (mut send, recv) = conn
@@ -1171,7 +1158,7 @@ impl Session {
     async fn read_datagram_owned(
         conn: quinn::Connection,
         session_id: Option<VarInt>,
-        error: Arc<OnceLock<SessionError>>,
+        error: Arc<CloseReason>,
     ) -> Result<Bytes, SessionError> {
         let mut datagram = conn
             .read_datagram()

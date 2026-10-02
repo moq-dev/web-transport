@@ -1,8 +1,9 @@
+use crate::error::CloseReason;
 use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     task::{ready, Context, Poll},
 };
 
@@ -17,17 +18,13 @@ use crate::{
 #[derive(Debug)]
 pub struct RecvStream {
     inner: quinn::RecvStream,
-    error: Arc<OnceLock<SessionError>>,
+    error: Arc<CloseReason>,
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
     raw: bool,
 }
 
 impl RecvStream {
-    pub(crate) fn new(
-        stream: quinn::RecvStream,
-        error: Arc<OnceLock<SessionError>>,
-        raw: bool,
-    ) -> Self {
+    pub(crate) fn new(stream: quinn::RecvStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             inner: stream,
             error,
@@ -50,7 +47,10 @@ impl RecvStream {
                 return ReadError::SessionError(err.clone());
             }
         }
-        e
+        match e {
+            ReadError::SessionError(err) => ReadError::SessionError(self.error.map(err)),
+            err => err,
+        }
     }
 
     /// Tell the other end to stop sending data with the given error code. See [`quinn::RecvStream::stop`].
@@ -115,7 +115,7 @@ impl RecvStream {
             Ok(None) => Ok(None),
             Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Err(quinn::ResetError::ConnectionLost(conn_err)) => {
-                Err(self.error.get().cloned().unwrap_or_else(|| conn_err.into()))
+                Err(self.error.map(conn_err.into()))
             }
             Err(quinn::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }

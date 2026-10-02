@@ -1,7 +1,8 @@
+use crate::error::CloseReason;
 use std::{
     io,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     task::{ready, Context, Poll},
 };
 
@@ -19,7 +20,7 @@ use crate::{
 #[derive(Debug)]
 pub struct SendStream {
     stream: quinn::SendStream,
-    error: Arc<OnceLock<SessionError>>,
+    error: Arc<CloseReason>,
 
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
     raw: bool,
@@ -29,11 +30,7 @@ pub struct SendStream {
 }
 
 impl SendStream {
-    pub(crate) fn new(
-        stream: quinn::SendStream,
-        error: Arc<OnceLock<SessionError>>,
-        raw: bool,
-    ) -> Self {
+    pub(crate) fn new(stream: quinn::SendStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             stream,
             error,
@@ -60,7 +57,10 @@ impl SendStream {
                 return WriteError::SessionError(err.clone());
             }
         }
-        e
+        match e {
+            WriteError::SessionError(err) => WriteError::SessionError(self.error.map(err)),
+            err => err,
+        }
     }
 
     /// Abruptly reset the stream with the provided error code. See [`quinn::SendStream::reset`].
@@ -80,7 +80,7 @@ impl SendStream {
             Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Ok(None) => Ok(None),
             Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                Err(self.error.get().cloned().unwrap_or_else(|| conn_err.into()))
+                Err(self.error.map(conn_err.into()))
             }
             Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
@@ -260,9 +260,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
                 },
                 Ok(None) => Ok(()),
                 Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                    Err(WriteError::SessionError(
-                        error.get().cloned().unwrap_or_else(|| conn_err.into()),
-                    ))
+                    Err(WriteError::SessionError(error.map(conn_err.into())))
                 }
                 Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
             }
