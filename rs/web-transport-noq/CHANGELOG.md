@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.0...web-transport-noq-v0.4.1) - 2026-10-02
+
+### Fixed
+
+- report a stream reset before its header as a reset ([#405](https://github.com/moq-dev/web-transport/pull/405))
+
 ## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.2.1...web-transport-noq-v0.3.0) - 2026-08-06
 
 ### Fixed

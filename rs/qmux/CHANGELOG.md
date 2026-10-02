@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.1...qmux-v0.6.2) - 2026-10-02
+
+### Fixed
+
+- *(qmux)* look up a receive stream once per inbound frame ([#406](https://github.com/moq-dev/web-transport/pull/406))
+
 ## [0.6.1](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.0...qmux-v0.6.1) - 2026-09-27
 
 ### Fixed

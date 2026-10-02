@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.0...web-transport-iroh-v0.8.1) - 2026-10-02
+
+### Fixed
+
+- send raw QUIC stream codes as is in iroh and quinn ([#408](https://github.com/moq-dev/web-transport/pull/408))
+- report a stream reset before its header as a reset ([#405](https://github.com/moq-dev/web-transport/pull/405))
+
 ## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.6.0...web-transport-iroh-v0.7.0) - 2026-08-06
 
 ### Fixed
