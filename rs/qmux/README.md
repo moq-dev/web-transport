@@ -53,6 +53,14 @@ To run QMux over something the built-in modules don't cover, wrap any
 `transport::Transport` yourself, then pass it to `Session::connect` /
 `Session::accept`.
 
+Unread receive data returns connection credit when its stream is stopped or
+dropped. Data and reset final sizes arriving after STOP_SENDING remain subject
+to flow control and return their credit immediately.
+
+A local `close()` finishes any in-flight write and flushes APPLICATION_CLOSE
+before closing the transport, within a one-second bound. The first close reason
+is preserved; a stalled transport is dropped when the bound expires.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

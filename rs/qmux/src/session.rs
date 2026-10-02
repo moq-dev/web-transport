@@ -56,18 +56,17 @@ struct Streams {
     peer_initial_max_stream_data_bidi_remote: u64,
 }
 
-/// Closes the connection once the last [`Session`] handle is dropped. Held in an
-/// `Arc` cloned with every `Session`, so its `Drop` runs only when they're all
-/// gone — at which point it flips `closed`, tearing the backend tasks down
-/// promptly rather than waiting for the transport to notice. Mirrors how a QUIC
-/// endpoint's connection handle owns the connection's lifetime.
+/// The last session handle triggers hard teardown unless a graceful close is
+/// already draining. A requested close owns the transport until its deadline.
 struct SessionGuard {
-    closed: watch::Sender<Option<Error>>,
+    closed: Closure,
 }
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        note_closed(&self.closed, Error::Closed);
+        if self.closed.requested.borrow().is_none() {
+            note_closed(&self.closed, Error::Closed);
+        }
     }
 }
 
@@ -92,7 +91,7 @@ pub struct Session {
     // frame (no open-vs-writer race) and there's no message-passing hop.
     streams: Arc<Mutex<Streams>>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: Closure,
 
     // Negotiated application protocol (via the application_protocols transport
     // parameter). Resolved exactly once, before the session is handed to the
@@ -224,7 +223,7 @@ struct SessionState<R: Reader> {
     // frontend inserts streams it opens; the reader inserts peer-initiated ones.
     streams: Arc<Mutex<Streams>>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: Closure,
 
     // Negotiated protocol and handshake-complete signal — see the matching
     // fields on `Session`.
@@ -338,13 +337,64 @@ fn instant_at(base: tokio::time::Instant, ms: u64) -> tokio::time::Instant {
     base + std::time::Duration::from_millis(ms)
 }
 
+/// Bound the complete close, including any write already in flight.
+const CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Clone)]
+struct CloseRequest {
+    reason: Error,
+    deadline: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+struct Closure {
+    terminal: watch::Sender<Option<Error>>,
+    requested: watch::Sender<Option<CloseRequest>>,
+}
+
+impl Closure {
+    fn new() -> Self {
+        Self {
+            terminal: watch::Sender::new(None),
+            requested: watch::Sender::new(None),
+        }
+    }
+}
+
+async fn close_deadline(closed: &Closure) {
+    let mut requested = closed.requested.subscribe();
+    let deadline = requested
+        .wait_for(|slot| slot.is_some())
+        .await
+        .map(|slot| slot.as_ref().unwrap().deadline);
+    if let Ok(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
+/// Hard teardown cancels a partial write, but a requested close must finish that
+/// write and flush its own frame first, or exhaust the shared close deadline.
+async fn hard_teardown(closed: &Closure, receiver: &mut watch::Receiver<Option<Error>>) {
+    receiver.wait_for(|slot| slot.is_some()).await.ok();
+    let graceful = closed.requested.borrow().is_some();
+    if graceful {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Record `err` as the session's terminal close reason, but only if none is set
 /// yet — the first reason wins. The reader, writer, timer, and [`SessionGuard`] all
 /// funnel through this so teardown reports a single, stable cause.
-fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
-    closed.send_if_modified(|slot| {
+fn note_closed(closed: &Closure, err: Error) {
+    closed.terminal.send_if_modified(|slot| {
         if slot.is_none() {
-            *slot = Some(err);
+            *slot = Some(
+                closed
+                    .requested
+                    .borrow()
+                    .as_ref()
+                    .map_or(err.clone(), |request| request.reason.clone()),
+            );
             true
         } else {
             false
@@ -380,7 +430,7 @@ struct WriterState<W: Writer> {
     // genuinely dead one, and not idle-close the former. See `transmit`.
     writer_backpressured: Arc<AtomicBool>,
 
-    closed: watch::Sender<Option<Error>>,
+    closed: Closure,
 
     // Origin shared with the reader and timer, plus the millis (since `base`) at
     // which our last send landed — published for keep-alive and idle scheduling.
@@ -390,6 +440,7 @@ struct WriterState<W: Writer> {
     // Stamped when a QX_PING request reaches the wire. The timer allocates the
     // sequence, but only the writer knows when it actually left.
     rtt: Arc<Rtt>,
+    close_frame: Option<Error>,
 }
 
 /// Outcome of a teardown-aware write (see [`WriterState::transmit_or_teardown`]).
@@ -410,7 +461,7 @@ impl<W: Writer> WriterState<W> {
     }
 
     async fn run(&mut self) {
-        let mut closed_rx = self.closed.subscribe();
+        let mut closed_rx = self.closed.terminal.subscribe();
         // Set if a write was abandoned mid-flight because the session tore down.
         // The transport may be parked mid-frame, so we must not touch it again.
         let mut interrupted = false;
@@ -420,6 +471,7 @@ impl<W: Writer> WriterState<W> {
                 frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
                     match frame {
                         Some(frame) => match self.transmit_or_teardown(frame, &mut closed_rx).await {
+                            Transmitted::Ok if self.close_frame.is_some() => break,
                             Transmitted::Ok => {}
                             Transmitted::Failed(err) => {
                                 self.note_closed(err);
@@ -442,19 +494,28 @@ impl<W: Writer> WriterState<W> {
                         break;
                     }
                 }
-                // Wrapped so the `watch::Ref` guard is dropped before the branch
-                // resolves — otherwise it (non-`Send`), held across a `send` await,
-                // would make the task non-`Send`.
-                _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
+                _ = hard_teardown(&self.closed, &mut closed_rx) => {
                     // Session tearing down while we were parked between writes (not
                     // mid-frame), so the transport is at a frame boundary: best-effort
                     // flush of any queued control frames (e.g. a ConnectionClose)
                     // before we stop.
-                    while let Ok(frame) = self.control.try_recv() {
-                        if self.transmit(frame).await.is_err() {
-                            break;
+                    let drain = async {
+                        while let Ok(frame) = self.control.try_recv() {
+                            self.transmit(frame).await?;
+                            if self.close_frame.is_some() {
+                                break;
+                            }
                         }
+                        Ok::<(), Error>(())
+                    };
+                    if !matches!(tokio::time::timeout(CLOSE_TIMEOUT, drain).await, Ok(Ok(()))) {
+                        interrupted = true;
                     }
+                    break;
+                }
+                _ = close_deadline(&self.closed) => {
+                    self.note_closed(Error::Closed);
+                    interrupted = true;
                     break;
                 }
             }
@@ -464,7 +525,11 @@ impl<W: Writer> WriterState<W> {
         // strand a `send` would wedge `close` just the same. Dropping the writer
         // hard-closes the socket, which is what prompt teardown needs.
         if !interrupted {
-            let _ = self.writer.close().await;
+            let deadline = self.closed.requested.borrow().as_ref().map_or_else(
+                || tokio::time::Instant::now() + CLOSE_TIMEOUT,
+                |request| request.deadline,
+            );
+            let _ = tokio::time::timeout_at(deadline, self.writer.close()).await;
         }
     }
 
@@ -480,15 +545,18 @@ impl<W: Writer> WriterState<W> {
         frame: Frame,
         closed_rx: &mut watch::Receiver<Option<Error>>,
     ) -> Transmitted {
+        let closed = self.closed.clone();
         tokio::select! {
             biased;
             result = self.transmit(frame) => match result {
                 Ok(()) => Transmitted::Ok,
                 Err(err) => Transmitted::Failed(err),
             },
-            // Wrapped so the non-`Send` `watch::Ref` is dropped before the branch
-            // resolves (same reason as the `closed` branch in `run`).
-            _ = async { closed_rx.wait_for(|slot| slot.is_some()).await.ok(); } => {
+            _ = hard_teardown(&closed, closed_rx) => {
+                Transmitted::Interrupted
+            }
+            _ = close_deadline(&closed) => {
+                note_closed(&closed, Error::Closed);
                 Transmitted::Interrupted
             }
         }
@@ -521,12 +589,23 @@ impl<W: Writer> WriterState<W> {
             Frame::Stream(stream) if stream.fin => {
                 self.streams.lock().unwrap().send.remove(&stream.id);
             }
-            Frame::StopSending(stop) => {
+            Frame::StopSending(stop) if !self.version.is_qmux() => {
                 self.streams.lock().unwrap().recv.remove(&stop.id);
             }
             _ => {}
         }
 
+        let close_frame = match &frame {
+            Frame::ApplicationClose(close) => Some(Error::ConnectionClosed {
+                code: close.code,
+                reason: close.reason.clone(),
+            }),
+            Frame::ConnectionClose(close) => Some(Error::ConnectionReset {
+                code: close.code,
+                reason: close.reason.clone(),
+            }),
+            _ => None,
+        };
         let bytes = frame.encode(self.version)?;
         if self.version.uses_records() {
             // `record_limit` holds the draft-01 default until the peer's params
@@ -545,6 +624,10 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.send(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
+        self.close_frame = close_frame;
+        if let Some(reason) = &self.close_frame {
+            self.note_closed(reason.clone());
+        }
         if let Some((id, len)) = transmitted_stream {
             if let Some(send) = self.streams.lock().unwrap().send.get_mut(&id) {
                 send.sent_offset += len;
@@ -604,10 +687,11 @@ mod writer_final_size_tests {
             streams,
             record_limit: Arc::new(AtomicU64::new(u64::MAX)),
             writer_backpressured: Arc::new(AtomicBool::new(false)),
-            closed: watch::Sender::new(None),
+            closed: Closure::new(),
             base: tokio::time::Instant::now(),
             last_send_at: Arc::new(AtomicU64::new(0)),
             rtt: Arc::new(Rtt::default()),
+            close_frame: None,
         };
 
         writer
@@ -713,7 +797,7 @@ struct TimerState {
 
     // Enqueues keep-alive pings; the writer transmits them like any control frame.
     control: mpsc::UnboundedSender<Frame>,
-    closed: watch::Sender<Option<Error>>,
+    closed: Closure,
     // Gates arming: the idle timeout only applies once params are exchanged.
     established: watch::Receiver<bool>,
 
@@ -798,7 +882,7 @@ impl TimerState {
     }
 
     async fn run(mut self) {
-        let mut closed_rx = self.closed.subscribe();
+        let mut closed_rx = self.closed.terminal.subscribe();
 
         // The idle timeout only applies once the peer's params have been exchanged.
         // Wait for establishment — or teardown — before arming anything.
@@ -934,7 +1018,7 @@ impl TimerState {
 
 impl<R: Reader> SessionState<R> {
     async fn run(&mut self) -> Result<(), Error> {
-        let mut closed = self.closed.subscribe();
+        let mut closed = self.closed.terminal.subscribe();
 
         loop {
             // The idle timeout and keep-alive ping are owned by the timer task,
@@ -1008,11 +1092,9 @@ impl<R: Reader> SessionState<R> {
 
                 let data_len = stream.data.len() as u64;
 
-                // Fast path: an existing stream. Look it up once and deliver under
-                // that lock (never held across an await). The writer task removes
-                // the entry concurrently when a dropped `RecvStream` queues
-                // STOP_SENDING, so a separate existence check can go stale and
-                // resurrect the stream below.
+                // Deliver and account under one lookup. Stopped QMux streams
+                // retain their offset and credit until the peer's FIN or RESET;
+                // legacy streams can still be retired concurrently by the writer.
                 {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.get_mut(&stream.id) {
@@ -1032,7 +1114,13 @@ impl<R: Reader> SessionState<R> {
                         }
                         let id = stream.id;
                         let fin = stream.fin;
-                        recv.inbound_data.send(stream).ok();
+                        if recv.inbound_data.send(stream).is_err() {
+                            // A stopped frontend owns no receive memory, but the
+                            // peer still counts these bytes against MAX_DATA.
+                            if let Some(max) = self.conn_recv_credit.consume(data_len) {
+                                self.control.send(Frame::MaxData(max)).ok();
+                            }
+                        }
                         if fin {
                             streams.recv.remove(&id);
                         }
@@ -1053,14 +1141,14 @@ impl<R: Reader> SessionState<R> {
                     return Ok(());
                 }
 
-                // Connection-level flow control.
-                if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
-                    return Err(Error::FlowControlError);
-                }
-
-                // A frame on one of our own (already-retired) streams: ignore it.
+                // A frame on one of our own (already-retired) streams carries
+                // no new connection credit, just like a retired peer stream.
                 if self.is_server == stream.id.server_initiated() {
                     return Ok(());
+                }
+
+                if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
+                    return Err(Error::FlowControlError);
                 }
 
                 // New peer-initiated stream. Enforce the stream-count limit — per
@@ -1105,20 +1193,25 @@ impl<R: Reader> SessionState<R> {
                     return Err(Error::FlowControlError);
                 }
 
+                let stream_count = if self.config.version.is_qmux() {
+                    Some(Arc::new(RecvCount {
+                        id: stream.id,
+                        control: self.control.clone(),
+                        credit: match stream.id.dir() {
+                            StreamDir::Bi => self.recv_bi_credit.clone(),
+                            StreamDir::Uni => self.recv_uni_credit.clone(),
+                        },
+                    }))
+                } else {
+                    None
+                };
+
                 let recv_backend = RecvState {
                     inbound_data: tx,
                     inbound_reset: tx2,
                     recv_credit: recv_credit.clone(),
                     recv_offset: data_len,
-                };
-
-                let recv_streams_credit = if self.config.version.is_qmux() {
-                    Some(match stream.id.dir() {
-                        StreamDir::Bi => self.recv_bi_credit.clone(),
-                        StreamDir::Uni => self.recv_uni_credit.clone(),
-                    })
-                } else {
-                    None
+                    _stream_count: stream_count.clone(),
                 };
 
                 let recv_frontend = RecvStream {
@@ -1132,10 +1225,19 @@ impl<R: Reader> SessionState<R> {
                     recv_credit,
                     conn_recv_credit: self.conn_recv_credit.clone(),
                     version: self.config.version,
-                    recv_streams_credit,
+                    stream_count,
                 };
 
-                match stream.id.dir() {
+                let id = stream.id;
+                let fin = stream.fin;
+                if data_len > 0 || fin {
+                    recv_backend.inbound_data.send(stream).ok();
+                }
+                if !fin {
+                    self.streams.lock().unwrap().recv.insert(id, recv_backend);
+                }
+
+                match id.dir() {
                     StreamDir::Uni => {
                         // Flag the reader backpressured while the bounded `accept`
                         // channel is full, so the timer defers the idle close rather
@@ -1162,7 +1264,7 @@ impl<R: Reader> SessionState<R> {
                         };
 
                         let send_frontend = SendStream {
-                            id: stream.id,
+                            id,
                             version: self.config.version,
                             record_limit: self.record_limit.clone(),
                             outbound: self.outbound.clone(),
@@ -1180,11 +1282,7 @@ impl<R: Reader> SessionState<R> {
                             },
                         };
 
-                        self.streams
-                            .lock()
-                            .unwrap()
-                            .send
-                            .insert(stream.id, send_backend);
+                        self.streams.lock().unwrap().send.insert(id, send_backend);
                         // See the uni arm: defer the idle close while a slow
                         // `accept_bi` consumer keeps the bounded channel full.
                         self.reader_backpressured.store(true, Ordering::Release);
@@ -1193,18 +1291,6 @@ impl<R: Reader> SessionState<R> {
                         result.map_err(|_| Error::Closed)?;
                     }
                 };
-
-                let id = stream.id;
-                let fin = stream.fin;
-                // The first empty non-FIN frame still opens the stream, but does
-                // not need to reach the application-facing receive queue.
-                if data_len > 0 || fin {
-                    recv_backend.inbound_data.send(stream).ok();
-                }
-
-                if !fin {
-                    self.streams.lock().unwrap().recv.insert(id, recv_backend);
-                }
             }
             Frame::ResetStream(reset) => {
                 // A RESET_STREAM_AT frame (draft-02) is only legal if we
@@ -1224,9 +1310,8 @@ impl<R: Reader> SessionState<R> {
                 let reset_id = reset.id;
                 let peer_initiated = reset_id.server_initiated() != self.is_server;
 
-                // Take the entry in one lookup. The writer task removes it
-                // concurrently when a dropped `RecvStream` queues STOP_SENDING, so a
-                // separate existence check can go stale before the entry is used.
+                // Take the entry once, including a stopped stream's final-size
+                // accounting. Only FIN or RESET retires receive state in QMux.
                 let live = self.streams.lock().unwrap().recv.remove(&reset_id);
 
                 if !self.config.version.is_qmux() {
@@ -1335,22 +1420,24 @@ impl<R: Reader> SessionState<R> {
             // APPLICATION_CLOSE (0x1d): a graceful, deliberate peer close — surfaces
             // as a clean session close carrying the peer's code/reason.
             Frame::ApplicationClose(close) => {
-                self.closed
-                    .send(Some(Error::ConnectionClosed {
+                note_closed(
+                    &self.closed,
+                    Error::ConnectionClosed {
                         code: close.code,
                         reason: close.reason,
-                    }))
-                    .ok();
+                    },
+                );
             }
             // CONNECTION_CLOSE (0x1c): the peer hit a protocol/transport error —
             // surfaces as an abnormal close, not a clean one.
             Frame::ConnectionClose(close) => {
-                self.closed
-                    .send(Some(Error::ConnectionReset {
+                note_closed(
+                    &self.closed,
+                    Error::ConnectionReset {
                         code: close.code,
                         reason: close.reason,
-                    }))
-                    .ok();
+                    },
+                );
             }
             // Flow control frames
             Frame::MaxData(max) => {
@@ -1557,6 +1644,44 @@ impl<R: Reader> SessionState<R> {
 }
 
 impl Session {
+    /// Wait until teardown records its stable close reason.
+    async fn close_reason(&self) -> Error {
+        let mut closed = self.closed.terminal.subscribe();
+        closed
+            .wait_for(|err| err.is_some())
+            .await
+            .map(|e| e.clone().unwrap_or(Error::Closed))
+            .unwrap_or(Error::Closed)
+    }
+
+    /// Request a close under the terminal slot's lock, preserving the first
+    /// reason. The writer publishes it after flushing the frame or timing out.
+    fn close_with(&self, frame: Frame, err: Error) -> Error {
+        self.closed.terminal.send_if_modified(|slot| {
+            if slot.is_none() {
+                self.closed.requested.send_if_modified(|requested| {
+                    if requested.is_some() {
+                        return false;
+                    }
+                    *requested = Some(CloseRequest {
+                        reason: err.clone(),
+                        deadline: tokio::time::Instant::now() + CLOSE_TIMEOUT,
+                    });
+                    self.outbound_priority.send(frame).ok();
+                    true
+                });
+            }
+            false
+        });
+        self.closed.terminal.borrow().clone().unwrap_or_else(|| {
+            self.closed
+                .requested
+                .borrow()
+                .as_ref()
+                .map_or(Error::Closed, |request| request.reason.clone())
+        })
+    }
+
     /// Open a client-side session over the given transport, waiting until it is
     /// established before returning.
     ///
@@ -1592,7 +1717,7 @@ impl Session {
             return Ok(());
         }
 
-        let wait = established.wait_for(|&done| done);
+        let wait = async { established.wait_for(|&done| done).await.is_ok() };
         let timeout = self.config.handshake_timeout;
         // A zero timeout disables the bound (wait indefinitely).
         let outcome = if timeout.is_zero() {
@@ -1603,23 +1728,20 @@ impl Session {
 
         match outcome {
             // Established.
-            Some(Ok(_)) => Ok(()),
+            Some(true) => Ok(()),
             // The backend task ended before establishing — surface the close reason.
-            Some(Err(_)) => Err(self.closed.borrow().clone().unwrap_or(Error::Closed)),
+            Some(false) => Err(self.close_reason().await),
             // Timed out waiting for the peer's parameters: abort the half-open
             // handshake, notifying the peer, and fail rather than hang.
+            // If the session closed first, report that reason instead.
             None => {
                 // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
                 // rather than seeing a graceful close.
-                let _ = self.outbound_priority.send(
-                    ConnectionClose {
-                        code: VarInt::from(0u32),
-                        reason: "handshake timeout".to_string(),
-                    }
-                    .into(),
-                );
-                self.closed.send_replace(Some(Error::HandshakeTimeout));
-                Err(Error::HandshakeTimeout)
+                let frame = ConnectionClose {
+                    code: VarInt::from(0u32),
+                    reason: "handshake timeout".to_string(),
+                };
+                Err(self.close_with(frame.into(), Error::HandshakeTimeout))
             }
         }
     }
@@ -1675,7 +1797,7 @@ impl Session {
         let reader_backpressured = Arc::new(AtomicBool::new(false));
         let writer_backpressured = Arc::new(AtomicBool::new(false));
 
-        let closed = watch::Sender::new(None);
+        let closed = Closure::new();
 
         // The QMux handshake requires TRANSPORT_PARAMETERS as the first frame. It
         // leads the FIFO control lane, so the writer emits it before anything else.
@@ -1706,6 +1828,7 @@ impl Session {
             base,
             last_send_at: last_send_at.clone(),
             rtt: rtt.clone(),
+            close_frame: None,
         };
         tokio::spawn(async move { writer.run().await });
 
@@ -1844,7 +1967,7 @@ impl Session {
             // call made after the session has already finished closing (e.g. after
             // awaiting establishment on a peer that closed without sending params).
             // Storing it unconditionally keeps late waiters correct.
-            backend.closed.send_replace(Some(err));
+            note_closed(&backend.closed, err);
         });
 
         // Closes the connection once every `Session` clone has dropped.
@@ -2008,6 +2131,7 @@ impl generic::Session for Session {
             inbound_reset: tx2,
             recv_credit: recv_credit.clone(),
             recv_offset: 0,
+            _stream_count: None,
         };
         let recv_frontend = RecvStream {
             id,
@@ -2020,7 +2144,7 @@ impl generic::Session for Session {
             recv_credit,
             conn_recv_credit: self.conn_recv_credit.clone(),
             version: self.config.version,
-            recv_streams_credit: None, // We initiated this stream, no stream count tracking
+            stream_count: None, // We initiated this stream, no stream count tracking
         };
 
         // Register both backends before returning the frontends (see `open_uni`).
@@ -2041,28 +2165,21 @@ impl generic::Session for Session {
 
     fn close(&self, code: u32, reason: &str) {
         // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
-        // session close carrying our code/reason.
+        // session close carrying our code/reason. A no-op once the session has a
+        // close reason.
         let frame = ApplicationClose {
             code: VarInt::from(code),
             reason: reason.to_string(),
         };
-        let _ = self.outbound_priority.send(frame.into());
-
-        self.closed
-            .send(Some(Error::ConnectionClosed {
-                code: VarInt::from(code),
-                reason: reason.to_string(),
-            }))
-            .ok();
+        let err = Error::ConnectionClosed {
+            code: VarInt::from(code),
+            reason: reason.to_string(),
+        };
+        self.close_with(frame.into(), err);
     }
 
     async fn closed(&self) -> Self::Error {
-        let mut closed = self.closed.subscribe();
-        closed
-            .wait_for(|err| err.is_some())
-            .await
-            .map(|e| e.clone().unwrap_or(Error::Closed))
-            .unwrap_or(Error::Closed)
+        self.close_reason().await
     }
 
     fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
@@ -2398,11 +2515,34 @@ impl generic::SendStream for SendStream {
     }
 }
 
+/// Replenish MAX_STREAMS only once the application and peer are both done.
+/// In particular, stopped streams need their accounting until FIN or RESET, so
+/// returning stream-count credit earlier would let retained state grow unbounded.
+struct RecvCount {
+    id: StreamId,
+    credit: Credit,
+    control: mpsc::UnboundedSender<Frame>,
+}
+
+impl Drop for RecvCount {
+    fn drop(&mut self) {
+        if let Some(max) = self.credit.consume(1) {
+            self.control
+                .send(match self.id.dir() {
+                    StreamDir::Bi => Frame::MaxStreamsBidi(max),
+                    StreamDir::Uni => Frame::MaxStreamsUni(max),
+                })
+                .ok();
+        }
+    }
+}
+
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
     recv_credit: Credit,
     recv_offset: u64,
+    _stream_count: Option<Arc<RecvCount>>,
 }
 
 /// The receive half of a multiplexed stream.
@@ -2431,8 +2571,8 @@ pub struct RecvStream {
     recv_credit: Credit,
     conn_recv_credit: Credit,
 
-    // Stream count credit — consume(1) on drop triggers MAX_STREAMS
-    recv_streams_credit: Option<Credit>,
+    // Shared with the backend, so stopped streams stay within MAX_STREAMS.
+    stream_count: Option<Arc<RecvCount>>,
 }
 
 impl RecvStream {
@@ -2472,6 +2612,25 @@ impl RecvStream {
         Some(data)
     }
 
+    /// Stop delivery before draining, so a concurrent sender either queues a
+    /// byte for us to release or releases it itself after the channel closes.
+    fn discard_unread(&mut self) {
+        self.inbound_data.close();
+        let mut len = self
+            .buffer
+            .drain(..)
+            .map(|data| data.len() as u64)
+            .sum::<u64>();
+        while let Ok(stream) = self.inbound_data.try_recv() {
+            len += stream.data.len() as u64;
+        }
+        if self.version.is_qmux() {
+            if let Some(max) = self.conn_recv_credit.consume(len) {
+                self.outbound_priority.send(Frame::MaxData(max)).ok();
+            }
+        }
+    }
+
     /// Report consumed bytes to flow control, sending window updates as needed.
     fn report_consumed(&self, len: u64) {
         if !self.version.is_qmux() {
@@ -2501,16 +2660,11 @@ impl Drop for RecvStream {
             generic::RecvStream::stop(self, 0);
         }
 
-        // Replenish stream count when this recv half is done
-        if let Some(credit) = &self.recv_streams_credit {
-            if let Some(new_max) = credit.consume(1) {
-                let frame = match self.id.dir() {
-                    StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                    StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                };
-                self.outbound_priority.send(frame).ok();
-            }
-        }
+        self.discard_unread();
+
+        // Release our share before leaving Drop. The backend retains its share
+        // until the peer supplies a terminal final size.
+        self.stream_count.take();
     }
 }
 
@@ -2570,6 +2724,7 @@ impl generic::RecvStream for RecvStream {
     }
 
     fn stop(&mut self, code: u32) {
+        self.discard_unread();
         let code = VarInt::from(code);
         let frame = StopSending { id: self.id, code };
 
@@ -2616,7 +2771,7 @@ mod timer_tests {
 
     use tokio::sync::{mpsc, watch};
 
-    use super::{rtt_cadence, TimerState};
+    use super::{rtt_cadence, Closure, TimerState};
     use crate::Error;
 
     /// The probe cadence must never be sub-millisecond.
@@ -2647,7 +2802,7 @@ mod timer_tests {
         reader_backpressured: Arc<AtomicBool>,
         last_recv_at: Arc<AtomicU64>,
         last_send_at: Arc<AtomicU64>,
-        closed: watch::Sender<Option<Error>>,
+        closed: Closure,
         // Kept alive so the control lane the timer pings on doesn't close under it.
         _control_rx: mpsc::UnboundedReceiver<crate::Frame>,
     }
@@ -2662,7 +2817,7 @@ mod timer_tests {
         let writer_backpressured = Arc::new(AtomicBool::new(false));
         let idle_timeout_ms = Arc::new(AtomicU64::new(idle_ms));
         let (control, _control_rx) = mpsc::unbounded_channel();
-        let closed = watch::Sender::new(None);
+        let closed = Closure::new();
         let (_est_tx, established) = watch::channel(true);
 
         let timer = TimerState {
@@ -2690,7 +2845,7 @@ mod timer_tests {
     }
 
     async fn closed_reason(h: &Harness) -> Error {
-        let mut rx = h.closed.subscribe();
+        let mut rx = h.closed.terminal.subscribe();
         rx.wait_for(|s| s.is_some()).await.unwrap();
         let reason = rx.borrow().clone().unwrap();
         reason
@@ -2720,7 +2875,7 @@ mod timer_tests {
         // Past the raw 100ms window but within the one-window grace: still open.
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.terminal.borrow().is_none(),
             "idle-close must be deferred while the reader is backpressured"
         );
 
@@ -2746,7 +2901,7 @@ mod timer_tests {
             h.last_recv_at.store(elapsed, Ordering::Release);
         }
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.terminal.borrow().is_none(),
             "a peer that keeps sending must not be idle-closed"
         );
     }
@@ -2771,7 +2926,7 @@ mod timer_tests {
             }
         }
         assert!(
-            h.closed.borrow().is_none(),
+            h.closed.terminal.borrow().is_none(),
             "a one-way sender whose peer still answers must not be idle-closed"
         );
     }
@@ -3156,6 +3311,99 @@ mod recv_open_tests {
         })
         .encode(Version::QMux01)
         .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_unread_streams_replenishes_connection_credit() {
+        use web_transport_trait::Session as _;
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 4;
+        config.max_stream_data_uni = 4;
+        let (session, tx) = scripted_session_with_config(config);
+        for index in 0..16 {
+            tx.send(uni_stream(index, b"data", true)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("connection credit stalled")
+                .unwrap();
+            drop(recv);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_stream_returns_late_data_and_reset_gap_credit() {
+        use web_transport_trait::{RecvStream as _, Session as _};
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 4;
+        config.max_stream_data_uni = 4;
+        let (session, tx) = scripted_session_with_config(config);
+        tx.send(uni_stream(0, b"a", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        recv.stop(0);
+        drop(recv);
+        tx.send(uni_stream_at(0, 1, b"b", false)).unwrap();
+        tx.send(uni_reset(0, 4)).unwrap();
+        tx.send(uni_stream(1, b"data", true)).unwrap();
+        let marker = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("stopped stream leaked connection credit")
+            .unwrap();
+        drop(marker);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_partially_read_stream_returns_buffered_and_queued_credit() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 8;
+        config.max_stream_data_uni = 8;
+        let (session, tx) = scripted_session_with_config(config);
+        tx.send(uni_stream(0, b"data", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        assert_eq!(recv.read_chunk(2).await.unwrap().unwrap().as_ref(), b"da");
+        tx.send(uni_stream_at(0, 4, b"tail", true)).unwrap();
+        tx.send(uni_stream(1, b"", true)).unwrap();
+        drop(session.accept_uni().await.unwrap());
+        drop(recv);
+        tx.send(uni_stream(2, b"12345678", true)).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_stream_still_enforces_flow_control() {
+        for (max_data, max_stream) in [(4, 8), (8, 4)] {
+            let mut config = Config::new(Version::QMux01);
+            config.max_data = max_data;
+            config.max_stream_data_uni = max_stream;
+            let (session, tx) = scripted_session_with_config(config);
+            tx.send(uni_stream(0, b"a", false)).unwrap();
+            let mut recv = session.accept_uni().await.unwrap();
+            recv.stop(0);
+            tokio::task::yield_now().await;
+            tx.send(uni_stream_at(0, 1, b"12345678", false)).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                .await
+                .unwrap();
+            assert!(matches!(error, Error::FlowControlError), "got {error:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_stream_keeps_count_credit_until_peer_terminal() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_streams_uni = 1;
+        let (session, tx) = scripted_session_with_config(config);
+        tx.send(uni_stream(0, b"a", false)).unwrap();
+        drop(session.accept_uni().await.unwrap());
+        tx.send(uni_stream(1, b"b", false)).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+            .await
+            .unwrap();
+        assert!(matches!(error, Error::StreamLimitExceeded), "got {error:?}");
     }
 
     /// Regression test for the #274 stream-resurrection bug: after a
@@ -4216,6 +4464,38 @@ mod teardown_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn wedged_writer_close_is_bounded() {
+        use web_transport_trait::Session as _;
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let session = Session::new(
+            WedgedTransport {
+                entered_send: entered_tx,
+                dropped: dropped_tx,
+            },
+            false,
+            Config::new(Version::QMux01),
+        );
+        entered_rx.recv().await.unwrap();
+        session.close(42, "bye");
+        let closed = session.closed();
+        tokio::pin!(closed);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(closed.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(super::CLOSE_TIMEOUT).await;
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(closed.await, Error::ConnectionClosed { code, .. } if code.into_inner() == 42)
+        );
+    }
+
     /// A writer parked inside `send()` on a wedged transport must still observe
     /// teardown when the last `Session` clone drops, cancelling the in-flight
     /// write instead of staying alive until the transport eventually errors.
@@ -4249,5 +4529,84 @@ mod teardown_tests {
             .await
             .expect("writer task did not tear down while wedged in send()")
             .expect("dropped channel closed unexpectedly");
+    }
+}
+
+#[cfg(test)]
+mod close_credit_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use web_transport_trait::Session as _;
+
+    struct GatedTransport {
+        entered: mpsc::UnboundedSender<()>,
+        frames: mpsc::UnboundedSender<Bytes>,
+        gate: Arc<Semaphore>,
+    }
+    struct GatedReader;
+    impl Transport for GatedTransport {
+        type Writer = Self;
+        type Reader = GatedReader;
+        fn split(self) -> (Self, GatedReader) {
+            (self, GatedReader)
+        }
+    }
+    impl Reader for GatedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            std::future::pending().await
+        }
+    }
+    impl Writer for GatedTransport {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.entered.send(()).unwrap();
+            self.gate.acquire().await.unwrap().forget();
+            self.frames.send(data).unwrap();
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn close_mid_write_delivers_application_close() {
+        let (entered, mut entered_rx) = mpsc::unbounded_channel();
+        let (frames, mut frames_rx) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let session = Session::new(
+            GatedTransport {
+                entered,
+                frames,
+                gate: gate.clone(),
+            },
+            false,
+            Config::new(Version::QMux01),
+        );
+        entered_rx.recv().await.unwrap();
+        session.close(42, "bye");
+        session.close(43, "later");
+        let mut terminal = session.closed.terminal.subscribe();
+        drop(session);
+        tokio::task::yield_now().await;
+        gate.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let bytes = frames_rx
+                    .recv()
+                    .await
+                    .expect("writer dropped before close frame");
+                if let Some(Frame::ApplicationClose(close)) =
+                    Frame::decode(bytes, Version::QMux01).unwrap()
+                {
+                    assert_eq!(close.code.into_inner(), 42);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(terminal.wait_for(|slot| slot.is_some()).await.unwrap().as_ref().unwrap(), Error::ConnectionClosed { code, .. } if code.into_inner() == 42)
+        );
     }
 }
