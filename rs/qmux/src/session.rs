@@ -1114,7 +1114,8 @@ impl<R: Reader> SessionState<R> {
                         }
                         let id = stream.id;
                         let fin = stream.fin;
-                        if recv.inbound_data.send(stream).is_err() {
+                        if recv.inbound_data.send(stream).is_err() && self.config.version.is_qmux()
+                        {
                             // A stopped frontend owns no receive memory, but the
                             // peer still counts these bytes against MAX_DATA.
                             if let Some(max) = self.conn_recv_credit.consume(data_len) {
