@@ -26,7 +26,7 @@ qlog = ["noq/qlog"]
 bytes = "1"
 futures = "0.3"
 http = "1"
-kio = "0.5.4"
+kio = "0.6.1"
 noq = { version = "1", default-features = false, features = [
     "tracing-log",
     "platform-verifier",
