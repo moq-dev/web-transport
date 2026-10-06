@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.2](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.1...web-transport-noq-v0.4.2) - 2026-10-06
+
+### Fixed
+
+- report 0 max datagram size without datagram support in quinn, noq, and iroh ([#416](https://github.com/moq-dev/web-transport/pull/416))
+
 ## [0.4.1](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.0...web-transport-noq-v0.4.1) - 2026-10-02
 
 ### Fixed

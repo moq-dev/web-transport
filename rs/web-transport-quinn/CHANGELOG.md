@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.1...web-transport-quinn-v0.13.2) - 2026-10-06
+
+### Fixed
+
+- report 0 max datagram size without datagram support in quinn, noq, and iroh ([#416](https://github.com/moq-dev/web-transport/pull/416))
+
 ## [0.13.1](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.0...web-transport-quinn-v0.13.1) - 2026-10-02
 
 ### Fixed
