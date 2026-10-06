@@ -10,14 +10,14 @@ use std::{
 
 use iroh::{
     Endpoint,
-    endpoint::{ConnectionError, presets},
+    endpoint::{ConnectionError, QuicTransportConfig, presets},
 };
 use n0_tracing_test::traced_test;
 use tokio::time::timeout;
 use tracing::Instrument;
 use url::Url;
 
-use crate::{ALPN_H3, Client, H3Request, QuicRequest, SessionError};
+use crate::{ALPN_H3, Client, H3Request, QuicRequest, Session, SessionError};
 
 /// A waker that records whether it was ever woken.
 #[derive(Default)]
@@ -425,4 +425,32 @@ async fn abandoned_accepters_release_their_wakers() -> n0_error::Result<()> {
         .unwrap();
 
     Ok(())
+}
+
+/// A peer without datagram support reports a max datagram size of 0 instead of panicking.
+#[tokio::test]
+async fn no_datagram_support() {
+    const ALPN: &[u8] = b"test";
+
+    let transport = QuicTransportConfig::builder()
+        .datagram_receive_buffer_size(None)
+        .build();
+    let client = Endpoint::builder(presets::Minimal)
+        .transport_config(transport)
+        .bind()
+        .await
+        .unwrap();
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+
+    let accept = async { server.accept().await.unwrap().await.unwrap() };
+    let (_client_conn, server_conn) = tokio::join!(
+        async { client.connect(server.addr(), ALPN).await.unwrap() },
+        accept
+    );
+
+    assert_eq!(Session::raw(server_conn).max_datagram_size(), 0);
 }
