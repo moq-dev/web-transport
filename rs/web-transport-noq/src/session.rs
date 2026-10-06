@@ -369,13 +369,12 @@ impl Session {
     }
 
     /// Computes the maximum size of datagrams that may be passed to
-    /// [`send_datagram`](Self::send_datagram).
+    /// [`send_datagram`](Self::send_datagram), or 0 when the peer does not accept datagrams.
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
+        self.conn
             .max_datagram_size()
-            .expect("datagram support is required");
-        mtu.saturating_sub(self.header_datagram.len())
+            .unwrap_or(0)
+            .saturating_sub(self.header_datagram.len())
     }
 
     /// Returns the available buffer space for sending datagrams.
@@ -1062,6 +1061,13 @@ mod tests {
 
     /// A connected client and server QUIC connection, plus the endpoints that drive them.
     async fn pair() -> (noq::Connection, noq::Connection, [noq::Endpoint; 2]) {
+        pair_with(Default::default()).await
+    }
+
+    /// [`pair`], with the client using `transport`.
+    async fn pair_with(
+        transport: noq::TransportConfig,
+    ) -> (noq::Connection, noq::Connection, [noq::Endpoint; 2]) {
         #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -1077,7 +1083,8 @@ mod tests {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        client_config.transport_config(Arc::new(transport));
         let client = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
 
         let connecting = client
@@ -1156,5 +1163,15 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A peer without datagram support reports a max datagram size of 0 instead of panicking.
+    #[tokio::test]
+    async fn no_datagram_support() {
+        let mut transport = noq::TransportConfig::default();
+        transport.datagram_receive_buffer_size(None);
+        let (_client, server, _endpoints) = pair_with(transport).await;
+
+        assert_eq!(Session::raw(server).max_datagram_size(), 0);
     }
 }

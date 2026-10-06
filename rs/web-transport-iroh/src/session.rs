@@ -219,12 +219,9 @@ impl Session {
     }
 
     /// Computes the maximum size of datagrams that may be passed to
-    /// [`send_datagram`](Self::send_datagram).
+    /// [`send_datagram`](Self::send_datagram), or 0 when the peer does not accept datagrams.
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
+        let mtu = self.conn.max_datagram_size().unwrap_or(0);
         if let Some(h3) = self.h3.as_ref() {
             mtu.saturating_sub(h3.header_datagram.len())
         } else {
@@ -790,7 +787,10 @@ impl web_transport_trait::Stats for SessionStats {
 
 #[cfg(test)]
 mod tests {
-    use iroh::{Endpoint, endpoint::presets};
+    use iroh::{
+        Endpoint,
+        endpoint::{QuicTransportConfig, presets},
+    };
 
     use super::*;
 
@@ -799,7 +799,16 @@ mod tests {
 
     /// A connected client and server connection, plus the endpoints that drive them.
     async fn pair() -> (Connection, Connection, [Endpoint; 2]) {
-        let client = Endpoint::bind(presets::Minimal).await.unwrap();
+        pair_with(Default::default()).await
+    }
+
+    /// [`pair`], with the client using `transport`.
+    async fn pair_with(transport: QuicTransportConfig) -> (Connection, Connection, [Endpoint; 2]) {
+        let client = Endpoint::builder(presets::Minimal)
+            .transport_config(transport)
+            .bind()
+            .await
+            .unwrap();
         let server = Endpoint::builder(presets::Minimal)
             .alpns(vec![ALPN.to_vec()])
             .bind()
@@ -882,5 +891,16 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A peer without datagram support reports a max datagram size of 0 instead of panicking.
+    #[tokio::test]
+    async fn no_datagram_support() {
+        let transport = QuicTransportConfig::builder()
+            .datagram_receive_buffer_size(None)
+            .build();
+        let (_client, server, _endpoints) = pair_with(transport).await;
+
+        assert_eq!(Session::raw(server).max_datagram_size(), 0);
     }
 }
