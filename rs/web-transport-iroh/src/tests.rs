@@ -601,3 +601,45 @@ async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
     server.close().await;
     Ok(())
 }
+
+/// A local close is final, so `close_reason` reports it at once rather than waiting for
+/// the CONNECT stream reader to look for a peer capsule.
+#[tokio::test]
+#[traced_test]
+async fn h3_local_close_reason() -> n0_error::Result<()> {
+    let client = Client::new(Endpoint::bind(presets::Minimal).await.unwrap());
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = server.addr();
+    let url: Url = format!("https://{}/", server.id()).parse().unwrap();
+
+    let server_task = tokio::task::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let session = H3Request::accept(conn).await.unwrap().ok().await.unwrap();
+        session.closed().await;
+        server.close().await;
+    });
+
+    let session = client.connect_h3(server_addr, url).await.unwrap();
+    session.close(7, b"bye");
+    let err = session.close_reason();
+    assert!(
+        matches!(
+            err,
+            Some(SessionError::ConnectionError(
+                ConnectionError::LocallyClosed
+            ))
+        ),
+        "{err:?}"
+    );
+
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
+    client.close().await;
+    Ok(())
+}
