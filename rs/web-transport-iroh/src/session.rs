@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     ops::Deref,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
@@ -15,6 +15,7 @@ use n0_future::{
     FuturesUnordered,
     stream::{Stream, StreamExt},
 };
+use tokio::sync::watch;
 use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt};
 
 use crate::{
@@ -72,27 +73,32 @@ impl Session {
 
     /// Creates a session from pre-established HTTP/3 handshake components.
     pub fn new_h3(conn: Connection, settings: Settings, mut connect: Connected) -> Self {
-        let h3 = H3SessionState::connect(conn.clone(), settings, &connect);
-        let peer_close = h3.peer_close.clone();
+        // The sender lives in the task below, so `closed` can wait for it to finish.
+        let (peer_close, peer_close_rx) = watch::channel(None);
+        let h3 = H3SessionState::connect(conn.clone(), settings, &connect, peer_close_rx);
         let this = Session { conn, h3: Some(h3) };
         // Run a background task to check if the connect stream is closed.
         let this2 = this.clone();
         tokio::spawn(async move {
             let closed = connect.run_closed().await;
+            let close_reason = this2.conn().close_reason();
+            // A peer may close the connection right after its capsule, so record the
+            // capsule even then; only an earlier local close wins over it.
+            if let Ok(Some((code, reason))) = &closed
+                && !matches!(close_reason, Some(endpoint::ConnectionError::LocallyClosed))
+            {
+                let err = WebTransportError::Closed {
+                    code: *code,
+                    reason: reason.clone(),
+                };
+                peer_close.send_replace(Some(err.into()));
+            }
             // A connection that is already closed has its own reason.
-            if this2.conn().close_reason().is_some() {
+            if close_reason.is_some() {
                 return;
             }
             let (code, reason) = match closed {
-                Ok(Some((code, reason))) => {
-                    // Recorded before closing, which `closed` would otherwise report as local.
-                    let err = WebTransportError::Closed {
-                        code,
-                        reason: reason.clone(),
-                    };
-                    let _ = peer_close.set(err.into());
-                    (code, reason)
-                }
+                Ok(Some(close)) => close,
                 Ok(None) => (0, "stream closed".to_string()),
                 Err(err) => {
                     tracing::warn!(?err, "failed to read capsule");
@@ -266,6 +272,12 @@ impl Session {
     /// A peer's `CloseWebTransportSession` capsule is reported as [`WebTransportError::Closed`].
     pub async fn closed(&self) -> SessionError {
         let err = self.conn.closed().await;
+        if let Some(h3) = &self.h3 {
+            // The CONNECT stream may still hold the peer's capsule; its reader ends
+            // promptly once the connection is closed.
+            let mut peer_close = h3.peer_close.clone();
+            while peer_close.changed().await.is_ok() {}
+        }
         self.peer_close().unwrap_or_else(|| err.into())
     }
 
@@ -276,7 +288,7 @@ impl Session {
     }
 
     fn peer_close(&self) -> Option<SessionError> {
-        self.h3.as_ref()?.peer_close.get().cloned()
+        self.h3.as_ref()?.peer_close.borrow().clone()
     }
 }
 
@@ -337,7 +349,7 @@ struct H3SessionState {
 
     // The peer's CloseWebTransportSession capsule. Our connection close echoes it, but
     // that would report the close as local, without the code or reason.
-    peer_close: Arc<OnceLock<SessionError>>,
+    peer_close: watch::Receiver<Option<SessionError>>,
 
     // The request sent by the client.
     request: ConnectRequest,
@@ -355,7 +367,12 @@ impl fmt::Debug for H3SessionState {
 }
 
 impl H3SessionState {
-    fn connect(conn: Connection, settings: Settings, connect: &Connected) -> Self {
+    fn connect(
+        conn: Connection,
+        settings: Settings,
+        connect: &Connected,
+        peer_close: watch::Receiver<Option<SessionError>>,
+    ) -> Self {
         // The session ID is the stream ID of the CONNECT request.
         let session_id = connect.session_id();
 
@@ -380,7 +397,7 @@ impl H3SessionState {
             header_datagram,
             settings: Arc::new(settings),
             accept: Arc::new(Mutex::new(accept)),
-            peer_close: Default::default(),
+            peer_close,
             request: connect.request.clone(),
             response: connect.response.clone(),
         }

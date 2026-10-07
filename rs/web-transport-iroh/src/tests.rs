@@ -516,6 +516,18 @@ async fn raw_stream_codes() -> n0_error::Result<()> {
 #[tokio::test]
 #[traced_test]
 async fn h3_capsule_close() -> n0_error::Result<()> {
+    h3_capsule_close_then(false).await
+}
+
+/// A peer that closes the connection right after its capsule still reports the capsule,
+/// even when its QUIC close lands before the client reads the CONNECT stream.
+#[tokio::test]
+#[traced_test]
+async fn h3_capsule_close_then_quic_close() -> n0_error::Result<()> {
+    h3_capsule_close_then(true).await
+}
+
+async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
     use web_transport_proto::{Capsule, ConnectResponse, Frame};
     use web_transport_trait::Error as _;
 
@@ -567,14 +579,20 @@ async fn h3_capsule_close() -> n0_error::Result<()> {
     connect.send.write_all(&frame).await.unwrap();
     connect.send.finish().unwrap();
 
-    // The client closes the connection on reading the capsule, echoing its code.
-    let err = timeout(Duration::from_secs(10), conn.closed())
-        .await
-        .expect("the client never closed");
-    assert!(
-        matches!(&err, ConnectionError::ApplicationClosed(close) if web_transport_proto::error_from_http3(close.error_code.into_inner()) == Some(42)),
-        "{err:?}"
-    );
+    if quic_close {
+        // Close once the client has acknowledged the capsule, so it is delivered.
+        connect.send.stopped().await.unwrap();
+        conn.close(VarInt::from_u32(0x100), b"");
+    } else {
+        // The client closes the connection on reading the capsule, echoing its code.
+        let err = timeout(Duration::from_secs(10), conn.closed())
+            .await
+            .expect("the client never closed");
+        assert!(
+            matches!(&err, ConnectionError::ApplicationClosed(close) if web_transport_proto::error_from_http3(close.error_code.into_inner()) == Some(42)),
+            "{err:?}"
+        );
+    }
 
     timeout(Duration::from_secs(10), client_task)
         .await
