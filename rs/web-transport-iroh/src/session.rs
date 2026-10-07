@@ -4,7 +4,7 @@ use std::{
     io::Cursor,
     ops::Deref,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll, Waker},
 };
 
@@ -73,15 +73,34 @@ impl Session {
     /// Creates a session from pre-established HTTP/3 handshake components.
     pub fn new_h3(conn: Connection, settings: Settings, mut connect: Connected) -> Self {
         let h3 = H3SessionState::connect(conn.clone(), settings, &connect);
+        let peer_close = h3.peer_close.clone();
         let this = Session { conn, h3: Some(h3) };
         // Run a background task to check if the connect stream is closed.
         let this2 = this.clone();
         tokio::spawn(async move {
-            let (code, reason) = connect.run_closed().await;
-            if this2.conn().close_reason().is_none() {
-                // TODO We shouldn't be closing the QUIC connection with the same error.
-                this2.close(code, reason.as_bytes());
+            let closed = connect.run_closed().await;
+            // A connection that is already closed has its own reason.
+            if this2.conn().close_reason().is_some() {
+                return;
             }
+            let (code, reason) = match closed {
+                Ok(Some((code, reason))) => {
+                    // Recorded before closing, which `closed` would otherwise report as local.
+                    let err = WebTransportError::Closed {
+                        code,
+                        reason: reason.clone(),
+                    };
+                    let _ = peer_close.set(err.into());
+                    (code, reason)
+                }
+                Ok(None) => (0, "stream closed".to_string()),
+                Err(err) => {
+                    tracing::warn!(?err, "failed to read capsule");
+                    (1, "capsule error".to_string())
+                }
+            };
+            // TODO We shouldn't be closing the QUIC connection with the same error.
+            this2.close(code, reason.as_bytes());
         });
         this
     }
@@ -243,13 +262,21 @@ impl Session {
     }
 
     /// Wait until the session is closed, returning the error. See [`iroh::endpoint::Connection::closed`].
+    ///
+    /// A peer's `CloseWebTransportSession` capsule is reported as [`WebTransportError::Closed`].
     pub async fn closed(&self) -> SessionError {
-        self.conn.closed().await.into()
+        let err = self.conn.closed().await;
+        self.peer_close().unwrap_or_else(|| err.into())
     }
 
     /// Return why the session was closed, or None if it's not closed. See [`iroh::endpoint::Connection::close_reason`].
     pub fn close_reason(&self) -> Option<SessionError> {
-        self.conn.close_reason().map(Into::into)
+        let err = self.conn.close_reason()?;
+        Some(self.peer_close().unwrap_or_else(|| err.into()))
+    }
+
+    fn peer_close(&self) -> Option<SessionError> {
+        self.h3.as_ref()?.peer_close.get().cloned()
     }
 }
 
@@ -308,6 +335,10 @@ struct H3SessionState {
     // The accept logic is stateful, so use an Arc<Mutex> to share it.
     accept: Arc<Mutex<H3SessionAccept>>,
 
+    // The peer's CloseWebTransportSession capsule. Our connection close echoes it, but
+    // that would report the close as local, without the code or reason.
+    peer_close: Arc<OnceLock<SessionError>>,
+
     // The request sent by the client.
     request: ConnectRequest,
 
@@ -349,6 +380,7 @@ impl H3SessionState {
             header_datagram,
             settings: Arc::new(settings),
             accept: Arc::new(Mutex::new(accept)),
+            peer_close: Default::default(),
             request: connect.request.clone(),
             response: connect.response.clone(),
         }

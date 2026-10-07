@@ -164,26 +164,22 @@ impl Connected {
         VarInt::try_from(stream_id.into_inner()).unwrap()
     }
 
-    // Keep reading from the control stream until it's closed.
-    pub(crate) async fn run_closed(&mut self) -> (u32, String) {
+    // Read capsules from the CONNECT stream until it ends, returning the peer's
+    // CloseWebTransportSession code and reason, or None if the stream ended without one.
+    pub(crate) async fn run_closed(
+        &mut self,
+    ) -> Result<Option<(u32, String)>, web_transport_proto::CapsuleError> {
+        let mut reader = web_transport_proto::Http3CapsuleReader::new(&mut self.recv);
         loop {
-            match web_transport_proto::Capsule::read(&mut self.recv).await {
-                Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
-                    code,
-                    reason,
-                })) => {
-                    return (code, reason);
+            match reader.read().await? {
+                Some(web_transport_proto::Capsule::CloseWebTransportSession { code, reason }) => {
+                    return Ok(Some((code, reason)));
                 }
-                Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
-                Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
+                Some(web_transport_proto::Capsule::Grease { .. }) => {}
+                Some(web_transport_proto::Capsule::Unknown { typ, payload }) => {
                     tracing::warn!(%typ, size = payload.len(), "unknown capsule");
                 }
-                Ok(None) => {
-                    return (0, "stream closed".to_string());
-                }
-                Err(_) => {
-                    return (1, "capsule error".to_string());
-                }
+                None => return Ok(None),
             }
         }
     }
