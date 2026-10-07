@@ -509,3 +509,137 @@ async fn raw_stream_codes() -> n0_error::Result<()> {
     server.close().await;
     Ok(())
 }
+
+/// A peer's `CloseWebTransportSession` capsule rides HTTP/3 DATA frames on the CONNECT
+/// stream, the way the other backends and browsers send it. The client unwraps that
+/// framing and reports the capsule's code and reason as the session's close.
+#[tokio::test]
+#[traced_test]
+async fn h3_capsule_close() -> n0_error::Result<()> {
+    h3_capsule_close_then(false).await
+}
+
+/// A peer that closes the connection right after its capsule still reports the capsule,
+/// even when its QUIC close lands before the client reads the CONNECT stream.
+#[tokio::test]
+#[traced_test]
+async fn h3_capsule_close_then_quic_close() -> n0_error::Result<()> {
+    h3_capsule_close_then(true).await
+}
+
+async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
+    use web_transport_proto::{Capsule, ConnectResponse, Frame};
+    use web_transport_trait::Error as _;
+
+    let client = Client::new(Endpoint::bind(presets::Minimal).await.unwrap());
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = server.addr();
+    let url: Url = format!("https://{}/", server.id()).parse().unwrap();
+
+    let client_task = tokio::task::spawn(async move {
+        let session = client.connect_h3(server_addr, url).await.unwrap();
+        let err = session.closed().await;
+        assert_eq!(
+            err.session_error(),
+            Some((42, "bye".to_string())),
+            "{err:?}"
+        );
+        assert_eq!(
+            session.close_reason().and_then(|err| err.session_error()),
+            Some((42, "bye".to_string()))
+        );
+        drop(session);
+        client.close().await;
+    });
+
+    // The server half by hand, since this crate's own server closes without a capsule.
+    let conn = server.accept().await.unwrap().await.unwrap();
+    let _settings = crate::Settings::connect(&conn).await.unwrap();
+    let mut connect = crate::Connecting::accept(&conn)
+        .await
+        .unwrap()
+        .respond(ConnectResponse::OK)
+        .await
+        .unwrap();
+
+    let mut capsule = Vec::new();
+    Capsule::CloseWebTransportSession {
+        code: 42,
+        reason: "bye".to_string(),
+    }
+    .encode(&mut capsule);
+    let mut frame = Vec::new();
+    Frame::DATA.encode(&mut frame);
+    web_transport_proto::VarInt::from_u32(capsule.len() as u32).encode(&mut frame);
+    frame.extend_from_slice(&capsule);
+    connect.send.write_all(&frame).await.unwrap();
+    connect.send.finish().unwrap();
+
+    if quic_close {
+        // Close once the client has acknowledged the capsule, so it is delivered.
+        connect.send.stopped().await.unwrap();
+        conn.close(VarInt::from_u32(0x100), b"");
+    } else {
+        // The client closes the connection on reading the capsule, echoing its code.
+        let err = timeout(Duration::from_secs(10), conn.closed())
+            .await
+            .expect("the client never closed");
+        assert!(
+            matches!(&err, ConnectionError::ApplicationClosed(close) if web_transport_proto::error_from_http3(close.error_code.into_inner()) == Some(42)),
+            "{err:?}"
+        );
+    }
+
+    timeout(Duration::from_secs(10), client_task)
+        .await
+        .expect("client task timed out")
+        .unwrap();
+    server.close().await;
+    Ok(())
+}
+
+/// A local close is final, so `close_reason` reports it at once rather than waiting for
+/// the CONNECT stream reader to look for a peer capsule.
+#[tokio::test]
+#[traced_test]
+async fn h3_local_close_reason() -> n0_error::Result<()> {
+    let client = Client::new(Endpoint::bind(presets::Minimal).await.unwrap());
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server_addr = server.addr();
+    let url: Url = format!("https://{}/", server.id()).parse().unwrap();
+
+    let server_task = tokio::task::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        let session = H3Request::accept(conn).await.unwrap().ok().await.unwrap();
+        session.closed().await;
+        server.close().await;
+    });
+
+    let session = client.connect_h3(server_addr, url).await.unwrap();
+    session.close(7, b"bye");
+    let err = session.close_reason();
+    assert!(
+        matches!(
+            err,
+            Some(SessionError::ConnectionError(
+                ConnectionError::LocallyClosed
+            ))
+        ),
+        "{err:?}"
+    );
+
+    timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timed out")
+        .unwrap();
+    client.close().await;
+    Ok(())
+}

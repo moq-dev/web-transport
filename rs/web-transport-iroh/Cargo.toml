@@ -28,6 +28,7 @@ n0-future = "0.3.1"
 tokio = { version = "1", default-features = false, features = [
     "io-util",
     "macros",
+    "sync",
 ] }
 tracing = "0.1.41"
 url = "2"
