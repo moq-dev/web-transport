@@ -218,12 +218,9 @@ impl Session {
     }
 
     /// Computes the maximum size of datagrams that may be passed to
-    /// [`send_datagram`](Self::send_datagram).
+    /// [`send_datagram`](Self::send_datagram), or 0 when the peer does not accept datagrams.
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
+        let mtu = self.conn.max_datagram_size().unwrap_or(0);
         if let Some(h3) = self.h3.as_ref() {
             mtu.saturating_sub(h3.header_datagram.len())
         } else {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.7.0...web-transport-iroh-v0.7.1) - 2026-10-06
+
+### Fixed
+
+- report 0 max datagram size without datagram support (backport of [#416](https://github.com/moq-dev/web-transport/pull/416))
+
 ## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.6.0...web-transport-iroh-v0.7.0) - 2026-08-06
 
 ### Fixed
