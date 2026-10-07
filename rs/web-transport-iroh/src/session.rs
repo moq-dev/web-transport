@@ -284,6 +284,13 @@ impl Session {
     /// Return why the session was closed, or None if it's not closed. See [`iroh::endpoint::Connection::close_reason`].
     pub fn close_reason(&self) -> Option<SessionError> {
         let err = self.conn.close_reason()?;
+        // The close is unsettled until the CONNECT stream reader finishes, since it may
+        // still hold the peer's capsule.
+        if let Some(h3) = &self.h3
+            && h3.peer_close.has_changed().is_ok()
+        {
+            return None;
+        }
         Some(self.peer_close().unwrap_or_else(|| err.into()))
     }
 
