@@ -17,7 +17,7 @@ use crate::{
     StreamId, TransportParams, Version, MAX_FRAME_PAYLOAD, MAX_FRAME_SIZE,
 };
 use bytes::{Buf, BufMut, Bytes};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use web_transport_proto::VarInt;
 use web_transport_trait as generic;
 
@@ -33,6 +33,42 @@ const DATAGRAM_RECV_BUFFER: usize = 1024;
 /// fills, and `send_datagram` drops on a full lane. Kept small so shedding tracks
 /// real backpressure closely rather than after a deep buffer of stale datagrams.
 const DATAGRAM_SEND_BUFFER: usize = 64;
+
+/// QMux §4.3 allows one response carrying the largest pending sequence. Keep
+/// that response outside the lossless control FIFO so a blocked writer cannot
+/// accumulate one allocation per inbound ping. At most one response is pending
+/// here in addition to the writer's bounded in-flight batch.
+#[derive(Default)]
+struct PingResponse {
+    sequence: Mutex<Option<u64>>,
+    ready: Notify,
+}
+
+impl PingResponse {
+    fn queue(&self, sequence: u64) {
+        let mut pending = self.sequence.lock().unwrap();
+        *pending = Some(pending.map_or(sequence, |prev| prev.max(sequence)));
+        self.ready.notify_one();
+    }
+
+    fn try_recv(&self) -> Option<Frame> {
+        self.sequence.lock().unwrap().take().map(|sequence| {
+            Frame::Ping(crate::Ping {
+                sequence,
+                response: true,
+            })
+        })
+    }
+
+    async fn recv(&self) -> Frame {
+        loop {
+            if let Some(frame) = self.try_recv() {
+                return frame;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
 
 /// Shared, lock-guarded per-stream backend state. The reader task inserts/looks
 /// up entries as inbound frames arrive; the writer task retires an entry when it
@@ -216,6 +252,7 @@ struct SessionState<R: Reader> {
     // reader never pulls from these — the writer does.
     outbound: PriorityQueue,
     control: mpsc::UnboundedSender<Frame>,
+    ping_response: Arc<PingResponse>,
 
     accept_bi: mpsc::Sender<(SendStream, RecvStream)>,
     accept_uni: mpsc::Sender<RecvStream>,
@@ -300,8 +337,9 @@ const BATCH_MAX_FRAMES: usize = 256;
 const BATCH_YIELD_BELOW_BYTES: usize = 128;
 
 /// Pick the next outbound frame in strict priority order: control (lossless,
-/// e.g. RESET/STOP/CLOSE/window updates) first, then datagrams (low-latency but
-/// droppable), then bulk stream data scheduled by [`PriorityQueue`]. Returns
+/// e.g. RESET/STOP/CLOSE/window updates) first, then the coalesced ping response,
+/// datagrams (low-latency but droppable), and bulk stream data scheduled by
+/// [`PriorityQueue`]. Returns
 /// `None` only once the stream queue is closed, which drives session teardown.
 ///
 /// Each source's future is cancel-safe (`mpsc::recv` and `PriorityQueue::pop`
@@ -309,12 +347,14 @@ const BATCH_YIELD_BELOW_BYTES: usize = 128;
 /// `select!` never drops a frame.
 async fn next_outbound(
     control: &mut mpsc::UnboundedReceiver<Frame>,
+    ping_response: &PingResponse,
     datagram: &mut mpsc::Receiver<Bytes>,
     stream: &PriorityQueue,
 ) -> Option<Frame> {
     tokio::select! {
         biased;
         Some(frame) = control.recv() => Some(frame),
+        frame = ping_response.recv() => Some(frame),
         // `.into()` builds the length-prefixed (0x31) form we always emit.
         Some(payload) = datagram.recv() => Some(Frame::Datagram(payload.into())),
         frame = stream.pop() => frame,
@@ -377,6 +417,7 @@ struct WriterState<W: Writer> {
     version: Version,
 
     control: mpsc::UnboundedReceiver<Frame>,
+    ping_response: Arc<PingResponse>,
     datagrams: mpsc::Receiver<Bytes>,
     outbound: PriorityQueue,
 
@@ -429,7 +470,7 @@ impl<W: Writer> WriterState<W> {
         loop {
             tokio::select! {
                 biased;
-                frame = next_outbound(&mut self.control, &mut self.datagrams, &self.outbound) => {
+                frame = next_outbound(&mut self.control, &self.ping_response, &mut self.datagrams, &self.outbound) => {
                     match frame {
                         Some(frame) => match self.transmit_or_teardown(frame, &mut closed_rx).await {
                             Transmitted::Ok => {}
@@ -546,6 +587,9 @@ impl<W: Writer> WriterState<W> {
     /// Non-blocking [`next_outbound`], in the same priority order.
     fn try_next_outbound(&mut self) -> Option<Frame> {
         if let Ok(frame) = self.control.try_recv() {
+            return Some(frame);
+        }
+        if let Some(frame) = self.ping_response.try_recv() {
             return Some(frame);
         }
         if let Ok(payload) = self.datagrams.try_recv() {
@@ -777,6 +821,7 @@ mod writer_final_size_tests {
             writer,
             version: Version::QMux01,
             control,
+            ping_response: Arc::new(PingResponse::default()),
             datagrams,
             outbound: PriorityQueue::new(1),
             streams,
@@ -1676,11 +1721,7 @@ impl<R: Reader> SessionState<R> {
                     self.rtt
                         .received(ping.sequence, tokio::time::Instant::now());
                 } else {
-                    let response = Frame::Ping(crate::Ping {
-                        sequence: ping.sequence,
-                        response: true,
-                    });
-                    self.control.send(response).ok();
+                    self.ping_response.queue(ping.sequence);
                 }
             }
             // DATAGRAM: fan out to the receive channel. `max_datagram_frame_size`
@@ -1941,10 +1982,11 @@ impl Session {
         let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
 
         let outbound = PriorityQueue::new(8);
-        // Control lane (lossless): RESET/STOP/CLOSE, window updates, pings, and the
-        // initial TRANSPORT_PARAMETERS. The reader and stream frontends produce;
+        // Control lane (lossless): RESET/STOP/CLOSE, window updates, ping requests,
+        // and the initial TRANSPORT_PARAMETERS. Reader and stream frontends produce;
         // the writer consumes.
         let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let ping_response = Arc::new(PingResponse::default());
 
         // Bounded, lossy datagram channels — drop on a full buffer rather than
         // stalling, matching QUIC's unreliable semantics. When the writer stalls on
@@ -2001,6 +2043,7 @@ impl Session {
             writer: writer_half,
             version,
             control: control_rx,
+            ping_response: ping_response.clone(),
             datagrams: outbound_datagram_rx,
             outbound: outbound.clone(),
             streams: streams.clone(),
@@ -2061,6 +2104,7 @@ impl Session {
             is_server,
             outbound: outbound.clone(),
             control: control_tx.clone(),
+            ping_response,
             accept_bi: accept_bi_tx,
             accept_uni: accept_uni_tx,
             streams: streams.clone(),
@@ -4677,5 +4721,213 @@ mod teardown_tests {
             .await
             .expect("writer task did not tear down while wedged in send()")
             .expect("dropped channel closed unexpectedly");
+    }
+}
+
+#[cfg(test)]
+mod ping_backpressure_tests {
+    use super::*;
+    use tokio::sync::Semaphore;
+    use web_transport_trait::Session as _;
+
+    struct BlockedTransport {
+        incoming: mpsc::Receiver<Bytes>,
+        outgoing: mpsc::Sender<Bytes>,
+        writable: Arc<Semaphore>,
+        entered: mpsc::Sender<()>,
+    }
+
+    struct BlockedWriter {
+        outgoing: mpsc::Sender<Bytes>,
+        writable: Arc<Semaphore>,
+        entered: mpsc::Sender<()>,
+    }
+
+    struct ScriptedReader(mpsc::Receiver<Bytes>);
+
+    impl Transport for BlockedTransport {
+        type Writer = BlockedWriter;
+        type Reader = ScriptedReader;
+
+        fn split(self) -> (Self::Writer, Self::Reader) {
+            (
+                BlockedWriter {
+                    outgoing: self.outgoing,
+                    writable: self.writable,
+                    entered: self.entered,
+                },
+                ScriptedReader(self.incoming),
+            )
+        }
+    }
+
+    impl Writer for BlockedWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.entered.try_send(()).ok();
+            self.writable.acquire().await.unwrap().forget();
+            self.outgoing.send(data).await.map_err(|_| Error::Closed)
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Reader for ScriptedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            self.0.recv().await.ok_or(Error::Closed)
+        }
+    }
+
+    async fn send_frame(tx: &mpsc::Sender<Bytes>, version: Version, frame: Frame) {
+        tx.send(frame.encode(version).unwrap()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_response_keeps_highest_sequence_and_survives_cancelled_wait() {
+        let pending = PingResponse::default();
+        // Losing a select race while empty must not consume the next response.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), pending.recv())
+                .await
+                .is_err()
+        );
+        for sequence in [0, 100, 50, 100] {
+            pending.queue(sequence);
+        }
+        assert!(
+            matches!(pending.recv().await, Frame::Ping(ping) if ping.response && ping.sequence == 100)
+        );
+        assert!(pending.try_recv().is_none());
+        // Coalescing only considers pending requests, even on draft-01 where
+        // the reader does not enforce strictly increasing sequences.
+        pending.queue(2);
+        assert!(
+            matches!(pending.recv().await, Frame::Ping(ping) if ping.response && ping.sequence == 2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ping_flood_with_blocked_writer_keeps_one_pending_response() {
+        tokio::time::timeout(std::time::Duration::from_secs(1), ping_flood())
+            .await
+            .expect("ping processing or writer wakeup stalled");
+    }
+
+    async fn ping_flood() {
+        for version in [Version::QMux01, Version::QMux02] {
+            let (incoming, reader) = mpsc::channel(1);
+            let (outgoing, mut written) = mpsc::channel(8);
+            let (entered, mut writing) = mpsc::channel(1);
+            let writable = Arc::new(Semaphore::new(0));
+            let session = Session::new(
+                BlockedTransport {
+                    incoming: reader,
+                    outgoing,
+                    writable: writable.clone(),
+                    entered,
+                },
+                true,
+                Config::new(version),
+            );
+            // Block the very first write, so no response can escape the queue.
+            writing.recv().await.unwrap();
+            send_frame(
+                &incoming,
+                version,
+                Frame::TransportParameters(Config::new(version).to_transport_params()),
+            )
+            .await;
+            for sequence in 0..10_000 {
+                send_frame(
+                    &incoming,
+                    version,
+                    Frame::Ping(crate::Ping {
+                        sequence,
+                        response: false,
+                    }),
+                )
+                .await;
+            }
+            // Accepting this stream proves all preceding pings were processed,
+            // and that stalled responses do not stop unrelated inbound traffic.
+            send_frame(
+                &incoming,
+                version,
+                Frame::Stream(Stream {
+                    id: StreamId::new(0, StreamDir::Uni, false),
+                    offset: 0,
+                    data: Bytes::new(),
+                    fin: false,
+                }),
+            )
+            .await;
+            let recv = session.accept_uni().await.unwrap();
+
+            // A separate session must still answer probes while this writer is
+            // blocked. Its input and output buffers are independent and bounded.
+            let (probe_in, probe_reader) = mpsc::channel(1);
+            let (probe_out, mut probe_written) = mpsc::channel(8);
+            let (probe_entered, _probe_writing) = mpsc::channel(1);
+            let probe = Session::new(
+                BlockedTransport {
+                    incoming: probe_reader,
+                    outgoing: probe_out,
+                    writable: Arc::new(Semaphore::new(2)),
+                    entered: probe_entered,
+                },
+                true,
+                Config::new(version),
+            );
+            send_frame(
+                &probe_in,
+                version,
+                Frame::TransportParameters(Config::new(version).to_transport_params()),
+            )
+            .await;
+            send_frame(
+                &probe_in,
+                version,
+                Frame::Ping(crate::Ping {
+                    sequence: 0,
+                    response: false,
+                }),
+            )
+            .await;
+            probe_written.recv().await.unwrap(); // transport parameters
+            let response = probe_written.recv().await.unwrap();
+            assert!(
+                matches!(Frame::decode(response, version).unwrap(), Some(Frame::Ping(ping)) if ping.response && ping.sequence == 0)
+            );
+            drop(probe);
+
+            writable.add_permits(3);
+            let first = written.recv().await.unwrap();
+            assert!(matches!(
+                Frame::decode(first, version).unwrap(),
+                Some(Frame::TransportParameters(_))
+            ));
+            let response = written.recv().await.unwrap();
+            assert!(
+                matches!(Frame::decode(response, version).unwrap(), Some(Frame::Ping(ping)) if ping.response && ping.sequence == 9_999)
+            );
+
+            // After the slot was drained, a fresh request must wake the writer.
+            send_frame(
+                &incoming,
+                version,
+                Frame::Ping(crate::Ping {
+                    sequence: 10_000,
+                    response: false,
+                }),
+            )
+            .await;
+            let response = written.recv().await.unwrap();
+            assert!(
+                matches!(Frame::decode(response, version).unwrap(), Some(Frame::Ping(ping)) if ping.response && ping.sequence == 10_000)
+            );
+            drop(recv);
+            drop(session);
+        }
     }
 }
