@@ -441,6 +441,10 @@ struct WriterState<W: Writer> {
     // sequence, but only the writer knows when it actually left.
     rtt: Arc<Rtt>,
 
+    // A close ends this batch and all future writes; only its flush and the
+    // transport shutdown may follow it (QMux §7.2).
+    close_fed: bool,
+
     // Signals for FINs fed since the last flush, sent `Finished` once it lands.
     finished: Vec<mpsc::UnboundedSender<SendSignal>>,
 }
@@ -467,7 +471,7 @@ impl<W: Writer> WriterState<W> {
         // Set if a write was abandoned mid-flight because the session tore down.
         // The transport may be parked mid-frame, so we must not touch it again.
         let mut interrupted = false;
-        loop {
+        while !self.close_fed {
             tokio::select! {
                 biased;
                 frame = next_outbound(&mut self.control, &self.ping_response, &mut self.datagrams, &self.outbound) => {
@@ -503,10 +507,14 @@ impl<W: Writer> WriterState<W> {
                     // mid-frame), so the transport is at a frame boundary: best-effort
                     // flush of any queued control frames (e.g. a ConnectionClose)
                     // before we stop.
+                    self.ping_response.try_recv();
                     let mut flushable = true;
                     while let Ok(frame) = self.control.try_recv() {
                         if self.transmit(frame).await.is_err() {
                             flushable = false;
+                            break;
+                        }
+                        if self.close_fed {
                             break;
                         }
                     }
@@ -568,7 +576,7 @@ impl<W: Writer> WriterState<W> {
         let mut bytes = self.transmit(first).await?;
         let mut frames = 1;
         let mut yielded = !may_yield;
-        while bytes < BATCH_MAX_BYTES && frames < BATCH_MAX_FRAMES {
+        while !self.close_fed && bytes < BATCH_MAX_BYTES && frames < BATCH_MAX_FRAMES {
             let frame = match self.try_next_outbound() {
                 Some(frame) => frame,
                 None if !yielded && bytes < BATCH_YIELD_BELOW_BYTES => {
@@ -625,6 +633,15 @@ impl<W: Writer> WriterState<W> {
     /// [`flush`](Self::flush) afterwards. Returns the encoded size. The `streams`
     /// lock is only held for the synchronous retirement, never across the await.
     async fn transmit(&mut self, mut frame: Frame) -> Result<usize, Error> {
+        // A response may have been selected just before teardown was recorded.
+        // It is no longer useful, and must not precede transport shutdown.
+        if matches!(&frame, Frame::Ping(ping) if ping.response) && self.closed.borrow().is_some() {
+            return Ok(0);
+        }
+        let closes = matches!(
+            &frame,
+            Frame::ConnectionClose(_) | Frame::ApplicationClose(_)
+        );
         let transmitted_stream = match &frame {
             Frame::Stream(stream) if !stream.fin => Some((stream.id, stream.data.len() as u64)),
             _ => None,
@@ -683,6 +700,10 @@ impl<W: Writer> WriterState<W> {
         let result = self.writer.feed(bytes).await;
         self.writer_backpressured.store(false, Ordering::Release);
         result?;
+        self.close_fed = closes;
+        if closes {
+            self.ping_response.try_recv();
+        }
         // Signalled by `flush`, once the FIN is actually on the transport.
         self.finished.extend(finished);
         // Counted once fed: the batch is flushed before any later frame, so a
@@ -831,8 +852,74 @@ mod writer_final_size_tests {
             base: tokio::time::Instant::now(),
             last_send_at: Arc::new(AtomicU64::new(0)),
             rtt: Arc::new(Rtt::default()),
+            close_fed: false,
             finished: Vec::new(),
         }
+    }
+
+    /// A close must be the last frame, even with a pending ping response or
+    /// additional control frames queued behind it. Exercise a close selected
+    /// both at the start of a batch and after another frame was already fed.
+    #[tokio::test(start_paused = true)]
+    async fn close_ends_batch_and_writer_with_pending_ping_response() {
+        for version in [Version::QMux01, Version::QMux02] {
+            for close in [
+                Frame::ConnectionClose(ConnectionClose {
+                    code: VarInt::from_u32(1002),
+                    reason: "protocol violation".into(),
+                }),
+                Frame::ApplicationClose(ApplicationClose {
+                    code: VarInt::from_u32(0),
+                    reason: "done".into(),
+                }),
+            ] {
+                for close_first in [true, false] {
+                    let batch = BatchWriter::default();
+                    let (fed, flushes) = (batch.fed.clone(), batch.flushes.clone());
+                    let mut writer = writer_state(batch, Arc::new(Mutex::new(Streams::default())));
+                    writer.version = version;
+                    let (control, queued) = mpsc::unbounded_channel();
+                    writer.control = queued;
+                    writer.ping_response.queue(42);
+                    // A real reader queues this close after a ping followed by
+                    // a protocol error; the close has priority over the response.
+                    control.send(close.clone()).unwrap();
+                    let first = if close_first {
+                        writer.try_next_outbound().unwrap()
+                    } else {
+                        Frame::MaxData(1)
+                    };
+                    writer.transmit_batch(first).await.unwrap();
+                    let expected = if close_first { 1 } else { 2 };
+                    assert_eq!(fed.lock().unwrap().len(), expected, "frame followed close");
+                    assert_eq!(*flushes.lock().unwrap(), vec![expected]);
+                    assert!(writer.ping_response.try_recv().is_none());
+
+                    // Even frames queued after the close was flushed must not
+                    // restart sending in the next writer iteration.
+                    control.send(Frame::MaxData(2)).unwrap();
+                    writer.ping_response.queue(43);
+                    tokio::time::timeout(std::time::Duration::from_secs(1), writer.run())
+                        .await
+                        .expect("writer did not stop after close");
+                    assert_eq!(fed.lock().unwrap().len(), expected);
+                }
+            }
+        }
+    }
+
+    /// Teardown without a local close (e.g. the peer closed) discards an already
+    /// selected response instead of feeding it before the writer observes close.
+    #[tokio::test]
+    async fn teardown_discards_selected_ping_response() {
+        let batch = BatchWriter::default();
+        let fed = batch.fed.clone();
+        let mut writer = writer_state(batch, Arc::new(Mutex::new(Streams::default())));
+        writer.ping_response.queue(42);
+        let response = writer.try_next_outbound().unwrap();
+        note_closed(&writer.closed, Error::Closed);
+        writer.transmit_batch(response).await.unwrap();
+        assert!(fed.lock().unwrap().is_empty());
     }
 
     /// Transmit a FIN for a registered stream, returning the write result and the
@@ -2053,6 +2140,7 @@ impl Session {
             base,
             last_send_at: last_send_at.clone(),
             rtt: rtt.clone(),
+            close_fed: false,
             finished: Vec::new(),
         };
         tokio::spawn(async move { writer.run().await });

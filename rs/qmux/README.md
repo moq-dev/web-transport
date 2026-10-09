@@ -58,7 +58,8 @@ To run QMux over something the built-in modules don't cover, wrap any
 Pending QX_PING responses are coalesced into one response carrying the highest
 sequence number, as permitted by QMux §4.3. A peer that stops reading cannot
 grow a response queue by sending more pings; inbound stream processing continues
-while the writer is blocked.
+while the writer is blocked. Pending responses are discarded during teardown,
+and a close frame ends the writer's output.
 
 ## License
 
