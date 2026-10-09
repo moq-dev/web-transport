@@ -4,6 +4,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # Quest serves its guide and skills; the repository keeps only skill stubs.
+    quest = {
+      url = "github:kixelated/quest/v0.1.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -16,6 +22,7 @@
       nixpkgs,
       flake-utils,
       rust-overlay,
+      quest,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -34,7 +41,10 @@
           targets = [ "wasm32-unknown-unknown" ];
         };
 
+        quest-cli = quest.packages.${system}.default;
+
         tools = [
+          quest-cli
           rust-toolchain
           pkgs.cargo-shear
           pkgs.cargo-sort
@@ -66,6 +76,9 @@
         ];
       in
       {
+        # Validate quests without realizing the full development shell.
+        packages.quest = quest-cli;
+
         devShells.default = pkgs.mkShell {
           packages = tools;
 
