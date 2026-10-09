@@ -1,0 +1,36 @@
+name: Quest
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "quest/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/quest.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "quest/**"
+      - "flake.nix"
+      - "flake.lock"
+      - ".github/workflows/quest.yml"
+
+concurrency:
+  group: quest-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # Check the tree without realizing the full development shell.
+      - run: nix run .#quest -- check

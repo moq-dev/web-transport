@@ -21,6 +21,8 @@ setup-tools:
 
 # Run the CI checks
 check:
+	quest check
+
 	cargo check --workspace --all-targets --all-features
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 

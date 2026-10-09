@@ -67,3 +67,5 @@ Keep this file short and cross-cutting. Put package-specific guidance in the
 nearest package README (or a nested `AGENTS.md` only when agents need instructions
 that do not belong in user documentation), then link to it here if it affects
 repository-wide work.
+
+Quests: when work mentions a quest, run `quest guide` and follow it.

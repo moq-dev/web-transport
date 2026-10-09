@@ -45,3 +45,14 @@ Built from `rs/web-transport-ffi` via UniFFI; all three release workflows fire f
 | Python   | [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) (PyPI)      | `py/web-transport` |
 | Kotlin   | `dev.moq:web-transport` (Maven Central)                                      | `kt/`        |
 | Swift    | `WebTransportFFI.xcframework.zip` (attached to GitHub Releases)              | `swift/`     |
+
+## Quests
+
+Development plans live in [`quest/`](quest/README.md). Enter `nix develop` to
+use the pinned Quest CLI, then run `quest guide` for the workflow. Without
+entering the shell, use `nix run .#quest -- guide`.
+
+Restart your agent session after setup to load the quest skills. Use
+`$quest-plan` in Codex or `/quest-plan` in Claude Code to plan work, and
+`$quest-import` or `/quest-import` to bring in GitHub issues. `quest check`
+validates the tree and runs as part of `just check` and CI.
