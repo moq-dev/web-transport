@@ -9,6 +9,9 @@ architecture, package usage, and release procedures next to the code they descri
 - Read the nearest package `README.md`, `Cargo.toml`, `package.json`, or language
   build file before editing that package. Package-local documentation is the source
   of truth for package-specific behavior.
+- Read any nested `AGENTS.md` for the area you change: [`rs/`](rs/AGENTS.md),
+  [`js/`](js/AGENTS.md), [`py/`](py/AGENTS.md), and
+  [`rs/web-transport-ffi/`](rs/web-transport-ffi/AGENTS.md).
 - Read [`justfile`](justfile) before adding or changing development commands.
 - For language bindings, also read [`py/web-transport/README.md`](py/web-transport/README.md),
   [`kt/README.md`](kt/README.md), or [`swift/README.md`](swift/README.md), as applicable.
@@ -43,6 +46,16 @@ binding, example, and README for corresponding updates. In particular, changes t
 
 ## Engineering rules
 
+- Keep changes focused. Refactor for maintainability within the affected scope;
+  split unrelated cleanup into separate work. Match existing conventions.
+- Keep new APIs private until a consumer needs them. Report public API and wire
+  compatibility impact in the PR description. Do not bump versions unless asked.
+- Reject malformed or unsupported input with an error unless the protocol
+  explicitly requires ignoring it.
+- Use controlled time in unit tests instead of sleeps; use real time only when
+  exercising real networking. Wire new tests into CI.
+- Measure performance-sensitive changes with benchmarks, including scaling across
+  independent dimensions such as sessions and streams.
 - Reproduce bugs and identify the mechanism before fixing them. Fix the lowest
   responsible layer and add a regression test that fails without the fix.
 - Treat public API design as a compatibility commitment. Prefer a small,
@@ -62,6 +75,9 @@ binding, example, and README for corresponding updates. In particular, changes t
   without explaining why failure is safe or why timing is the root cause.
 
 ## Maintaining these instructions
+
+Edit agent instructions only when asked. Keep rules concise, state each once,
+and describe goals and recurring pitfalls rather than prescribing implementations.
 
 Keep this file short and cross-cutting. Put package-specific guidance in the
 nearest package README (or a nested `AGENTS.md` only when agents need instructions
