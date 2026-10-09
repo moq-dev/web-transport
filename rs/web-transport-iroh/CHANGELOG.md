@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.3](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.2...web-transport-iroh-v0.8.3) - 2026-10-09
+
+### Fixed
+
+- *(iroh)* read a peer's close capsule out of its HTTP/3 DATA frames ([#419](https://github.com/moq-dev/web-transport/pull/419))
+
 ## [0.8.2](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.1...web-transport-iroh-v0.8.2) - 2026-10-06
 
 ### Fixed
