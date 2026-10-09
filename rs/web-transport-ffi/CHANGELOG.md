@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.2.1...web-transport-ffi-v0.2.2) - 2026-10-09
+
+### Other
+
+- import relevant MoQ agent guidance ([#423](https://github.com/moq-dev/web-transport/pull/423))
+
 ## [0.2.1](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.2.0...web-transport-ffi-v0.2.1) - 2026-09-27
 
 ### Other
