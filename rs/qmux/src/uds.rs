@@ -47,6 +47,18 @@ impl Config {
         self
     }
 
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which this builder keeps. Call it before
+    /// [`handshake_timeout`](Self::handshake_timeout), which it would replace.
+    pub fn session_config(mut self, config: crate::Config) -> Self {
+        self.inner = crate::Config {
+            version: self.inner.version,
+            protocol: self.inner.protocol,
+            ..config
+        };
+        self
+    }
+
     /// Override how long establishment waits for the peer's transport
     /// parameters before failing with [`Error::HandshakeTimeout`]. Defaults to
     /// 10s; a zero duration waits indefinitely. See
