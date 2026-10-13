@@ -68,6 +68,7 @@ pub struct Upgraded<T> {
     alpn: Option<String>,
     keep_alive: Option<KeepAlive>,
     socket_stats: Option<crate::SharedSocketStats>,
+    session: Config,
 }
 
 impl<T> Upgraded<T>
@@ -84,6 +85,7 @@ where
             alpn: None,
             keep_alive: None,
             socket_stats: None,
+            session: Config::default(),
         }
     }
 
@@ -96,6 +98,13 @@ where
     /// Drive a keep-alive Ping/timeout on the WebSocket.
     pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
         self.keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which the handshake negotiates.
+    pub fn with_session_config(mut self, config: Config) -> Self {
+        self.session = config;
         self
     }
 
@@ -117,7 +126,7 @@ where
     /// this returns synchronously without awaiting in-band parameters.
     pub fn connect(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        let config = Config::negotiated(version, protocol);
+        let config = self.session.clone().with_negotiated(version, protocol);
         let transport = self.into_transport(config.version, config.max_record_size);
         Session::new(transport, false, config)
     }
@@ -128,7 +137,7 @@ where
     /// negotiated subprotocol, so this returns synchronously.
     pub fn accept(self) -> Session {
         let (version, protocol) = alpn::parse(self.alpn.as_deref());
-        let config = Config::negotiated(version, protocol);
+        let config = self.session.clone().with_negotiated(version, protocol);
         let transport = self.into_transport(config.version, config.max_record_size);
         Session::new(transport, true, config)
     }
@@ -161,6 +170,7 @@ pub struct Client {
     require_protocol: bool,
     config: Option<tungstenite::protocol::WebSocketConfig>,
     keep_alive: Option<KeepAlive>,
+    session: Config,
     #[cfg(feature = "wss")]
     connector: Option<tokio_tungstenite::Connector>,
 }
@@ -213,6 +223,13 @@ impl Client {
     /// stays "connected" until OS-level TCP keep_alive eventually probes.
     pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
         self.keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which the handshake negotiates.
+    pub fn with_session_config(mut self, config: Config) -> Self {
+        self.session = config;
         self
     }
 
@@ -279,7 +296,7 @@ impl Client {
             ));
         }
 
-        let config = Config::negotiated(version, protocol);
+        let config = self.session.clone().with_negotiated(version, protocol);
         let transport = WsTransport::new(ws_stream, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -305,6 +322,7 @@ pub struct Server {
     protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
     keep_alive: Option<KeepAlive>,
+    session: Config,
 }
 
 impl Server {
@@ -350,6 +368,13 @@ impl Server {
     /// stays "connected" until OS-level TCP keep_alive eventually probes.
     pub fn with_keep_alive(mut self, keep_alive: KeepAlive) -> Self {
         self.keep_alive = Some(keep_alive);
+        self
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which the handshake negotiates.
+    pub fn with_session_config(mut self, config: Config) -> Self {
+        self.session = config;
         self
     }
 
@@ -434,7 +459,7 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
-        let config = Config::negotiated(version, protocol);
+        let config = self.session.clone().with_negotiated(version, protocol);
         let transport = WsTransport::new(ws, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
