@@ -23,8 +23,8 @@ use crate::{Error, Protocol, Session, Version};
 /// # }
 /// ```
 ///
-/// For flow-control tuning beyond version + protocols, build a [`crate::Config`]
-/// and drive [`crate::transport::Stream`] + [`Session::connect`] yourself.
+/// For flow control and other session settings, pass a [`crate::Config`] to
+/// [`Config::session_config`].
 #[derive(Debug, Clone)]
 pub struct Config {
     inner: crate::Config,
@@ -46,6 +46,18 @@ impl Config {
         S: Into<String>,
     {
         self.inner.protocol = Protocol::Negotiate(protocols.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which this builder keeps. Call it before
+    /// [`handshake_timeout`](Self::handshake_timeout), which it would replace.
+    pub fn session_config(mut self, config: crate::Config) -> Self {
+        self.inner = crate::Config {
+            version: self.inner.version,
+            protocol: self.inner.protocol,
+            ..config
+        };
         self
     }
 
@@ -100,4 +112,24 @@ async fn finish(
     // returning, so `protocol()` is resolved on the session we hand back
     // (bounded by the config's handshake timeout).
     build_stream_session(stream, config, is_server, socket_stats).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_config_keeps_version_and_protocols() {
+        let mut session = crate::Config::new(Version::QMux00);
+        session.max_streams_bidi = 1_000;
+        let config = Config::new(Version::QMux02)
+            .protocols(["moq-lite-04"])
+            .session_config(session);
+
+        assert_eq!(config.inner.version, Version::QMux02);
+        assert!(
+            matches!(&config.inner.protocol, Protocol::Negotiate(list) if list == &["moq-lite-04"])
+        );
+        assert_eq!(config.inner.max_streams_bidi, 1_000);
+    }
 }
