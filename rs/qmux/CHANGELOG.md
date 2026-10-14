@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.2...qmux-v0.6.3) - 2026-10-14
+
+### Added
+
+- *(qmux)* take a session config on every transport builder ([#426](https://github.com/moq-dev/web-transport/pull/426))
+
+### Fixed
+
+- *(qmux)* coalesce pending ping responses ([#422](https://github.com/moq-dev/web-transport/pull/422))
+
 ## [0.6.2](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.1...qmux-v0.6.2) - 2026-10-02
 
 ### Fixed
