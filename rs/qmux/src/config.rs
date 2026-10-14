@@ -128,12 +128,18 @@ impl Config {
     /// Create a config whose protocol was already negotiated out of band
     /// (TLS / WebSocket ALPN). `protocol` is the chosen name, or `None`.
     pub fn negotiated(version: Version, protocol: Option<String>) -> Self {
+        Self::default().with_negotiated(version, protocol)
+    }
+
+    /// This config with the out-of-band negotiation's outcome applied.
+    pub(crate) fn with_negotiated(self, version: Version, protocol: Option<String>) -> Self {
         Self {
+            version,
             protocol: match protocol {
                 Some(name) => Protocol::Negotiated(name),
                 None => Protocol::None,
             },
-            ..Self::new(version)
+            ..self
         }
     }
 

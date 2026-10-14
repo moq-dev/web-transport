@@ -48,6 +48,13 @@ async fn connect(addr: std::net::SocketAddr) -> Result<Session, Error> {
 }
 ```
 
+Every entry point takes a `Config` for flow control and timeouts:
+`session_config` on `tcp::Config` and `uds::Config`, `with_session_config` on
+the rest. The wire-format version and application protocol still come from the
+builder or the handshake. The default grants a peer 100 concurrent streams in
+each direction; raise `max_streams_bidi` and `max_streams_uni` if your
+application holds more streams open at once.
+
 To run QMux over something the built-in modules don't cover, wrap any
 `AsyncRead + AsyncWrite` byte stream in `transport::Stream`, or implement
 `transport::Transport` yourself, then pass it to `Session::connect` /

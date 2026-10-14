@@ -20,6 +20,7 @@ pub struct Client {
     config: Arc<rustls::ClientConfig>,
     protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
+    session: Config,
 }
 
 impl Client {
@@ -29,6 +30,7 @@ impl Client {
             config,
             protocols: Vec::new(),
             require_protocol: false,
+            session: Config::default(),
         }
     }
 
@@ -58,6 +60,13 @@ impl Client {
     /// version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) offered by default.
     pub fn require_protocol(mut self) -> Self {
         self.require_protocol = true;
+        self
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which the handshake negotiates.
+    pub fn with_session_config(mut self, config: Config) -> Self {
+        self.session = config;
         self
     }
 
@@ -107,7 +116,7 @@ impl Client {
             ));
         }
 
-        let session_config = Config::negotiated(version, protocol);
+        let session_config = self.session.clone().with_negotiated(version, protocol);
         let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
         if let Some(stats) = socket_stats {
             transport = transport.with_socket_stats(stats);
@@ -127,12 +136,23 @@ impl Client {
 #[derive(Clone)]
 pub struct Server {
     config: Arc<rustls::ServerConfig>,
+    session: Config,
 }
 
 impl Server {
     /// Create a TLS server from the given `rustls::ServerConfig`.
     pub fn new(config: Arc<rustls::ServerConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: Config::default(),
+        }
+    }
+
+    /// Use `config` for every session setting except the wire-format version
+    /// and application protocol, which the handshake negotiates.
+    pub fn with_session_config(mut self, config: Config) -> Self {
+        self.session = config;
+        self
     }
 
     /// Accept a TLS connection over an established TCP stream.
@@ -154,7 +174,7 @@ impl Server {
         let (version, protocol) = alpn::parse(negotiated_str);
         tracing::debug!(?version, ?protocol, "parsed ALPN");
 
-        let session_config = Config::negotiated(version, protocol);
+        let session_config = self.session.clone().with_negotiated(version, protocol);
         let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
         if let Some(stats) = socket_stats {
             transport = transport.with_socket_stats(stats);
