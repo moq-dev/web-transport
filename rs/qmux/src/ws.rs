@@ -103,6 +103,12 @@ where
 
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
+    ///
+    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
+    /// WebSocket handshake already settled the protocol, so the session starts
+    /// without awaiting the peer's transport parameters. Keep
+    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
+    /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -228,6 +234,12 @@ impl Client {
 
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
+    ///
+    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
+    /// WebSocket handshake already settled the protocol, so the session starts
+    /// without awaiting the peer's transport parameters. Keep
+    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
+    /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -373,6 +385,12 @@ impl Server {
 
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
+    ///
+    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
+    /// WebSocket handshake already settled the protocol, so the session starts
+    /// without awaiting the peer's transport parameters. Keep
+    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
+    /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
