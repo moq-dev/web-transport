@@ -112,11 +112,15 @@ enum OpenUni {
 enum OpenBi {
     #[default]
     Idle,
-    Header {
-        send: ez::SendStream,
-        recv: ez::RecvStream,
-        offset: usize,
-    },
+    /// Streams taken, header partially written. Boxed because a stream pair is
+    /// several times larger than `Idle`, which every session clone carries.
+    Header(Box<OpenBiHeader>),
+}
+
+struct OpenBiHeader {
+    send: ez::SendStream,
+    recv: ez::RecvStream,
+    offset: usize,
 }
 
 impl Clone for OpenUni {
@@ -923,24 +927,26 @@ impl web_transport_trait::poll::Session for Connection {
             match &mut self.open_bi {
                 OpenBi::Idle => {
                     let (send, recv) = ready!(self.conn.poll_open_bi(waiter))?;
-                    self.open_bi = OpenBi::Header {
+                    self.open_bi = OpenBi::Header(Box::new(OpenBiHeader {
                         send,
                         recv,
                         offset: 0,
-                    };
+                    }));
                 }
-                OpenBi::Header { send, offset, .. } => {
-                    while *offset < self.header_bi.len() {
-                        let size = ready!(send.poll_write(waiter, &self.header_bi[*offset..]))
-                            .map_err(SessionError::Header)?;
-                        *offset += size;
+                OpenBi::Header(header) => {
+                    while header.offset < self.header_bi.len() {
+                        let size = ready!(header
+                            .send
+                            .poll_write(waiter, &self.header_bi[header.offset..]))
+                        .map_err(SessionError::Header)?;
+                        header.offset += size;
                     }
 
-                    let OpenBi::Header { send, recv, .. } =
-                        std::mem::replace(&mut self.open_bi, OpenBi::Idle)
+                    let OpenBi::Header(header) = std::mem::replace(&mut self.open_bi, OpenBi::Idle)
                     else {
                         unreachable!("checked above");
                     };
+                    let OpenBiHeader { send, recv, .. } = *header;
 
                     return Poll::Ready(Ok((SendStream::new(send), RecvStream::new(recv))));
                 }
