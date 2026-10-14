@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.4](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.3...web-transport-iroh-v0.8.4) - 2026-10-14
+
+### Other
+
+- *(deps)* update kio requirement from 0.5.4 to 0.6.2 in the cargo group across 1 directory ([#415](https://github.com/moq-dev/web-transport/pull/415))
+
 ## [0.8.3](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.2...web-transport-iroh-v0.8.3) - 2026-10-14
 
 ### Fixed

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.3](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.2...web-transport-noq-v0.4.3) - 2026-10-14
+
+### Other
+
+- *(deps)* update kio requirement from 0.5.4 to 0.6.2 in the cargo group across 1 directory ([#415](https://github.com/moq-dev/web-transport/pull/415))
+
 ## [0.4.2](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.1...web-transport-noq-v0.4.2) - 2026-10-06
 
 ### Fixed
