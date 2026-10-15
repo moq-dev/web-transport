@@ -42,9 +42,9 @@ pub struct Config {
     /// How the application protocol is determined. See [`Protocol`].
     pub protocol: Protocol,
 
-    /// Max concurrent bidirectional streams the peer can open.
+    /// Max concurrent bidirectional streams the peer can open. Default: 10,000.
     pub max_streams_bidi: u64,
-    /// Max concurrent unidirectional streams the peer can open.
+    /// Max concurrent unidirectional streams the peer can open. Default: 10,000.
     pub max_streams_uni: u64,
     /// Connection-level receive window in bytes.
     pub max_data: u64,
@@ -99,8 +99,8 @@ impl Default for Config {
         Self {
             version: Version::QMux02,
             protocol: Protocol::None,
-            max_streams_bidi: 100,
-            max_streams_uni: 100,
+            max_streams_bidi: 10_000,
+            max_streams_uni: 10_000,
             max_data: 1_048_576,                  // 1 MB
             max_stream_data_bidi_local: 262_144,  // 256 KB
             max_stream_data_bidi_remote: 262_144, // 256 KB
