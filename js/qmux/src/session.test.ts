@@ -1010,6 +1010,27 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("the default config holds a thousand open streams", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		for (let i = 0n; i < 1_000n; i++) {
+			for (const dir of [Stream.Dir.Bi, Stream.Dir.Uni]) {
+				peer.send({
+					type: "stream",
+					id: Stream.Id.create(i, dir, true),
+					data: new Uint8Array([1]),
+					fin: false,
+				});
+			}
+		}
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response") || sentClose(peer) !== undefined);
+		expect(sentClose(peer)).toBeUndefined();
+		session.close();
+	});
+
 	// Regression: a STREAM frame delivered by the read loop after the session has
 	// closed used to hit the already-closed incoming-stream controllers, and the
 	// throw escaped as an unhandled rejection because #handleStreamFrame was an

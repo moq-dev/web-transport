@@ -24,9 +24,9 @@ export type Version = Exclude<WireFormat, "webtransport">;
 
 /** Configuration for a QMux session. */
 export interface Config {
-	/** Max concurrent bidirectional streams the peer can open. */
+	/** Max concurrent bidirectional streams the peer can open. Defaults to 10,000. */
 	maxStreamsBidi?: bigint;
-	/** Max concurrent unidirectional streams the peer can open. */
+	/** Max concurrent unidirectional streams the peer can open. Defaults to 10,000. */
 	maxStreamsUni?: bigint;
 	/** Connection-level receive window in bytes. */
 	maxData?: bigint;
@@ -50,8 +50,8 @@ export interface Config {
 }
 
 const DEFAULT_CONFIG: Required<Config> = {
-	maxStreamsBidi: 100n,
-	maxStreamsUni: 100n,
+	maxStreamsBidi: 10_000n,
+	maxStreamsUni: 10_000n,
 	maxData: 1_048_576n,
 	maxStreamDataBidiLocal: 262_144n,
 	maxStreamDataBidiRemote: 262_144n,

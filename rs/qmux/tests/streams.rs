@@ -55,17 +55,17 @@ async fn held(config: Config, target: usize) -> usize {
     accepted.len()
 }
 
-/// Applications such as MoQ hold a stream per subscription, so they need to
-/// grant more than the default.
+/// Applications such as MoQ hold a stream per subscription, so the default must
+/// hold far more than a hundred open streams.
 #[tokio::test(start_paused = true)]
-async fn configured_limit_holds_a_thousand_streams() {
-    let mut config = Config::default();
-    config.max_streams_bidi = 1_000;
-    config.max_streams_uni = 1_000;
-    assert_eq!(held(config, 1_000).await, 1_000);
+async fn default_config_holds_a_thousand_open_streams() {
+    assert_eq!(held(Config::default(), 1_000).await, 1_000);
 }
 
 #[tokio::test(start_paused = true)]
-async fn default_limit_stalls_at_a_hundred_streams() {
-    assert_eq!(held(Config::default(), 1_000).await, 100);
+async fn configured_limit_bounds_open_streams() {
+    let mut config = Config::default();
+    config.max_streams_bidi = 100;
+    config.max_streams_uni = 100;
+    assert_eq!(held(config, 1_000).await, 100);
 }
