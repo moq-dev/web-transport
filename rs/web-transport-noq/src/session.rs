@@ -293,6 +293,29 @@ impl Session {
         ))
     }
 
+    /// Open a bidirectional stream without waiting for stream credit.
+    pub async fn try_open_bi(&self) -> Result<Option<(SendStream, RecvStream)>, SessionError> {
+        let (mut send, recv) = {
+            let mut open = std::pin::pin!(self.conn.open_bi());
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(result) = open.as_mut().poll(&mut cx) else {
+                return Ok(None);
+            };
+            result.map_err(|e| self.map_error(e))?
+        };
+
+        send.set_priority(i32::MAX).ok();
+        Self::write_full(&mut send, &self.header_bi)
+            .await
+            .map_err(|e| self.map_error(e))?;
+        send.set_priority(0).ok();
+
+        Ok(Some((
+            SendStream::new(send, self.error.clone()),
+            RecvStream::new(recv, self.error.clone()),
+        )))
+    }
+
     /// Asynchronously receives an application datagram from the remote peer.
     ///
     /// This method is used to receive an application datagram sent by the remote
@@ -1012,6 +1035,12 @@ impl web_transport_trait::Session for Session {
 
     async fn open_bi(&self) -> Result<(Self::SendStream, Self::RecvStream), Self::Error> {
         Self::open_bi(self).await
+    }
+
+    async fn try_open_bi(
+        &self,
+    ) -> Result<Option<(Self::SendStream, Self::RecvStream)>, Self::Error> {
+        Self::try_open_bi(self).await
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, Self::Error> {
