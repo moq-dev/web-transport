@@ -77,6 +77,7 @@ impl PingResponse {
 /// it without message passing, the way a QUIC endpoint shares connection state.
 #[derive(Default)]
 struct Streams {
+    closed: bool,
     send: HashMap<StreamId, SendState>,
     recv: HashMap<StreamId, RecvState>,
 
@@ -90,6 +91,40 @@ struct Streams {
     // other's effect).
     peer_initial_max_stream_data_uni: u64,
     peer_initial_max_stream_data_bidi_remote: u64,
+}
+
+impl Streams {
+    fn open(&mut self, id: StreamId, send: SendState, recv: Option<RecvState>) -> bool {
+        // A local open can claim stream credit before teardown, then acquire
+        // this lock afterwards. Never restore channel senders once closed.
+        if self.closed {
+            return false;
+        }
+        if let Some(credit) = &send.stream_credit {
+            let max = match id.dir() {
+                StreamDir::Uni => self.peer_initial_max_stream_data_uni,
+                StreamDir::Bi => self.peer_initial_max_stream_data_bidi_remote,
+            };
+            credit.increase_max(max).ok();
+        }
+        self.send.insert(id, send);
+        if let Some(recv) = recv {
+            self.recv.insert(id, recv);
+        }
+        true
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        for (_, send) in self.send.drain() {
+            if let Some(credit) = send.stream_credit {
+                credit.close();
+            }
+        }
+        // Session handles retain this table after the backend exits. Drop its
+        // senders so receivers drain queued data and then observe closure.
+        self.recv.clear();
+    }
 }
 
 /// Closes the connection once the last [`Session`] handle is dropped. Held in an
@@ -2271,12 +2306,8 @@ impl Session {
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
             backend.outbound.close();
-            for send in backend.streams.lock().unwrap().send.values() {
-                if let Some(credit) = &send.stream_credit {
-                    credit.close();
-                }
-            }
-            // Recorded last, so a `closed()` waiter sees every credit closed.
+            backend.streams.lock().unwrap().close();
+            // Recorded last, so a `closed()` waiter sees credits and streams closed.
             // The reader often fails (EOF, WebSocket Close) right after an
             // APPLICATION_CLOSE, so keep the reason recorded first.
             note_closed(&backend.closed, err);
@@ -2388,14 +2419,9 @@ impl generic::Session for Session {
         // from the peer's params if they've already arrived (otherwise it's still
         // zero here and `recv_transport_parameters` will credit it later) — see the
         // note on `Streams::peer_initial_max_stream_data_uni`.
-        {
-            let mut streams = self.streams.lock().unwrap();
-            if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_uni)
-                    .ok();
-            }
-            streams.send.insert(id, send_backend);
+        let registered = self.streams.lock().unwrap().open(id, send_backend, None);
+        if !registered {
+            return Err(self.close_reason().await);
         }
 
         Ok(send_frontend)
@@ -2472,15 +2498,13 @@ impl generic::Session for Session {
 
         // Register both backends before returning the frontends (see `open_uni`).
         // A bidi stream we initiate sends under the peer's `bidi_remote` limit.
-        {
-            let mut streams = self.streams.lock().unwrap();
-            if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_bidi_remote)
-                    .ok();
-            }
-            streams.send.insert(id, send_backend);
-            streams.recv.insert(id, recv_backend);
+        let registered = self
+            .streams
+            .lock()
+            .unwrap()
+            .open(id, send_backend, Some(recv_backend));
+        if !registered {
+            return Err(self.close_reason().await);
         }
 
         Ok((send_frontend, recv_frontend))
@@ -3525,12 +3549,12 @@ mod recv_open_tests {
 
     use bytes::Bytes;
     use tokio::sync::mpsc;
-    use web_transport_trait::{RecvStream as _, Session as _};
+    use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
     use web_transport_proto::VarInt;
 
     use super::{Reader, Session, Transport, Writer};
-    use crate::proto::{Frame, ResetStream, Stream};
+    use crate::proto::{ApplicationClose, Frame, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
     /// A transport whose inbound frames are scripted through a channel; outbound
@@ -3827,6 +3851,153 @@ mod recv_open_tests {
 
         // Reads resume at offset 2, in order, with nothing dropped.
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"lloworld!");
+    }
+
+    fn poll_once<F: std::future::Future>(future: F) -> std::task::Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    fn terminal_stream_table_rejects_late_registration() {
+        let mut streams = super::Streams::default();
+        let (send, mut signal) = mpsc::unbounded_channel();
+        let (data, mut received) = mpsc::unbounded_channel();
+        let (reset, mut resets) = mpsc::unbounded_channel();
+        let send = super::SendState {
+            inbound_signal: send,
+            sent_offset: 0,
+            stream_credit: None,
+        };
+        let recv = super::RecvState {
+            inbound_data: data,
+            inbound_reset: reset,
+            recv_credit: super::Credit::new(0),
+            recv_offset: 0,
+        };
+        streams.close();
+        assert!(!streams.open(StreamId::new(0, StreamDir::Bi, false), send, Some(recv)));
+        assert!(matches!(
+            signal.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            resets.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(streams.send.is_empty());
+        assert!(streams.recv.is_empty());
+    }
+
+    fn application_close() -> Bytes {
+        Frame::ApplicationClose(ApplicationClose {
+            code: VarInt::from_u32(42),
+            reason: "done".into(),
+        })
+        .encode(Version::QMux01)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_session_drains_unfinished_receive_stream() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        assert_eq!(recv.read_chunk(2).await.unwrap().unwrap(), b"he".as_slice());
+        tx.send(uni_stream_at(0, 5, b"world", false)).unwrap();
+        tx.send(application_close()).unwrap();
+
+        session.closed().await;
+        // The accepted-stream queue closes after reader teardown, even while
+        // this Session handle keeps the shared per-stream table alive.
+        assert!(session.accept_uni().await.is_err());
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"llo".as_slice()
+        );
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"world".as_slice()
+        );
+        assert!(matches!(
+            poll_once(recv.read_chunk(64)),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_receive_closed_preserves_buffered_data() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        assert_eq!(recv.read_chunk(2).await.unwrap().unwrap(), b"he".as_slice());
+        tx.send(uni_stream_at(0, 5, b"world", false)).unwrap();
+        tx.send(application_close()).unwrap();
+        session.closed().await;
+        assert!(session.accept_uni().await.is_err());
+
+        assert!(matches!(
+            poll_once(recv.closed()),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"llo".as_slice()
+        );
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"world".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_session_preserves_received_fin() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"finished", true)).unwrap();
+        tx.send(application_close()).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        session.closed().await;
+        assert!(session.accept_uni().await.is_err());
+        assert_eq!(recv.read_all().await.unwrap(), b"finished".as_slice());
+        assert!(recv.closed().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_session_closes_unfinished_bidirectional_stream() {
+        let (session, tx) = scripted_session();
+        tx.send(
+            Frame::Stream(Stream {
+                id: StreamId::new(0, StreamDir::Bi, true),
+                offset: 0,
+                data: Bytes::from_static(b"hello"),
+                fin: false,
+            })
+            .encode(Version::QMux01)
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut send, mut recv) = session.accept_bi().await.unwrap();
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"hello".as_slice()
+        );
+        session.close(42, "done");
+        assert!(session.accept_bi().await.is_err());
+
+        assert!(matches!(
+            poll_once(send.closed()),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+        assert!(matches!(
+            poll_once(recv.read_chunk(64)),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
     }
 
     /// Streams raced against a dropped `RecvStream`: dropping it queues
