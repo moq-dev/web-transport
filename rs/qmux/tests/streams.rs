@@ -50,6 +50,8 @@ async fn held(config: Config, target: usize) -> usize {
     })
     .await;
 
+    assert!(client.try_open_bi().await.unwrap().is_none());
+
     client.close(0, "done");
     server.close(0, "done");
     accepted.len()
