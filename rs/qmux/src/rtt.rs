@@ -91,18 +91,26 @@ impl Rtt {
 
 /// The connection statistics QMux can report.
 ///
-/// QMux has no congestion controller of its own, so loss and byte counters belong
-/// to the transport underneath and are left unreported. Round-trip time it can
-/// always measure itself, from `QX_PING`; a send-rate estimate only ever comes
-/// from the transport.
+/// QMux measures round-trip time from `QX_PING`. Byte counters and send-rate
+/// estimates come from the underlying transport; loss counters remain unavailable.
 pub(crate) struct SessionStats {
     pub(crate) rtt: Option<Duration>,
     pub(crate) estimated_send_rate: Option<u64>,
+    pub(crate) bytes_sent: Option<u64>,
+    pub(crate) bytes_received: Option<u64>,
 }
 
 impl web_transport_trait::Stats for SessionStats {
     fn rtt(&self) -> Option<Duration> {
         self.rtt
+    }
+
+    fn bytes_sent(&self) -> Option<u64> {
+        self.bytes_sent
+    }
+
+    fn bytes_received(&self) -> Option<u64> {
+        self.bytes_received
     }
 
     fn estimated_send_rate(&self) -> Option<u64> {

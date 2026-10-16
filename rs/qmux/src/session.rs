@@ -2325,6 +2325,8 @@ impl generic::Session for Session {
             // can't answer; a TCP socket already knows before we've pinged once.
             rtt: socket.and_then(|s| s.rtt()).or_else(|| self.rtt.get()),
             estimated_send_rate: socket.and_then(|s| s.estimated_send_rate()),
+            bytes_sent: socket.and_then(|s| s.bytes_sent()),
+            bytes_received: socket.and_then(|s| s.bytes_received()),
         }
     }
 
