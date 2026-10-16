@@ -118,8 +118,8 @@ where
     ///
     /// An HTTP server hands over a type-erased upgraded stream, so QMux can't find
     /// the socket itself. A server that kept a handle on the accepted connection
-    /// can attach it here and get the kernel's RTT (and, on Linux, delivery rate)
-    /// instead of only QMux's own `QX_PING` measurement. See
+    /// can attach it here to report the kernel's RTT and supported delivery-rate
+    /// and byte counters, rather than only QMux's own `QX_PING` measurement. See
     /// [`TcpStats`](crate::TcpStats).
     pub fn with_socket_stats(mut self, stats: crate::SharedSocketStats) -> Self {
         self.socket_stats = Some(stats);

@@ -2,7 +2,7 @@
 //!
 //! QMux runs over a reliable byte stream and has no congestion controller of its
 //! own, but the transport it sits on usually does. Where that transport is TCP the
-//! kernel already tracks a smoothed RTT and (on Linux) a delivery-rate estimate,
+//! kernel already tracks a smoothed RTT and (on Linux) delivery rate and bytes,
 //! so the figures are available immediately and cost no extra traffic. This is
 //! strictly better than QMux's own [`QX_PING`](crate::Config::rtt_interval)
 //! measurement, which needs a round trip before it can report anything.
@@ -18,6 +18,16 @@ use std::time::Duration;
 pub trait SocketStats: Send + Sync + 'static {
     /// Smoothed round-trip time, if the transport tracks one.
     fn rtt(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Total transmitted bytes, including transport framing and retransmissions.
+    fn bytes_sent(&self) -> Option<u64> {
+        None
+    }
+
+    /// Total received bytes, with the underlying transport's delivery semantics.
+    fn bytes_received(&self) -> Option<u64> {
         None
     }
 
@@ -46,6 +56,11 @@ mod unix {
     /// long as the session needs it no matter what the transport does with the
     /// original. Construct it from the accepted socket and hand it to the transport
     /// with `with_socket_stats`.
+    ///
+    /// Byte counters require Linux 4.19 or newer. Sent bytes include TLS,
+    /// WebSocket and QMux framing plus TCP retransmissions, excluding TCP/IP
+    /// headers. Received bytes count TCP-delivered payload (RFC 4898), including
+    /// that framing but excluding duplicate retransmissions.
     ///
     /// Reports nothing for a non-TCP socket (a Unix socket, say): the `getsockopt`
     /// simply fails and every metric reads `None`.
@@ -135,10 +150,27 @@ mod unix {
             pub segs_in: u32,
             pub notsent_bytes: u32,
             pub min_rtt: u32,
-            pub data_segs_out: u32,
             pub data_segs_in: u32,
+            pub data_segs_out: u32,
             /// Delivery-rate estimate in bytes per second (Linux 4.9+).
             pub delivery_rate: u64,
+            pub busy_time: u64,
+            pub rwnd_limited: u64,
+            pub sndbuf_limited: u64,
+            pub delivered: u32,
+            pub delivered_ce: u32,
+            /// Transmitted TCP payload, including retransmissions (Linux 4.19+).
+            pub bytes_sent: u64,
+        }
+
+        /// Require both byte counters so older kernels report them as unavailable.
+        pub fn byte_counters(info: TcpInfo, len: usize) -> Option<(u64, u64)> {
+            has_field(
+                len,
+                std::mem::offset_of!(TcpInfo, bytes_sent),
+                size_of::<u64>(),
+            )
+            .then_some((info.bytes_sent, info.bytes_received))
         }
 
         const IPPROTO_TCP: libc::c_int = 6;
@@ -249,6 +281,30 @@ mod unix {
             }
         }
 
+        fn bytes_sent(&self) -> Option<u64> {
+            #[cfg(target_os = "linux")]
+            {
+                let (info, len) = sys::tcp_info(self.borrow())?;
+                sys::byte_counters(info, len).map(|(sent, _)| sent)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        }
+
+        fn bytes_received(&self) -> Option<u64> {
+            #[cfg(target_os = "linux")]
+            {
+                let (info, len) = sys::tcp_info(self.borrow())?;
+                sys::byte_counters(info, len).map(|(_, received)| received)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        }
+
         fn estimated_send_rate(&self) -> Option<u64> {
             // Only Linux measures a delivery rate. macOS exposes a congestion window
             // but no rate, and cwnd/rtt is a poor stand-in, so report nothing there
@@ -288,9 +344,26 @@ mod unix {
         fn linux_tcp_info_layout() {
             assert_eq!(std::mem::offset_of!(super::sys::TcpInfo, rtt), 68);
             assert_eq!(
+                std::mem::offset_of!(super::sys::TcpInfo, bytes_received),
+                128
+            );
+            assert_eq!(std::mem::offset_of!(super::sys::TcpInfo, bytes_sent), 200);
+            assert_eq!(
                 std::mem::offset_of!(super::sys::TcpInfo, delivery_rate),
                 160
             );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn byte_counters_distinguish_short_kernel_results_from_zero() {
+            let mut info = super::sys::TcpInfo::default();
+            let end = std::mem::offset_of!(super::sys::TcpInfo, bytes_sent) + size_of::<u64>();
+            assert_eq!(super::sys::byte_counters(info, end - 1), None);
+            assert_eq!(super::sys::byte_counters(info, end), Some((0, 0)));
+            info.bytes_sent = 123;
+            info.bytes_received = 456;
+            assert_eq!(super::sys::byte_counters(info, end), Some((123, 456)));
         }
 
         /// Offsets from macOS `netinet/tcp.h`.
