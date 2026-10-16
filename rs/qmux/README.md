@@ -60,6 +60,15 @@ To run QMux over something the built-in modules don't cover, wrap any
 `transport::Transport` yourself, then pass it to `Session::connect` /
 `Session::accept`.
 
+## Statistics
+
+`Session::stats()` reports the socket's RTT and delivery rate when available,
+falling back to QMux ping RTT. On Linux 4.19 and newer, `TcpStats` also reports
+cumulative TCP payload bytes. Sent bytes include retransmissions and TLS,
+WebSocket, and QMux framing; TCP/IP headers are excluded. Received bytes count
+what TCP delivered, so duplicate retransmissions are excluded. Other platforms
+and older kernels report these counters as unavailable.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
