@@ -1676,7 +1676,9 @@ export default class Session implements WebTransport {
 		});
 	}
 
-	async createBidirectionalStream(options?: WebTransportSendStreamOptions): Promise<WebTransportBidirectionalStream> {
+	async createBidirectionalStream(
+		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
+	): Promise<WebTransportBidirectionalStream> {
 		await this.ready;
 
 		if (this.#closed) {
@@ -1685,8 +1687,7 @@ export default class Session implements WebTransport {
 
 		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;
 
-		// Wait for stream count permit
-		await this.#bidiStreamCredit.claim(1n);
+		await this.#claimStreamCredit(this.#bidiStreamCredit, options);
 
 		const streamId = Stream.Id.create(this.#nextBiStreamId++, Stream.Dir.Bi, this.#isServer);
 		const streamIdVal = streamId.value.value;
@@ -1753,7 +1754,9 @@ export default class Session implements WebTransport {
 		return { readable: recvStream.readable, writable: writer };
 	}
 
-	async createUnidirectionalStream(options?: WebTransportSendStreamOptions): Promise<WritableStream<Uint8Array>> {
+	async createUnidirectionalStream(
+		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
+	): Promise<WritableStream<Uint8Array>> {
 		await this.ready;
 
 		if (this.#closed) {
@@ -1762,8 +1765,7 @@ export default class Session implements WebTransport {
 
 		const sendOrder = options?.sendOrder ?? DEFAULT_SEND_ORDER;
 
-		// Wait for stream count permit
-		await this.#uniStreamCredit.claim(1n);
+		await this.#claimStreamCredit(this.#uniStreamCredit, options);
 
 		const streamId = Stream.Id.create(this.#nextUniStreamId++, Stream.Dir.Uni, this.#isServer);
 		const streamIdVal = streamId.value.value;
@@ -1811,6 +1813,17 @@ export default class Session implements WebTransport {
 		this.#attachSendOrder(writer, streamIdVal, sendOrder);
 
 		return writer;
+	}
+
+	async #claimStreamCredit(
+		credit: Credit,
+		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
+	): Promise<void> {
+		if (options?.waitUntilAvailable === false) {
+			if (credit.tryClaim(1n) === 0n) throw new DOMException(undefined, "QuotaExceededError");
+			return;
+		}
+		await credit.claim(1n);
 	}
 
 	/** Shared teardown for both terminal transitions: tears down streams,
