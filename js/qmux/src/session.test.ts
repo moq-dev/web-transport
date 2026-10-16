@@ -1257,6 +1257,29 @@ describe("Session integration (scripted peer)", () => {
 		});
 	});
 
+	describe("stream count credit", () => {
+		for (const [name, create] of [
+			["unidirectional", (session: Session) => session.createUnidirectionalStream({ waitUntilAvailable: false })],
+			["bidirectional", (session: Session) => session.createBidirectionalStream({ waitUntilAvailable: false })],
+		] satisfies ReadonlyArray<readonly [string, (session: Session) => Promise<unknown>]>) {
+			test(`${name} creation rejects when waiting is disabled and no credit is available`, async () => {
+				const { session, peer } = connect();
+				await session.ready;
+				peer.send({
+					type: "transport_parameters",
+					params: peerParams({ initialMaxStreamsBidi: 0n, initialMaxStreamsUni: 0n }),
+				});
+				peer.send({ type: "ping_request", sequence: 1n });
+				await waitFor(() => peer.has("ping_response"));
+
+				const err = await settleTo(create(session) as Promise<unknown>);
+				expect(err).toBeInstanceOf(DOMException);
+				expect((err as DOMException).name).toBe("QuotaExceededError");
+				session.close();
+			});
+		}
+	});
+
 	test("createBidirectionalStream on an already-closed session rejects with the descriptive reason", async () => {
 		const { session } = connect();
 		await session.ready;
