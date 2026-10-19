@@ -82,6 +82,20 @@ impl Credit {
         }
     }
 
+    /// Snapshot the two distinct stream-count credits while both locks are held.
+    pub(crate) fn available_pair(bidi: &Self, uni: &Self) -> (u64, u64) {
+        let bidi = bidi.inner.lock().unwrap();
+        let uni = uni.inner.lock().unwrap();
+        let available = |state: &CreditState| {
+            if state.closed {
+                0
+            } else {
+                state.max.saturating_sub(state.used)
+            }
+        };
+        (available(&bidi.state), available(&uni.state))
+    }
+
     // --- Send-side methods ---
 
     /// Try to claim up to `limit` units. Returns amount claimed (0 if none available).

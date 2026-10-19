@@ -7,11 +7,41 @@ use std::time::Duration;
 pub use crate::util::{MaybeSend, MaybeSync};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// A snapshot of locally initiated transport streams.
+///
+/// Counts describe backend protocol state, not application stream handles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Streams {
+    /// Bidirectional streams initiated by this endpoint.
+    pub bidi: StreamState,
+    /// Unidirectional streams initiated by this endpoint.
+    pub uni: StreamState,
+}
+
+/// Stream occupancy and remaining opening credit for one direction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamState {
+    /// Streams not yet fully closed by the transport. A bidirectional stream
+    /// remains open until both halves are closed, including transport retirement.
+    pub open: u64,
+    /// Additional stream IDs permitted by the peer's current cumulative limit.
+    ///
+    /// Closing a stream does not directly restore this credit: it increases only
+    /// when the peer grants more. This is not a fixed concurrent capacity.
+    pub available: u64,
+}
+
 /// Connection-level statistics.
 ///
 /// Methods return `Option` — `None` means the implementation doesn't track
 /// this metric, while `Some(0)` means actually zero.
 pub trait Stats {
+    /// Locally initiated stream occupancy and remaining opening credit, sampled
+    /// together. `None` means the backend cannot report this snapshot.
+    fn streams(&self) -> Option<Streams> {
+        None
+    }
+
     /// Total bytes sent over the connection, including retransmissions and overhead.
     fn bytes_sent(&self) -> Option<u64> {
         None

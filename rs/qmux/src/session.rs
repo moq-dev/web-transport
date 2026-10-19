@@ -79,6 +79,9 @@ impl PingResponse {
 struct Streams {
     send: HashMap<StreamId, SendState>,
     recv: HashMap<StreamId, RecvState>,
+    // One count per initiator and direction; a bidi stream occupies one slot
+    // until its last backend half retires.
+    open: [[u64; 2]; 2],
 
     // The peer's initial per-stream send-credit limits, applied to the streams
     // we open. Zero until the peer's transport parameters arrive;
@@ -90,6 +93,48 @@ struct Streams {
     // other's effect).
     peer_initial_max_stream_data_uni: u64,
     peer_initial_max_stream_data_bidi_remote: u64,
+}
+
+impl Streams {
+    fn count(&mut self, id: StreamId) -> &mut u64 {
+        let dir = match id.dir() {
+            StreamDir::Bi => 0,
+            StreamDir::Uni => 1,
+        };
+        &mut self.open[usize::from(id.server_initiated())][dir]
+    }
+
+    fn insert_send(&mut self, id: StreamId, state: SendState) {
+        let new = !self.recv.contains_key(&id) && !self.send.contains_key(&id);
+        self.send.insert(id, state);
+        if new {
+            *self.count(id) += 1;
+        }
+    }
+
+    fn insert_recv(&mut self, id: StreamId, state: RecvState) {
+        let new = !self.recv.contains_key(&id) && !self.send.contains_key(&id);
+        self.recv.insert(id, state);
+        if new {
+            *self.count(id) += 1;
+        }
+    }
+
+    fn remove_send(&mut self, id: &StreamId) -> Option<SendState> {
+        let state = self.send.remove(id)?;
+        if !self.recv.contains_key(id) {
+            *self.count(*id) -= 1;
+        }
+        Some(state)
+    }
+
+    fn remove_recv(&mut self, id: &StreamId) -> Option<RecvState> {
+        let state = self.recv.remove(id)?;
+        if !self.send.contains_key(id) {
+            *self.count(*id) -= 1;
+        }
+        Some(state)
+    }
 }
 
 /// Closes the connection once the last [`Session`] handle is dropped. Held in an
@@ -661,7 +706,7 @@ impl<W: Writer> WriterState<W> {
                 // The frontend offset includes frames that may still be queued.
                 // RESET_STREAM is a priority frame and drops that backlog, so its
                 // final size must come from bytes this writer actually emitted.
-                if let Some(send) = self.streams.lock().unwrap().send.remove(&reset.id) {
+                if let Some(send) = self.streams.lock().unwrap().remove_send(&reset.id) {
                     reset.final_size = send.sent_offset;
                 }
             }
@@ -670,12 +715,11 @@ impl<W: Writer> WriterState<W> {
                     .streams
                     .lock()
                     .unwrap()
-                    .send
-                    .remove(&stream.id)
+                    .remove_send(&stream.id)
                     .map(|send| send.inbound_signal);
             }
             Frame::StopSending(stop) => {
-                self.streams.lock().unwrap().recv.remove(&stop.id);
+                self.streams.lock().unwrap().remove_recv(&stop.id);
             }
             _ => {}
         }
@@ -744,7 +788,7 @@ mod writer_final_size_tests {
         let streams = Arc::new(Mutex::new(Streams::default()));
         let id = StreamId::new(0, StreamDir::Uni, false);
         let (stopped, _stopped_rx) = mpsc::unbounded_channel();
-        streams.lock().unwrap().send.insert(
+        streams.lock().unwrap().insert_send(
             id,
             SendState {
                 inbound_signal: stopped,
@@ -928,7 +972,7 @@ mod writer_final_size_tests {
         let streams = Arc::new(Mutex::new(Streams::default()));
         let id = StreamId::new(0, StreamDir::Uni, false);
         let (signal, mut signal_rx) = mpsc::unbounded_channel();
-        streams.lock().unwrap().send.insert(
+        streams.lock().unwrap().insert_send(
             id,
             SendState {
                 inbound_signal: signal,
@@ -992,7 +1036,7 @@ mod writer_final_size_tests {
         let streams = Arc::new(Mutex::new(Streams::default()));
         let id = StreamId::new(0, StreamDir::Uni, false);
         let (signal, _signal_rx) = mpsc::unbounded_channel();
-        streams.lock().unwrap().send.insert(
+        streams.lock().unwrap().insert_send(
             id,
             SendState {
                 inbound_signal: signal,
@@ -1439,7 +1483,7 @@ impl<R: Reader> SessionState<R> {
                         let fin = stream.fin;
                         recv.inbound_data.send(stream).ok();
                         if fin {
-                            streams.recv.remove(&id);
+                            streams.remove_recv(&id);
                         }
                         return Ok(());
                     }
@@ -1589,8 +1633,7 @@ impl<R: Reader> SessionState<R> {
                         self.streams
                             .lock()
                             .unwrap()
-                            .send
-                            .insert(stream.id, send_backend);
+                            .insert_send(stream.id, send_backend);
                         // See the uni arm: defer the idle close while a slow
                         // `accept_bi` consumer keeps the bounded channel full.
                         self.reader_backpressured.store(true, Ordering::Release);
@@ -1609,7 +1652,7 @@ impl<R: Reader> SessionState<R> {
                 }
 
                 if !fin {
-                    self.streams.lock().unwrap().recv.insert(id, recv_backend);
+                    self.streams.lock().unwrap().insert_recv(id, recv_backend);
                 }
             }
             Frame::ResetStream(reset) => {
@@ -1633,7 +1676,7 @@ impl<R: Reader> SessionState<R> {
                 // Take the entry in one lookup. The writer task removes it
                 // concurrently when a dropped `RecvStream` queues STOP_SENDING, so a
                 // separate existence check can go stale before the entry is used.
-                let live = self.streams.lock().unwrap().recv.remove(&reset_id);
+                let live = self.streams.lock().unwrap().remove_recv(&reset_id);
 
                 if !self.config.version.is_qmux() {
                     if let Some(recv) = live {
@@ -2320,7 +2363,34 @@ impl generic::Session for Session {
 
     fn stats(&self) -> impl generic::Stats {
         let socket = self.socket_stats.as_ref();
+        let streams = if self.config.version.is_qmux() {
+            let state = self.streams.lock().unwrap();
+            let closed = self.closed.borrow();
+            let open = if closed.is_some() {
+                [0, 0]
+            } else {
+                state.open[usize::from(self.is_server)]
+            };
+            let (bidi, uni) = if closed.is_some() {
+                (0, 0)
+            } else {
+                Credit::available_pair(&self.open_bi_credit, &self.open_uni_credit)
+            };
+            Some(generic::Streams {
+                bidi: generic::StreamState {
+                    open: open[0],
+                    available: bidi,
+                },
+                uni: generic::StreamState {
+                    open: open[1],
+                    available: uni,
+                },
+            })
+        } else {
+            None
+        };
         SessionStats {
+            streams,
             // Fall back to our own QX_PING measurement only when the transport
             // can't answer; a TCP socket already knows before we've pinged once.
             rtt: socket.and_then(|s| s.rtt()).or_else(|| self.rtt.get()),
@@ -2395,7 +2465,7 @@ impl generic::Session for Session {
                     .increase_max(streams.peer_initial_max_stream_data_uni)
                     .ok();
             }
-            streams.send.insert(id, send_backend);
+            streams.insert_send(id, send_backend);
         }
 
         Ok(send_frontend)
@@ -2479,8 +2549,8 @@ impl generic::Session for Session {
                     .increase_max(streams.peer_initial_max_stream_data_bidi_remote)
                     .ok();
             }
-            streams.send.insert(id, send_backend);
-            streams.recv.insert(id, recv_backend);
+            streams.insert_send(id, send_backend);
+            streams.insert_recv(id, recv_backend);
         }
 
         Ok((send_frontend, recv_frontend))

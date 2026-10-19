@@ -96,11 +96,16 @@ impl Rtt {
 /// always measure itself, from `QX_PING`; a send-rate estimate only ever comes
 /// from the transport.
 pub(crate) struct SessionStats {
+    pub(crate) streams: Option<web_transport_trait::Streams>,
     pub(crate) rtt: Option<Duration>,
     pub(crate) estimated_send_rate: Option<u64>,
 }
 
 impl web_transport_trait::Stats for SessionStats {
+    fn streams(&self) -> Option<web_transport_trait::Streams> {
+        self.streams
+    }
+
     fn rtt(&self) -> Option<Duration> {
         self.rtt
     }
