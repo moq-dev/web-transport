@@ -84,8 +84,12 @@
           packages = tools;
 
           shellHook = ''
+            # Linux Python extension wheels also need the compiler's C++ runtime.
             export LD_LIBRARY_PATH=${
-              pkgs.lib.makeLibraryPath [ pkgs.llvmPackages.libclang.lib ]
+              pkgs.lib.makeLibraryPath (
+                [ pkgs.llvmPackages.libclang.lib ]
+                ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.stdenv.cc.cc.lib ]
+              )
             }:$LD_LIBRARY_PATH
           '';
         };

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { cp, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -64,6 +64,9 @@ try {
 		],
 		PACKAGE,
 	);
+	// prepack runs the same TypeScript build as publishing. Only its build
+	// tools come from the checkout; the extracted package has no such link.
+	await symlink(join(ROOT, "node_modules"), join(prepared, "node_modules"), "dir");
 	await run(["bun", "pm", "pack", "--destination", stage], prepared);
 	const archives = (await readdir(stage)).filter((name) => name.endsWith(".tgz"));
 	if (archives.length !== 1) throw new Error(`Expected one packed package, found ${archives.length}`);
@@ -73,6 +76,29 @@ try {
 	if (!(await readdir(installed)).some((name) => name.endsWith(".node"))) {
 		throw new Error("The packed package did not contain the native artifact");
 	}
+	await cp(join(PACKAGE, "tests/consumer.ts"), join(stage, "consumer.mts"));
+	await run(
+		[
+			"bunx",
+			"--no-install",
+			"tsc",
+			"--ignoreConfig",
+			"--noEmit",
+			"--strict",
+			"--target",
+			"esnext",
+			"--module",
+			"nodenext",
+			"--lib",
+			"esnext,dom,dom.iterable",
+			"--types",
+			"node",
+			"--typeRoots",
+			join(ROOT, "node_modules/@types"),
+			join(stage, "consumer.mts"),
+		],
+		PACKAGE,
+	);
 	await cp(join(PACKAGE, "tests/runtime.mjs"), join(stage, "runtime.mjs"));
 	const cert = join(stage, "cert.pem");
 	const key = join(stage, "key.pem");
