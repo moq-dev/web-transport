@@ -45,6 +45,17 @@ export function closingDatagramTransport() {
     };
 }
 
+export function openDatagramTransport() {
+    let controller;
+    const failure = new Error('controlled cleanup');
+    const stream = new WritableStream({ start(value) { controller = value; } });
+    return {
+        transport: { protocol: '', datagrams: { createWritable: () => stream } },
+        error: () => controller.error(failure),
+        failure,
+    };
+}
+
 export async function flushMicrotasks() {
     for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -52,6 +63,8 @@ export async function flushMicrotasks() {
 extern "C" {
     #[wasm_bindgen(js_name = closingDatagramTransport)]
     fn closing_datagram_transport() -> Object;
+    #[wasm_bindgen(js_name = openDatagramTransport)]
+    fn open_datagram_transport() -> Object;
     #[wasm_bindgen(js_name = flushMicrotasks)]
     async fn flush_microtasks();
 }
@@ -75,7 +88,7 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     ));
 
     for (name, already_closed) in [
-        ("clean datagram closure terminates pending sends", false),
+        ("closing datagram writer terminates pending sends", false),
         ("cleanly closed datagram writer rejects new sends", true),
     ] {
         let outcome = clean_datagram_writer_terminates(already_closed).await;
@@ -85,6 +98,21 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         };
         results.push(&outcome);
     }
+
+    let outcome = dropped_datagram_senders_release_wakers().await;
+    let outcome = match outcome {
+        Ok(detail) => row(
+            "dropped datagram senders release their wakers",
+            true,
+            &detail,
+        ),
+        Err(err) => row(
+            "dropped datagram senders release their wakers",
+            false,
+            &format!("{err}"),
+        ),
+    };
+    results.push(&outcome);
 
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
@@ -356,36 +384,107 @@ async fn clean_datagram_writer_terminates(already_closed: bool) -> Result<String
     let waker = Waker::from(wake.clone());
     let mut cx = Context::from_waker(&waker);
 
-    if !already_closed && !session.poll_send_datagram(&mut cx, b"pending").is_pending() {
-        return expect(false, "closing writer did not wait".into());
+    if already_closed {
+        finish_controlled_close(&fixture).await?;
+    } else {
+        if !session.poll_send_datagram(&mut cx, b"pending").is_pending() {
+            return expect(false, "closing writer did not start pending".into());
+        }
+        flush_microtasks().await;
+        if !wake.0.swap(false, Ordering::SeqCst) {
+            return expect(
+                false,
+                "terminal readiness did not wake the pending send".into(),
+            );
+        }
     }
 
-    flush_microtasks().await;
-    wake.0.store(false, Ordering::SeqCst);
-
-    let finish: js_sys::Function = Reflect::get(&fixture, &"finish".into())?.unchecked_into();
-    finish.call0(&fixture)?;
-    let closed: js_sys::Promise = Reflect::get(&fixture, &"closed".into())?.unchecked_into();
-    wasm_bindgen_futures::JsFuture::from(closed).await?;
-    flush_microtasks().await;
-
-    if !already_closed && !wake.0.swap(false, Ordering::SeqCst) {
-        return expect(false, "closure did not wake the pending send".into());
-    }
-
+    let mut outcome = expect(
+        false,
+        "writer remained in a fulfilled-ready wake loop".into(),
+    );
     for _ in 0..4 {
         match session.poll_send_datagram(&mut cx, b"late") {
             Poll::Ready(Err(Error::Closed)) => {
-                return expect(true, "clean writer closure returned Closed".into());
+                outcome = expect(true, "terminal readiness returned Closed".into());
+                break;
             }
-            Poll::Ready(other) => return expect(false, format!("unexpected result: {other:?}")),
+            Poll::Ready(other) => {
+                outcome = expect(false, format!("unexpected result: {other:?}"));
+                break;
+            }
+            Poll::Pending => flush_microtasks().await,
+        }
+    }
+
+    // The sink cannot finish until polling has terminated. A ready wake loop
+    // would starve the browser task responsible for that completion.
+    if !already_closed {
+        finish_controlled_close(&fixture).await?;
+    }
+    outcome
+}
+
+async fn finish_controlled_close(fixture: &Object) -> Result<(), Error> {
+    flush_microtasks().await;
+    let finish: js_sys::Function = Reflect::get(fixture, &"finish".into())?.unchecked_into();
+    finish.call0(fixture)?;
+    let closed: js_sys::Promise = Reflect::get(fixture, &"closed".into())?.unchecked_into();
+    wasm_bindgen_futures::JsFuture::from(closed).await?;
+    Ok(())
+}
+
+/// Dropping a sender must release its task waker even while the writer stays open.
+async fn dropped_datagram_senders_release_wakers() -> Result<String, Error> {
+    let fixture = open_datagram_transport();
+    let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
+    let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
+    let mut wakes = Vec::new();
+
+    for _ in 0..32 {
+        let wake = Arc::new(FlagWake::default());
+        {
+            let sender = session.clone();
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            match sender.poll_send_datagram(&mut cx, b"once") {
+                Poll::Ready(Ok(())) => {}
+                other => return expect(false, format!("open writer send returned {other:?}")),
+            }
+        }
+        flush_microtasks().await;
+        wakes.push(wake);
+    }
+
+    let retained = wakes
+        .iter()
+        .filter(|wake| Arc::strong_count(wake) != 1)
+        .count();
+    let error: js_sys::Function = Reflect::get(&fixture, &"error".into())?.unchecked_into();
+    error.call0(&fixture)?;
+    flush_microtasks().await;
+    let stale_wakes = wakes
+        .iter()
+        .filter(|wake| wake.0.load(Ordering::SeqCst))
+        .count();
+
+    let failure = Reflect::get(&fixture, &"failure".into())?;
+    let mut original_error = false;
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..4 {
+        match session.poll_send_datagram(&mut cx, b"late") {
+            Poll::Ready(Err(Error::Unknown(err))) => {
+                original_error = Object::is(&err, &failure);
+                break;
+            }
+            Poll::Ready(_) => break,
             Poll::Pending => flush_microtasks().await,
         }
     }
 
     expect(
-        false,
-        "clean writer remained in a fulfilled-ready wake loop".into(),
+        retained == 0 && stale_wakes == 0 && original_error,
+        format!("{retained} dropped send tasks retained, {stale_wakes} stale wakes, original error preserved: {original_error}"),
     )
 }
 

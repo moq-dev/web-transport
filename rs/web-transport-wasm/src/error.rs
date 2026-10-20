@@ -19,8 +19,8 @@ pub enum Error {
     Stream(web_sys::WebTransportError),
 
     /// The stream was closed locally, by [`crate::SendStream::finish`] or
-    /// [`crate::SendStream::reset`], or the browser datagram writer closed cleanly,
-    /// so it can accept no more writes.
+    /// [`crate::SendStream::reset`], or the browser datagram writer is closing or
+    /// has closed cleanly, so it can accept no more writes.
     #[error("stream is closed")]
     Closed,
 

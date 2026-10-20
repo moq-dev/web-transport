@@ -23,7 +23,8 @@ CI only compiles this crate: the browser API it wraps exists nowhere else, so th
 automated coverage. `just harness` builds a browser harness and the QUIC peer that drives it, then
 serves the page for a browser to open. It exercises accept, a peer reset code, closed-watches racing
 buffered bytes, datagrams, and a session close, and reports a row per check. Controlled browser
-`WritableStream` fixtures additionally exercise clean datagram-writer closure without network timing.
+`WritableStream` fixtures additionally exercise datagram writers whose close step is still pending,
+already-closed writers, and dropped send-task ownership without network timing.
 They model the Streams contract; clean closure has not been reproduced through a real WebTransport
 session, whose teardown currently exercises the errored-writer path in Chromium.
 
