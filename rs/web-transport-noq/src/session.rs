@@ -54,7 +54,8 @@ fn negotiated_alpn(_conn: &noq::Connection) -> Option<String> {
 /// Clones share ownership of the session. Dropping the final [`Session`] closes the
 /// connection immediately, even if streams or native connection handles remain.
 /// An explicit [`close`](Self::close) already in progress keeps its bounded graceful
-/// close instead. This ownership contract also applies to [`Session::raw`].
+/// close instead. Cancelling that task closes locally and cancels the capsule reader,
+/// including during runtime shutdown. This ownership contract also applies to [`Session::raw`].
 ///
 /// Deref is used to expose non-overloaded methods on [`noq::Connection`].
 /// These should be safe to use with WebTransport, but file a PR if you find one that isn't.
@@ -112,6 +113,26 @@ struct SessionOwner {
     error: Arc<OnceLock<SessionError>>,
     reader: Option<tokio::task::AbortHandle>,
     drop_code: noq::VarInt,
+}
+
+/// Own teardown independently of the graceful future being polled or completing.
+struct CloseCleanup {
+    conn: noq::Connection,
+    reader: Option<tokio::task::AbortHandle>,
+    code: noq::VarInt,
+    reason: Bytes,
+}
+
+impl Drop for CloseCleanup {
+    fn drop(&mut self) {
+        // Noq's close replaces its stored error, so preserve observed peer errors.
+        if self.conn.close_reason().is_none() {
+            self.conn.close(self.code, &self.reason);
+        }
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+    }
 }
 
 impl Drop for SessionOwner {
@@ -433,6 +454,14 @@ impl Session {
     /// including writes blocked by flow control. Dropping the final Session preserves
     /// this pending close. Await [`Session::closed()`] to wait for connection teardown;
     /// delivery of the capsule is best effort. The first close code and reason win.
+    ///
+    /// Cancelling the task, even before its first poll, closes the native connection
+    /// and requests waiter wakeups synchronously, then cancels the capsule reader.
+    /// The capsule carries the full UTF-8 reason; the native fallback carries at most
+    /// 1024 bytes at a character boundary. Already observed native errors are preserved.
+    /// Runtime shutdown guarantees local cleanup when the task is dropped; peer
+    /// delivery, draining and execution of awakened tasks require a live runtime.
+    /// Forgotten futures, non-yielding tasks and process abort are outside this guarantee.
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
@@ -449,8 +478,6 @@ impl Session {
             if let Some(send) = send {
                 let reason = String::from_utf8_lossy(reason).into_owned();
                 let conn = self.conn.clone();
-                let capsule =
-                    web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
                 let rtt = self
                     .conn
                     .rtt(noq::PathId::ZERO)
@@ -461,8 +488,18 @@ impl Session {
                 // without retaining frontend Session ownership.
                 let settings = self.settings.clone();
                 let accept = self.accept.clone();
+                // Construct cleanup before constructing/spawning the task: the
+                // runtime may drop it without ever polling its async body.
+                let close = Self::close_with_capsule(
+                    conn,
+                    send,
+                    code,
+                    reason,
+                    timeout,
+                    self._owner.reader.clone(),
+                );
                 tokio::spawn(async move {
-                    Self::close_with_capsule(conn, send, capsule, code, timeout).await;
+                    close.await;
                     drop((settings, accept));
                 });
             }
@@ -474,48 +511,63 @@ impl Session {
 
     /// Write the CloseWebTransportSession capsule, finish the stream, wait for
     /// the peer to close the connection (or timeout), then force-close.
-    async fn close_with_capsule(
+    fn close_with_capsule(
         conn: noq::Connection,
         mut send: noq::SendStream,
-        capsule: web_transport_proto::Capsule,
         code: u32,
+        reason: String,
         timeout: std::time::Duration,
-    ) {
-        let http3_code: noq::VarInt = web_transport_proto::error_to_http3(code)
-            .try_into()
-            .unwrap();
-
-        // Flow control can block the capsule write too, so the deadline includes
-        // the entire operation, not just the wait for peer closure.
-        let close = async {
-            let mut capsule_bytes = Vec::new();
-            capsule.encode(&mut capsule_bytes);
-
-            let mut frame = Vec::new();
-            Frame::DATA.encode(&mut frame);
-            let Ok(len) = VarInt::try_from(capsule_bytes.len()) else {
-                tracing::warn!("capsule too large to encode as DATA frame");
-                return;
-            };
-            len.encode(&mut frame);
-            frame.extend_from_slice(&capsule_bytes);
-
-            if let Err(e) = send.write_all(&frame).await {
-                tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
-                return;
-            }
-            if let Err(e) = send.finish() {
-                tracing::warn!(?e, "failed to finish CONNECT send stream");
-                return;
-            }
-
-            conn.closed().await;
-        };
-
-        if tokio::time::timeout(timeout, close).await.is_err() {
-            tracing::debug!("graceful close timed out");
+        reader: Option<tokio::task::AbortHandle>,
+    ) -> impl Future<Output = ()> {
+        // Keep the QUIC fallback below one packet. Noq's long-reason truncation
+        // can overflow for the eight-byte mapped HTTP/3 code; the capsule still
+        // carries the complete UTF-8 reason.
+        let mut limit = reason.len().min(1024);
+        while !reason.is_char_boundary(limit) {
+            limit -= 1;
         }
-        conn.close(http3_code, b"");
+        let cleanup = CloseCleanup {
+            conn,
+            reader,
+            code: web_transport_proto::error_to_http3(code)
+                .try_into()
+                .unwrap(),
+            reason: Bytes::copy_from_slice(&reason.as_bytes()[..limit]),
+        };
+        let capsule = web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
+
+        async move {
+            // The deadline includes flow control, not just the peer-close wait.
+            let close = async {
+                let mut capsule_bytes = Vec::new();
+                capsule.encode(&mut capsule_bytes);
+
+                let mut frame = Vec::new();
+                Frame::DATA.encode(&mut frame);
+                let Ok(len) = VarInt::try_from(capsule_bytes.len()) else {
+                    tracing::warn!("capsule too large to encode as DATA frame");
+                    return;
+                };
+                len.encode(&mut frame);
+                frame.extend_from_slice(&capsule_bytes);
+
+                if let Err(e) = send.write_all(&frame).await {
+                    tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
+                    return;
+                }
+                if let Err(e) = send.finish() {
+                    tracing::warn!(?e, "failed to finish CONNECT send stream");
+                    return;
+                }
+
+                cleanup.conn.closed().await;
+            };
+
+            if tokio::time::timeout(timeout, close).await.is_err() {
+                tracing::debug!("graceful close timed out");
+            }
+            drop(cleanup);
+        }
     }
 
     /// Wait until the session is closed, returning the error. See [`noq::Connection::closed`].
@@ -1100,7 +1152,14 @@ impl web_transport_trait::Session for Session {
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests {
-    use std::{net::Ipv4Addr, sync::Arc};
+    use std::{
+        net::Ipv4Addr,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::Wake,
+    };
 
     use rcgen::{CertifiedKey, KeyPair};
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -1125,6 +1184,15 @@ mod tests {
         transport: noq::TransportConfig,
         peer_transport: noq::TransportConfig,
     ) -> (noq::Connection, noq::Connection, [noq::Endpoint; 2]) {
+        let endpoints = endpoints_with_transports(transport, peer_transport);
+        let (client, server) = connect_endpoints(&endpoints).await;
+        (client, server, endpoints)
+    }
+
+    fn endpoints_with_transports(
+        transport: noq::TransportConfig,
+        peer_transport: noq::TransportConfig,
+    ) -> [noq::Endpoint; 2] {
         #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -1144,14 +1212,21 @@ mod tests {
         let mut client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
         client_config.transport_config(Arc::new(transport));
         let client = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        client.set_default_client_config(client_config);
+        [client, server]
+    }
 
+    async fn connect_endpoints(
+        endpoints: &[noq::Endpoint; 2],
+    ) -> (noq::Connection, noq::Connection) {
+        let [client, server] = endpoints;
         let connecting = client
-            .connect_with(client_config, server.local_addr().unwrap(), "localhost")
+            .connect(server.local_addr().unwrap(), "localhost")
             .unwrap();
         let accept = async { server.accept().await.unwrap().await.unwrap() };
         let (client_conn, server_conn) = tokio::join!(async { connecting.await.unwrap() }, accept);
 
-        (client_conn, server_conn, [client, server])
+        (client_conn, server_conn)
     }
 
     async fn http3_pair() -> (
@@ -1175,11 +1250,19 @@ mod tests {
     ) {
         let (client, server, endpoints) =
             pair_with_transports(Default::default(), peer_transport).await;
+        let (session, connect, settings) = http3_session(client, &server).await;
+        (session, server, connect, settings, endpoints)
+    }
+
+    async fn http3_session(
+        client: noq::Connection,
+        server: &noq::Connection,
+    ) -> (Session, Connected, Settings) {
         let client_session =
             Session::connect(client, url::Url::parse("https://localhost/").unwrap());
         let peer = async {
-            let settings = Settings::connect(&server).await.unwrap();
-            let connect = crate::Connecting::accept(&server)
+            let settings = Settings::connect(server).await.unwrap();
+            let connect = crate::Connecting::accept(server)
                 .await
                 .unwrap()
                 .respond(http::StatusCode::OK)
@@ -1188,7 +1271,7 @@ mod tests {
             (settings, connect)
         };
         let (session, (settings, connect)) = tokio::join!(client_session, peer);
-        (session.unwrap(), server, connect, settings, endpoints)
+        (session.unwrap(), connect, settings)
     }
 
     #[tokio::test]
@@ -1241,6 +1324,318 @@ mod tests {
             .expect("peer must observe final raw Session drop");
     }
 
+    fn close_operation(session: &Session, code: u32, reason: &str) -> impl Future<Output = ()> {
+        session
+            .error
+            .set(noq::ConnectionError::LocallyClosed.into())
+            .unwrap();
+        let send = session.connect_send.lock().unwrap().take().unwrap();
+        Session::close_with_capsule(
+            session.conn.clone(),
+            send,
+            code,
+            reason.to_owned(),
+            Duration::from_secs(60),
+            session._owner.reader.clone(),
+        )
+    }
+
+    async fn reader_finished(reader: &tokio::task::AbortHandle) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capsule reader must terminate after graceful close ends");
+    }
+
+    #[derive(Default)]
+    struct FlagWake(AtomicBool);
+
+    impl Wake for FlagWake {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_before_first_poll_closes_and_wakes_waiters() {
+        let (session, peer, _connect, _settings, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = session._owner.reader.as_ref().unwrap().clone();
+        let wakes = [(); 3].map(|_| Arc::new(FlagWake::default()));
+        let wakers = wakes.each_ref().map(|wake| Waker::from(wake.clone()));
+        let [mut cx, mut datagram_cx, mut accept_cx] = wakers.each_ref().map(Context::from_waker);
+        let mut closed = Box::pin(session.closed());
+        let mut datagram = Box::pin(session.read_datagram());
+        let mut accept = Box::pin(session.accept_uni());
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        assert!(datagram.as_mut().poll(&mut datagram_cx).is_pending());
+        assert!(accept.as_mut().poll(&mut accept_cx).is_pending());
+
+        let close = close_operation(&session, 42, "first reason");
+        session.close(43, b"second reason");
+        for wake in &wakes {
+            wake.0.store(false, Ordering::SeqCst);
+        }
+        drop(close);
+        assert!(
+            native.close_reason().is_some(),
+            "unpolled close cancellation must close synchronously"
+        );
+        assert!(
+            wakes.iter().all(|wake| wake.0.load(Ordering::SeqCst)),
+            "native close must request every waiter wakeup synchronously"
+        );
+        assert!(matches!(
+            closed.as_mut().poll(&mut cx),
+            Poll::Ready(SessionError::ConnectionError(
+                noq::ConnectionError::LocallyClosed
+            ))
+        ));
+        assert!(matches!(
+            datagram.as_mut().poll(&mut datagram_cx),
+            Poll::Ready(Err(SessionError::ConnectionError(
+                noq::ConnectionError::LocallyClosed
+            )))
+        ));
+        assert!(matches!(
+            accept.as_mut().poll(&mut accept_cx),
+            Poll::Ready(Err(SessionError::ConnectionError(
+                noq::ConnectionError::LocallyClosed
+            )))
+        ));
+        let error = tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .unwrap();
+        assert!(
+            matches!(error, noq::ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == web_transport_proto::error_to_http3(42)
+                && close.reason == b"first reason"[..])
+        );
+        reader_finished(&reader).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_during_blocked_capsule_write_closes_synchronously() {
+        let mut transport = noq::TransportConfig::default();
+        transport.stream_receive_window(1024u32.into());
+        let (session, _peer, _connect, _settings, _endpoints) = http3_pair_with(transport).await;
+        let native = session.conn.clone();
+        let reader = session._owner.reader.as_ref().unwrap().clone();
+        tokio::time::pause();
+        let mut close = Box::pin(close_operation(&session, 42, &"blocked".repeat(2048)));
+        assert!(futures::poll!(&mut close).is_pending());
+        assert!(native.close_reason().is_none());
+        drop(close);
+        assert!(
+            native.close_reason().is_some(),
+            "blocked capsule cancellation must close synchronously"
+        );
+        tokio::time::resume();
+        reader_finished(&reader).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_while_waiting_for_peer_closes_and_releases_reader() {
+        let (session, _peer, connect, _settings, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = session._owner.reader.as_ref().unwrap().clone();
+        let owner = Arc::downgrade(&session._owner);
+        let mut close = Box::pin(close_operation(&session, 42, "waiting"));
+        assert!(futures::poll!(&mut close).is_pending());
+        let mut capsules = web_transport_proto::Http3CapsuleReader::new(connect.recv);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), capsules.read())
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(web_transport_proto::Capsule::CloseWebTransportSession { code: 42, .. })
+        ));
+        assert!(native.close_reason().is_none());
+        drop(session);
+        assert!(
+            owner.upgrade().is_none(),
+            "graceful close must not retain frontend ownership"
+        );
+        drop(close);
+        assert!(
+            native.close_reason().is_some(),
+            "peer-wait cancellation must close synchronously"
+        );
+        reader_finished(&reader).await;
+    }
+
+    #[tokio::test]
+    async fn completed_close_preserves_observed_peer_error() {
+        let (session, peer, _connect, _settings, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let mut close = Box::pin(close_operation(&session, 42, "local first"));
+        assert!(futures::poll!(&mut close).is_pending());
+        peer.close(123u32.into(), b"peer reason");
+        native.closed().await;
+        assert!(futures::poll!(&mut close).is_ready());
+        assert!(
+            matches!(native.close_reason(), Some(noq::ConnectionError::ApplicationClosed(close))
+            if close.error_code == 123u32.into() && close.reason == b"peer reason"[..]),
+            "graceful cleanup must not overwrite an observed native peer error"
+        );
+    }
+
+    fn assert_shutdown_closes(yielded: bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (native, reader, resources, mut closed, wake, _held) = runtime.block_on(async {
+            let mut transport = noq::TransportConfig::default();
+            transport.stream_receive_window(1024u32.into());
+            let (session, peer, connect, settings, endpoints) = http3_pair_with(transport).await;
+            let native = session.conn.clone();
+            let reader = session._owner.reader.as_ref().unwrap().clone();
+            let resources = Arc::downgrade(&session.error);
+            let conn = native.clone();
+            let mut closed = Box::pin(async move { conn.closed().await });
+            let wake = Arc::new(FlagWake::default());
+            let waker = Waker::from(wake.clone());
+            assert!(closed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            tokio::time::pause();
+            session.close(42, &vec![b'x'; 8192]);
+            drop(session);
+            if yielded {
+                tokio::task::yield_now().await;
+            }
+            assert!(native.close_reason().is_none());
+            wake.0.store(false, Ordering::SeqCst);
+            (
+                native,
+                reader,
+                resources,
+                closed,
+                wake,
+                (peer, connect, settings, endpoints),
+            )
+        });
+        drop(runtime);
+        assert!(
+            native.close_reason().is_some(),
+            "runtime shutdown must close locally (yielded={yielded})"
+        );
+        assert!(
+            wake.0.load(Ordering::SeqCst),
+            "runtime shutdown must request waiter wakeups"
+        );
+        assert!(reader.is_finished());
+        assert!(
+            resources.upgrade().is_none(),
+            "runtime shutdown must release task-owned shared state"
+        );
+        assert!(matches!(
+            closed
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref())),
+            Poll::Ready(noq::ConnectionError::LocallyClosed)
+        ));
+    }
+
+    #[test]
+    fn runtime_shutdown_closes_unpolled_graceful_task() {
+        assert_shutdown_closes(false);
+    }
+
+    #[test]
+    fn runtime_shutdown_closes_yielded_graceful_task() {
+        assert_shutdown_closes(true);
+    }
+
+    #[tokio::test]
+    async fn repeated_lifetimes_return_fixed_endpoints_to_baseline() {
+        let endpoints = endpoints_with_transports(Default::default(), Default::default());
+        let baseline = endpoints.each_ref().map(noq::Endpoint::open_connections);
+        assert_eq!(baseline, [0, 0]);
+        // Reuse both endpoints across every mode and cycle. Endpoint shutdown
+        // would hide leaked connection drivers, so only wait for natural draining.
+        for cycle in 0..3 {
+            for mode in ["implicit", "explicit", "cancelled"] {
+                let (client, peer) = connect_endpoints(&endpoints).await;
+                let (session, mut connect, settings) = http3_session(client, &peer).await;
+                let native = session.conn.clone();
+                let weak_native = native.weak_handle();
+                let owner = Arc::downgrade(&session._owner);
+                let error = Arc::downgrade(&session.error);
+                let reader = session._owner.reader.as_ref().unwrap().clone();
+                let stream = session.open_uni().await.unwrap();
+                match mode {
+                    "explicit" => {
+                        // The capsule keeps the complete reason, independently
+                        // of the shorter native fallback carried by cancellation.
+                        let reason = "é".repeat(800);
+                        session.close(42, reason.as_bytes());
+                        let mut capsules =
+                            web_transport_proto::Http3CapsuleReader::new(&mut connect.recv);
+                        let capsule = tokio::time::timeout(Duration::from_secs(1), capsules.read())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            matches!(capsule, Some(web_transport_proto::Capsule::CloseWebTransportSession {code:42, reason:actual}) if actual == reason)
+                        );
+                        peer.close(
+                            web_transport_proto::error_to_http3(42).try_into().unwrap(),
+                            b"ack",
+                        );
+                        session.closed().await;
+                    }
+                    "cancelled" => {
+                        let reason = format!("x{}", "é".repeat(800));
+                        drop(close_operation(&session, 42, &reason));
+                        assert!(native.close_reason().is_some());
+                        let closed = tokio::time::timeout(Duration::from_secs(1), peer.closed())
+                            .await
+                            .unwrap();
+                        assert!(
+                            matches!(closed, noq::ConnectionError::ApplicationClosed(close)
+                            if close.error_code.into_inner() == web_transport_proto::error_to_http3(42)
+                                && close.reason.len() <= 1024
+                                && std::str::from_utf8(&close.reason).is_ok_and(|prefix| reason.starts_with(prefix)))
+                        );
+                    }
+                    "implicit" => {}
+                    _ => unreachable!(),
+                }
+                drop(session);
+                assert!(
+                    native.close_reason().is_some(),
+                    "{mode} cycle {cycle} must close locally"
+                );
+                assert!(owner.upgrade().is_none());
+                reader_finished(&reader).await;
+                drop((stream, native, peer, connect, settings));
+                // Real QUIC networking includes its draining timer. This bound
+                // measures eventual driver release, not synchronous local close.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(endpoints[0].wait_idle(), endpoints[1].wait_idle());
+                })
+                .await
+                .expect("connection drivers must return to baseline");
+                assert_eq!(
+                    endpoints.each_ref().map(noq::Endpoint::open_connections),
+                    baseline,
+                    "{mode} cycle {cycle}"
+                );
+                assert!(!weak_native.is_alive());
+                assert!(error.upgrade().is_none());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn graceful_close_deadline_includes_blocked_capsule_write() {
         let mut peer_transport = noq::TransportConfig::default();
@@ -1248,14 +1643,17 @@ mod tests {
         let (session, _peer, _connect, _settings, _endpoints) =
             http3_pair_with(peer_transport).await;
         let send = session.connect_send.lock().unwrap().take().unwrap();
-        let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
-            code: 42,
-            reason: "blocked".repeat(1024),
-        };
         tokio::time::pause();
         let deadline = Duration::from_millis(100);
         let expires = tokio::time::Instant::now() + deadline;
-        let close = Session::close_with_capsule(session.conn.clone(), send, capsule, 42, deadline);
+        let close = Session::close_with_capsule(
+            session.conn.clone(),
+            send,
+            42,
+            "blocked".repeat(1024),
+            deadline,
+            session._owner.reader.clone(),
+        );
         tokio::pin!(close);
         assert!(futures::poll!(&mut close).is_pending());
         tokio::time::advance(deadline - Duration::from_millis(1)).await;

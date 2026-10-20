@@ -21,7 +21,3 @@ Keep signatures and wire formats unchanged. Update backend and router lifecycle 
 ## Closes
 
 - [#428](https://github.com/moq-dev/web-transport/issues/428) - restore final-handle cleanup
-
-## Related
-
-- [Noq close cancellation](/quest/a0/noq-close-cancellation.md) - independently repair the graceful-close fallback and verify repeated cleanup
