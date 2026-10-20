@@ -96,48 +96,17 @@ fix:
 	bun install
 	bun run fix
 
-# Run the browser harness for web-transport-wasm.
-#
-# CI only compiles the WASM crate; the browser API it wraps exists nowhere else, so
-# the poll paths that are easiest to get wrong have no automated coverage. This
-# builds the harness, starts its QUIC peer, and serves the page for a browser to
-# open. Requires `dev/setup` to have generated the localhost certificate.
-harness port="8080":
-	#!/usr/bin/env bash
-	set -euo pipefail
+# Build and serve the WASM browser harness for manual inspection.
+harness port="8080": harness-build
+	./dev/serve-harness {{port}}
 
-	if [ ! -f dev/localhost.crt ] || [ ! -f dev/localhost.key ] || [ ! -f dev/localhost.hex ]; then
-		./dev/setup
-	fi
+# Shared build for the interactive page and automated Chromium runner.
+harness-build:
+	./dev/build-harness
 
-	# wasm-bindgen refuses to process a file built against a different schema, but
-	# adjacent crate and CLI versions can share one. Let the CLI make that decision;
-	# if it fails, add the version provenance its schema error omits.
-	want=$(cargo metadata --format-version 1 \
-		| python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wasm-bindgen"))')
-	got=$(wasm-bindgen --version | awk '{print $2}')
-
-	# Build the harness and generate its JS bindings next to the page.
-	out="target/harness"
-	cargo build --example harness -p web-transport-wasm --target wasm32-unknown-unknown
-	if ! wasm-bindgen --target web --out-dir "$out" \
-		target/wasm32-unknown-unknown/debug/examples/harness.wasm; then
-		echo "wasm-bindgen CLI is $got but the build uses $want." >&2
-		echo "Install the matching one, outside the nix shell if that is where this came from:" >&2
-		echo "    cargo binstall -y --force wasm-bindgen-cli@$want" >&2
-		exit 1
-	fi
-	cp rs/web-transport-wasm/examples/harness.html "$out/index.html"
-	cp dev/localhost.hex "$out/localhost.hex"
-
-	cargo build --example harness-server -p web-transport-quinn
-	./target/debug/examples/harness-server \
-		--tls-cert dev/localhost.crt --tls-key dev/localhost.key &
-	server=$!
-	trap 'kill $server 2>/dev/null || true' EXIT
-
-	echo "==> open http://localhost:{{port}}/"
-	python3 -m http.server {{port}} --directory "$out"
+# Execute every harness result row in Chromium; environment failures are errors.
+test-browser: harness-build
+	bun run test:browser
 
 # Build the FFI staticlib/cdylib for the host and generate language bindings.
 build-ffi:

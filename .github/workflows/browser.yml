@@ -1,0 +1,42 @@
+name: WASM browser
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'justfile'
+      - 'dev/**'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/browser.yml'
+
+jobs:
+  chromium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix develop --command bun install --frozen-lockfile
+      - run: nix develop --command bunx playwright install --with-deps chromium
+      - run: nix develop --command just test-browser
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: wasm-chromium-diagnostics
+          path: target/browser-results/
+          if-no-files-found: warn

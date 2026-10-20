@@ -13,7 +13,3 @@ Use a controlled spec-compliant writable to reproduce clean closure, since Chrom
 ## Closes
 
 - [#375](https://github.com/moq-dev/web-transport/issues/375) - the implementation completes this report
-
-## Related
-
-- [Browser CI](/quest/a0/browser-ci.md) - run these regressions automatically; neither quest blocks the other

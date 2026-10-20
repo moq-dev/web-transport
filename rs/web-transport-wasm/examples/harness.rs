@@ -2,14 +2,9 @@
 
 //! A browser harness for the poll state machine.
 //!
-//! `cargo check` proves this crate compiles for `wasm32`; nothing in CI runs it,
-//! because the browser API it wraps only exists in a browser. So the paths that are
-//! easiest to get wrong — an accept whose handle went away, a closed-watch racing
-//! buffered bytes, a peer reset code — had no coverage at all. This runs them
-//! against a real browser and a real QUIC peer.
-//!
-//! Pair it with `harness-server` from `web-transport-quinn`, which is driven by the
-//! commands sent here. See `just harness`.
+//! `just test-browser` runs this against Chromium and the real QUIC peer from
+//! `web-transport-quinn`. The peer is driven by the commands sent here; use
+//! `just harness` for interactive inspection.
 //!
 //! Each check returns a row rather than panicking, so one failure does not hide the
 //! rest.
@@ -64,8 +59,12 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("echo round trip", echo_round_trip);
     check!("no subprotocol reports None", no_subprotocol_is_none);
     check!(
-        "dropped pending opens release stream credit",
+        "dropped pending bi opens release stream credit",
         dropped_pending_opens_release_credit
+    );
+    check!(
+        "dropped pending uni opens release stream credit",
+        dropped_pending_uni_opens_release_credit
     );
     check!("accept_uni delivers every stream", accept_all);
     check!("a dropped clone does not swallow a stream", orphaned_accept);
@@ -176,6 +175,34 @@ async fn dropped_pending_opens_release_credit(session: Session) -> Result<String
     .map_err(|_| stalled("an abandoned open retained the peer's stream credit"))??;
 
     expect(got == "credit returned", format!("echoed {got:?}"))
+}
+
+/// Exercise the separate unidirectional open path past the peer's stream limit.
+async fn dropped_pending_uni_opens_release_credit(session: Session) -> Result<String, Error> {
+    for _ in 0..110 {
+        let doomed = session.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        match doomed.poll_open_uni(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(mut send)) => send.reset(0),
+            Poll::Ready(Err(err)) => return Err(err),
+        }
+    }
+
+    sleep(250).await;
+    let got = timeout(
+        async {
+            let mut send = session.open_uni().await?;
+            send.write(b"uni credit returned").await?;
+            send.finish()?;
+            session.recv_datagram().await
+        },
+        3_000,
+    )
+    .await
+    .map_err(|_| stalled("an abandoned uni open retained the peer's stream credit"))??;
+
+    expect(got == b"uni credit returned"[..], format!("echoed {got:?}"))
 }
 
 /// Every stream the peer opens is delivered, in order.
