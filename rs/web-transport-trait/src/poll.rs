@@ -260,7 +260,8 @@ pub trait RecvStream {
     /// Poll to read some data into the provided buffer, advancing it by the number
     /// of bytes read.
     ///
-    /// The default initializes spare capacity before calling [`poll_read`](Self::poll_read).
+    /// The default initializes at most 8 KiB of spare capacity before calling
+    /// [`poll_read`](Self::poll_read).
     /// Override this to avoid a copy when the underlying transport already owns the
     /// bytes as a [`Bytes`], which can be handed to [`BufMut::put`] directly.
     fn poll_read_buf<B: BufMut>(
@@ -306,7 +307,7 @@ pub trait RecvStream {
 
         // Don't allocate too much. Override this to avoid the copy, or to use a
         // larger per-poll buffer.
-        let capacity = max.min(8 * 1024);
+        let capacity = max.min(crate::util::READ_CAPACITY);
         let mut buf = BytesMut::with_capacity(capacity);
 
         // Limit to `capacity` rather than trusting the allocation: `with_capacity`

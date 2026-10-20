@@ -325,3 +325,21 @@ fn invalid_lengths_panic_before_advancing_buffers() {
         assert!(panic.is_err());
     }
 }
+
+#[test]
+fn initialization_is_bounded_independently_of_spare_capacity_and_progress() {
+    for surface in SURFACES {
+        for capacity in [64 * 1024, 1024 * 1024] {
+            let mut reader = Reader::new(b"fragmented");
+            let mut buf = BytesMut::with_capacity(capacity);
+            for _ in 0..10 {
+                assert_eq!(
+                    read_buf(surface, &mut reader, &mut buf),
+                    Poll::Ready(Ok(Some(1)))
+                );
+                assert!(reader.destination_len <= 8 * 1024);
+            }
+            assert_eq!(&buf[..], b"fragmented");
+        }
+    }
+}

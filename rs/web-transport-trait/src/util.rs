@@ -3,8 +3,13 @@
 //! These traits allow the same code to work on both native and WASM targets,
 //! where WASM doesn't support Send/Sync.
 
+pub(crate) const READ_CAPACITY: usize = 8 * 1024;
+
 /// Initialize spare capacity before exposing it to a safe reader.
 pub(crate) fn initialize(dst: &mut bytes::buf::UninitSlice) -> &mut [u8] {
+    // Bound initialization independently of allocation size and read progress.
+    let len = dst.len().min(READ_CAPACITY);
+    let dst = &mut dst[..len];
     for index in 0..dst.len() {
         dst.write_byte(index, 0);
     }

@@ -297,7 +297,7 @@ pub trait RecvStream: MaybeSend {
     /// Read some data into the provided slice.
     ///
     /// Returns the number of bytes read, or `None` once the peer has finished the
-    /// stream. An empty `dst` reads nothing and returns `Some(0)`.
+    /// stream.
     fn read(
         &mut self,
         dst: &mut [u8],
@@ -306,10 +306,12 @@ pub trait RecvStream: MaybeSend {
     /// Read some data into the provided buffer.
     ///
     /// The number of bytes read is returned, or None if the stream is closed.
-    /// The buffer will be advanced by the number of bytes read. A destination
-    /// with no room returns `Some(0)` without reading the stream.
+    /// The buffer will be advanced by the number of bytes read. In the default
+    /// implementation, a destination with no room returns `Some(0)` without
+    /// reading the stream.
     ///
-    /// The default initializes spare capacity before passing it to [`read`](Self::read).
+    /// The default initializes at most 8 KiB of spare capacity before passing it
+    /// to [`read`](Self::read).
     /// Override this when the transport can copy owned bytes directly into `buf`.
     fn read_buf<B: BufMut + MaybeSend>(
         &mut self,
@@ -337,7 +339,7 @@ pub trait RecvStream: MaybeSend {
     /// Read the next chunk of data, up to the max size.
     ///
     /// This returns a chunk of data instead of copying, which may be more efficient.
-    /// A zero `max` returns an empty chunk without reading the stream.
+    /// The default returns an empty chunk without reading for a zero `max`.
     fn read_chunk(
         &mut self,
         max: usize,
@@ -348,7 +350,7 @@ pub trait RecvStream: MaybeSend {
             }
 
             // Don't allocate too much. Write your own if you want to increase this buffer.
-            let capacity = max.min(8 * 1024);
+            let capacity = max.min(util::READ_CAPACITY);
             let mut buf = BytesMut::with_capacity(capacity);
 
             // Allocations may exceed the requested capacity. Bound the read to max.

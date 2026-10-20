@@ -16,3 +16,7 @@ rust-version = "1.75"
 
 [dependencies]
 bytes = "1"
+
+[[bench]]
+name = "receive"
+harness = false
