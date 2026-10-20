@@ -40,6 +40,7 @@ pub struct Session {
     open_uni: Op,
     open_bi: Op,
     send_datagram: Op,
+    send_datagram_closed: Op,
     recv_datagram: IncomingOp,
     closed: Op,
 }
@@ -247,6 +248,7 @@ impl Session {
             open_uni: Op::default(),
             open_bi: Op::default(),
             send_datagram: Op::default(),
+            send_datagram_closed: Op::default(),
             recv_datagram: IncomingOp::default(),
             closed: Op::default(),
         }
@@ -317,7 +319,8 @@ impl Session {
     ///
     /// Returns [`Poll::Pending`] until the browser has accepted the *previous*
     /// datagram, so a caller waits for capacity instead of piling up payloads. The
-    /// payload is untouched while pending.
+    /// payload is untouched while pending. A cleanly closed datagram writer
+    /// returns [`Error::Closed`].
     pub fn poll_send_datagram(
         &self,
         cx: &mut Context<'_>,
@@ -331,6 +334,18 @@ impl Session {
             Ok(writer) => writer,
             Err(err) => return Poll::Ready(Err(err)),
         };
+
+        // A clean close fulfills `ready` with zero desired size. Watch `closed`
+        // independently so that readiness cannot keep waking a terminal send.
+        // A pending close watch must still allow an open writer to regain room.
+        match self
+            .send_datagram_closed
+            .poll(cx, || promise(writer.closed()))
+        {
+            Poll::Ready(Ok(_)) => return Poll::Ready(Err(Error::Closed)),
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => {}
+        }
 
         // The writer is shared by every clone, so a local idle slot does not mean
         // the browser has room. Wait on the shared backpressure promise and
@@ -347,9 +362,6 @@ impl Session {
                     // cleared is what the next pass subscribes through. Waiting on
                     // `closed` here instead would wait out the session, which is
                     // the deadlock `concurrent_datagram_senders` pins.
-                    //
-                    // A writer that closed rather than filled rejects `ready`, so
-                    // that case leaves through the arm below rather than spinning.
                     Poll::Ready(Ok(_)) => continue,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 },

@@ -28,6 +28,34 @@ use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 use web_transport_wasm::{ClientBuilder, Error, RecvStream, Session};
 
+// The real Streams implementation supplies the writer state machine. Only the
+// WebTransport getters are stand-ins: Chromium's session teardown errors its
+// datagram writable, so it cannot demonstrate a clean writer closure.
+#[wasm_bindgen(inline_js = "
+export function closingDatagramTransport() {
+    let finish;
+    const stream = new WritableStream({
+        close() { return new Promise(resolve => { finish = resolve; }); }
+    }, { highWaterMark: 0 });
+    const closed = stream.close();
+    return {
+        transport: { protocol: '', datagrams: { createWritable: () => stream } },
+        finish: () => finish(),
+        closed,
+    };
+}
+
+export async function flushMicrotasks() {
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+}
+")]
+extern "C" {
+    #[wasm_bindgen(js_name = closingDatagramTransport)]
+    fn closing_datagram_transport() -> Object;
+    #[wasm_bindgen(js_name = flushMicrotasks)]
+    async fn flush_microtasks();
+}
+
 /// Run every check against `url`, trusting the sha-256 certificate hash `hash`.
 ///
 /// Returns an array of `{ name, ok, detail }` for the page to render.
@@ -45,6 +73,18 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         decode_hex("é").is_none(),
         "non-ASCII input returned None without panicking",
     ));
+
+    for (name, already_closed) in [
+        ("clean datagram closure terminates pending sends", false),
+        ("cleanly closed datagram writer rejects new sends", true),
+    ] {
+        let outcome = clean_datagram_writer_terminates(already_closed).await;
+        let outcome = match outcome {
+            Ok(detail) => row(name, true, &detail),
+            Err(err) => row(name, false, &format!("{err}")),
+        };
+        results.push(&outcome);
+    }
 
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
@@ -76,7 +116,7 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("peer reset code reaches the receiver", peer_reset_code);
     check!("datagram round trip", datagram_round_trip);
     check!(
-        "closed datagram writer terminates poll",
+        "session teardown terminates datagram sends",
         closed_datagram_writer_terminates
     );
     check!(
@@ -301,6 +341,51 @@ async fn datagram_round_trip(session: Session) -> Result<String, Error> {
     expect(
         got.as_ref() == b"ping",
         format!("received {:?}", String::from_utf8_lossy(&got)),
+    )
+}
+
+/// Zero high-water mark keeps desiredSize at zero while close is controlled by
+/// the sink. Streams resolves ready on close even though no capacity returns.
+/// Bound the polls and advance only microtasks: a timer cannot interrupt the
+/// original promise wake loop, which would starve the rest of the harness.
+async fn clean_datagram_writer_terminates(already_closed: bool) -> Result<String, Error> {
+    let fixture = closing_datagram_transport();
+    let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
+    let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
+    let wake = Arc::new(FlagWake::default());
+    let waker = Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    if !already_closed && !session.poll_send_datagram(&mut cx, b"pending").is_pending() {
+        return expect(false, "closing writer did not wait".into());
+    }
+
+    flush_microtasks().await;
+    wake.0.store(false, Ordering::SeqCst);
+
+    let finish: js_sys::Function = Reflect::get(&fixture, &"finish".into())?.unchecked_into();
+    finish.call0(&fixture)?;
+    let closed: js_sys::Promise = Reflect::get(&fixture, &"closed".into())?.unchecked_into();
+    wasm_bindgen_futures::JsFuture::from(closed).await?;
+    flush_microtasks().await;
+
+    if !already_closed && !wake.0.swap(false, Ordering::SeqCst) {
+        return expect(false, "closure did not wake the pending send".into());
+    }
+
+    for _ in 0..4 {
+        match session.poll_send_datagram(&mut cx, b"late") {
+            Poll::Ready(Err(Error::Closed)) => {
+                return expect(true, "clean writer closure returned Closed".into());
+            }
+            Poll::Ready(other) => return expect(false, format!("unexpected result: {other:?}")),
+            Poll::Pending => flush_microtasks().await,
+        }
+    }
+
+    expect(
+        false,
+        "clean writer remained in a fulfilled-ready wake loop".into(),
     )
 }
 
