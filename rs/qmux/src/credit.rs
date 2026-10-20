@@ -254,11 +254,10 @@ mod tests {
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc as std_mpsc, Arc,
+            mpsc as std_mpsc, Arc, TryLockError,
         },
         task::{Context, Poll, Wake, Waker},
         thread,
-        time::Duration,
     };
 
     use tokio::sync::mpsc;
@@ -286,8 +285,9 @@ mod tests {
         out
     }
 
-    /// Two consumers race to replenish one credit. The first is held while it
-    /// queues its update; the second must not overtake it with a larger limit.
+    /// Two consumers race to replenish one credit. The first is paused while it
+    /// queues its update, which must happen under the credit lock: otherwise the
+    /// second could compute and queue a larger limit ahead of it.
     #[test]
     fn concurrent_updates_are_queued_in_increasing_order() {
         let credit = Credit::new(4);
@@ -309,22 +309,18 @@ mod tests {
         });
         inside_rx.recv().unwrap();
 
-        let (done_tx, done_rx) = std_mpsc::channel();
+        // The first update is computed but not yet queued. Holding the lock here
+        // is what keeps any other consumer from computing a later limit first.
+        assert!(
+            matches!(credit.inner.try_lock(), Err(TryLockError::WouldBlock)),
+            "the update is queued after the credit lock is released"
+        );
+
         let second = thread::spawn({
             let credit = credit.clone();
             let control = control.clone();
-            move || {
-                credit.consume(2, &control, Frame::MaxData);
-                done_tx.send(()).unwrap();
-            }
+            move || credit.consume(2, &control, Frame::MaxData)
         });
-
-        // The wait only gives an implementation that queues after unlocking a
-        // chance to overtake; a correct one blocks here for the full timeout.
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "the second update was queued while the first was still being queued"
-        );
         release_tx.send(()).unwrap();
         first.join().unwrap();
         second.join().unwrap();
