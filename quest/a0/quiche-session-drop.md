@@ -17,5 +17,4 @@ Keep signatures and wire formats unchanged. Update lifecycle documentation and a
 ## Related
 
 - [Quinn final Session drop](/quest/a0/quinn-session-drop.md) - shared frontend ownership policy
-- [Noq final Session drop](/quest/a0/noq-session-drop.md) - independently verified sibling behavior
 - [Quiche lifecycle](/quest/a0/quiche/README.md) - nearby driver coverage with separate ownership

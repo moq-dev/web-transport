@@ -20,5 +20,4 @@ Keep signatures and wire formats unchanged. Update backend and router lifecycle 
 
 ## Related
 
-- [Noq final Session drop](/quest/a0/noq-session-drop.md) - independently reproduce and repair the sibling ownership path
 - [Quiche final Session drop](/quest/a0/quiche-session-drop.md) - independently repair capsule-task ownership
