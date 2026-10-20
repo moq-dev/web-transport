@@ -1010,41 +1010,4 @@ impl<T> DriverOpen<T> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn handshake_completes_without_an_alpn() {
-        // The established flag, not the ALPN, is what resolves the handshake: a
-        // connection that negotiates no ALPN must still hand back a Connection
-        // rather than wait forever.
-        let mut state = DriverState::new(false);
-        let waiter = Waiter::noop();
-
-        assert!(state.poll_handshake(&waiter).is_pending());
-
-        state.established = true;
-        let _ = state.complete_handshake();
-
-        assert!(state.alpn().is_none());
-        assert!(matches!(state.poll_handshake(&waiter), Poll::Ready(Ok(()))));
-    }
-
-    #[test]
-    fn closed_waits_for_driver_completion() {
-        let mut state = DriverState::new(false);
-        let waiter = Waiter::noop();
-        let err = ConnectionError::Local(42, "done".to_string());
-
-        assert!(state.closed(&waiter).is_pending());
-
-        let _ = state.close(err.clone());
-
-        assert!(state.close_requested(&waiter).is_ready());
-        assert!(state.closed(&waiter).is_pending());
-
-        let _ = state.finish_close(err);
-
-        assert!(state.closed(&waiter).is_ready());
-    }
-}
+mod tests;
