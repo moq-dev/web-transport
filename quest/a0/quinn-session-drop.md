@@ -25,4 +25,3 @@ Keep signatures and wire formats unchanged. Update backend and router lifecycle 
 ## Related
 
 - [Noq close cancellation](/quest/a0/noq-close-cancellation.md) - independently repair the graceful-close fallback and verify repeated cleanup
-- [Quiche final Session drop](/quest/a0/quiche-session-drop.md) - independently repair capsule-task ownership

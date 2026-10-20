@@ -20,6 +20,7 @@ const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x636E6E6F);
 
 struct ConnectionDrop {
     conn: ez::Connection,
+    reader: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for ConnectionDrop {
@@ -27,6 +28,10 @@ impl Drop for ConnectionDrop {
         if !self.conn.is_closed() {
             tracing::warn!("connection dropped without calling `close`");
             self.conn.close(DROP_CODE, "connection dropped");
+        }
+
+        if let Some(reader) = &self.reader {
+            reader.abort();
         }
     }
 }
@@ -37,11 +42,16 @@ impl Drop for ConnectionDrop {
 ///   1. Each stream starts with a few bytes identifying the stream type and session ID.
 ///   2. Error codes are encoded with the session ID, so they aren't full QUIC error codes.
 ///   3. Stream IDs may have gaps in them, used by HTTP/3 transparent to the application.
+///
+/// Clones share ownership of the session. Dropping the final `Connection` initiates
+/// immediate closure, including raw QUIC sessions. Streams and underlying
+/// [`ez::Connection`] handles do not keep the session alive. Call
+/// [`close`](Self::close) first to choose the close code and reason.
 #[derive(Clone)]
 pub struct Connection {
     conn: ez::Connection,
 
-    // Dropped when all references are dropped.
+    // Shared only by frontend clones, never by background tasks or streams.
     #[allow(dead_code)]
     drop: Arc<ConnectionDrop>,
 
@@ -161,9 +171,18 @@ impl Connection {
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id);
 
-        let drop = Arc::new(ConnectionDrop { conn: conn.clone() });
+        tracing::debug!(url = %connect.request.url, "WebTransport connection established");
+        let request = connect.request.clone();
+        let response = connect.response.clone();
 
-        let this = Self {
+        // The capsule reader owns transport handles, never frontend ownership.
+        let reader = tokio::spawn(Self::run_closed(conn.clone(), connect));
+        let drop = Arc::new(ConnectionDrop {
+            conn: conn.clone(),
+            reader: Some(reader.abort_handle()),
+        });
+
+        Self {
             conn,
             drop,
             accept: Some(Arc::new(Mutex::new(accept))),
@@ -171,8 +190,8 @@ impl Connection {
             header_uni,
             header_bi,
             header_datagram,
-            request: Some(connect.request.clone()),
-            response: Some(connect.response.clone()),
+            request: Some(request),
+            response: Some(response),
             alpn: Default::default(),
             settings: Some(Arc::new(settings)),
             open_uni: OpenUni::Idle,
@@ -183,18 +202,11 @@ impl Connection {
             parked_open_bi: Parked::default(),
             parked_recv_datagram: Parked::default(),
             parked_closed: Parked::default(),
-        };
-
-        tracing::debug!(url = %connect.request.url, "WebTransport connection established");
-
-        // Run a background task to check if the connect stream is closed.
-        tokio::spawn(this.clone().run_closed(connect));
-
-        this
+        }
     }
 
     // Keep reading from the control stream until it's closed.
-    async fn run_closed(self, mut connect: h3::Connected) {
+    async fn run_closed(conn: ez::Connection, mut connect: h3::Connected) {
         loop {
             match web_transport_proto::Capsule::read(&mut connect.recv).await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
@@ -203,7 +215,7 @@ impl Connection {
                 })) => {
                     // TODO We shouldn't be closing the QUIC connection with the same error.
                     // Instead, we should return it to the application.
-                    self.close(code, &reason);
+                    conn.close(web_transport_proto::error_to_http3(code), &reason);
                     return;
                 }
                 Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
@@ -215,7 +227,7 @@ impl Connection {
                     return;
                 }
                 Err(_) => {
-                    self.close(500, "capsule error");
+                    conn.close(web_transport_proto::error_to_http3(500), "capsule error");
                     return;
                 }
             }
@@ -399,7 +411,10 @@ impl Connection {
     /// return `None`. [`Self::protocol`] reports the ALPN negotiated by the QUIC
     /// handshake, read from `conn` on demand.
     pub fn raw(conn: ez::Connection) -> Self {
-        let drop = Arc::new(ConnectionDrop { conn: conn.clone() });
+        let drop = Arc::new(ConnectionDrop {
+            conn: conn.clone(),
+            reader: None,
+        });
 
         Self {
             conn,
@@ -998,5 +1013,226 @@ impl web_transport_trait::poll::Session for Connection {
     #[allow(refining_impl_trait)]
     fn stats(&self) -> ez::ConnectionStats {
         Self::stats(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{Context as _, Result};
+    use std::{net::Ipv4Addr, time::Duration};
+    use tokio::time::timeout;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    async fn pair() -> Result<(ez::Connection, ez::Connection)> {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        let chain = vec![rustls_pki_types::CertificateDer::from(cert.der().to_vec())];
+        let key = rustls_pki_types::PrivateKeyDer::Pkcs8(
+            rustls_pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
+        );
+        let mut server = ez::ServerBuilder::default()
+            .with_bind((Ipv4Addr::LOCALHOST, 0))?
+            .with_single_cert(chain, key)?;
+        let port = server.local_addrs()[0].port();
+        let mut settings = ez::Settings::default();
+        settings.verify_peer = false;
+        let client = ez::ClientBuilder::new()
+            .with_bind((Ipv4Addr::LOCALHOST, 0))?
+            .with_settings(settings);
+        timeout(TIMEOUT, async {
+            tokio::try_join!(
+                async {
+                    anyhow::Ok(
+                        client
+                            .connect("127.0.0.1", port)
+                            .await?
+                            .established()
+                            .await?,
+                    )
+                },
+                async {
+                    anyhow::Ok(
+                        server
+                            .accept()
+                            .await
+                            .context("no incoming connection")?
+                            .accept()
+                            .await?,
+                    )
+                },
+            )
+        })
+        .await?
+    }
+
+    // The peer deliberately retains CONNECT without a capsule reader or a frontend
+    // wrapper. Only dropping the client's final frontend can initiate teardown.
+    struct HttpPair {
+        session: Connection,
+        native: ez::Connection,
+        peer: ez::Connection,
+        _settings: h3::Settings,
+        _connect: h3::Connected,
+    }
+
+    async fn http_pair() -> Result<HttpPair> {
+        let (client, peer) = pair().await?;
+        let url = url::Url::parse("https://localhost/")?;
+        let (session, (settings, connect)) = timeout(TIMEOUT, async {
+            tokio::try_join!(Connection::connect(client.clone(), url), async {
+                let settings = h3::Settings::connect(&peer).await?;
+                let connect = h3::Connecting::accept(&peer).await?.ok().await?;
+                Ok((settings, connect))
+            },)
+        })
+        .await??;
+        Ok(HttpPair {
+            session,
+            native: client,
+            peer,
+            _settings: settings,
+            _connect: connect,
+        })
+    }
+
+    #[tokio::test]
+    async fn final_http_frontend_drop_closes_with_connect_held_open() -> Result<()> {
+        let HttpPair {
+            session,
+            native,
+            peer,
+            _settings,
+            _connect,
+        } = http_pair().await?;
+        let guard = Arc::downgrade(&session.drop);
+        let reader = session.drop.reader.clone().expect("HTTP/3 reader");
+        let streams = session.open_bi().await?;
+        drop(session);
+        assert!(
+            native.is_closed(),
+            "capsule task retained the frontend drop guard"
+        );
+        assert!(guard.upgrade().is_none());
+        timeout(TIMEOUT, async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("capsule reader did not terminate")?;
+        assert!(matches!(
+            timeout(TIMEOUT, peer.closed()).await?,
+            ez::ConnectionError::Remote(DROP_CODE, _)
+        ));
+        drop(streams);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_clone_keeps_session_usable() -> Result<()> {
+        let HttpPair {
+            session,
+            native,
+            peer,
+            _settings,
+            _connect,
+        } = http_pair().await?;
+        let survivor = session.clone();
+        drop(session);
+        assert!(!native.is_closed());
+        survivor.send_datagram(Bytes::from_static(b"still open"))?;
+        assert!(timeout(TIMEOUT, peer.read_datagram())
+            .await??
+            .ends_with(b"still open"));
+        drop(survivor);
+        assert!(native.is_closed());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_open_operations_do_not_keep_frontend_alive() -> Result<()> {
+        let HttpPair {
+            mut session,
+            native,
+            peer: _peer,
+            _settings,
+            _connect,
+        } = http_pair().await?;
+        let (send, recv) = native.open_bi().await?;
+        session.open_bi = OpenBi::Header(Box::new(OpenBiHeader {
+            send,
+            recv,
+            offset: 0,
+        }));
+        session.open_uni = OpenUni::Header {
+            send: native.open_uni().await?,
+            offset: 0,
+        };
+        drop(session);
+        assert!(native.is_closed());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_frontend_clones_own_lifetime_independently_of_native_handles() -> Result<()> {
+        let (native, peer) = pair().await?;
+        let session = Connection::raw(native.clone());
+        let survivor = session.clone();
+        drop(session);
+        assert!(!native.is_closed());
+        let mut send = survivor.open_uni().await?;
+        send.write_all(b"still open").await?;
+        let mut recv = timeout(TIMEOUT, peer.accept_uni()).await??;
+        let mut buf = [0; 10];
+        assert_eq!(timeout(TIMEOUT, recv.read(&mut buf)).await??, Some(10));
+        assert_eq!(&buf, b"still open");
+        drop(survivor);
+        assert!(
+            native.is_closed(),
+            "streams and native handles must not own the frontend"
+        );
+        assert!(matches!(
+            timeout(TIMEOUT, peer.closed()).await?,
+            ez::ConnectionError::Remote(DROP_CODE, _)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_http_close_reason_survives_final_drop() -> Result<()> {
+        let HttpPair {
+            session,
+            native,
+            peer,
+            _settings,
+            _connect,
+        } = http_pair().await?;
+        session.close(42, "explicit close");
+        drop(session);
+        let code = web_transport_proto::error_to_http3(42);
+        assert!(
+            matches!(timeout(TIMEOUT, native.closed()).await?, ez::ConnectionError::Local(c, reason) if c == code && reason == "explicit close")
+        );
+        assert!(
+            matches!(timeout(TIMEOUT, peer.closed()).await?, ez::ConnectionError::Remote(c, reason) if c == code && reason == "explicit close")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_raw_close_reason_survives_final_drop() -> Result<()> {
+        let (native, peer) = pair().await?;
+        let session = Connection::raw(native.clone());
+        session.close(42, "explicit raw close");
+        drop(session);
+        assert!(
+            matches!(timeout(TIMEOUT, native.closed()).await?, ez::ConnectionError::Local(42, reason) if reason == "explicit raw close")
+        );
+        assert!(
+            matches!(timeout(TIMEOUT, peer.closed()).await?, ez::ConnectionError::Remote(42, reason) if reason == "explicit raw close")
+        );
+        Ok(())
     }
 }

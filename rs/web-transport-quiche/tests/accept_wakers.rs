@@ -26,7 +26,7 @@ use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{io::AsyncReadExt, time::timeout};
 use url::Url;
-use web_transport_quiche::{ClientBuilder, ServerBuilder, Settings};
+use web_transport_quiche::{ClientBuilder, Connection, ServerBuilder, Settings};
 
 /// A waker that records whether it was ever woken.
 #[derive(Default)]
@@ -87,7 +87,7 @@ async fn abandoned_accepters_release_their_wakers() -> Result<()> {
         .first()
         .context("server has no local address")?;
 
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Vec<Arc<FlagWaker>>>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<(Connection, Vec<Arc<FlagWaker>>)>();
 
     let server_task = tokio::spawn(async move {
         let request = server.accept().await.expect("a connection");
@@ -112,7 +112,11 @@ async fn abandoned_accepters_release_their_wakers() -> Result<()> {
             abandoned.push(flag);
         }
 
-        done_tx.send(abandoned).ok().expect("client is listening");
+        // Keep the session alive through the client's handshake and assertions.
+        done_tx
+            .send((session, abandoned))
+            .ok()
+            .expect("client is listening");
     });
 
     let url = Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))?;
@@ -123,7 +127,7 @@ async fn abandoned_accepters_release_their_wakers() -> Result<()> {
         .established()
         .await?;
 
-    let abandoned = timeout(Duration::from_secs(10), done_rx)
+    let (_server_session, abandoned) = timeout(Duration::from_secs(10), done_rx)
         .await
         .context("the server never finished registering")??;
 

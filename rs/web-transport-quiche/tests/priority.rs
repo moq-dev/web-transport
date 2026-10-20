@@ -129,6 +129,9 @@ async fn spawn_server() -> Result<(SocketAddr, mpsc::UnboundedReceiver<u8>)> {
             });
         }
 
+        // Readers own streams, so retain the session until the client completes.
+        session.closed().await;
+
         anyhow::Ok(())
     });
 
