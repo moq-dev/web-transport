@@ -23,6 +23,11 @@ Pull requests run the harness in headless Chromium on Linux through Playwright. 
 must pass, including clone/cancellation, stream-opening cleanup, peer reset, datagram and close
 checks. Missing browser dependencies, an unavailable peer, page errors and timeouts fail the run.
 
+Controlled browser `WritableStream` fixtures additionally exercise datagram writers whose close
+step is still pending, already-closed writers, and dropped send-task ownership without network
+timing. They model the Streams contract; clean closure has not been reproduced through a real
+WebTransport session, whose teardown currently exercises the errored-writer path in Chromium.
+
 From the workspace root:
 
 ```sh
@@ -33,8 +38,9 @@ just test-browser
 ```
 
 The browser installation command installs Linux system dependencies through the host package
-manager; install those separately when using NixOS. The harness dev-dependency and Nix shell pin the wasm-bindgen crate/CLI schema
-and supplies the unstable web-sys flags through the repository Cargo configuration. The build
+manager; install those separately when using NixOS. The harness dev-dependency and Nix shell pin
+the wasm-bindgen crate/CLI schema. The repository Cargo configuration supplies the unstable
+web-sys flags. The build
 honors `CARGO_TARGET_DIR`. Playwright reports, traces, screenshots and peer logs are written under
 that target directory's `browser-results` folder; CI uploads them on failure. No browser coverage
 is silently skipped and failed checks are not retried.
