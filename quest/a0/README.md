@@ -11,6 +11,7 @@ The Required list is ordered by priority. Independent children may proceed concu
 ## Required
 
 - [Quinn final Session drop](/quest/a0/quinn-session-drop.md) - close the connection and release the capsule reader
+- [Noq close cancellation](/quest/a0/noq-close-cancellation.md) - release sessions when graceful-close futures are cancelled
 - [Quiche final Session drop](/quest/a0/quiche-session-drop.md) - keep capsule tasks outside frontend ownership
 - [QMux credit updates](/quest/a0/qmux-credit-updates.md) - serialize advertisements and ignore stale peer limits
 - [Quiche lifecycle](/quest/a0/quiche/README.md) - deterministic harness and retirement handling
