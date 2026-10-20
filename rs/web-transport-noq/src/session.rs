@@ -458,7 +458,7 @@ impl Session {
     /// Cancelling the task, even before its first poll, closes the native connection
     /// and requests waiter wakeups synchronously, then cancels the capsule reader.
     /// The capsule carries the full UTF-8 reason; the native fallback carries at most
-    /// 1024 bytes at a character boundary. Already observed native errors are preserved.
+    /// 16 bytes at a character boundary. Already observed native errors are preserved.
     /// Runtime shutdown guarantees local cleanup when the task is dropped; peer
     /// delivery, draining and execution of awakened tasks require a live runtime.
     /// Forgotten futures, non-yielding tasks and process abort are outside this guarantee.
@@ -519,10 +519,11 @@ impl Session {
         timeout: std::time::Duration,
         reader: Option<tokio::task::AbortHandle>,
     ) -> impl Future<Output = ()> {
-        // Keep the QUIC fallback below one packet. Noq's long-reason truncation
-        // can overflow for the eight-byte mapped HTTP/3 code; the capsule still
-        // carries the complete UTF-8 reason.
-        let mut limit = reason.len().min(1024);
+        // Noq writes ACKs first, then encodes close only with >25 bytes left.
+        // Its truncation undercounts our eight-byte HTTP/3 code, so fit even
+        // that minimum budget: type (1) + code (8) + length (1) + reason (16).
+        // The capsule still carries the complete UTF-8 reason.
+        let mut limit = reason.len().min(16);
         while !reason.is_char_boundary(limit) {
             limit -= 1;
         }
@@ -1421,6 +1422,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_close_reason_fits_minimum_native_close_budget() {
+        let (session, peer, _connect, _settings, _endpoints) = http3_pair().await;
+        // A character straddles byte 16, so the fallback must preserve UTF-8
+        // while the complete reason remains available for the close capsule.
+        let reason = format!("{}é{}", "x".repeat(15), "é".repeat(800));
+        drop(close_operation(&session, 42, &reason));
+        let closed = tokio::time::timeout(Duration::from_secs(1), peer.closed())
+            .await
+            .unwrap();
+        let noq::ConnectionError::ApplicationClosed(close) = closed else {
+            panic!("expected application close, got {closed:?}");
+        };
+        assert_eq!(
+            close.error_code.into_inner(),
+            web_transport_proto::error_to_http3(42)
+        );
+        let prefix = std::str::from_utf8(&close.reason).unwrap();
+        assert!(!prefix.is_empty() && reason.starts_with(prefix));
+
+        // Noq writes ACKs first and encodes close only when the remaining
+        // frame budget exceeds ConnectionClose::SIZE_BOUND (1 + 8 + 8 + 8).
+        // Encode the actually received fallback independently of Noq's buggy
+        // truncation, against that minimum available space of 26 bytes.
+        let mut frame = Vec::new();
+        VarInt::from_u32(0x1d).encode(&mut frame);
+        VarInt::try_from(close.error_code.into_inner())
+            .unwrap()
+            .encode(&mut frame);
+        VarInt::try_from(close.reason.len())
+            .unwrap()
+            .encode(&mut frame);
+        frame.extend_from_slice(&close.reason);
+        assert!(
+            frame.len() <= 26,
+            "native fallback needs {} bytes, but ACKs can leave only 26",
+            frame.len()
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_close_during_blocked_capsule_write_closes_synchronously() {
         let mut transport = noq::TransportConfig::default();
         transport.stream_receive_window(1024u32.into());
@@ -1603,7 +1644,7 @@ mod tests {
                         assert!(
                             matches!(closed, noq::ConnectionError::ApplicationClosed(close)
                             if close.error_code.into_inner() == web_transport_proto::error_to_http3(42)
-                                && close.reason.len() <= 1024
+                                && close.reason.len() <= 16
                                 && std::str::from_utf8(&close.reason).is_ok_and(|prefix| reason.starts_with(prefix)))
                         );
                     }
