@@ -28,6 +28,8 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: cachix/install-nix-action@v31.11.1
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
