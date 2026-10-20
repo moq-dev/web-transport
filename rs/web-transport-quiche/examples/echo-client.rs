@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let msg = recv.read_all(1024).await?;
     tracing::info!("recv: {}", String::from_utf8_lossy(&msg));
 
+    // Choose a reason before final drop, then let the driver finish teardown.
     session.close(42069, "bye");
     session.closed().await;
 

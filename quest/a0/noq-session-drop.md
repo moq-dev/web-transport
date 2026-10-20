@@ -17,4 +17,3 @@ Cover clone survival, peer-held CONNECT, reader termination, retained handles, r
 ## Related
 
 - [Quinn final Session drop](/quest/a0/quinn-session-drop.md) - shared frontend ownership policy
-- [Quiche final Session drop](/quest/a0/quiche-session-drop.md) - sibling ownership verification

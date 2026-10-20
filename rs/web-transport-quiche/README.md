@@ -40,3 +40,14 @@ They are basically UDP packets, except they are encrypted and congestion control
 
 # Usage
 To use web-transport-quiche, figure it out yourself lul.
+
+## Session lifetime
+
+`Connection` clones share ownership of a session. Dropping the final clone
+requests immediate QUIC closure and cancels its capsule reader.
+Retained streams or native `ez::Connection` handles do not keep the session alive.
+Raw QUIC sessions use the same final-clone ownership boundary.
+
+Call `Connection::close` before dropping to choose the close code and reason;
+final drop preserves an explicit close already in progress. Await
+`Connection::closed` when the application needs the driver to complete teardown.
