@@ -446,6 +446,14 @@ fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
     });
 }
 
+/// The MAX_STREAMS frame constructor for streams in `dir`.
+fn max_streams_frame(dir: StreamDir) -> fn(u64) -> Frame {
+    match dir {
+        StreamDir::Bi => Frame::MaxStreamsBidi,
+        StreamDir::Uni => Frame::MaxStreamsUni,
+    }
+}
+
 /// Writer-side task state: owns the transport send half and is the sole producer
 /// on the wire. It pulls the outbound queues in strict priority order via
 /// [`next_outbound`], retires the stream a terminal frame closes and encodes it
@@ -1739,9 +1747,8 @@ impl<R: Reader> SessionState<R> {
                 // The gap consumes connection flow control, but no bytes in it can
                 // ever occupy receive memory. Make it immediately eligible to
                 // replenish the connection window.
-                if let Some(new_max) = self.conn_recv_credit.consume(gap) {
-                    self.control.send(Frame::MaxData(new_max)).ok();
-                }
+                self.conn_recv_credit
+                    .consume(gap, &self.control, Frame::MaxData);
 
                 match live {
                     // Deliver the reset. The id was recorded in `recv_open` at
@@ -1762,13 +1769,7 @@ impl<R: Reader> SessionState<R> {
                             StreamDir::Bi => &self.recv_bi_credit,
                             StreamDir::Uni => &self.recv_uni_credit,
                         };
-                        if let Some(new_max) = credit.consume(1) {
-                            let frame = match reset_id.dir() {
-                                StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                                StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                            };
-                            self.control.send(frame).ok();
-                        }
+                        credit.consume(1, &self.control, max_streams_frame(reset_id.dir()));
                     }
                 }
             }
@@ -1803,22 +1804,28 @@ impl<R: Reader> SessionState<R> {
                     },
                 );
             }
-            // Flow control frames
+            // Flow control frames. A limit that doesn't increase is stale and is
+            // ignored (RFC 9000 §19.9–§19.11); `increase_max` handles that.
             Frame::MaxData(max) => {
-                self.conn_send_credit.increase_max(max)?;
+                self.conn_send_credit.increase_max(max);
             }
             Frame::MaxStreamData { id, max } => {
+                // RFC 9000 §19.10: MAX_STREAM_DATA for a receive-only stream is a
+                // STREAM_STATE_ERROR.
+                if !id.can_send(self.is_server) {
+                    return Err(Error::InvalidStreamId);
+                }
                 if let Some(send) = self.streams.lock().unwrap().send.get(&id) {
                     if let Some(credit) = &send.stream_credit {
-                        credit.increase_max(max)?;
+                        credit.increase_max(max);
                     }
                 }
             }
             Frame::MaxStreamsBidi(max) => {
-                self.open_bi_credit.increase_max(max)?;
+                self.open_bi_credit.increase_max(max);
             }
             Frame::MaxStreamsUni(max) => {
-                self.open_uni_credit.increase_max(max)?;
+                self.open_uni_credit.increase_max(max);
             }
             // Informational frames — peer is telling us they're blocked.
             // We don't need to act on these since we auto-tune windows.
@@ -1915,17 +1922,13 @@ impl<R: Reader> SessionState<R> {
         }
 
         // Set connection-level send credit from peer's initial_max_data
-        self.conn_send_credit
-            .increase_max(params.initial_max_data)
-            .ok();
+        self.conn_send_credit.increase_max(params.initial_max_data);
 
         // Set stream count limits from peer's params
         self.open_bi_credit
-            .increase_max(params.initial_max_streams_bidi)
-            .ok();
+            .increase_max(params.initial_max_streams_bidi);
         self.open_uni_credit
-            .increase_max(params.initial_max_streams_uni)
-            .ok();
+            .increase_max(params.initial_max_streams_uni);
 
         // Publish the peer's initial per-stream send limits and credit the streams
         // we've already opened — both under one lock, so a stream being opened
@@ -1951,7 +1954,7 @@ impl<R: Reader> SessionState<R> {
                         }
                         StreamDir::Uni => params.initial_max_stream_data_uni,
                     };
-                    credit.increase_max(initial).ok();
+                    credit.increase_max(initial);
                 }
             }
         }
@@ -2461,9 +2464,7 @@ impl generic::Session for Session {
         {
             let mut streams = self.streams.lock().unwrap();
             if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_uni)
-                    .ok();
+                credit.increase_max(streams.peer_initial_max_stream_data_uni);
             }
             streams.insert_send(id, send_backend);
         }
@@ -2545,9 +2546,7 @@ impl generic::Session for Session {
         {
             let mut streams = self.streams.lock().unwrap();
             if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_bidi_remote)
-                    .ok();
+                credit.increase_max(streams.peer_initial_max_stream_data_bidi_remote);
             }
             streams.insert_send(id, send_backend);
             streams.insert_recv(id, recv_backend);
@@ -3009,20 +3008,14 @@ impl RecvStream {
             return;
         }
 
-        // Per-stream window update
-        if let Some(new_max) = self.recv_credit.consume(len) {
-            let frame = Frame::MaxStreamData {
-                id: self.id,
-                max: new_max,
-            };
-            self.outbound_priority.send(frame).ok();
-        }
-
-        // Connection-level window update
-        if let Some(new_max) = self.conn_recv_credit.consume(len) {
-            let frame = Frame::MaxData(new_max);
-            self.outbound_priority.send(frame).ok();
-        }
+        let id = self.id;
+        self.recv_credit
+            .consume(len, &self.outbound_priority, |max| Frame::MaxStreamData {
+                id,
+                max,
+            });
+        self.conn_recv_credit
+            .consume(len, &self.outbound_priority, Frame::MaxData);
     }
 }
 
@@ -3034,13 +3027,7 @@ impl Drop for RecvStream {
 
         // Replenish stream count when this recv half is done
         if let Some(credit) = &self.recv_streams_credit {
-            if let Some(new_max) = credit.consume(1) {
-                let frame = match self.id.dir() {
-                    StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                    StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                };
-                self.outbound_priority.send(frame).ok();
-            }
+            credit.consume(1, &self.outbound_priority, max_streams_frame(self.id.dir()));
         }
     }
 }
@@ -5086,6 +5073,220 @@ mod ping_backpressure_tests {
             );
             drop(recv);
             drop(session);
+        }
+    }
+}
+
+#[cfg(test)]
+mod credit_update_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+    use web_transport_trait::{SendStream as _, Session as _};
+
+    use super::{Reader, Session, Transport, Writer};
+    use crate::proto::{Frame, TransportParams};
+    use crate::{Config, Error, StreamDir, StreamId, Version};
+
+    const VERSIONS: [Version; 3] = [Version::QMux00, Version::QMux01, Version::QMux02];
+
+    /// A transport whose inbound frames are scripted and whose outbound records
+    /// are kept for inspection.
+    struct ScriptedTransport {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedWriter {
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+    }
+
+    impl Transport for ScriptedTransport {
+        type Writer = ScriptedWriter;
+        type Reader = ScriptedReader;
+
+        fn split(self) -> (ScriptedWriter, ScriptedReader) {
+            (
+                ScriptedWriter {
+                    outgoing: self.outgoing,
+                },
+                ScriptedReader {
+                    incoming: self.incoming,
+                },
+            )
+        }
+    }
+
+    impl Writer for ScriptedWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.outgoing.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Reader for ScriptedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            match self.incoming.recv().await {
+                Some(bytes) => Ok(bytes),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct Peer {
+        version: Version,
+        inbound: mpsc::UnboundedSender<Bytes>,
+        outbound: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    impl Peer {
+        fn send(&self, frame: Frame) {
+            self.inbound
+                .send(frame.encode(self.version).unwrap())
+                .unwrap();
+        }
+
+        /// Payload bytes the session has written on stream `id`.
+        fn sent_on(&self, id: StreamId) -> usize {
+            self.outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|record| match self.version {
+                    Version::QMux00 => Frame::decode(record.clone(), self.version)
+                        .unwrap()
+                        .into_iter()
+                        .collect(),
+                    _ => Frame::decode_record(record.clone()).unwrap(),
+                })
+                .map(|frame| match frame {
+                    Frame::Stream(stream) if stream.id == id => stream.data.len(),
+                    _ => 0,
+                })
+                .sum()
+        }
+    }
+
+    /// A client session opposite a scripted server that has announced `params`.
+    fn scripted_session(version: Version, params: TransportParams) -> (Session, Peer) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new(
+            ScriptedTransport {
+                incoming: rx,
+                outgoing: outbound.clone(),
+            },
+            false,
+            Config::new(version),
+        );
+        let peer = Peer {
+            version,
+            inbound: tx,
+            outbound,
+        };
+        peer.send(Frame::TransportParameters(params));
+        (session, peer)
+    }
+
+    fn small_params(version: Version) -> TransportParams {
+        let mut params = Config::new(version).to_transport_params();
+        params.initial_max_streams_bidi = 1;
+        params.initial_max_streams_uni = 1;
+        params.initial_max_data = 4;
+        params.initial_max_stream_data_uni = 4;
+        params
+    }
+
+    /// Lower and equal limits after a higher one arrive as a peer's reordered
+    /// updates would. They are ignored: the session stays open and keeps the
+    /// highest credit for stream counts, connection data and stream data.
+    #[tokio::test(start_paused = true)]
+    async fn stale_limits_are_ignored() {
+        for version in VERSIONS {
+            let (session, peer) = scripted_session(version, small_params(version));
+            let mut send = session.open_uni().await.unwrap();
+            let id = StreamId::new(0, StreamDir::Uni, false);
+
+            for frame in [
+                Frame::MaxStreamsUni(3),
+                Frame::MaxStreamsUni(2),
+                Frame::MaxStreamsUni(3),
+                Frame::MaxStreamsBidi(2),
+                Frame::MaxStreamsBidi(1),
+                Frame::MaxData(8),
+                Frame::MaxData(6),
+                Frame::MaxData(8),
+                Frame::MaxStreamData { id, max: 8 },
+                Frame::MaxStreamData { id, max: 6 },
+            ] {
+                peer.send(frame);
+            }
+
+            // Paused time only advances once every task is idle, so this fires
+            // only if an open or write stalls on credit or the session closed.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                session.open_uni().await.unwrap();
+                session.open_uni().await.unwrap();
+                session.open_bi().await.unwrap();
+                session.open_bi().await.unwrap();
+                let mut written = 0;
+                while written < 8 {
+                    written += send.write(&[0; 8][written..]).await.unwrap();
+                }
+                while peer.sent_on(id) < 8 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{version:?}: stale limit reduced credit"));
+            assert_eq!(peer.sent_on(id), 8, "{version:?}");
+
+            let closed = tokio::time::timeout(Duration::from_millis(1), session.closed()).await;
+            assert!(closed.is_err(), "{version:?}: session closed: {closed:?}");
+        }
+    }
+
+    async fn closed_with(frame: Frame) -> Vec<Error> {
+        let mut errors = Vec::new();
+        for version in VERSIONS {
+            let (session, peer) = scripted_session(version, small_params(version));
+            peer.send(frame.clone());
+            let err = tokio::time::timeout(Duration::from_secs(10), session.closed())
+                .await
+                .unwrap_or_else(|_| panic!("{version:?}: {frame:?} was accepted"));
+            errors.push(err);
+        }
+        errors
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_streams_above_2_60_is_a_frame_encoding_error() {
+        for frame in [
+            Frame::MaxStreamsBidi((1 << 60) + 1),
+            Frame::MaxStreamsUni((1 << 60) + 1),
+        ] {
+            for err in closed_with(frame).await {
+                assert!(matches!(err, Error::FrameEncoding), "got {err:?}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_stream_data_on_receive_only_stream_is_rejected() {
+        // A server-initiated uni stream is receive-only for this client.
+        let id = StreamId::new(0, StreamDir::Uni, true);
+        for err in closed_with(Frame::MaxStreamData { id, max: 10 }).await {
+            assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
         }
     }
 }

@@ -896,6 +896,11 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "max_data") {
 			this.#connCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_stream_data") {
+			// RFC 9000 §19.10: MAX_STREAM_DATA for a receive-only stream is a
+			// STREAM_STATE_ERROR.
+			if (!frame.id.canSend(this.#isServer)) {
+				throw new Error("MAX_STREAM_DATA on a receive-only stream");
+			}
 			const flow = this.#streamFlow.get(frame.id.value.value);
 			if (flow) flow.sendCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_streams_bidi") {
