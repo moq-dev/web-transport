@@ -294,9 +294,10 @@ pub trait SendStream: MaybeSend {
 pub trait RecvStream: MaybeSend {
     type Error: Error;
 
-    /// Read the next chunk of data, up to the max size.
+    /// Read some data into the provided slice.
     ///
-    /// This returns a chunk of data instead of copying, which may be more efficient.
+    /// Returns the number of bytes read, or `None` once the peer has finished the
+    /// stream. An empty `dst` reads nothing and returns `Some(0)`.
     fn read(
         &mut self,
         dst: &mut [u8],
@@ -305,20 +306,28 @@ pub trait RecvStream: MaybeSend {
     /// Read some data into the provided buffer.
     ///
     /// The number of bytes read is returned, or None if the stream is closed.
-    /// The buffer will be advanced by the number of bytes read.
+    /// The buffer will be advanced by the number of bytes read. A destination
+    /// with no room returns `Some(0)` without reading the stream.
+    ///
+    /// The default initializes spare capacity before passing it to [`read`](Self::read).
+    /// Override this when the transport can copy owned bytes directly into `buf`.
     fn read_buf<B: BufMut + MaybeSend>(
         &mut self,
         buf: &mut B,
     ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
         async move {
-            let dst = unsafe {
-                std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
-            };
+            let dst = buf.chunk_mut();
+            if dst.len() == 0 {
+                return Ok(Some(0));
+            }
+            let dst = util::initialize(dst);
             let size = match self.read(dst).await? {
-                Some(size) if size > 0 => size,
-                _ => return Ok(None),
+                Some(size) => size,
+                None => return Ok(None),
             };
 
+            assert!(size <= dst.len(), "read exceeded the destination length");
+            // SAFETY: The whole destination was initialized and size is in bounds.
             unsafe { buf.advance_mut(size) };
 
             Ok(Some(size))
@@ -328,16 +337,23 @@ pub trait RecvStream: MaybeSend {
     /// Read the next chunk of data, up to the max size.
     ///
     /// This returns a chunk of data instead of copying, which may be more efficient.
+    /// A zero `max` returns an empty chunk without reading the stream.
     fn read_chunk(
         &mut self,
         max: usize,
     ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + MaybeSend {
         async move {
-            // Don't allocate too much. Write your own if you want to increase this buffer.
-            let mut buf = BytesMut::with_capacity(max.min(8 * 1024));
+            if max == 0 {
+                return Ok(Some(Bytes::new()));
+            }
 
-            // TODO Test this, I think it will work?
-            Ok(self.read_buf(&mut buf).await?.map(|_| buf.freeze()))
+            // Don't allocate too much. Write your own if you want to increase this buffer.
+            let capacity = max.min(8 * 1024);
+            let mut buf = BytesMut::with_capacity(capacity);
+
+            // Allocations may exceed the requested capacity. Bound the read to max.
+            let size = self.read_buf(&mut (&mut buf).limit(capacity)).await?;
+            Ok(size.map(|_| buf.freeze()))
         }
     }
 

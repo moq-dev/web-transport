@@ -16,6 +16,23 @@ This crate provides a WebTransport trait for Send runtimes.
 
 If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
 
+## Receive defaults
+
+The async and poll receive helpers initialize destination bytes before passing
+them to a safe `read` or `poll_read` implementation. Implementations may inspect
+the entire destination. Reporting more bytes than the destination holds causes a
+panic before buffer advancement. Backends can override the helpers to copy owned
+bytes directly or return an existing `Bytes` chunk.
+
+An empty destination returns `Some(0)`, and a zero-sized chunk request returns an
+empty chunk, without reading the stream. `None` indicates end of stream; a
+successful read of zero bytes does not. Pending or cancelled default reads do not
+advance the destination buffer.
+
+The receive regression tests run with the workspace tests. With a nightly
+toolchain that includes Miri, also run `cargo miri test -p web-transport-trait` to
+check that inspecting a destination never reads uninitialized memory.
+
 ## Why Send?
 Async traits are awful because you have to choose either `Send` or `!Send`.
 We could define a separate `!Send` trait but I currently don't have a use-case for it.
