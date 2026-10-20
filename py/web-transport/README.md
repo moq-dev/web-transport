@@ -1,6 +1,6 @@
-# web-transport
+# web-transport-rs
 
-[![PyPI](https://img.shields.io/pypi/v/web-transport-quinn)](https://pypi.org/project/web-transport-quinn/)
+[![PyPI](https://img.shields.io/pypi/v/web-transport-rs)](https://pypi.org/project/web-transport-rs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Python bindings for [web-transport-quinn](https://docs.rs/web-transport-quinn/) — a pure-Rust WebTransport library built on QUIC.
@@ -12,12 +12,12 @@ Python bindings for [web-transport-quinn](https://docs.rs/web-transport-quinn/) 
 - **Datagrams** — unreliable, low-latency messaging
 - **Certificate pinning** — connect to self-signed servers by hash
 - **Async-native** — built for `asyncio`, works with `async with` and `async for`
-- **Fast** — Rust core compiled to a native extension via PyO3
+- **Rust core** — shared UniFFI bindings with a thin, typed Python wrapper
 
 ## Installation
 
 ```bash
-pip install web-transport-quinn
+pip install web-transport-rs
 ```
 
 Requires Python 3.12+. Prebuilt wheels are available for Linux, macOS, and Windows.
@@ -88,7 +88,7 @@ asyncio.run(main())
 
 `Server` and `Client` accept DER-encoded `bytes` for certificates and keys, so you can use any TLS library (e.g. [`cryptography`](https://cryptography.io/)) to generate or load them.
 
-All exceptions inherit from `web_transport.WebTransportError`. See the [type stubs](python/web_transport/_web_transport.pyi) for the full API reference.
+All exceptions inherit from `web_transport.WebTransportError`. See the [typed Python wrapper](python/web_transport/__init__.py) for the full API reference.
 
 ## Certificate pinning
 
@@ -115,6 +115,26 @@ data = await session.receive_datagram()
 The maximum payload size is available via `session.max_datagram_size`.
 
 ## Development
+
+From the repository root, test the installed wheel, including unit tests,
+Python client/server integration and headless Chromium interop:
+
+```bash
+nix develop --command ./py/web-transport/test-wheel.sh
+```
+
+This builds a UniFFI wheel with the release profile used for publishing and installs
+it with locked dependencies into a temporary virtual environment. It verifies that
+imports come from that installation. It downloads Playwright's Chromium;
+Linux browser system dependencies must already be installed. On Ubuntu, pass
+`--with-browser-deps` to install them (requires sudo). PR CI runs this command
+on every change, including shared Rust and build configuration changes.
+Test execution is bounded to 15 minutes; pytest prints Python stacks when a
+test runs for 60 seconds. The temporary environment and wheel are removed
+on exit, and browser fixtures close their processes. Cargo and browser download
+caches remain available for subsequent runs.
+
+For editable development:
 
 ```bash
 # From py/web-transport/ in the monorepo:
