@@ -58,3 +58,10 @@ When possible, `Deref` is used to expose the underlying Noq API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
 - Stream IDs are not available.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
+
+Session clones share ownership of the connection. Dropping the final `Session`
+closes it immediately, including raw QUIC sessions, even if streams or native
+`noq::Connection` handles remain. Keep a `Session` clone while using those handles.
+Call `close` explicitly to send a best-effort close capsule; its entire graceful
+close is bounded by three round trips (at least 100 ms), including flow-controlled
+writes, and continues if the final Session is dropped. The first close wins.
