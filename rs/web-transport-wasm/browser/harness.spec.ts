@@ -24,9 +24,9 @@ test("every WASM harness check passes in Chromium", async ({ page }, testInfo) =
 	console.log(JSON.stringify(result, null, 2));
 	expect(errors, "browser page errors").toEqual([]);
 	expect(result.rows.length, "harness must execute assertions").toBeGreaterThan(0);
-	expect(result.failed, result.status ?? "failed harness checks").toBe(0);
-	expect(result.passed).toBe(result.rows.length);
 	for (const row of result.rows as { name: string; ok: boolean; detail: string }[]) {
 		expect(row.ok, `${row.name}: ${row.detail}`).toBe(true);
 	}
+	expect(result.failed, result.status ?? "failed harness checks").toBe(0);
+	expect(result.passed).toBe(result.rows.length);
 });
