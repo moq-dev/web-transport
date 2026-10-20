@@ -149,3 +149,30 @@ console.log(info.closeCode, info.reason);
 ## License
 
 MIT OR Apache-2.0
+
+## Runtime tests
+
+From the repository root, install the Bun tooling and run:
+
+```bash
+nix develop --command bun install --frozen-lockfile
+nix develop --command bun run --cwd js/web-transport test:runtime
+```
+
+The command currently exposes a packaging failure: the package exports
+`src/index.ts`, and Node rejects TypeScript files inside `node_modules` with
+`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. The runtime CI job requires a
+JavaScript package entry point before it can pass.
+
+This builds the native release artifact, packs the package, and extracts it into
+a temporary `node_modules` directory. The tests import the packaged entry point
+under the Nix shell's Node runtime and exercise a local client/server connection,
+uni/bi streams, datagrams, close information, and blocked readers waking on close.
+One process must exit naturally after cleanup; another exits with native operations
+still pending to exercise runtime teardown. A 30-second process deadline catches
+leaked handles and reports the last completed phase. Temporary files and timed-out
+process groups are removed; no registry publishing is needed. OpenSSL generates a
+short-lived test certificate.
+
+The independent Node runtime PR workflow runs this command on Linux for all pull
+requests, including changes to shared Rust code and build/workflow files.
