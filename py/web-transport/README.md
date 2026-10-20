@@ -123,8 +123,8 @@ Python client/server integration and headless Chromium interop:
 nix develop --command ./py/web-transport/test-wheel.sh
 ```
 
-This builds the same UniFFI wheel as the release workflow, installs it with
-locked dependencies into a temporary virtual environment, and verifies that
+This builds a UniFFI wheel with the release profile used for publishing and installs
+it with locked dependencies into a temporary virtual environment. It verifies that
 imports come from that installation. It downloads Playwright's Chromium;
 Linux browser system dependencies must already be installed. On Ubuntu, pass
 `--with-browser-deps` to install them (requires sudo). PR CI runs this command

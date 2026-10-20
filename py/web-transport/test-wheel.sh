@@ -20,7 +20,7 @@ export UV_PROJECT_ENVIRONMENT="$scratch/venv"
 cd "$package"
 uv sync --locked --no-install-project --python 3.12
 python="$UV_PROJECT_ENVIRONMENT/bin/python"
-"$UV_PROJECT_ENVIRONMENT/bin/maturin" build --out "$scratch/wheels"
+"$UV_PROJECT_ENVIRONMENT/bin/maturin" build --release --out "$scratch/wheels"
 uv pip install --python "$python" --no-deps "$scratch"/wheels/*.whl
 "$python" -I -m playwright install "${browser_args[@]}" chromium
 
