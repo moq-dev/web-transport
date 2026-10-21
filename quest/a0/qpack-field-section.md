@@ -24,6 +24,10 @@ Non-goal: SETTINGS and capsule frames keep `MAX_FRAME_SIZE`.
 
 Decided 2026-10-21 (maintainer, in moq's planning):
 
+- **Charge the budget while expanding.** Pass the remaining budget into
+  string and Huffman decoding, so a single literal aborts at the limit
+  instead of materializing first: Huffman codes as short as 5 bits expand a
+  literal up to 1.6x.
 - **One private 16 KiB limit.** It is the decoded budget and also the HEADERS
   frame cap in `read_headers_frame` and in the sync
   `ConnectRequest::decode`/`ConnectResponse::decode`. The sync decoders refuse
@@ -43,8 +47,9 @@ Decided 2026-10-21 (maintainer, in moq's planning):
   peers.
 - **Regression test.** A HEADERS frame under 16 KiB carrying about 4,000
   distinct empty-valued literal names (over 140 KB with the per-field
-  overhead) fails with `FieldSectionTooLarge` and decodes without the fix. A
-  declared length over 16 KiB fails at the frame header. The existing round
+  overhead) fails with `FieldSectionTooLarge` and decodes without the fix. So
+  does one Huffman literal under 16 KiB that expands past it. A declared
+  length over 16 KiB fails at the frame header. The existing round
   trips still pass, and a settings test checks the advertisement.
 - **Patch release.** It lands on `main` and release-plz publishes 0.6.3; the
   crate has no unreleased API change since 0.6.2. web-transport-iroh's 0.7
