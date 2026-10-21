@@ -102,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
     session.close(42069, b"bye");
+    // Keep the runtime alive for best-effort peer delivery; runtime shutdown
+    // still closes locally, but cannot promise delivery or connection draining.
     session.closed().await;
 
     Ok(())

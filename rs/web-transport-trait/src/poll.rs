@@ -260,6 +260,8 @@ pub trait RecvStream {
     /// Poll to read some data into the provided buffer, advancing it by the number
     /// of bytes read.
     ///
+    /// The default initializes at most 8 KiB of spare capacity before calling
+    /// [`poll_read`](Self::poll_read).
     /// Override this to avoid a copy when the underlying transport already owns the
     /// bytes as a [`Bytes`], which can be handed to [`BufMut::put`] directly.
     fn poll_read_buf<B: BufMut>(
@@ -267,24 +269,23 @@ pub trait RecvStream {
         cx: &mut Context<'_>,
         buf: &mut B,
     ) -> Poll<Result<Option<usize>, Self::Error>> {
-        let len = buf.chunk_mut().len();
+        let dst = buf.chunk_mut();
 
         // A destination with no room is not a closed stream. Collapsing the two
         // would turn "buffer full" into "stream ended", which reads as truncation.
-        if len == 0 {
+        if dst.len() == 0 {
             return Poll::Ready(Ok(Some(0)));
         }
 
-        let dst = unsafe {
-            std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
-        };
+        let dst = crate::util::initialize(dst);
 
         let size = match ready!(self.poll_read(cx, dst))? {
-            Some(size) if size > 0 => size,
-            Some(_) => return Poll::Ready(Ok(Some(0))),
+            Some(size) => size,
             None => return Poll::Ready(Ok(None)),
         };
 
+        assert!(size <= dst.len(), "read exceeded the destination length");
+        // SAFETY: The whole destination was initialized and size is in bounds.
         unsafe { buf.advance_mut(size) };
 
         Poll::Ready(Ok(Some(size)))
@@ -306,27 +307,14 @@ pub trait RecvStream {
 
         // Don't allocate too much. Override this to avoid the copy, or to use a
         // larger per-poll buffer.
-        let capacity = max.min(8 * 1024);
+        let capacity = max.min(crate::util::READ_CAPACITY);
         let mut buf = BytesMut::with_capacity(capacity);
 
-        // Slice to `capacity` rather than trusting the allocation: `with_capacity`
+        // Limit to `capacity` rather than trusting the allocation: `with_capacity`
         // promises only a lower bound, so an over-allocation would let this return
         // more than `max`, which the method documents it won't.
-        let dst = unsafe {
-            std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
-        };
-        let dst = &mut dst[..capacity];
-
-        let size = match ready!(self.poll_read(cx, dst))? {
-            Some(size) if size > 0 => size,
-            Some(_) => return Poll::Ready(Ok(Some(Bytes::new()))),
-            None => return Poll::Ready(Ok(None)),
-        };
-
-        // The read wrote into spare capacity, so the length is still zero.
-        unsafe { buf.advance_mut(size) };
-
-        Poll::Ready(Ok(Some(buf.freeze())))
+        let size = ready!(self.poll_read_buf(cx, &mut (&mut buf).limit(capacity)))?;
+        Poll::Ready(Ok(size.map(|_| buf.freeze())))
     }
 
     /// Send a `STOP_SENDING` QUIC code, informing the peer that no more data will be

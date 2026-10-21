@@ -58,3 +58,18 @@ When possible, `Deref` is used to expose the underlying Noq API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
 - Stream IDs are not available.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
+
+Session clones share ownership of the connection. Dropping the final `Session`
+closes it immediately, including raw QUIC sessions, even if streams or native
+`noq::Connection` handles remain. Keep a `Session` clone while using those handles.
+Call `close` explicitly to send a best-effort close capsule; its entire graceful
+close is bounded by three round trips (at least 100 ms), including flow-controlled
+writes, and continues if the final Session is dropped. The first close wins.
+
+Cancelling the graceful-close task, including before its first poll or during
+runtime shutdown, closes the native connection and requests waiter wakeups
+synchronously, then cancels the capsule reader. The capsule carries the full
+UTF-8 reason; the native fallback carries a prefix of at most 16 bytes at a character
+boundary. Already observed native errors are preserved. Peer delivery, endpoint
+draining and execution of awakened tasks require a live runtime. Forgotten
+futures, non-yielding tasks and process abort are outside this guarantee.

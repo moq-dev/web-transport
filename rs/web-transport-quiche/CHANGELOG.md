@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.1...web-transport-quiche-v0.8.2) - 2026-10-20
+
+### Other
+
+- *(deps)* update kio requirement from 0.5.4 to 0.6.2 in the cargo group across 1 directory ([#415](https://github.com/moq-dev/web-transport/pull/415))
+
 ## [0.8.1](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.0...web-transport-quiche-v0.8.1) - 2026-09-27
 
 ### Other
