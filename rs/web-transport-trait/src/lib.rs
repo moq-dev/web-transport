@@ -125,6 +125,19 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
         &self,
     ) -> impl Future<Output = Result<(Self::SendStream, Self::RecvStream), Self::Error>> + MaybeSend;
 
+    /// Open a bidirectional stream only when stream credit is immediately available.
+    ///
+    /// `None` means the peer has not granted enough concurrent stream credit, or the
+    /// backend does not expose a non-waiting open. Once credit is claimed, the returned
+    /// future may still wait for transport work such as writing a WebTransport session
+    /// header.
+    fn try_open_bi(
+        &self,
+    ) -> impl Future<Output = Result<Option<(Self::SendStream, Self::RecvStream)>, Self::Error>>
+           + MaybeSend {
+        async { Ok(None) }
+    }
+
     /// Open a new unidirectional stream, which may block when there are too many concurrent streams.
     fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, Self::Error>> + MaybeSend;
 

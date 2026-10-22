@@ -136,6 +136,20 @@ impl Credit {
         poll_fn(|cx| self.poll_claim_index(cx)).await
     }
 
+    /// Claim one unit immediately, returning `None` when no credit is available.
+    pub fn try_claim_index(&self) -> Result<Option<u64>, Error> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.state.closed {
+            return Err(Error::Closed);
+        }
+        if inner.state.used == inner.state.max {
+            return Ok(None);
+        }
+        let index = inner.state.used;
+        inner.state.used += 1;
+        Ok(Some(index))
+    }
+
     /// Poll to claim exactly 1 unit, returning the index it claimed.
     pub fn poll_claim_index(&self, cx: &mut Context<'_>) -> Poll<Result<u64, Error>> {
         let mut inner = self.inner.lock().unwrap();

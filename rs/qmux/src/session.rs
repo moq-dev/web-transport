@@ -2501,6 +2501,56 @@ impl generic::Session for Session {
         let Ok(index) = self.open_bi_credit.claim_index().await else {
             return Err(self.close_reason().await);
         };
+        Ok(self.open_bi_claimed(index))
+    }
+
+    async fn try_open_bi(
+        &self,
+    ) -> Result<Option<(Self::SendStream, Self::RecvStream)>, Self::Error> {
+        let Some(index) = self.open_bi_credit.try_claim_index()? else {
+            return Ok(None);
+        };
+        Ok(Some(self.open_bi_claimed(index)))
+    }
+
+    fn close(&self, code: u32, reason: &str) {
+        // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
+        // session close carrying our code/reason. A no-op once the session has a
+        // close reason.
+        let frame = ApplicationClose {
+            code: VarInt::from(code),
+            reason: reason.to_string(),
+        };
+        let err = Error::ConnectionClosed {
+            code: VarInt::from(code),
+            reason: reason.to_string(),
+        };
+        self.close_with(frame.into(), err);
+    }
+
+    async fn closed(&self) -> Self::Error {
+        self.close_reason().await
+    }
+
+    fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
+        Session::send_datagram(self, payload)
+    }
+
+    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
+        Session::recv_datagram(self).await
+    }
+
+    fn max_datagram_size(&self) -> usize {
+        Session::max_datagram_size(self)
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        Session::protocol(self)
+    }
+}
+
+impl Session {
+    fn open_bi_claimed(&self, index: u64) -> (SendStream, RecvStream) {
         let id = StreamId::new(index, StreamDir::Bi, self.is_server);
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2576,29 +2626,10 @@ impl generic::Session for Session {
             return Err(self.close_reason().await);
         }
 
-        Ok((send_frontend, recv_frontend))
+        (send_frontend, recv_frontend)
     }
 
-    fn close(&self, code: u32, reason: &str) {
-        // App-initiated: an APPLICATION_CLOSE (0x1d) the peer surfaces as a clean
-        // session close carrying our code/reason. A no-op once the session has a
-        // close reason.
-        let frame = ApplicationClose {
-            code: VarInt::from(code),
-            reason: reason.to_string(),
-        };
-        let err = Error::ConnectionClosed {
-            code: VarInt::from(code),
-            reason: reason.to_string(),
-        };
-        self.close_with(frame.into(), err);
-    }
-
-    async fn closed(&self) -> Self::Error {
-        self.close_reason().await
-    }
-
-    fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error> {
+    fn send_datagram(&self, payload: Bytes) -> Result<(), Error> {
         let max = self.datagram_max_size.load(Ordering::Acquire);
         if max == 0 {
             // The peer never advertised max_datagram_frame_size (or zeroed it).
@@ -2624,7 +2655,7 @@ impl generic::Session for Session {
         self.datagram_max_size.load(Ordering::Acquire)
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes, Self::Error> {
+    async fn recv_datagram(&self) -> Result<Bytes, Error> {
         match self.recv_datagram.recv().await {
             Some(item) => Ok(item),
             None => Err(self.close_reason().await),
