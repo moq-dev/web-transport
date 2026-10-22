@@ -73,8 +73,9 @@
           pkgs.cmake
           # Required to compile boringssl (via bindgen loading libclang)
           pkgs.llvmPackages.libclang.lib
-          # Only for NPM publishing
+          # Node runtime tests and NPM publishing.
           pkgs.nodejs_24
+          pkgs.openssl
         ];
       in
       {

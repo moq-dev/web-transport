@@ -16,19 +16,27 @@
 		]
 	},
 	"exports": {
-		".": "./src/index.ts"
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
 	},
-	"types": "./src/index.ts",
+	"types": "./dist/index.d.ts",
 	"files": [
+		"./dist",
 		"./src",
 		"napi.cjs",
 		"napi.d.cts",
 		"*.node"
 	],
 	"scripts": {
-		"build": "napi build --platform --release --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir . --js napi.cjs --dts napi.d.cts",
+		"build": "bun run build:native && bun run build:js",
 		"check": "tsc --noEmit",
-		"release": "bun scripts/release.ts"
+		"test:runtime": "bun scripts/test-runtime.ts",
+		"release": "bun scripts/release.ts",
+		"build:native": "napi build --platform --release --manifest-path ../../rs/web-transport-node/Cargo.toml --output-dir . --js napi.cjs --dts napi.d.cts",
+		"build:js": "tsc",
+		"prepack": "bun run build:js"
 	},
 	"devDependencies": {
 		"@napi-rs/cli": "^3",

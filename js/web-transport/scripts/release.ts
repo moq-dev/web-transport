@@ -21,6 +21,9 @@ if (version === published) {
 	process.exit(0);
 }
 
+// Validate the JavaScript package before publishing any platform artifacts.
+execSync("bun run build:js", { stdio: "inherit" });
+
 // Move downloaded artifacts into the correct platform package directories
 if (existsSync("artifacts")) {
 	console.log("Moving artifacts...");
