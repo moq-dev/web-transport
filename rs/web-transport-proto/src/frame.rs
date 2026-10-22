@@ -5,6 +5,18 @@ use crate::{VarInt, VarIntUnexpectedEnd};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Frame(pub VarInt);
 
+#[derive(Debug)]
+pub(crate) enum FrameReadError {
+    UnexpectedEnd,
+    TooLarge(Frame),
+}
+
+impl From<VarIntUnexpectedEnd> for FrameReadError {
+    fn from(_: VarIntUnexpectedEnd) -> Self {
+        Self::UnexpectedEnd
+    }
+}
+
 impl Frame {
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, VarIntUnexpectedEnd> {
         let typ = VarInt::decode(buf)?;
@@ -30,21 +42,36 @@ impl Frame {
     pub fn read<B: Buf>(
         buf: &mut B,
     ) -> Result<(Frame, bytes::buf::Take<&mut B>), VarIntUnexpectedEnd> {
-        let typ = Frame::decode(buf)?;
-        let size = VarInt::decode(buf)?;
+        Self::read_bounded(buf, u64::MAX, u64::MAX).map_err(|_| VarIntUnexpectedEnd)
+    }
 
-        let mut limit = Buf::take(buf, size.into_inner() as usize);
-        if limit.remaining() < limit.limit() {
-            return Err(VarIntUnexpectedEnd);
+    pub(crate) fn read_bounded<B: Buf>(
+        buf: &mut B,
+        headers_limit: u64,
+        other_limit: u64,
+    ) -> Result<(Frame, bytes::buf::Take<&mut B>), FrameReadError> {
+        loop {
+            let typ = Frame::decode(buf)?;
+            let size = VarInt::decode(buf)?.into_inner();
+            let limit = if typ == Frame::HEADERS {
+                headers_limit
+            } else {
+                other_limit
+            };
+            if size > limit {
+                return Err(FrameReadError::TooLarge(typ));
+            }
+            // A wire length cannot be narrowed until it fits the host address space.
+            let size = usize::try_from(size).map_err(|_| FrameReadError::UnexpectedEnd)?;
+            if buf.remaining() < size {
+                return Err(FrameReadError::UnexpectedEnd);
+            }
+            if typ.is_grease() {
+                buf.advance(size);
+                continue;
+            }
+            return Ok((typ, buf.take(size)));
         }
-
-        // Try again if this is a GREASE frame we need to ignore
-        if typ.is_grease() {
-            limit.advance(limit.limit());
-            return Self::read(limit.into_inner());
-        }
-
-        Ok((typ, limit))
     }
 }
 

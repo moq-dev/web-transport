@@ -124,7 +124,11 @@ impl Settings {
             return Err(SettingsError::UnexpectedStreamType(typ));
         }
 
-        let (typ, mut data) = Frame::read(buf).map_err(|_| SettingsError::UnexpectedEnd)?;
+        let (typ, mut data) =
+            Frame::read_bounded(buf, MAX_FRAME_SIZE, MAX_FRAME_SIZE).map_err(|err| match err {
+                crate::frame::FrameReadError::UnexpectedEnd => SettingsError::UnexpectedEnd,
+                crate::frame::FrameReadError::TooLarge(_) => SettingsError::FrameTooLarge,
+            })?;
         if typ != Frame::SETTINGS {
             return Err(SettingsError::UnexpectedFrame(typ));
         }
@@ -231,6 +235,10 @@ impl Settings {
     pub fn enable_webtransport(&mut self, max_sessions: u32) {
         let max = VarInt::from_u32(max_sessions);
 
+        self.insert(
+            Setting::MAX_FIELD_SECTION_SIZE,
+            VarInt::from_u32(crate::MAX_FIELD_SECTION_SIZE as u32),
+        );
         self.insert(Setting::ENABLE_CONNECT_PROTOCOL, VarInt::from_u32(1));
         self.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
         self.insert(Setting::ENABLE_DATAGRAM_DEPRECATED, VarInt::from_u32(1));
@@ -308,6 +316,65 @@ mod tests {
         let mut buf = BytesMut::new();
         settings.encode(&mut buf);
         buf.to_vec()
+    }
+
+    #[test]
+    fn webtransport_advertises_enforced_field_section_size() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(4);
+        let decoded = Settings::decode(&mut encode_settings(&settings).as_slice()).unwrap();
+        assert_eq!(
+            decoded
+                .get(&Setting::MAX_FIELD_SECTION_SIZE)
+                .map(|size| size.into_inner()),
+            Some(crate::MAX_FIELD_SECTION_SIZE)
+        );
+    }
+
+    #[test]
+    fn sync_settings_reject_declared_size_before_payload_arrives() {
+        for size in [MAX_FRAME_SIZE + 1, (1_u64 << 32) + 2] {
+            let mut wire = Vec::new();
+            StreamUni::CONTROL.encode(&mut wire);
+            Frame::SETTINGS.encode(&mut wire);
+            VarInt::try_from(size).unwrap().encode(&mut wire);
+            assert!(matches!(
+                Settings::decode(&mut wire.as_slice()),
+                Err(SettingsError::FrameTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_skip_large_and_repeated_grease_without_recursion() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport(1);
+        let encoded = encode_settings(&settings);
+        let mut frame = encoded.as_slice();
+        StreamUni::decode(&mut frame).unwrap();
+        let mut wire = Vec::new();
+        StreamUni::CONTROL.encode(&mut wire);
+        Frame(VarInt::from_u32(0x21)).encode(&mut wire);
+        VarInt::from_u32(MAX_FRAME_SIZE as u32).encode(&mut wire);
+        wire.resize(wire.len() + MAX_FRAME_SIZE as usize, 0);
+        for _ in 0..10_000 {
+            Frame(VarInt::from_u32(0x21)).encode(&mut wire);
+            VarInt::from_u32(0).encode(&mut wire);
+        }
+        wire.extend_from_slice(frame);
+        assert_eq!(
+            Settings::decode(&mut wire.as_slice())
+                .unwrap()
+                .supports_webtransport(),
+            1
+        );
+        assert_eq!(
+            Settings::read(&mut Cursor::new(wire))
+                .await
+                .unwrap()
+                .supports_webtransport(),
+            1
+        );
     }
 
     #[tokio::test]
