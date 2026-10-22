@@ -23,6 +23,9 @@ Pull requests run the harness in headless Chromium on Linux through Playwright. 
 must pass, including clone/cancellation, stream-opening cleanup, peer reset, datagram and close
 checks. Missing browser dependencies, an unavailable peer, page errors and timeouts fail the run.
 
+Controlled stream-open fixtures preserve errors from synchronous exceptions and rejected promises
+for both stream directions, including opening again after an error.
+
 Controlled browser `WritableStream` fixtures additionally exercise datagram writers whose close
 step is still pending, already-closed writers, and dropped send-task ownership without network
 timing. They model the Streams contract; clean closure has not been reproduced through a real

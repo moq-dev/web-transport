@@ -51,6 +51,26 @@ export function openDatagramTransport() {
     };
 }
 
+export function failingStreamTransport(reject) {
+    const failure = new DOMException('transport is closed', 'InvalidStateError');
+    let calls = 0;
+    const create = options => {
+        if (options.waitUntilAvailable !== true) throw new Error('missing stream credit option');
+        calls++;
+        if (reject) return Promise.reject(failure);
+        throw failure;
+    };
+    return {
+        transport: {
+            protocol: '',
+            createUnidirectionalStream: create,
+            createBidirectionalStream: create,
+        },
+        failure,
+        calls: () => calls,
+    };
+}
+
 export async function flushMicrotasks() {
     for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -60,6 +80,8 @@ extern "C" {
     fn closing_datagram_transport() -> Object;
     #[wasm_bindgen(js_name = openDatagramTransport)]
     fn open_datagram_transport() -> Object;
+    #[wasm_bindgen(js_name = failingStreamTransport)]
+    fn failing_stream_transport(reject: bool) -> Object;
     #[wasm_bindgen(js_name = flushMicrotasks)]
     async fn flush_microtasks();
 }
@@ -108,6 +130,17 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         ),
     };
     results.push(&outcome);
+
+    for (name, reject) in [
+        ("synchronous stream-open errors return to Rust", false),
+        ("rejected stream-open promises return to Rust", true),
+    ] {
+        let outcome = match stream_open_errors(reject).await {
+            Ok(detail) => row(name, true, &detail),
+            Err(err) => row(name, false, &format!("{err}")),
+        };
+        results.push(&outcome);
+    }
 
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
@@ -165,6 +198,34 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("session close code and reason survive", session_close);
 
     Ok(results)
+}
+
+/// A browser can throw before returning an open promise, or reject it later.
+/// Both directions must preserve the same error and leave the operation reusable.
+async fn stream_open_errors(reject: bool) -> Result<String, Error> {
+    let fixture = failing_stream_transport(reject);
+    let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
+    let failure = Reflect::get(&fixture, &"failure".into())?;
+    let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
+
+    for _ in 0..2 {
+        let uni = session.open_uni().await.err();
+        let bi = session.open_bi().await.err();
+        for result in [uni, bi] {
+            match result {
+                Some(Error::Unknown(error)) if Object::is(&error, &failure) => {}
+                other => return expect(false, format!("stream open lost its error: {other:?}")),
+            }
+        }
+    }
+
+    let calls = Reflect::get(&fixture, &"calls".into())?
+        .unchecked_into::<js_sys::Function>()
+        .call0(&fixture)?;
+    expect(
+        calls.as_f64() == Some(4.0),
+        format!("both stream directions preserved their errors across {calls:?} calls"),
+    )
 }
 
 async fn connect(url: &url::Url, hash: &[u8]) -> Result<Session, Error> {
