@@ -30,11 +30,32 @@ pub enum DecodeError {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
-#[cfg(target_pointer_width = "64")]
-const MAX_POWER: usize = 10 * 7;
+#[derive(Debug, Error)]
+pub(crate) enum FieldSectionError {
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error("field section too large")]
+    TooLarge,
+}
 
-#[cfg(target_pointer_width = "32")]
-const MAX_POWER: usize = 5 * 7;
+// RFC 9114 section 4.2.2: each field line costs name + value + 32 bytes.
+const FIELD_LINE_OVERHEAD: usize = 32;
+
+struct Budget(usize);
+
+impl Budget {
+    fn new() -> Self {
+        Self(crate::MAX_FIELD_SECTION_SIZE as usize)
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), FieldSectionError> {
+        self.0 = self
+            .0
+            .checked_sub(bytes)
+            .ok_or(FieldSectionError::TooLarge)?;
+        Ok(())
+    }
+}
 
 // Simple QPACK implementation that ONLY supports the static table and literals.
 #[derive(Debug, Default)]
@@ -51,13 +72,16 @@ impl Headers {
         self.fields.insert(name.to_string(), value.to_string());
     }
 
-    pub fn decode<B: Buf>(mut buf: &mut B) -> Result<Self, DecodeError> {
+    pub(crate) fn decode<B: Buf>(mut buf: &mut B) -> Result<Self, FieldSectionError> {
+        let mut budget = Budget::new();
         // We don't support dynamic entries so we can skip these.
         let (_, _insert_count) = decode_prefix(buf, 8)?;
         let (_sign, _delta_base) = decode_prefix(buf, 7)?;
 
         let mut fields = HashMap::new();
         while buf.has_remaining() {
+            // Every field line counts, including one that overwrites a previous name.
+            budget.charge(FIELD_LINE_OVERHEAD)?;
             // Read the first byte;
             let peek = buf.get_u8();
 
@@ -69,30 +93,32 @@ impl Headers {
             // This is over-engineered, LUL
             let (name, value) = match peek & 0b1100_0000 {
                 // Indexed line field from static table
-                0b1100_0000 => Self::decode_index(&mut chain)?,
+                0b1100_0000 => Self::decode_index(&mut chain, &mut budget)?,
 
                 // Indexed line field from dynamic table
-                0b1000_0000 => return Err(DecodeError::DynamicEntry),
+                0b1000_0000 => return Err(DecodeError::DynamicEntry.into()),
 
                 _ => match peek & 0b1101_0000 {
                     // Indexed with literal name ref from static table
-                    0b0101_0000 => Self::decode_literal_value(&mut chain)?,
+                    0b0101_0000 => Self::decode_literal_value(&mut chain, &mut budget)?,
 
                     // Indexed with literal name ref from dynamic table
-                    0b0100_0000 => return Err(DecodeError::DynamicEntry),
+                    0b0100_0000 => return Err(DecodeError::DynamicEntry.into()),
 
                     // Literal
-                    _ if peek & 0b1110_0000 == 0b0010_0000 => Self::decode_literal(&mut chain)?,
+                    _ if peek & 0b1110_0000 == 0b0010_0000 => {
+                        Self::decode_literal(&mut chain, &mut budget)?
+                    }
 
                     _ => match peek & 0b1111_0000 {
                         // Indexed with post base
-                        0b0001_0000 => return Err(DecodeError::DynamicEntry),
+                        0b0001_0000 => return Err(DecodeError::DynamicEntry.into()),
 
                         // Indexed with post base name ref
-                        0b0000_0000 => return Err(DecodeError::DynamicEntry),
+                        0b0000_0000 => return Err(DecodeError::DynamicEntry.into()),
 
                         // ugh
-                        _ => return Err(DecodeError::UnknownEntry),
+                        _ => return Err(DecodeError::UnknownEntry.into()),
                     },
                 },
             };
@@ -106,7 +132,10 @@ impl Headers {
         Ok(Self { fields })
     }
 
-    fn decode_index<B: Buf>(buf: &mut B) -> Result<(String, String), DecodeError> {
+    fn decode_index<B: Buf>(
+        buf: &mut B,
+        budget: &mut Budget,
+    ) -> Result<(String, String), FieldSectionError> {
         /*
             0   1   2   3   4   5   6   7
         +---+---+---+---+---+---+---+---+
@@ -116,10 +145,15 @@ impl Headers {
 
         let (_, index) = decode_prefix(buf, 6)?;
         let (name, value) = StaticTable::get(index)?;
+        budget.charge(name.len())?;
+        budget.charge(value.len())?;
         Ok((name.to_string(), value.to_string()))
     }
 
-    fn decode_literal_value<B: Buf>(buf: &mut B) -> Result<(String, String), DecodeError> {
+    fn decode_literal_value<B: Buf>(
+        buf: &mut B,
+        budget: &mut Budget,
+    ) -> Result<(String, String), FieldSectionError> {
         /*
           0   1   2   3   4   5   6   7
         +---+---+---+---+---+---+---+---+
@@ -134,13 +168,15 @@ impl Headers {
         let (_, name) = decode_prefix(buf, 4)?;
         let (name, _) = StaticTable::get(name)?;
 
-        let value = decode_string(buf, 8)?;
-        let value = std::str::from_utf8(&value)?;
-
-        Ok((name.to_string(), value.to_string()))
+        budget.charge(name.len())?;
+        let value = decode_string(buf, 8, budget)?;
+        Ok((name.to_string(), value))
     }
 
-    fn decode_literal<B: Buf>(buf: &mut B) -> Result<(String, String), DecodeError> {
+    fn decode_literal<B: Buf>(
+        buf: &mut B,
+        budget: &mut Budget,
+    ) -> Result<(String, String), FieldSectionError> {
         /*
           0   1   2   3   4   5   6   7
         +---+---+---+---+---+---+---+---+
@@ -154,16 +190,23 @@ impl Headers {
         +-------------------------------+
         */
 
-        let name = decode_string(buf, 4)?;
-        let name = std::str::from_utf8(&name)?;
-
-        let value = decode_string(buf, 8)?;
-        let value = std::str::from_utf8(&value)?;
-
-        Ok((name.to_string(), value.to_string()))
+        let name = decode_string(buf, 4, budget)?;
+        let value = decode_string(buf, 8, budget)?;
+        Ok((name, value))
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    /// Encodes the field section, refusing one the decoder would reject as too large.
+    ///
+    /// Nothing is written on error. Without Huffman coding, each encoded field line
+    /// is shorter than its decoded cost, so the encoded section also fits the limit.
+    pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), FieldSectionError> {
+        let mut budget = Budget::new();
+        for (name, value) in &self.fields {
+            budget.charge(FIELD_LINE_OVERHEAD)?;
+            budget.charge(name.len())?;
+            budget.charge(value.len())?;
+        }
+
         // We don't support dynamic entries so we can skip these.
         encode_prefix(buf, 8, 0, 0);
         encode_prefix(buf, 7, 0, 0);
@@ -182,6 +225,7 @@ impl Headers {
                 Self::encode_literal(buf, name, value)
             }
         }
+        Ok(())
     }
 
     fn encode_index<B: BufMut>(buf: &mut B, index: usize) {
@@ -269,14 +313,20 @@ pub fn decode_prefix<B: Buf>(buf: &mut B, size: u8) -> Result<(u8, usize), Decod
         }
 
         let byte = buf.get_u8() as usize;
-        value += (byte & 127) << power;
+        let part = byte & 127;
+        if power >= usize::BITS as usize || part > usize::MAX >> power {
+            return Err(DecodeError::BoundsExceeded);
+        }
+        value = value
+            .checked_add(part << power)
+            .ok_or(DecodeError::BoundsExceeded)?;
         power += 7;
 
         if byte & 128 == 0 {
             break;
         }
 
-        if power >= MAX_POWER {
+        if power >= usize::BITS as usize {
             return Err(DecodeError::BoundsExceeded);
         }
     }
@@ -310,27 +360,33 @@ pub fn encode_prefix<B: BufMut>(buf: &mut B, size: u8, flags: u8, value: usize) 
     buf.put_u8(remaining as u8);
 }
 
-pub fn decode_string<B: Buf>(buf: &mut B, size: u8) -> Result<Vec<u8>, DecodeError> {
+fn decode_string<B: Buf>(
+    buf: &mut B,
+    size: u8,
+    budget: &mut Budget,
+) -> Result<String, FieldSectionError> {
     if !buf.has_remaining() {
-        return Err(DecodeError::UnexpectedEnd);
+        return Err(DecodeError::UnexpectedEnd.into());
     }
-
     let (flags, len) = decode_prefix(buf, size - 1)?;
     if buf.remaining() < len {
-        return Err(DecodeError::UnexpectedEnd);
+        return Err(DecodeError::UnexpectedEnd.into());
     }
 
-    let payload = buf.copy_to_bytes(len);
-    let value: Vec<u8> = if flags & 1 == 0 {
-        payload.into_iter().collect()
+    let value = if flags & 1 == 0 {
+        budget.charge(len)?;
+        buf.copy_to_bytes(len).to_vec()
     } else {
+        let encoded = buf.copy_to_bytes(len).to_vec();
         let mut decoded = Vec::new();
-        for byte in payload.into_iter().collect::<Vec<u8>>().hpack_decode() {
-            decoded.push(byte?);
+        for byte in encoded.hpack_decode() {
+            let byte = byte.map_err(DecodeError::from)?;
+            budget.charge(1)?;
+            decoded.push(byte);
         }
         decoded
     };
-    Ok(value)
+    String::from_utf8(value).map_err(|err| DecodeError::Utf8Error(err.utf8_error()).into())
 }
 
 // Based on https://github.com/hyperium/h3/blob/master/h3/src/qpack/static_.rs
@@ -625,3 +681,75 @@ const PREDEFINED_HEADERS: [(&str, &str); 99] = [
     ("x-frame-options", "deny"),
     ("x-frame-options", "sameorigin"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strings_charge_before_output_and_validate_at_exact_budget() {
+        let mut plain = Vec::new();
+        encode_prefix(&mut plain, 7, 0, 4);
+        plain.extend_from_slice(b"text");
+        let mut input = plain.as_slice();
+        assert!(matches!(
+            decode_string(&mut input, 8, &mut Budget(3)),
+            Err(FieldSectionError::TooLarge)
+        ));
+        assert_eq!(input, b"text", "raw payload was not copied before charging");
+
+        // One 'a' plus legal three-bit padding, then invalid zero padding.
+        assert_eq!(
+            decode_string(&mut &[0x81, 0x1f][..], 8, &mut Budget(1)).unwrap(),
+            "a"
+        );
+        assert!(matches!(
+            decode_string(&mut &[0x81, 0x18][..], 8, &mut Budget(1)),
+            Err(FieldSectionError::Decode(DecodeError::HuffmanError(_)))
+        ));
+        assert_eq!(
+            decode_string(&mut &[0x80][..], 8, &mut Budget(0)).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn exact_field_budget_accepts_empty_huffman_value() {
+        let mut wire = vec![0, 0];
+        let name = "a".repeat(crate::MAX_FIELD_SECTION_SIZE as usize - 32);
+        encode_prefix(&mut wire, 3, 0b00100, name.len());
+        wire.extend_from_slice(name.as_bytes());
+        encode_prefix(&mut wire, 7, 1, 0);
+        let headers = Headers::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(headers.get(&name), Some(""));
+        // A second occurrence still costs its own 32-byte overhead.
+        Headers::encode_literal(&mut wire, "x", "");
+        assert!(matches!(
+            Headers::decode(&mut wire.as_slice()),
+            Err(FieldSectionError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn prefixed_integer_refuses_shift_and_sum_overflow() {
+        let mut maximum = Vec::new();
+        encode_prefix(&mut maximum, 8, 0, usize::MAX);
+        assert_eq!(
+            decode_prefix(&mut maximum.as_slice(), 8).unwrap().1,
+            usize::MAX
+        );
+        *maximum.last_mut().unwrap() += 1;
+        assert!(matches!(
+            decode_prefix(&mut maximum.as_slice(), 8),
+            Err(DecodeError::BoundsExceeded)
+        ));
+
+        let groups = usize::BITS.div_ceil(7) as usize;
+        let mut sum_overflow = vec![0xff; groups];
+        sum_overflow.push(((1_usize << ((usize::BITS - 1) % 7 + 1)) - 1) as u8);
+        assert!(matches!(
+            decode_prefix(&mut sum_overflow.as_slice(), 8),
+            Err(DecodeError::BoundsExceeded)
+        ));
+    }
+}
