@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.2...qmux-v0.5.3) - 2026-10-23
+
+### Added
+
+- *(qmux)* take a session config on every transport builder ([#427](https://github.com/moq-dev/web-transport/pull/427))
+
 ## [0.5.2](https://github.com/moq-dev/web-transport/compare/qmux-v0.5.1...qmux-v0.5.2) - 2026-09-30
 
 ### Fixed
