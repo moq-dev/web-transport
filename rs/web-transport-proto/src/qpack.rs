@@ -38,9 +38,16 @@ pub(crate) enum FieldSectionError {
     TooLarge,
 }
 
+// RFC 9114 section 4.2.2: each field line costs name + value + 32 bytes.
+const FIELD_LINE_OVERHEAD: usize = 32;
+
 struct Budget(usize);
 
 impl Budget {
+    fn new() -> Self {
+        Self(crate::MAX_FIELD_SECTION_SIZE as usize)
+    }
+
     fn charge(&mut self, bytes: usize) -> Result<(), FieldSectionError> {
         self.0 = self
             .0
@@ -66,7 +73,7 @@ impl Headers {
     }
 
     pub(crate) fn decode<B: Buf>(mut buf: &mut B) -> Result<Self, FieldSectionError> {
-        let mut budget = Budget(crate::MAX_FIELD_SECTION_SIZE as usize);
+        let mut budget = Budget::new();
         // We don't support dynamic entries so we can skip these.
         let (_, _insert_count) = decode_prefix(buf, 8)?;
         let (_sign, _delta_base) = decode_prefix(buf, 7)?;
@@ -74,7 +81,7 @@ impl Headers {
         let mut fields = HashMap::new();
         while buf.has_remaining() {
             // Every field line counts, including one that overwrites a previous name.
-            budget.charge(32)?;
+            budget.charge(FIELD_LINE_OVERHEAD)?;
             // Read the first byte;
             let peek = buf.get_u8();
 
@@ -188,7 +195,18 @@ impl Headers {
         Ok((name, value))
     }
 
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
+    /// Encodes the field section, refusing one the decoder would reject as too large.
+    ///
+    /// Nothing is written on error. Without Huffman coding, each encoded field line
+    /// is shorter than its decoded cost, so the encoded section also fits the limit.
+    pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), FieldSectionError> {
+        let mut budget = Budget::new();
+        for (name, value) in &self.fields {
+            budget.charge(FIELD_LINE_OVERHEAD)?;
+            budget.charge(name.len())?;
+            budget.charge(value.len())?;
+        }
+
         // We don't support dynamic entries so we can skip these.
         encode_prefix(buf, 8, 0, 0);
         encode_prefix(buf, 7, 0, 0);
@@ -207,6 +225,7 @@ impl Headers {
                 Self::encode_literal(buf, name, value)
             }
         }
+        Ok(())
     }
 
     fn encode_index<B: BufMut>(buf: &mut B, index: usize) {

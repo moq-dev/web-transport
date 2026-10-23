@@ -9,8 +9,9 @@ CONNECT requests and responses accept a HEADERS payload and decoded field sectio
 of at most 16 KiB. Decoded size counts every field line as its name and value
 lengths plus 32 bytes, including repeated names. Literal and Huffman expansion
 stop at the remaining budget, and an oversized declared HEADERS length is
-refused before its payload is buffered. Both paths report
-`ConnectError::FieldSectionTooLarge`.
+refused before its payload is buffered. Encoding a request or response whose
+field section exceeds the limit is refused before anything is written. All of
+these paths report `ConnectError::FieldSectionTooLarge`.
 
 `Settings::enable_webtransport` advertises this bound through
 `MAX_FIELD_SECTION_SIZE`. SETTINGS, capsule, and GREASE frames retain their

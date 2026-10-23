@@ -243,16 +243,7 @@ impl ConnectRequest {
             headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
-        // Use a temporary buffer so we can compute the size.
-        let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
-        let size = VarInt::from_u32(tmp.len() as u32);
-
-        Frame::HEADERS.encode(buf);
-        size.encode(buf);
-        buf.put_slice(&tmp);
-
-        Ok(())
+        encode_headers_frame(&headers, buf)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
@@ -346,16 +337,7 @@ impl ConnectResponse {
             headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
         }
 
-        // Use a temporary buffer so we can compute the size.
-        let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
-        let size = VarInt::from_u32(tmp.len() as u32);
-
-        Frame::HEADERS.encode(buf);
-        size.encode(buf);
-        buf.put_slice(&tmp);
-
-        Ok(())
+        encode_headers_frame(&headers, buf)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
@@ -388,6 +370,22 @@ fn check_frame_size(typ: Frame, size: u64) -> Result<(), ConnectError> {
     if size > MAX_FRAME_SIZE {
         return Err(ConnectError::FrameTooLarge);
     }
+    Ok(())
+}
+
+fn encode_headers_frame<B: BufMut>(
+    headers: &qpack::Headers,
+    buf: &mut B,
+) -> Result<(), ConnectError> {
+    // Use a temporary buffer so we can compute the size and write nothing on error.
+    let mut tmp = Vec::new();
+    headers.encode(&mut tmp)?;
+    let size = VarInt::from_u32(tmp.len() as u32);
+
+    Frame::HEADERS.encode(buf);
+    size.encode(buf);
+    buf.put_slice(&tmp);
+
     Ok(())
 }
 
@@ -584,12 +582,53 @@ mod tests {
 
     #[test]
     fn response_charges_repeated_static_fields() {
-        let headers = payload(&encode_response());
-        let mut repeated = headers.clone();
-        for _ in 0..500 {
-            repeated.extend_from_slice(&headers[2..]);
-        }
-        assert_section_too_large(ConnectResponse::decode(&mut reframe(&repeated).as_slice()));
+        let mut headers = payload(&encode_response());
+        // The indexed `:status: 200` line is one byte but costs 42 decoded bytes.
+        let status = headers[2];
+        assert_eq!(status, 0b1100_0000 | 25);
+        headers.resize(headers.len() + 500, status);
+        assert!(headers.len() < MAX_FIELD_SECTION_SIZE as usize);
+        assert_section_too_large(ConnectResponse::decode(&mut reframe(&headers).as_slice()));
+    }
+
+    #[tokio::test]
+    async fn request_encode_refuses_field_section_over_limit() {
+        // The pseudo-headers for https://example.com/ cost 234 bytes; `x-pad` costs 37 plus its value.
+        let fill = MAX_FIELD_SECTION_SIZE as usize - 234 - 37;
+        let request = |len: usize| {
+            ConnectRequest::new(Url::parse("https://example.com/").unwrap()).with_header(
+                http::HeaderName::from_static("x-pad"),
+                http::HeaderValue::from_str(&"a".repeat(len)).unwrap(),
+            )
+        };
+
+        let mut wire = Vec::new();
+        request(fill).encode(&mut wire).unwrap();
+        let decoded = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.headers["x-pad"].len(), fill);
+
+        let mut wire = Vec::new();
+        assert_section_too_large(request(fill + 1).encode(&mut wire));
+        assert_section_too_large(request(fill + 1).write(&mut wire).await);
+        assert!(
+            wire.is_empty(),
+            "a refused request wrote {} bytes",
+            wire.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn response_encode_refuses_field_section_over_limit() {
+        let response =
+            ConnectResponse::OK.with_protocol("a".repeat(MAX_FIELD_SECTION_SIZE as usize));
+        let mut wire = Vec::new();
+        assert_section_too_large(response.encode(&mut wire));
+        assert_section_too_large(response.write(&mut wire).await);
+        assert!(
+            wire.is_empty(),
+            "a refused response wrote {} bytes",
+            wire.len()
+        );
     }
 
     // RFC 7541 Appendix B gives 'a' the five-bit code 00011.
