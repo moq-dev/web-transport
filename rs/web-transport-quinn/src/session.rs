@@ -1,7 +1,7 @@
 use crate::error::CloseReason;
 use std::{
     fmt,
-    future::Future,
+    future::{poll_fn, Future},
     io::Cursor,
     ops::Deref,
     pin::Pin,
@@ -171,9 +171,11 @@ impl Session {
             parked_accept_bi: Default::default(),
         };
 
-        // Run a background task to read capsules from the CONNECT recv stream.
+        // Run a background task to read capsules from the CONNECT recv stream, on whichever
+        // runtime quinn detects, as quinn's own Endpoint::client and Endpoint::server do.
+        let runtime = quinn::default_runtime().expect("no async runtime found");
         let conn2 = this.conn.clone();
-        tokio::spawn(Self::run_recv(conn2, connect.recv, error));
+        runtime.spawn(Box::pin(Self::run_recv(conn2, connect.recv, error)));
 
         this
     }
@@ -391,9 +393,14 @@ impl Session {
     /// capsule is written on the CONNECT stream before the QUIC connection is closed.
     /// This allows browser clients to receive the close code and reason via `WebTransport.closed`.
     ///
-    /// The capsule write and connection close happen asynchronously in a spawned task.
-    /// Callers should `await` [`Session::closed()`] to ensure the capsule has been
-    /// delivered. Session operations will fail once the QUIC connection is closed.
+    /// The capsule write and connection close happen asynchronously in a task spawned on
+    /// the runtime [`quinn::default_runtime`] detects. Callers should `await`
+    /// [`Session::closed()`] to ensure the capsule has been delivered. Session operations
+    /// will fail once the QUIC connection is closed.
+    ///
+    /// When called where no runtime can be detected, such as outside a tokio runtime with
+    /// only quinn's tokio support enabled, the capsule is skipped and the QUIC connection is
+    /// closed immediately with the same code and reason.
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
@@ -411,15 +418,25 @@ impl Session {
             let send = self.connect_send.lock().unwrap().take();
 
             if let Some(send) = send {
+                // Without a runtime to run the graceful close on, such as when called from
+                // outside one, close the connection now and carry the reason there instead.
+                let Some(runtime) = quinn::default_runtime() else {
+                    let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
+                        .try_into()
+                        .unwrap();
+                    self.conn.close(http3_code, reason);
+                    return;
+                };
+
                 let reason = String::from_utf8_lossy(reason).into_owned();
                 let conn = self.conn.clone();
                 let capsule =
                     web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
                 let timeout = (self.rtt() * 3).max(Duration::from_millis(100));
 
-                tokio::spawn(async move {
-                    Self::close_with_capsule(conn, send, capsule, code, timeout).await;
-                });
+                runtime.clone().spawn(Box::pin(async move {
+                    Self::close_with_capsule(conn, send, capsule, code, timeout, runtime).await;
+                }));
             }
         } else {
             // Raw QUIC mode: no capsule needed.
@@ -435,6 +452,7 @@ impl Session {
         capsule: web_transport_proto::Capsule,
         code: u32,
         timeout: std::time::Duration,
+        runtime: Arc<dyn quinn::Runtime>,
     ) {
         let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
             .try_into()
@@ -479,7 +497,14 @@ impl Session {
             conn.closed().await;
         };
 
-        if tokio::time::timeout(timeout, graceful).await.is_err() {
+        // Timer deadlines are on the runtime's clock, which need not match Instant::now.
+        let mut timer = runtime.new_timer(runtime.now() + timeout);
+        let expired = poll_fn(|cx| timer.as_mut().poll(cx));
+
+        futures::pin_mut!(graceful, expired);
+
+        if let futures::future::Either::Right(_) = futures::future::select(graceful, expired).await
+        {
             tracing::debug!("timeout waiting for peer to close; force-closing connection");
             conn.close(http3_code, b"");
         }
@@ -1428,5 +1453,85 @@ mod tests {
         let (_client, server, _endpoints) = pair_with(transport).await;
 
         assert_eq!(Session::raw(server).max_datagram_size(), 0);
+    }
+
+    /// How far [`OffsetRuntime`]'s clock runs ahead of the real one, well past any close timeout.
+    const OFFSET: Duration = Duration::from_secs(60 * 60);
+
+    /// Quinn's tokio runtime with a clock that runs [`OFFSET`] ahead of `Instant::now`, as
+    /// tokio's paused time or a simulator can. It records every deadline it is asked to time.
+    #[derive(Debug, Default)]
+    struct OffsetRuntime {
+        deadlines: Mutex<Vec<std::time::Instant>>,
+    }
+
+    impl quinn::Runtime for OffsetRuntime {
+        fn new_timer(&self, deadline: std::time::Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+            self.deadlines.lock().unwrap().push(deadline);
+
+            // Move the deadline onto the real clock; one already in this clock's past fires at once.
+            let remaining = deadline.saturating_duration_since(self.now());
+            quinn::TokioRuntime.new_timer(std::time::Instant::now() + remaining)
+        }
+
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            quinn::TokioRuntime.spawn(future)
+        }
+
+        fn wrap_udp_socket(
+            &self,
+            socket: std::net::UdpSocket,
+        ) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+            quinn::TokioRuntime.wrap_udp_socket(socket)
+        }
+
+        fn now(&self) -> std::time::Instant {
+            std::time::Instant::now() + OFFSET
+        }
+    }
+
+    /// The graceful close bounds its wait for the peer with a timer on the runtime it runs
+    /// on, so the deadline has to be ahead of that runtime's clock rather than `Instant::now`.
+    #[tokio::test]
+    async fn close_deadline_follows_the_runtime_clock() {
+        use quinn::Runtime;
+
+        let (client, _server, _endpoints) = pair().await;
+        let (send, _recv) = client.open_bi().await.unwrap();
+
+        let runtime = Arc::new(OffsetRuntime::default());
+        let before = runtime.now();
+
+        // The peer never closes, so only the timer can end the graceful close.
+        let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
+            code: 0,
+            reason: "bye".into(),
+        };
+        Session::close_with_capsule(
+            client.clone(),
+            send,
+            capsule,
+            0,
+            Duration::from_millis(100),
+            runtime.clone(),
+        )
+        .await;
+
+        let deadlines = runtime.deadlines.lock().unwrap().clone();
+        assert_eq!(deadlines.len(), 1, "close did not time out on the runtime");
+        assert!(
+            deadlines[0] > before,
+            "the close deadline is {:?} behind the runtime's clock",
+            before - deadlines[0]
+        );
+        assert!(client.close_reason().is_some(), "the timeout did not close");
+    }
+
+    /// Sessions and requests do not store the runtime, so they stay unwind safe.
+    #[test]
+    fn unwind_safe() {
+        fn assert<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert::<Session>();
+        assert::<crate::Request>();
     }
 }
