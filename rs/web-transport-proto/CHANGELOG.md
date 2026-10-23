@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.6.2...web-transport-proto-v0.6.3) - 2026-10-23
+
+### Other
+
+- Bound decoded CONNECT field sections ([#458](https://github.com/moq-dev/web-transport/pull/458))
+
 ## [0.6.1](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.6.0...web-transport-proto-v0.6.1) - 2026-08-06
 
 ### Other

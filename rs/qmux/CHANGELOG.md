@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.5...qmux-v0.6.6) - 2026-10-23
+
+### Fixed
+
+- *(qmux)* serialize credit updates and accept stale limits ([#451](https://github.com/moq-dev/web-transport/pull/451))
+
 ## [0.6.5](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.4...qmux-v0.6.5) - 2026-10-22
 
 ### Fixed
