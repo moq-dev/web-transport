@@ -6,7 +6,7 @@ Rust and TypeScript QMux close the session when the peer sends MAX_STREAM_DATA o
 
 ## Plan
 
-A locally initiated stream is unopened when its index is at or beyond the next index this side will allocate in that direction. Frames for streams that were opened and have since closed stay ignored. Use the existing errors: Rust returns `Error::InvalidStreamId`, matching the receive-only MAX_STREAM_DATA and STOP_SENDING direction checks; TypeScript throws like its existing receive-only check. Do not add a public error variant.
+A locally initiated stream is unopened when its index is at or beyond the next index this side will allocate in that direction. Frames for streams that were opened and have since closed stay ignored, and handling of peer-initiated streams is unchanged. Use the existing errors: Rust returns `Error::InvalidStreamId`, matching the receive-only MAX_STREAM_DATA and STOP_SENDING direction checks; TypeScript throws like its existing receive-only check. Do not add a public error variant. The close keeps the existing CONNECTION_CLOSE code 1002 that every detected violation uses; per-error RFC 9000 wire codes are out of scope.
 
 Read the next-index state without introducing a new lock order; the frame handlers already take the streams lock. Cover uni and bidi, opened, closed and unopened streams, and the TypeScript direction check with scripted-peer session tests in both languages.
 
