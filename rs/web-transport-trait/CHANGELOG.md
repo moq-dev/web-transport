@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.5.1...web-transport-trait-v0.5.2) - 2026-10-22
+
+### Other
+
+- Make safe receive defaults sound ([#444](https://github.com/moq-dev/web-transport/pull/444))
+
 ## [0.5.1](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.5.0...web-transport-trait-v0.5.1) - 2026-10-20
 
 ### Added

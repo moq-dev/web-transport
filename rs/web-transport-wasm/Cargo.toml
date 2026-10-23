@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -51,6 +51,8 @@ features = [
 
 [dev-dependencies]
 futures = "0.3"
+# Pair the harness schema with the CLI in flake.nix without pinning consumers.
+wasm-bindgen = "=0.2.126"
 
 # `Window` is only needed by the harness, for its timeouts.
 [dev-dependencies.web-sys]

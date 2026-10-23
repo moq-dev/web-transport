@@ -59,10 +59,12 @@
           # implying release equality. nixpkgs follows its own default, which
           # drifts independently, hence the explicit version.
           #
-          # `wasm-bindgen = "0.2"` with an ignored Cargo.lock means the crate
-          # can resolve past this on its own. That surfaces as the harness's
-          # schema error, which names both versions and the command to fix it.
+          # The WASM package pins its harness dev-dependency to this release;
+          # update both together. Published library consumers keep a broad range.
           pkgs.wasm-bindgen-cli_0_2_126
+          # Localhost certificate generation for the browser harness.
+          pkgs.openssl
+          pkgs.xxd
           pkgs.python312
           pkgs.uv
           pkgs.pkg-config

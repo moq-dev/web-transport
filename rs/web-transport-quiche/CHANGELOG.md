@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.2...web-transport-quiche-v0.8.3) - 2026-10-22
+
+### Other
+
+- Test Quiche pre-accept stream retirement deterministically ([#450](https://github.com/moq-dev/web-transport/pull/450))
+- Release Quiche capsule reader on final session drop ([#445](https://github.com/moq-dev/web-transport/pull/445))
+
 ## [0.8.2](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.1...web-transport-quiche-v0.8.2) - 2026-10-20
 
 ### Other

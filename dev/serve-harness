@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+target=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+mkdir -p "$target/browser-results"
+log="$target/browser-results/peer.log"
+peer=""
+http=""
+cleanup() {
+    trap - EXIT INT TERM
+    # SIGKILL gives a bounded cleanup even if a child stops responding.
+    for pid in "$http" "$peer"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            # A child may exit between the liveness check and kill.
+            kill -KILL "$pid" 2>/dev/null || :
+        fi
+    done
+    # Reaping a deliberately killed child returns nonzero; cleanup already succeeded.
+    for pid in "$http" "$peer"; do
+        if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || :; fi
+    done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+"$target/debug/examples/harness-server" --tls-cert dev/localhost.crt --tls-key dev/localhost.key >"$log" 2>&1 &
+peer=$!
+# The peer logs this only after binding its UDP socket successfully.
+ready=false
+for ((attempt=0; attempt<100; attempt++)); do
+    if ! kill -0 "$peer" 2>/dev/null; then
+        cat "$log" >&2
+        echo 'QUIC harness peer exited before readiness' >&2
+        exit 1
+    fi
+    if grep -q 'harness server listening' "$log"; then ready=true; break; fi
+    sleep 0.1
+done
+if [ "$ready" != true ]; then
+    cat "$log" >&2
+    echo 'QUIC harness peer was not ready within 10 seconds' >&2
+    exit 1
+fi
+
+python3 -m http.server "${1:-8080}" --bind 127.0.0.1 --directory "$target/harness" &
+http=$!
+echo "==> open http://localhost:${1:-8080}/"
+# Stop the whole service if either process exits; Playwright owns this process group.
+wait -n "$peer" "$http"

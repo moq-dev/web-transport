@@ -19,10 +19,40 @@ while the underlying browser stream locks are shared — a browser stream can on
 
 ## Testing
 
-CI only compiles this crate: the browser API it wraps exists nowhere else, so the poll paths have no
-automated coverage. `just harness` builds a browser harness and the QUIC peer that drives it, then
-serves the page for a browser to open. It exercises accept, a peer reset code, closed-watches racing
-buffered bytes, datagrams, and a session close, and reports a row per check.
+Pull requests run the harness in headless Chromium on Linux through Playwright. Every result row
+must pass, including clone/cancellation, stream-opening cleanup, peer reset, datagram and close
+checks. Missing browser dependencies, an unavailable peer, page errors and timeouts fail the run.
+
+Controlled stream-open fixtures preserve errors from synchronous exceptions and rejected promises
+for both stream directions, including opening again after an error.
+
+Controlled browser `WritableStream` fixtures additionally exercise datagram writers whose close
+step is still pending, already-closed writers, and dropped send-task ownership without network
+timing. They model the Streams contract; clean closure has not been reproduced through a real
+WebTransport session, whose teardown currently exercises the errored-writer path in Chromium.
+
+From the workspace root:
+
+```sh
+nix develop
+bun install --frozen-lockfile
+bunx playwright install --with-deps chromium
+just test-browser
+```
+
+The browser installation command installs Linux system dependencies through the host package
+manager; install those separately when using NixOS. The harness dev-dependency and Nix shell pin
+the wasm-bindgen crate/CLI schema. The repository Cargo configuration supplies the unstable
+web-sys flags. The build
+honors `CARGO_TARGET_DIR`. Playwright reports, traces, screenshots and peer logs are written under
+that target directory's `browser-results` folder; CI uploads them on failure. No browser coverage
+is silently skipped and failed checks are not retried.
+
+For interactive inspection, `just harness` builds the same page and QUIC peer, then serves it at
+`http://localhost:8080` (`just harness 8081` selects another HTTP port). Both commands generate a
+short-lived localhost certificate with `dev/setup` when needed. The QUIC peer binds UDP port 4443;
+stop other harness instances first. The automated runner waits for peer and HTTP readiness and
+bounds startup, test execution and process cleanup.
 
 ## Requirements
 

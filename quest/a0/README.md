@@ -10,10 +10,8 @@ The Required list is ordered by priority. Independent children may proceed concu
 
 ## Required
 
+- [Bound decoded CONNECT headers](/quest/a0/qpack-field-section.md) - a CONNECT can make its receiver hold at most a 16 KiB field section, released as web-transport-proto 0.6.3
 - [Quinn final Session drop](/quest/a0/quinn-session-drop.md) - close the connection and release the capsule reader
-- [Noq close cancellation](/quest/a0/noq-close-cancellation.md) - release sessions when graceful-close futures are cancelled
 - [Quiche lifecycle](/quest/a0/quiche/README.md) - deterministic harness and retirement handling
-- [WASM datagram closure](/quest/a0/wasm-datagram-closure.md) - terminate cleanly closed writers
-- [Browser regression CI](/quest/a0/browser-ci.md) - execute Chromium harness
 - [QMux socket teardown](/quest/a0/qmux-socket-teardown.md) - release retained stats descriptors
 - [WebSocket handshake timeout](/quest/a0/qmux-ws-handshake-timeout.md) - close sessions whose peer never sends parameters

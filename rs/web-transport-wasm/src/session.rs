@@ -7,9 +7,9 @@ use std::{
 };
 
 use bytes::Bytes;
-use js_sys::{Function, Reflect, Uint8Array};
+use js_sys::{Function, Promise, Reflect, Uint8Array};
 use url::Url;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
@@ -22,6 +22,26 @@ use crate::{
     js::{promise, read_value, Op},
     Error, RecvStream, SendStream,
 };
+
+// The web-sys stream-open methods do not catch synchronous browser exceptions.
+// A closed transport can throw before returning its promise.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = WebTransport, js_name = WebTransport)]
+    type StreamTransport;
+
+    #[wasm_bindgen(method, structural, catch, js_name = createUnidirectionalStream)]
+    fn create_unidirectional_stream(
+        this: &StreamTransport,
+        options: &WebTransportSendStreamOptions,
+    ) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(method, structural, catch, js_name = createBidirectionalStream)]
+    fn create_bidirectional_stream(
+        this: &StreamTransport,
+        options: &WebTransportSendStreamOptions,
+    ) -> Result<Promise, JsValue>;
+}
 
 /// A session represents a connection between a client and a server.
 ///
@@ -39,7 +59,7 @@ pub struct Session {
     accept_bi: IncomingOp,
     open_uni: Op,
     open_bi: Op,
-    send_datagram: Op,
+    send_datagram: DatagramSend,
     recv_datagram: IncomingOp,
     closed: Op,
 }
@@ -59,6 +79,20 @@ struct Shared {
     accept_bi: Incoming,
     datagrams: Incoming,
     send_datagram: RefCell<Option<WritableStreamDefaultWriter>>,
+}
+
+/// Retain which readiness promise an in-flight capacity wait observes.
+#[derive(Default)]
+struct DatagramSend {
+    operation: Op,
+    ready: RefCell<Option<Promise>>,
+}
+
+impl Clone for DatagramSend {
+    fn clone(&self) -> Self {
+        // A clone starts idle, including the identity of its capacity wait.
+        Self::default()
+    }
 }
 
 /// One browser stream this session reads from.
@@ -246,7 +280,7 @@ impl Session {
             accept_bi: IncomingOp::default(),
             open_uni: Op::default(),
             open_bi: Op::default(),
-            send_datagram: Op::default(),
+            send_datagram: DatagramSend::default(),
             recv_datagram: IncomingOp::default(),
             closed: Op::default(),
         }
@@ -293,7 +327,10 @@ impl Session {
     pub fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, Error>> {
         let inner = &self.shared.inner;
         let stream = ready!(self.open_uni.poll(cx, || {
-            promise(inner.create_unidirectional_stream_with_options(&stream_options()))
+            inner
+                .unchecked_ref::<StreamTransport>()
+                .create_unidirectional_stream(&stream_options())
+                .unwrap_or_else(|error| Promise::reject(&error))
         }))?;
 
         Poll::Ready(SendStream::new(stream.unchecked_into()))
@@ -307,7 +344,10 @@ impl Session {
     ) -> Poll<Result<(SendStream, RecvStream), Error>> {
         let inner = &self.shared.inner;
         let stream = ready!(self.open_bi.poll(cx, || {
-            promise(inner.create_bidirectional_stream_with_options(&stream_options()))
+            inner
+                .unchecked_ref::<StreamTransport>()
+                .create_bidirectional_stream(&stream_options())
+                .unwrap_or_else(|error| Promise::reject(&error))
         }))?;
 
         Poll::Ready(bi_streams(stream.unchecked_into()))
@@ -317,7 +357,8 @@ impl Session {
     ///
     /// Returns [`Poll::Pending`] until the browser has accepted the *previous*
     /// datagram, so a caller waits for capacity instead of piling up payloads. The
-    /// payload is untouched while pending.
+    /// payload is untouched while pending. A cleanly closed datagram writer
+    /// returns [`Error::Closed`].
     pub fn poll_send_datagram(
         &self,
         cx: &mut Context<'_>,
@@ -325,7 +366,9 @@ impl Session {
     ) -> Poll<Result<(), Error>> {
         // Draining the previous write is what bounds this path: one datagram
         // outstanding per handle, never a queue.
-        ready!(self.send_datagram.poll_settled(cx))?;
+        let settled = ready!(self.send_datagram.operation.poll_settled(cx));
+        let mut observed_ready = self.send_datagram.ready.borrow_mut().take();
+        settled?;
 
         let writer = match self.datagram_writer() {
             Ok(writer) => writer,
@@ -338,21 +381,34 @@ impl Session {
         loop {
             match writer.desired_size() {
                 Ok(size) if datagram_has_capacity(size) => break,
-                Ok(_) => match self.send_datagram.poll(cx, || promise(writer.ready())) {
-                    Poll::Pending => return Poll::Pending,
-                    // Recheck, and resubscribe when the capacity is gone again. A
-                    // clone that lost the race to it holds a `ready` that has
-                    // already fulfilled and never will again, so only the writer's
-                    // current promise can wake it — the slot this `poll` just
-                    // cleared is what the next pass subscribes through. Waiting on
-                    // `closed` here instead would wait out the session, which is
-                    // the deadlock `concurrent_datagram_senders` pins.
-                    //
-                    // A writer that closed rather than filled rejects `ready`, so
-                    // that case leaves through the arm below rather than spinning.
-                    Poll::Ready(Ok(_)) => continue,
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                },
+                Ok(size) => {
+                    let current_ready = promise(writer.ready());
+                    // An open writer replaces `ready` when backpressure returns.
+                    // If the same fulfilled promise still has no capacity, close
+                    // is queued or complete. Do not wait for `closed`: its sink
+                    // may need browser tasks that a ready wake loop would starve.
+                    // None instead denotes an error; poll ready for its cause.
+                    if size.is_some()
+                        && observed_ready.as_ref().is_some_and(|observed| {
+                            js_sys::Object::is(observed.as_ref(), current_ready.as_ref())
+                        })
+                    {
+                        return Poll::Ready(Err(Error::Closed));
+                    }
+
+                    match self
+                        .send_datagram
+                        .operation
+                        .poll(cx, || current_ready.clone())
+                    {
+                        Poll::Pending => {
+                            *self.send_datagram.ready.borrow_mut() = Some(current_ready);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Ok(_)) => observed_ready = Some(current_ready),
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    }
+                }
                 Err(err) => return Poll::Ready(Err(err.into())),
             }
         }
@@ -403,7 +459,9 @@ impl Session {
 
     /// Hand a datagram over, keeping the write as this handle's in-flight operation.
     fn write_datagram(&self, writer: &WritableStreamDefaultWriter, payload: &[u8]) {
+        self.send_datagram.ready.borrow_mut().take();
         self.send_datagram
+            .operation
             .start(promise(writer.write_with_chunk(&Uint8Array::from(payload))));
     }
 

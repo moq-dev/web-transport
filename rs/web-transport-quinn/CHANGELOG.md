@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.3...web-transport-quinn-v0.13.4) - 2026-10-22
+
+### Other
+
+- Run WASM browser regressions in Chromium CI ([#454](https://github.com/moq-dev/web-transport/pull/454))
+
 ## [0.13.3](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.2...web-transport-quinn-v0.13.3) - 2026-10-20
 
 ### Other
