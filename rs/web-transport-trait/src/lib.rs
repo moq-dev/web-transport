@@ -12,12 +12,14 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// Methods return `Option` — `None` means the implementation doesn't track
 /// this metric, while `Some(0)` means actually zero.
 pub trait Stats {
-    /// Total bytes sent over the connection, including retransmissions and overhead.
+    /// Total bytes sent over the connection, including retransmissions and transport overhead.
+    /// TCP counts payload on the wire, excluding TCP/IP headers.
     fn bytes_sent(&self) -> Option<u64> {
         None
     }
 
-    /// Total bytes received over the connection, including duplicate and overhead.
+    /// Total bytes received over the connection, including transport overhead.
+    /// TCP reports delivered payload, excluding duplicate retransmissions and TCP/IP headers.
     fn bytes_received(&self) -> Option<u64> {
         None
     }
