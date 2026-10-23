@@ -328,6 +328,18 @@ export interface AcceptOptions extends Pick<SessionOptions, "config" | "sendBuff
 	protocol?: string;
 }
 
+/** Options for [[Session.createBidirectionalStream]] and
+ *  [[Session.createUnidirectionalStream]]. */
+export interface SendStreamOptions extends WebTransportSendStreamOptions {
+	/** Whether to wait for the peer to grant stream-count credit.
+	 *
+	 *  When omitted or `true`, stream creation waits until the peer allows
+	 *  another stream. When `false`, creation rejects immediately with a
+	 *  `DOMException` named `QuotaExceededError` if no credit is available,
+	 *  matching the W3C WebTransport behavior. */
+	waitUntilAvailable?: boolean;
+}
+
 /** Default send-buffer high-water mark (bytes) for the WebSocketStream ponyfill. */
 const DEFAULT_SEND_BUFFER_SIZE = 64 * 1024;
 
@@ -1676,9 +1688,9 @@ export default class Session implements WebTransport {
 		});
 	}
 
-	async createBidirectionalStream(
-		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
-	): Promise<WebTransportBidirectionalStream> {
+	/** Open a bidirectional stream. Waits for stream-count credit unless
+	 *  `options.waitUntilAvailable` is `false`; see [[SendStreamOptions]]. */
+	async createBidirectionalStream(options?: SendStreamOptions): Promise<WebTransportBidirectionalStream> {
 		await this.ready;
 
 		if (this.#closed) {
@@ -1754,9 +1766,9 @@ export default class Session implements WebTransport {
 		return { readable: recvStream.readable, writable: writer };
 	}
 
-	async createUnidirectionalStream(
-		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
-	): Promise<WritableStream<Uint8Array>> {
+	/** Open a unidirectional stream. Waits for stream-count credit unless
+	 *  `options.waitUntilAvailable` is `false`; see [[SendStreamOptions]]. */
+	async createUnidirectionalStream(options?: SendStreamOptions): Promise<WritableStream<Uint8Array>> {
 		await this.ready;
 
 		if (this.#closed) {
@@ -1815,10 +1827,7 @@ export default class Session implements WebTransport {
 		return writer;
 	}
 
-	async #claimStreamCredit(
-		credit: Credit,
-		options?: WebTransportSendStreamOptions & { waitUntilAvailable?: boolean },
-	): Promise<void> {
+	async #claimStreamCredit(credit: Credit, options?: SendStreamOptions): Promise<void> {
 		if (options?.waitUntilAvailable === false) {
 			if (credit.tryClaim(1n) === 0n) throw new DOMException(undefined, "QuotaExceededError");
 			return;
