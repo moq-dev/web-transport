@@ -40,3 +40,26 @@ They are basically UDP packets, except they are encrypted and congestion control
 
 # Usage
 To use web-transport-quiche, figure it out yourself lul.
+
+## Session lifetime
+
+`Connection` clones share ownership of a session. Dropping the final clone
+requests immediate QUIC closure and cancels its capsule reader.
+Retained streams or native `ez::Connection` handles do not keep the session alive.
+Raw QUIC sessions use the same final-clone ownership boundary.
+
+Call `Connection::close` before dropping to choose the close code and reason;
+final drop preserves an explicit close already in progress. Await
+`Connection::closed` when the application needs the driver to complete teardown.
+
+## Testing
+
+Run `cargo test -p web-transport-quiche` for the unit tests and socket integration
+coverage. Driver lifecycle tests in `src/ez/driver/tests.rs` use an in-memory QUIC
+pair: packet delivery is explicit and separate from driver callbacks, so a test
+can deliver `STOP_SENDING` before accepting a stream without a socket race or
+sleep. Certificates are generated in memory; no fixture files are needed.
+
+For a focused run, use `cargo test -p web-transport-quiche --lib ez::driver::tests`.
+The pair pumps queued packets only; tests that need QUIC timer expiry require a
+separate clock-driving seam.

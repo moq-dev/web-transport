@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.4...qmux-v0.6.5) - 2026-10-22
+
+### Fixed
+
+- *(qmux)* release stream waiters at terminal teardown ([#437](https://github.com/moq-dev/web-transport/pull/437))
+
+## [0.6.4](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.3...qmux-v0.6.4) - 2026-10-20
+
+### Added
+
+- report stream occupancy and remaining opening credit ([#440](https://github.com/moq-dev/web-transport/pull/440))
+
 ## [0.6.3](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.2...qmux-v0.6.3) - 2026-10-14
 
 ### Added

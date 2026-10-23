@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.4...web-transport-wasm-v0.8.5) - 2026-10-22
+
+### Other
+
+- Run WASM browser regressions in Chromium CI ([#454](https://github.com/moq-dev/web-transport/pull/454))
+- Terminate datagram sends on clean browser writer closure ([#449](https://github.com/moq-dev/web-transport/pull/449))
+
+## [0.8.4](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.3...web-transport-wasm-v0.8.4) - 2026-10-20
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.8.3](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.2...web-transport-wasm-v0.8.3) - 2026-10-14
 
 ### Other

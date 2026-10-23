@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.4.2"
+version = "0.4.4"
 edition = "2021"
 
 keywords = ["quic", "http3", "webtransport"]
@@ -55,5 +55,5 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rcgen = "0.14"
 rustls-pemfile = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
