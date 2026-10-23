@@ -287,6 +287,17 @@ const QX_PING_RESPONSE = 0x348c67529ef8c7ben;
 // RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset), permitted by QMux
 // draft-02. Decode-only: accepted, validated, and treated as a plain reset.
 const RESET_STREAM_AT = 0x24n;
+// RFC 9000 §19.11: a stream count above 2^60 can't be encoded as a stream ID.
+const MAX_STREAM_COUNT = 1n << 60n;
+
+/** Validate a decoded MAX_STREAMS count; one above 2^60 is a FRAME_ENCODING_ERROR. */
+function maxStreams(max: bigint): bigint {
+	if (max > MAX_STREAM_COUNT) {
+		throw new Error("MAX_STREAMS exceeds 2^60");
+	}
+	return max;
+}
+
 // max_record_size transport parameter ID
 const MAX_RECORD_SIZE_ID = 0x0571c59429cd0845n;
 // application_protocols transport parameter ID (QMux-specific, non-TLS ALPN).
@@ -897,13 +908,13 @@ function decodeQMux(buffer: Uint8Array): Any | null {
 	// MAX_STREAMS (bidi)
 	if (frameType === 0x12n) {
 		[v, buffer] = VarInt.decode(buffer);
-		return { type: "max_streams_bidi", max: v.value };
+		return { type: "max_streams_bidi", max: maxStreams(v.value) };
 	}
 
 	// MAX_STREAMS (uni)
 	if (frameType === 0x13n) {
 		[v, buffer] = VarInt.decode(buffer);
-		return { type: "max_streams_uni", max: v.value };
+		return { type: "max_streams_uni", max: maxStreams(v.value) };
 	}
 
 	// DATA_BLOCKED
@@ -1087,13 +1098,13 @@ function decodeQMuxOne(buffer: Uint8Array): [Any | null, Uint8Array] | null {
 	// MAX_STREAMS (bidi)
 	if (frameType === 0x12n) {
 		[v, buffer] = VarInt.decode(buffer);
-		return [{ type: "max_streams_bidi", max: v.value }, buffer];
+		return [{ type: "max_streams_bidi", max: maxStreams(v.value) }, buffer];
 	}
 
 	// MAX_STREAMS (uni)
 	if (frameType === 0x13n) {
 		[v, buffer] = VarInt.decode(buffer);
-		return [{ type: "max_streams_uni", max: v.value }, buffer];
+		return [{ type: "max_streams_uni", max: maxStreams(v.value) }, buffer];
 	}
 
 	// DATA_BLOCKED

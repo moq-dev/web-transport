@@ -67,13 +67,12 @@ export class Credit {
 		this.#wake();
 	}
 
-	/** Increase the max. Returns false if new_max < current max. */
-	increaseMax(newMax: bigint): boolean {
-		if (newMax < this.#max) return false;
-		if (newMax === this.#max) return true;
+	/** Raise the max to `newMax`. A non-increasing value is stale and ignored,
+	 *  as RFC 9000 §19.9–§19.11 require for MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS. */
+	increaseMax(newMax: bigint): void {
+		if (newMax <= this.#max) return;
 		this.#max = newMax;
 		this.#wake();
-		return true;
 	}
 
 	/** Close the credit, rejecting all pending and future `claim()` calls.

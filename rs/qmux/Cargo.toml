@@ -49,6 +49,11 @@ url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
+[[bench]]
+name = "credit"
+harness = false
+required-features = ["tcp"]
+
 [[example]]
 name = "h3qx"
 required-features = ["tcp"]

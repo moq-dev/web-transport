@@ -494,6 +494,65 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	test("stale MAX_STREAMS, MAX_DATA and MAX_STREAM_DATA limits are ignored", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({
+			type: "transport_parameters",
+			params: peerParams({ initialMaxStreamsUni: 1n, initialMaxData: 4n, initialMaxStreamDataUni: 4n }),
+		});
+
+		const first = (await session.createUnidirectionalStream()).getWriter();
+		const id = Stream.Id.create(0n, Stream.Dir.Uni, false);
+
+		// Each larger limit is followed by a lower and an equal one, as reordered
+		// updates from a peer would arrive. None may close the session or shrink credit.
+		peer.send({ type: "max_streams_uni", max: 3n });
+		peer.send({ type: "max_streams_uni", max: 2n });
+		peer.send({ type: "max_streams_uni", max: 3n });
+		peer.send({ type: "max_data", max: 8n });
+		peer.send({ type: "max_data", max: 6n });
+		peer.send({ type: "max_stream_data", id, max: 8n });
+		peer.send({ type: "max_stream_data", id, max: 6n });
+		peer.send({ type: "ping_request", sequence: 1n });
+		await waitFor(() => peer.has("ping_response"));
+
+		await session.createUnidirectionalStream();
+		await session.createUnidirectionalStream();
+		await first.write(new Uint8Array(8));
+		await waitFor(() => peer.count("stream") >= 1);
+		const sent = peer
+			.received()
+			.filter((f): f is Frame.Data => f.type === "stream" && f.id.value.value === id.value.value)
+			.reduce((n, f) => n + f.data.byteLength, 0);
+		expect(sent).toBe(8);
+		expect(peer.has("connection_close")).toBe(false);
+		session.close();
+	});
+
+	test("MAX_STREAMS above 2^60 is a connection error", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		peer.send({ type: "max_streams_bidi", max: (1n << 60n) + 1n });
+
+		await expectSessionFailure(session);
+		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
+	test("MAX_STREAM_DATA on a receive-only stream is a connection error", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+
+		// A server-initiated uni stream is receive-only for this client.
+		peer.send({ type: "max_stream_data", id: Stream.Id.create(0n, Stream.Dir.Uni, true), max: 10n });
+
+		await expectSessionFailure(session);
+		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
 	test("draft-01 tolerates the legacy zero final_size after data", async () => {
 		const { session, peer } = connect();
 		await session.ready;
