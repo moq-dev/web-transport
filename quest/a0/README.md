@@ -10,7 +10,6 @@ The Required list is ordered by priority. Independent children may proceed concu
 
 ## Required
 
-- [Bound decoded CONNECT headers](/quest/a0/qpack-field-section.md) - a CONNECT can make its receiver hold at most a 16 KiB field section, released as web-transport-proto 0.6.3
 - [Quinn final Session drop](/quest/a0/quinn-session-drop.md) - close the connection and release the capsule reader
 - [Quiche lifecycle](/quest/a0/quiche/README.md) - deterministic harness and retirement handling
 - [QMux socket teardown](/quest/a0/qmux-socket-teardown.md) - release retained stats descriptors
