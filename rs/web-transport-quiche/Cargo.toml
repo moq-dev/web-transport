@@ -49,6 +49,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rcgen = "0.14"
 rustls-pemfile = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
