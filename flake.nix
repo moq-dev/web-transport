@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     # Quest serves its guide and skills; the repository keeps only skill stubs.
     quest = {
-      url = "github:kixelated/quest/v0.1.0";
+      url = "github:kixelated/quest/ed657ba9362a941b3be9bbea55120a3c5a90374c";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };
