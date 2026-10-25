@@ -18,3 +18,6 @@ __pycache__/
 # Playwright
 playwright-report/
 test-results/
+
+# Agent scratch
+/.tmp/
