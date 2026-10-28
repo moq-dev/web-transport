@@ -72,6 +72,10 @@ test:
 	bun run --cwd js/qmux test
 	bun run --cwd js/qmux test:interop
 
+	# The Node polyfill's tests load its native module.
+	bun run --cwd js/web-transport build
+	bun run --cwd js/web-transport test
+
 # Automatically fix some issues.
 fix:
 	cargo fix --allow-staged --allow-dirty --workspace --all-targets --all-features

@@ -36,6 +36,43 @@ fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiC
     }
 }
 
+/// The origin of a stream failure, matching W3C `WebTransportErrorSource`.
+#[napi(string_enum = "lowercase")]
+pub enum NapiErrorSource {
+    /// The peer reset or stopped this stream.
+    Stream,
+    /// The whole session failed.
+    Session,
+}
+
+/// A stream failure carrying the fields of W3C `WebTransportError`.
+#[napi(object)]
+pub struct NapiStreamError {
+    pub source: NapiErrorSource,
+    /// The peer's RESET_STREAM or STOP_SENDING code, or null for a session failure or a code
+    /// outside the WebTransport range.
+    pub stream_error_code: Option<u32>,
+    pub message: String,
+}
+
+impl NapiStreamError {
+    fn stream(code: Option<u32>, message: String) -> Self {
+        Self {
+            source: NapiErrorSource::Stream,
+            stream_error_code: code,
+            message,
+        }
+    }
+
+    fn session(err: &web_transport_quinn::SessionError) -> Self {
+        Self {
+            source: NapiErrorSource::Session,
+            stream_error_code: None,
+            message: err.to_string(),
+        }
+    }
+}
+
 /// A WebTransport client that can connect to servers.
 #[napi]
 pub struct NapiClient {
@@ -423,16 +460,43 @@ pub struct NapiSendStream {
 
 #[napi]
 impl NapiSendStream {
-    /// Write data to the stream.
+    /// Write data to the stream, returning the error if the peer stopped it or the session failed.
     #[napi]
-    pub async fn write(&self, data: Buffer) -> Result<()> {
+    pub async fn write(&self, data: Buffer) -> Result<Option<NapiStreamError>> {
+        use web_transport_quinn::WriteError;
+
         // Own the shared stream for the duration of the future (see module note).
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        stream
-            .write_all(&data)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))
+        let err = match stream.write_all(&data).await {
+            Ok(()) => return Ok(None),
+            Err(err @ WriteError::Stopped(code)) => {
+                NapiStreamError::stream(Some(code), err.to_string())
+            }
+            Err(err @ WriteError::InvalidStopped(_)) => {
+                NapiStreamError::stream(None, err.to_string())
+            }
+            Err(WriteError::SessionError(err)) => NapiStreamError::session(&err),
+            Err(err @ WriteError::ClosedStream) => return Err(Error::from_reason(err.to_string())),
+        };
+        Ok(Some(err))
+    }
+
+    /// Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+    #[napi]
+    pub async fn closed(&self) -> Result<Option<NapiStreamError>> {
+        // Quinn's future owns what it needs, so awaiting it neither borrows the stream (see
+        // module note) nor holds the lock that writes need.
+        let inner = self.inner.clone();
+        let stopped = inner.lock().await.stopped();
+        Ok(match stopped.await {
+            Ok(None) => None,
+            Ok(Some(code)) => Some(NapiStreamError::stream(
+                Some(code),
+                format!("STOP_SENDING: {code}"),
+            )),
+            Err(err) => Some(NapiStreamError::session(&err)),
+        })
     }
 
     /// Signal that no more data will be written.
@@ -474,21 +538,29 @@ pub struct NapiRecvStream {
 
 #[napi]
 impl NapiRecvStream {
-    /// Read up to `max_size` bytes from the stream. Returns null on FIN.
+    /// Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
+    /// peer reset the stream or the session failed.
     #[napi]
-    pub async fn read(&self, max_size: u32) -> Result<Option<Buffer>> {
+    pub async fn read(&self, max_size: u32) -> Result<Option<Either<Buffer, NapiStreamError>>> {
+        use web_transport_quinn::ReadError;
+
         // Own the shared stream for the duration of the future (see module note).
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        let Some(chunk) = stream
-            .read_chunk(max_size as usize, true)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?
-        else {
-            return Ok(None);
+        let err = match stream.read_chunk(max_size as usize, true).await {
+            Ok(chunk) => {
+                return Ok(chunk.map(|chunk| Either::A(Buffer::from(chunk.bytes.to_vec()))))
+            }
+            Err(err @ ReadError::Reset(code)) => {
+                NapiStreamError::stream(Some(code), err.to_string())
+            }
+            Err(err @ ReadError::InvalidReset(_)) => NapiStreamError::stream(None, err.to_string()),
+            Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
+            Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
+                return Err(Error::from_reason(err.to_string()))
+            }
         };
-
-        Ok(Some(Buffer::from(chunk.bytes.to_vec())))
+        Ok(Some(Either::B(err)))
     }
 
     /// Tell the peer to stop sending with the given error code.

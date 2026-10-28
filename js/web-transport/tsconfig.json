@@ -11,7 +11,7 @@
 		"strict": true,
 		"skipLibCheck": true,
 		"rewriteRelativeImportExtensions": true,
-		"types": ["node"]
+		"types": ["node", "bun"]
 	},
 	"include": ["src/**/*"]
 }

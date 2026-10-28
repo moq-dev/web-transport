@@ -1,6 +1,7 @@
 import type { NapiRecvStream, NapiSendStream, NapiSession } from "../napi.cjs";
 import napi from "../napi.cjs";
 import { Datagrams } from "./datagrams.ts";
+import { fromNapi, resetCode, sessionError } from "./error.ts";
 
 const { NapiClient } = napi;
 
@@ -8,28 +9,37 @@ function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {
 	return new ReadableStream({
 		async pull(controller) {
 			const chunk = await recv.read(65536);
-			if (chunk) {
+			if (chunk === null) {
+				controller.close();
+			} else if (chunk instanceof Uint8Array) {
 				controller.enqueue(new Uint8Array(chunk));
 			} else {
-				controller.close();
+				controller.error(fromNapi(chunk));
 			}
 		},
-		cancel() {
-			recv.stop(0).catch(() => {});
+		cancel(reason) {
+			recv.stop(resetCode(reason)).catch(() => {});
 		},
 	});
 }
 
 function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 	return new WritableStream({
+		start(controller) {
+			// A STOP_SENDING or session failure errors the stream even while nothing is being written.
+			void send.closed().then((err) => {
+				if (err) controller.error(fromNapi(err));
+			});
+		},
 		async write(chunk) {
-			await send.write(Buffer.from(chunk));
+			const err = await send.write(Buffer.from(chunk));
+			if (err) throw fromNapi(err);
 		},
 		async close() {
 			await send.finish();
 		},
-		async abort() {
-			await send.reset(0);
+		async abort(reason) {
+			await send.reset(resetCode(reason));
 		},
 	});
 }
@@ -181,7 +191,10 @@ export default class Session implements WebTransport {
 	async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
 		await this.ready;
 		if (!this.#session) throw new Error("session not connected");
-		const bi = await this.#session.openBi();
+		// Opening only fails when the session does.
+		const bi = await this.#session.openBi().catch((err: unknown) => {
+			throw sessionError(err);
+		});
 		return {
 			readable: wrapRecvStream(bi.takeRecv()),
 			writable: wrapSendStream(bi.takeSend()),
@@ -191,7 +204,9 @@ export default class Session implements WebTransport {
 	async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
 		await this.ready;
 		if (!this.#session) throw new Error("session not connected");
-		const send = await this.#session.openUni();
+		const send = await this.#session.openUni().catch((err: unknown) => {
+			throw sessionError(err);
+		});
 		return wrapSendStream(send);
 	}
 
