@@ -1,4 +1,4 @@
-import type { NapiRecvStream, NapiSendStream, NapiSession } from "../napi.cjs";
+import type { NapiRecvStream, NapiSendClosed, NapiSendStream, NapiSession } from "../napi.cjs";
 import napi from "../napi.cjs";
 import { Datagrams } from "./datagrams.ts";
 import { fromNapi, resetCode, sessionError } from "./error.ts";
@@ -23,13 +23,20 @@ function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {
 	});
 }
 
+// A STOP_SENDING or session failure errors the stream even while nothing is being written.
+// Declared outside wrapSendStream and holding the controller weakly, so the pending watch does not
+// keep an abandoned stream (and its native handle) alive, which would withhold its implicit FIN.
+function watchClosed(closed: NapiSendClosed, controller: WritableStreamDefaultController) {
+	const ref = new WeakRef(controller);
+	void closed.wait().then((err) => {
+		if (err) ref.deref()?.error(fromNapi(err));
+	});
+}
+
 function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 	return new WritableStream({
 		start(controller) {
-			// A STOP_SENDING or session failure errors the stream even while nothing is being written.
-			void send.closed().then((err) => {
-				if (err) controller.error(fromNapi(err));
-			});
+			watchClosed(send.closed(), controller);
 		},
 		async write(chunk) {
 			const err = await send.write(Buffer.from(chunk));

@@ -153,3 +153,41 @@ test("a session close fails its streams and new streams with a session error", a
 		expect(err.streamErrorCode).toBeNull();
 	}
 });
+
+test("streamErrorCode is clamped like a WebIDL [Clamp] unsigned long", () => {
+	const code = (streamErrorCode: number) => new WebTransportError("", { streamErrorCode }).streamErrorCode;
+	expect(code(-1)).toBe(0);
+	expect(code(2 ** 32)).toBe(0xffffffff);
+	expect(code(2.5)).toBe(2);
+	expect(code(3.5)).toBe(4);
+	expect(code(Number.NaN)).toBe(0);
+});
+
+test("an abandoned writer still finishes its stream", async () => {
+	const { client, peer } = await connect();
+
+	// Leave nothing referencing the writable once this returns.
+	await (async () => {
+		const writer = (await client.createUnidirectionalStream()).getWriter();
+		await writer.write(new Uint8Array([1]));
+	})();
+
+	const { value: readable } = await peer.incomingUnidirectionalStreams.getReader().read();
+	if (!readable) throw new Error("no stream");
+	const reader = readable.getReader();
+	expect((await reader.read()).value).toEqual(new Uint8Array([1]));
+
+	// Collecting the writable drops the native stream, which sends its implicit FIN. Finalizers
+	// run between turns of the event loop, so collect until the FIN arrives.
+	let done = false;
+	const read = reader.read().then((result) => {
+		done = result.done;
+	});
+	while (!done) {
+		Bun.gc(true);
+		await new Promise(setImmediate);
+	}
+	await read;
+
+	client.close();
+});

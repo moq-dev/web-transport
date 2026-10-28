@@ -854,6 +854,7 @@ module.exports.NapiBiStream = nativeBinding.NapiBiStream;
 module.exports.NapiClient = nativeBinding.NapiClient;
 module.exports.NapiRecvStream = nativeBinding.NapiRecvStream;
 module.exports.NapiRequest = nativeBinding.NapiRequest;
+module.exports.NapiSendClosed = nativeBinding.NapiSendClosed;
 module.exports.NapiSendStream = nativeBinding.NapiSendStream;
 module.exports.NapiServer = nativeBinding.NapiServer;
 module.exports.NapiSession = nativeBinding.NapiSession;

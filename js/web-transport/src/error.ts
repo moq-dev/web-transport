@@ -14,7 +14,7 @@ export class WebTransportError extends DOMException {
 	constructor(message = "", options: WebTransportErrorOptions = {}) {
 		super(message, "WebTransportError");
 		this.source = options.source ?? "stream";
-		this.streamErrorCode = options.streamErrorCode ?? null;
+		this.streamErrorCode = options.streamErrorCode == null ? null : clamp(options.streamErrorCode);
 	}
 }
 
@@ -38,7 +38,13 @@ export function sessionError(cause: unknown): WebTransportError {
 export function resetCode(reason: unknown): number {
 	if (typeof reason !== "object" || reason === null) return 0;
 	const { streamErrorCode } = reason as { streamErrorCode?: unknown };
-	if (typeof streamErrorCode !== "number") return 0;
-	// `unsigned long`, wrapped as the platform would.
-	return streamErrorCode >>> 0;
+	return typeof streamErrorCode === "number" ? clamp(streamErrorCode) : 0;
+}
+
+/** Convert to a WebIDL `[Clamp] unsigned long`: saturate, then round half to even. */
+function clamp(code: number): number {
+	if (Number.isNaN(code)) return 0;
+	const saturated = Math.min(Math.max(code, 0), 0xffffffff);
+	const rounded = Math.round(saturated);
+	return rounded - saturated === 0.5 && rounded % 2 === 1 ? rounded - 1 : rounded;
 }

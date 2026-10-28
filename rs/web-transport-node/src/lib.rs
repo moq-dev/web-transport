@@ -482,20 +482,18 @@ impl NapiSendStream {
         Ok(Some(err))
     }
 
-    /// Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+    /// Watch for the stream to close. Call before any write, since it takes the stream lock.
+    ///
+    /// The watch is its own object because a pending call keeps its receiver alive: awaiting
+    /// on this stream would keep an abandoned one from dropping and sending its implicit FIN.
     #[napi]
-    pub async fn closed(&self) -> Result<Option<NapiStreamError>> {
-        // Quinn's future owns what it needs, so awaiting it neither borrows the stream (see
-        // module note) nor holds the lock that writes need.
-        let inner = self.inner.clone();
-        let stopped = inner.lock().await.stopped();
-        Ok(match stopped.await {
-            Ok(None) => None,
-            Ok(Some(code)) => Some(NapiStreamError::stream(
-                Some(code),
-                format!("STOP_SENDING: {code}"),
-            )),
-            Err(err) => Some(NapiStreamError::session(&err)),
+    pub fn closed(&self) -> Result<NapiSendClosed> {
+        let stream = self
+            .inner
+            .try_lock()
+            .map_err(|_| Error::from_reason("send stream busy"))?;
+        Ok(NapiSendClosed {
+            stopped: Arc::new(Mutex::new(Some(Box::pin(stream.stopped())))),
         })
     }
 
@@ -527,6 +525,44 @@ impl NapiSendStream {
         stream
             .set_priority(priority)
             .map_err(|e| Error::from_reason(e.to_string()))
+    }
+}
+
+type Stopped = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<Option<u32>, web_transport_quinn::SessionError>,
+            > + Send,
+    >,
+>;
+
+/// A watch on a send stream, holding only the connection rather than the stream.
+#[napi]
+pub struct NapiSendClosed {
+    stopped: Arc<Mutex<Option<Stopped>>>,
+}
+
+#[napi]
+impl NapiSendClosed {
+    /// Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+    /// Can only be called once.
+    #[napi]
+    pub async fn wait(&self) -> Result<Option<NapiStreamError>> {
+        // Own the shared state for the duration of the future (see module note).
+        let stopped = self.stopped.clone();
+        let stopped = stopped
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| Error::from_reason("already waited"))?;
+        Ok(match stopped.await {
+            Ok(None) => None,
+            Ok(Some(code)) => Some(NapiStreamError::stream(
+                Some(code),
+                format!("STOP_SENDING: {code}"),
+            )),
+            Err(err) => Some(NapiStreamError::session(&err)),
+        })
     }
 }
 

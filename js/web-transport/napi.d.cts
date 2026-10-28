@@ -44,12 +44,26 @@ export declare class NapiRequest {
 	reject(status: number): Promise<void>;
 }
 
+/** A watch on a send stream, holding only the connection rather than the stream. */
+export declare class NapiSendClosed {
+	/**
+	 * Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+	 * Can only be called once.
+	 */
+	wait(): Promise<NapiStreamError | null>;
+}
+
 /** A send stream for writing data. */
 export declare class NapiSendStream {
 	/** Write data to the stream, returning the error if the peer stopped it or the session failed. */
 	write(data: Buffer): Promise<NapiStreamError | null>;
-	/** Wait until the peer has read the whole stream (null), stopped it, or the session failed. */
-	closed(): Promise<NapiStreamError | null>;
+	/**
+	 * Watch for the stream to close. Call before any write, since it takes the stream lock.
+	 *
+	 * The watch is its own object because a pending call keeps its receiver alive: awaiting
+	 * on this stream would keep an abandoned one from dropping and sending its implicit FIN.
+	 */
+	closed(): NapiSendClosed;
 	/** Signal that no more data will be written. */
 	finish(): Promise<void>;
 	/** Abruptly reset the stream with an error code. */
