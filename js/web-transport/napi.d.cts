@@ -25,8 +25,11 @@ export declare class NapiClient {
 
 /** A receive stream for reading data. */
 export declare class NapiRecvStream {
-	/** Read up to `max_size` bytes from the stream. Returns null on FIN. */
-	read(maxSize: number): Promise<Buffer | null>;
+	/**
+	 * Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
+	 * peer reset the stream or the session failed.
+	 */
+	read(maxSize: number): Promise<Buffer | NapiStreamError | null>;
 	/** Tell the peer to stop sending with the given error code. */
 	stop(code: number): Promise<void>;
 }
@@ -41,10 +44,26 @@ export declare class NapiRequest {
 	reject(status: number): Promise<void>;
 }
 
+/** A watch on a send stream, holding only the connection rather than the stream. */
+export declare class NapiSendClosed {
+	/**
+	 * Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+	 * Can only be called once.
+	 */
+	wait(): Promise<NapiStreamError | null>;
+}
+
 /** A send stream for writing data. */
 export declare class NapiSendStream {
-	/** Write data to the stream. */
-	write(data: Buffer): Promise<void>;
+	/** Write data to the stream, returning the error if the peer stopped it or the session failed. */
+	write(data: Buffer): Promise<NapiStreamError | null>;
+	/**
+	 * Watch for the stream to close. Call before any write, since it takes the stream lock.
+	 *
+	 * The watch is its own object because a pending call keeps its receiver alive: awaiting
+	 * on this stream would keep an abandoned one from dropping and sending its implicit FIN.
+	 */
+	closed(): NapiSendClosed;
 	/** Signal that no more data will be written. */
 	finish(): Promise<void>;
 	/** Abruptly reset the stream with an error code. */
@@ -97,4 +116,23 @@ export interface NapiCloseInfo {
 export interface NapiConnectOptions {
 	/** Subprotocols for WT-Available-Protocols negotiation. */
 	protocols?: Array<string>;
+}
+
+/** The origin of a stream failure, matching W3C `WebTransportErrorSource`. */
+export declare enum NapiErrorSource {
+	/** The peer reset or stopped this stream. */
+	Stream = "stream",
+	/** The whole session failed. */
+	Session = "session",
+}
+
+/** A stream failure carrying the fields of W3C `WebTransportError`. */
+export interface NapiStreamError {
+	source: NapiErrorSource;
+	/**
+	 * The peer's RESET_STREAM or STOP_SENDING code, or null for a session failure or a code
+	 * outside the WebTransport range.
+	 */
+	streamErrorCode?: number;
+	message: string;
 }
