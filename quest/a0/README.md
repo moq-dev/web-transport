@@ -16,3 +16,5 @@ The Required list is ordered by priority. Independent children may proceed concu
 - [WebSocket handshake timeout](/quest/a0/qmux-ws-handshake-timeout.md) - close sessions whose peer never sends parameters
 - [QMux initial stream-count bound](/quest/a0/qmux-max-streams-param.md) - refuse initial_max_streams parameters above 2^60
 - [QMux stream-state checks](/quest/a0/qmux-stream-state.md) - refuse MAX_STREAM_DATA and STOP_SENDING for unopened local streams
+- [Node Server.close()](/quest/a0/node-server-close.md) - close completes while an accept is pending
+- [Node session and reader lifetime](/quest/a0/node-session-lifetime.md) - `closed` rejects on an abnormal end, and an abandoned reader releases its stream
