@@ -19,7 +19,8 @@ Decided 2026-10-28 (maintainer): its own quest in a0, apart from
 
 Add a loopback regression that fails without the fix: start the README's
 accept loop, wait until its `accept()` is pending in native code, then close
-the server and require both to finish. `close()` is synchronous, so a
+the server and require both to finish, with `accept()` resolving to `null`.
+`close()` is synchronous, so a
 same-thread deadlock blocks any JS timer; bound the test from outside the
 event loop, such as the test runner's process timeout.
 
