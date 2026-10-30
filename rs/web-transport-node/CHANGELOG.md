@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.7...web-transport-node-v0.0.8) - 2026-10-30
+
+### Fixed
+
+- *(web-transport)* report stream errors as WebTransportError in the Node polyfill ([#470](https://github.com/moq-dev/web-transport/pull/470))
+
 ## [0.0.6](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.5...web-transport-node-v0.0.6) - 2026-08-06
 
 ### Other
