@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let mut settings = web_transport_quiche::Settings::default();
     settings.verify_peer = !args.tls_disable_verify;
 
-    tracing::info!("connecting to {}", args.url);
+    tracing::info!(host = ?args.url.host_str(), path = args.url.path(), "connecting");
     let session = client
         .with_settings(settings)
         .connect(args.url)

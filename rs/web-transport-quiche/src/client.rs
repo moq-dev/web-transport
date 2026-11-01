@@ -154,7 +154,11 @@ impl ClientBuilder {
             Some(url::Host::Domain(host)) => host.to_string(),
             Some(url::Host::Ipv4(ip)) => ip.to_string(),
             Some(url::Host::Ipv6(ip)) => ip.to_string(),
-            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
+            // Without a host there is no userinfo, so this drops only the query and fragment.
+            None => {
+                let url = &request.url[..url::Position::AfterPath];
+                return Err(ClientError::InvalidUrl(url.to_string()));
+            }
         };
 
         Ok((host, request.url.port().unwrap_or(443)))

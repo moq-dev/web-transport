@@ -1,8 +1,8 @@
-use std::{str::FromStr, sync::Arc};
+use std::{fmt, str::FromStr, sync::Arc};
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use url::Url;
+use url::{Position, Url};
 
 use super::{qpack, Frame, VarInt, MAX_FRAME_SIZE};
 
@@ -99,8 +99,14 @@ impl From<sfv::Error> for ConnectError {
 }
 
 /// A CONNECT request to initiate a WebTransport session.
+///
+/// The [`Debug`](fmt::Debug) output is safe to log. It keeps the URL's scheme,
+/// host, port, and path, the protocols, and the header names, but redacts the
+/// URL's userinfo, query, and fragment. Header values are redacted too, except
+/// `origin` and `user-agent` when not marked
+/// [sensitive](http::HeaderValue::set_sensitive).
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectRequest {
     /// The URL to connect to.
     pub url: Url,
@@ -261,6 +267,70 @@ impl From<Url> for ConnectRequest {
             protocols: Vec::new(),
             headers: http::HeaderMap::new(),
         }
+    }
+}
+
+/// Header values shown by [`ConnectRequest`]'s `Debug` output.
+///
+/// This is an allowlist so that credentials in unknown or custom headers
+/// (`authorization`, `cookie`, `x-api-key`, ...) are redacted by default.
+const DEBUG_VISIBLE_HEADERS: [http::HeaderName; 2] =
+    [http::header::ORIGIN, http::header::USER_AGENT];
+
+/// Replaces a redacted value in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// Formats a URL with its userinfo, query, and fragment redacted.
+struct RedactedUrl<'a>(&'a Url);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        let mut redacted = String::from(&url[..Position::BeforeUsername]);
+        if !url.username().is_empty() || url.password().is_some() {
+            redacted.push_str("[redacted]@");
+        }
+        redacted.push_str(&url[Position::BeforeHost..Position::AfterPath]);
+        if url.query().is_some() {
+            redacted.push_str("?[redacted]");
+        }
+        if url.fragment().is_some() {
+            redacted.push_str("#[redacted]");
+        }
+        fmt::Debug::fmt(&redacted, f)
+    }
+}
+
+/// Formats headers with every value outside [`DEBUG_VISIBLE_HEADERS`] redacted.
+struct RedactedHeaders<'a>(&'a http::HeaderMap);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for (name, value) in self.0 {
+            if DEBUG_VISIBLE_HEADERS.contains(name) && !value.is_sensitive() {
+                map.entry(name, value);
+            } else {
+                map.entry(name, &Redacted);
+            }
+        }
+        map.finish()
+    }
+}
+
+impl fmt::Debug for ConnectRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectRequest")
+            .field("url", &RedactedUrl(&self.url))
+            .field("protocols", &self.protocols)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
     }
 }
 
@@ -943,5 +1013,106 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[test]
+    fn request_debug_keeps_url_without_credentials() {
+        let req = ConnectRequest::new(Url::parse("https://example.com:4443/moq/room").unwrap())
+            .with_protocol("moq-lite-03");
+        assert_eq!(
+            format!("{req:?}"),
+            r#"ConnectRequest { url: "https://example.com:4443/moq/room", protocols: ["moq-lite-03"], headers: {} }"#
+        );
+    }
+
+    #[test]
+    fn request_debug_redacts_url_credentials() {
+        let url = "https://alice:hunter2@example.com/moq?jwt=SECRET&x=1#access_token=SECRET";
+        let req = ConnectRequest::new(Url::parse(url).unwrap());
+        let debug = format!("{req:?}");
+        assert!(
+            debug.contains(r#"url: "https://[redacted]@example.com/moq?[redacted]#[redacted]""#),
+            "{debug}"
+        );
+        for secret in ["alice", "hunter2", "SECRET", "x=1"] {
+            assert!(!debug.contains(secret), "{secret} leaked: {debug}");
+        }
+
+        let req = ConnectRequest::new(Url::parse("https://alice@example.com/").unwrap());
+        assert!(format!("{req:?}").contains(r#""https://[redacted]@example.com/""#));
+    }
+
+    #[test]
+    fn request_debug_redacts_header_values() {
+        use http::{header, HeaderName, HeaderValue};
+
+        let mut sensitive_agent = HeaderValue::from_static("agent-SECRET");
+        sensitive_agent.set_sensitive(true);
+
+        let req = ConnectRequest::new(Url::parse("https://example.com/").unwrap())
+            .with_header(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer SECRET"),
+            )
+            .with_header(
+                header::PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic SECRET"),
+            )
+            .with_header(header::COOKIE, HeaderValue::from_static("session=SECRET"))
+            .with_header(
+                header::SET_COOKIE,
+                HeaderValue::from_static("session=SECRET"),
+            )
+            .with_header(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("SECRET"),
+            )
+            .with_header(
+                header::ORIGIN,
+                HeaderValue::from_static("https://app.example"),
+            )
+            .with_header(header::USER_AGENT, sensitive_agent);
+        let debug = format!("{req:?}");
+
+        assert!(!debug.contains("SECRET"), "{debug}");
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+        ] {
+            assert!(
+                debug.contains(&format!(r#""{name}": [redacted]"#)),
+                "{name}: {debug}"
+            );
+        }
+        assert!(
+            debug.contains(r#""origin": "https://app.example""#),
+            "{debug}"
+        );
+        assert!(debug.contains(r#""user-agent": [redacted]"#), "{debug}");
+    }
+
+    #[test]
+    fn decoded_request_debug_redacts_credentials() {
+        let req = ConnectRequest::new(Url::parse("https://example.com/moq?jwt=SECRET").unwrap())
+            .with_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_static("Bearer SECRET"),
+            )
+            .with_header(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static("moq-test"),
+            );
+        let mut wire = Vec::new();
+        req.encode(&mut wire).unwrap();
+
+        let decoded = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.url.query(), Some("jwt=SECRET"));
+        assert_eq!(
+            format!("{decoded:?}"),
+            r#"ConnectRequest { url: "https://example.com/moq?[redacted]", protocols: [], headers: {"authorization": [redacted], "user-agent": "moq-test"} }"#
+        );
     }
 }
