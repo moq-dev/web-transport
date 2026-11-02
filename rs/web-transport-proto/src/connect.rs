@@ -1110,9 +1110,16 @@ mod tests {
 
         let decoded = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
         assert_eq!(decoded.url.query(), Some("jwt=SECRET"));
-        assert_eq!(
-            format!("{decoded:?}"),
-            r#"ConnectRequest { url: "https://example.com/moq?[redacted]", protocols: [], headers: {"authorization": [redacted], "user-agent": "moq-test"} }"#
-        );
+
+        // Decoded header order is unspecified, so check each entry separately.
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        for expected in [
+            r#"url: "https://example.com/moq?[redacted]""#,
+            r#""authorization": [redacted]"#,
+            r#""user-agent": "moq-test""#,
+        ] {
+            assert!(debug.contains(expected), "{expected}: {debug}");
+        }
     }
 }
