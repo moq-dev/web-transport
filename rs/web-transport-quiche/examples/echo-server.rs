@@ -52,7 +52,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {
-        tracing::info!("accepted connection, url={}", conn.url);
+        // The Debug output redacts credentials, such as the query and header values.
+        tracing::info!(request = ?conn.request, "accepted connection");
 
         tokio::spawn(async move {
             match run_conn(conn).await {
@@ -68,8 +69,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_conn(request: web_transport_quiche::h3::Request) -> anyhow::Result<()> {
-    tracing::info!("received WebTransport request: {}", request.url);
-
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
     tracing::info!("accepted session");

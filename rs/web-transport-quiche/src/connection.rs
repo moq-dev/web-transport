@@ -171,7 +171,7 @@ impl Connection {
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id);
 
-        tracing::debug!(url = %connect.request.url, "WebTransport connection established");
+        tracing::debug!(request = ?connect.request, "WebTransport connection established");
         let request = connect.request.clone();
         let response = connect.response.clone();
 

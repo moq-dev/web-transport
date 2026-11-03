@@ -63,13 +63,14 @@ async fn main() -> anyhow::Result<()> {
         client.with_system_roots()?
     };
 
-    tracing::info!(url = %args.url, "connecting");
-
     // Connect to the given URL.
     let mut request = ConnectRequest::new(args.url);
     if let Some(protocol) = &args.protocol {
         request = request.with_protocol(protocol);
     }
+
+    // The Debug output redacts credentials, such as the query and header values.
+    tracing::info!(?request, "connecting");
     let session = client.connect(request).await?;
 
     tracing::info!("connected");
