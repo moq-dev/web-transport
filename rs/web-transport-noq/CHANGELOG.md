@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.5](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.4...web-transport-noq-v0.4.5) - 2026-11-03
+
+### Fixed
+
+- *(proto)* redact credentials from ConnectRequest's Debug output ([#475](https://github.com/moq-dev/web-transport/pull/475))
+
 ## [0.4.4](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.3...web-transport-noq-v0.4.4) - 2026-10-22
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.3...web-transport-quiche-v0.8.4) - 2026-11-03
+
+### Fixed
+
+- *(proto)* redact credentials from ConnectRequest's Debug output ([#475](https://github.com/moq-dev/web-transport/pull/475))
+
 ## [0.8.3](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.2...web-transport-quiche-v0.8.3) - 2026-10-22
 
 ### Other
