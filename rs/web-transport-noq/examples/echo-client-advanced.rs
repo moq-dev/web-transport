@@ -44,16 +44,24 @@ async fn main() -> anyhow::Result<()> {
     // Standard noq setup, accepting only the given certificate.
     // You should use system roots in production.
     let mut config =
-        rustls::ClientConfig::builder_with_provider(web_transport_noq::crypto::default_provider())
+        rustls::ClientConfig::builder_with_provider(web_transport_noq::crypto::default_provider()?)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_root_certificates(roots)
             .with_no_client_auth();
     config.alpn_protocols = vec![web_transport_noq::ALPN.as_bytes().to_vec()]; // this one is important
 
-    let config: noq::crypto::rustls::QuicClientConfig = config.try_into()?;
+    let config = noq::crypto::rustls::QuicClientConfig::with_initial(
+        Arc::new(config),
+        web_transport_noq::crypto::initial_suite()?,
+    )?;
     let config = noq::ClientConfig::new(Arc::new(config));
 
-    let client = noq::Endpoint::client("[::]:0".parse()?)?;
+    let client = noq::Endpoint::new(
+        web_transport_noq::crypto::endpoint_config()?,
+        None,
+        std::net::UdpSocket::bind("[::]:0")?,
+        Arc::new(noq::TokioRuntime),
+    )?;
     let client = web_transport_noq::Client::new(client, config);
 
     // Connect to the given URL.
