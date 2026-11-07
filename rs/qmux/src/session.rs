@@ -28,6 +28,9 @@ use crate::shared::SharedRecv;
 /// applying backpressure to the whole session.
 const DATAGRAM_RECV_BUFFER: usize = 1024;
 
+/// Maximum peer-initiated streams awaiting application acceptance per direction.
+const ACCEPT_QUEUE_CAPACITY: usize = 1024;
+
 /// How many outbound datagrams to buffer before dropping. The writer pulls from
 /// this lane; when it stalls on transport backpressure it stops pulling, the lane
 /// fills, and `send_datagram` drops on a full lane. Kept small so shedding tracks
@@ -1447,24 +1450,32 @@ impl<R: Reader> SessionState<R> {
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
-        // Race the whole loop, including delivery to bounded accept queues,
-        // against closure so a retained Session cannot strand terminal cleanup.
-        tokio::select! {
-            biased;
-            result = async {
-                loop {
-                    let data = self.reader.recv().await?;
+        loop {
+            // The idle timeout and keep-alive ping are owned by the timer task,
+            // which reads the `last_recv_at` we publish below. Keeping the deadline
+            // off this select is what stops application backpressure — parking in
+            // `recv_frame`'s `accept_*.send().await` — from starving the deadline
+            // and firing a spurious idle close on re-entry.
+            tokio::select! {
+                biased;
+                result = self.reader.recv() => {
+                    let data = result?;
+                    // Publish receive progress for the timer's idle deadline.
                     self.last_recv_at.store(
                         millis_since(self.base, tokio::time::Instant::now()),
                         Ordering::Release,
                     );
                     if self.config.version.uses_records() {
+                        // Record-framed drafts: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
                             self.recv_frame(frame).await?;
                         }
                     } else {
-                        // Draft-00 bounds the whole frame; the legacy binding
-                        // predates max_frame_size and has no such bound.
+                        // draft-00 §5.2: `max_frame_size` bounds the whole frame,
+                        // header included, and may only be raised from its initial
+                        // value — which we never do, so the initial value is what a
+                        // peer may send. Each message is one frame here. The legacy
+                        // binding predates the parameter and bounds nothing.
                         if self.config.version == Version::QMux00 && data.len() > MAX_FRAME_SIZE {
                             return Err(Error::FrameTooLarge);
                         }
@@ -1473,9 +1484,9 @@ impl<R: Reader> SessionState<R> {
                         }
                     }
                 }
-            } => result,
-            _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
-                Err(closed.borrow().clone().unwrap_or(Error::Closed))
+                _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
+                    return Err(closed.borrow().clone().unwrap_or(Error::Closed))
+                }
             }
         }
     }
@@ -2157,8 +2168,8 @@ impl Session {
         let version = config.version;
         let our_params = config.to_transport_params();
 
-        let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
-        let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
+        let (accept_bi_tx, accept_bi_rx) = mpsc::channel(ACCEPT_QUEUE_CAPACITY);
+        let (accept_uni_tx, accept_uni_rx) = mpsc::channel(ACCEPT_QUEUE_CAPACITY);
 
         let outbound = PriorityQueue::new(8);
         // Control lane (lossless): RESET/STOP/CLOSE, window updates, ping requests,
@@ -2337,7 +2348,25 @@ impl Session {
 
         let teardown_socket_stats = SocketStatsGuard(socket_stats.clone());
         tokio::spawn(async move {
-            let err = backend.run().await.err().unwrap_or(Error::Closed);
+            let mut closed = backend.closed.subscribe();
+            let err = {
+                let run = backend.run();
+                tokio::pin!(run);
+                // Release stats on closure even when the reader is parked on an
+                // accept queue. Keep polling the same future afterwards so streams
+                // and frames already received can still reach the application.
+                let result = tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => None,
+                };
+                drop(teardown_socket_stats);
+                match result {
+                    Some(result) => result,
+                    None => run.await,
+                }
+            }
+            .err()
+            .unwrap_or(Error::Closed);
             // If we tore down because of a protocol/transport violation *we*
             // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
             // session rejects too, rather than seeing a bare drop. Enqueue on the
@@ -2365,7 +2394,6 @@ impl Session {
             backend.conn_recv_credit.close();
             backend.outbound.close();
             backend.streams.lock().unwrap().close();
-            drop(teardown_socket_stats);
             // Publish the backend's reason after cleanup, preserving an earlier
             // close signal such as APPLICATION_CLOSE rather than replacing it
             // with the transport's subsequent EOF or WebSocket Close.
@@ -5494,7 +5522,7 @@ mod socket_stats_tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::oneshot;
-    use web_transport_trait::{Session as _, Stats as _};
+    use web_transport_trait::{RecvStream as _, Session as _, Stats as _};
 
     struct Stats {
         panic: AtomicBool,
@@ -5513,6 +5541,7 @@ mod socket_stats_tests {
         incoming: mpsc::UnboundedReceiver<Bytes>,
         received: mpsc::UnboundedSender<()>,
         failed: oneshot::Receiver<()>,
+        closing: oneshot::Sender<()>,
     }
 
     struct TestReader {
@@ -5520,7 +5549,10 @@ mod socket_stats_tests {
         received: mpsc::UnboundedSender<()>,
     }
 
-    struct TestWriter(oneshot::Receiver<()>);
+    struct TestWriter {
+        failed: oneshot::Receiver<()>,
+        closing: Option<oneshot::Sender<()>>,
+    }
 
     impl Transport for TestTransport {
         type Reader = TestReader;
@@ -5532,7 +5564,10 @@ mod socket_stats_tests {
 
         fn split(self) -> (Self::Writer, Self::Reader) {
             (
-                TestWriter(self.failed),
+                TestWriter {
+                    failed: self.failed,
+                    closing: Some(self.closing),
+                },
                 TestReader {
                     incoming: self.incoming,
                     received: self.received,
@@ -5554,10 +5589,11 @@ mod socket_stats_tests {
             Ok(())
         }
         async fn close(&mut self) -> Result<(), Error> {
-            Ok(())
+            self.closing.take().unwrap().send(()).ok();
+            std::future::pending().await
         }
         async fn maintain(&mut self) -> Result<(), Error> {
-            let _ = (&mut self.0).await;
+            let _ = (&mut self.failed).await;
             Err(Error::Closed)
         }
     }
@@ -5568,6 +5604,7 @@ mod socket_stats_tests {
         received: mpsc::UnboundedReceiver<()>,
         fail: oneshot::Sender<()>,
         released: oneshot::Receiver<()>,
+        closing: oneshot::Receiver<()>,
     }
 
     fn fixture(panic: bool) -> Fixture {
@@ -5579,12 +5616,14 @@ mod socket_stats_tests {
         let (incoming, reader) = mpsc::unbounded_channel();
         let (received, received_rx) = mpsc::unbounded_channel();
         let (fail, failed) = oneshot::channel();
+        let (closing, close_started) = oneshot::channel();
         let session = Session::new(
             TestTransport {
                 stats,
                 incoming: reader,
                 received,
                 failed,
+                closing,
             },
             false,
             Config::new(Version::WebTransport),
@@ -5595,6 +5634,7 @@ mod socket_stats_tests {
             received: received_rx,
             fail,
             released: done,
+            closing: close_started,
         }
     }
 
@@ -5606,24 +5646,35 @@ mod socket_stats_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn full_accept_queue_does_not_retain_stats_on_close_or_writer_failure() {
+    async fn full_accept_queue_releases_stats_without_losing_received_streams() {
         for dir in [StreamDir::Uni, StreamDir::Bi] {
             for writer_failure in [false, true] {
                 let mut f = fixture(false);
-                for index in 0..=1024 {
-                    let frame = Frame::Stream(Stream {
-                        id: StreamId::new(index, dir, true),
+                let frame = |index| {
+                    Frame::Stream(Stream {
+                        id: StreamId::new(index as u64, dir, true),
                         offset: 0,
-                        data: Bytes::new(),
-                        fin: false,
-                    });
-                    f.incoming
-                        .send(frame.encode(Version::WebTransport).unwrap())
+                        data: Bytes::from_static(b"received"),
+                        fin: true,
+                    })
+                    .encode(Version::WebTransport)
+                    .unwrap()
+                };
+                for index in 0..=ACCEPT_QUEUE_CAPACITY {
+                    f.incoming.send(frame(index)).unwrap();
+                    tokio::time::timeout(Duration::from_secs(1), f.received.recv())
+                        .await
+                        .expect("reader stopped before accept queue filled")
                         .unwrap();
-                    // On this single-threaded runtime the reader processes the
-                    // frame until it yields before this notification is observed.
-                    f.received.recv().await.unwrap();
                 }
+                // A further frame cannot reach recv() while delivery of the
+                // preceding stream is parked on the full accept queue.
+                f.incoming.send(frame(ACCEPT_QUEUE_CAPACITY + 1)).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), f.received.recv())
+                        .await
+                        .is_err()
+                );
                 if writer_failure {
                     f.fail.send(()).unwrap();
                 } else {
@@ -5631,8 +5682,31 @@ mod socket_stats_tests {
                 }
                 released(f.released).await;
                 assert_eq!(f.session.stats().rtt(), None);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    for _ in 0..ACCEPT_QUEUE_CAPACITY + 2 {
+                        let mut recv = match dir {
+                            StreamDir::Uni => f.session.accept_uni().await.unwrap(),
+                            StreamDir::Bi => f.session.accept_bi().await.unwrap().1,
+                        };
+                        assert_eq!(recv.read_all().await.unwrap(), b"received"[..]);
+                    }
+                })
+                .await
+                .expect("received streams did not drain after closure");
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_transport_close_does_not_retain_socket_stats() {
+        let f = fixture(false);
+        f.session.close(0, "done");
+        tokio::time::timeout(Duration::from_secs(1), f.closing)
+            .await
+            .expect("writer did not enter close")
+            .unwrap();
+        released(f.released).await;
+        assert_eq!(f.session.stats().rtt(), None);
     }
 
     #[tokio::test(start_paused = true)]
