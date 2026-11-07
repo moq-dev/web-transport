@@ -286,3 +286,33 @@ fn cancelled_rejection_drain_is_removed() {
     driver.check_drained(&mut pair.server);
     assert!(driver.state.lock().draining.is_empty());
 }
+
+#[tokio::test]
+async fn rejection_accepts_a_peer_stop_before_finish() {
+    let mut pair = Pair::new();
+    let mut driver = driver(true);
+    let id = StreamId::CLIENT_BI;
+    pair.client
+        .stream_send(id.into(), b"request", false)
+        .unwrap();
+    pair.pump();
+    driver.read(&mut pair.server).unwrap();
+    let Poll::Ready(Ok((_, send, _recv))) = driver.state.lock().poll_accept_bi(&Waiter::noop())
+    else {
+        panic!("request was not accepted");
+    };
+    let mut send = super::super::SendStream::new(id, send, driver.state.clone());
+    send.write_all(b"response").await.unwrap();
+    driver.flush_send(&mut pair.server, id).unwrap();
+    pair.client
+        .stream_shutdown(id.into(), quiche::Shutdown::Read, 42)
+        .unwrap();
+    pair.pump();
+    driver.write(&mut pair.server).unwrap();
+    assert!(matches!(
+        send.finish(),
+        Err(super::super::StreamError::Stop(42) | super::super::StreamError::Closed)
+    ));
+    send.rejected().await.unwrap();
+    assert!(driver.state.lock().draining.is_empty());
+}

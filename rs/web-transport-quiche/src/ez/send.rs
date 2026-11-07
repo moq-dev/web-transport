@@ -475,9 +475,14 @@ impl SendStream {
         kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 
-    // Used only after rejecting CONNECT and stopping its receive half. Unlike
-    // `closed`, this keeps the connection alive while quiche still owns bytes.
+    // Finish a rejected CONNECT after stopping its receive half. Unlike `closed`,
+    // this keeps the connection alive while quiche still owns response bytes.
     pub(crate) async fn rejected(&mut self) -> Result<(), StreamError> {
+        match self.finish() {
+            Ok(()) => (),
+            Err(StreamError::Stop(_) | StreamError::Closed) => return Ok(()),
+            Err(err) => return Err(err),
+        }
         match self.closed().await {
             Ok(()) => (),
             Err(StreamError::Stop(_) | StreamError::Closed) => return Ok(()),

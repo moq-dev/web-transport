@@ -87,7 +87,6 @@ impl Connecting {
     pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
         let mut connect = self.respond(response).await?;
         connect.recv.stop(0);
-        connect.send.finish()?;
         match connect.send.rejected().await {
             Ok(()) | Err(ez::StreamError::Connection(ez::ConnectionError::Remote(..))) => (),
             Err(err) => return Err(err.into()),
