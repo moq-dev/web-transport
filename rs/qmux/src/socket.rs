@@ -339,14 +339,14 @@ mod unix {
         #[test]
         fn zero_kernel_rate_keeps_the_last_estimate() {
             use super::*;
-            use std::net::{TcpListener, TcpStream};
+            use std::net::TcpListener;
 
+            // A listener has no ACK-derived samples, regardless of how a kernel
+            // accounts for SYNs on connected sockets.
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (_peer, _) = listener.accept().unwrap();
-            let stats = TcpStats::new(&socket).unwrap();
+            let stats = TcpStats::new(&listener).unwrap();
             let (info, _) = sys::tcp_info(stats.borrow()).unwrap();
-            assert_eq!(info.delivery_rate, 0, "no payload has been sent");
+            assert_eq!(info.delivery_rate, 0, "a listener has no rate samples");
             assert_eq!(stats.estimated_send_rate(), None);
             stats
                 .rate
