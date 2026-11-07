@@ -12,5 +12,4 @@ Binding-specific installation/build instructions are owned by the corresponding 
 
 ## Related
 
-- [Package-selection guide](/quest/a1/package-selection.md) - new comparative guidance
 - [Binding runtime coverage](/quest/a1/bindings/README.md) - owns binding-local command corrections

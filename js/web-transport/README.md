@@ -4,6 +4,8 @@ WebTransport for Node.js, powered by native QUIC/HTTP3 via NAPI-RS.
 
 Provides a custom client and server API for setup, then exposes the standard [W3C WebTransport API](https://www.w3.org/TR/webtransport/) for streams, datagrams, and session lifecycle.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Installation
 
 ```bash

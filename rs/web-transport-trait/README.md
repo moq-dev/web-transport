@@ -16,6 +16,8 @@ This crate provides a WebTransport trait for Send runtimes.
 
 If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Receive defaults
 
 The default async and poll receive helpers initialize at most 8 KiB of destination

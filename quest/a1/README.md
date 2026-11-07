@@ -21,4 +21,3 @@ The Required list is ordered by priority. Independent children may proceed concu
 - [WebSocket record size](/quest/a1/qmux-ws-record-size.md) - advertise only what the socket accepts
 - [Response headers](/quest/a1/response-headers.md) - preserve success and rejection metadata
 - [Current architecture docs](/quest/a1/docs-current.md) - repair stale workspace descriptions
-- [Package selection](/quest/a1/package-selection.md) - verified comparison and selection guide
