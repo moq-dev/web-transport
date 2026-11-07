@@ -162,8 +162,8 @@ console.log(info.closeCode, info.reason);
 ```
 
 Cancel a reader when finished to release its receive stream immediately, even during a
-pending read. If every reference to the reader and readable stream is abandoned, garbage
-collection also releases the native stream and stops the peer with stream error code 0.
+pending read. Pending reads retain their receive stream until data, closure, or cancellation
+settles them, so garbage collection alone does not cancel an abandoned pending read.
 
 ## License
 

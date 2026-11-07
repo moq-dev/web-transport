@@ -30,7 +30,7 @@ export declare class NapiRecvStream {
 	 * peer reset the stream or the session failed.
 	 */
 	read(maxSize: number): Promise<Buffer | NapiStreamError | null>;
-	/** Tell the peer to stop sending with the given error code. */
+	/** Tell the peer to stop sending with the given code; an already terminal stream is a no-op. */
 	stop(code: number): Promise<void>;
 }
 

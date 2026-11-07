@@ -6,42 +6,20 @@ import { fromNapi, resetCode, sessionError } from "./error.ts";
 const { NapiClient } = napi;
 
 function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {
-	const state = { reading: false, cancelled: false };
+	let cancelled = false;
 	return new ReadableStream({
-		pull(controller) {
-			if (state.reading) return;
-			state.reading = true;
-			readChunk(recv.read(65536), controller, state);
-		},
-		cancel(reason) {
-			state.cancelled = true;
-			return recv.stop(resetCode(reason));
-		},
-	});
-}
-
-// Returning the pending native promise from pull would let the Web Streams machinery
-// retain the controller and its stream. Only this weak callback waits for the read.
-function readChunk(
-	read: ReturnType<NapiRecvStream["read"]>,
-	controller: ReadableStreamDefaultController<Uint8Array>,
-	state: { reading: boolean; cancelled: boolean },
-) {
-	const ref = new WeakRef(controller);
-	void read.then(
-		(chunk) => {
-			state.reading = false;
-			const controller = ref.deref();
-			if (!controller || state.cancelled) return;
+		async pull(controller) {
+			const chunk = await recv.read(65536);
+			if (cancelled) return;
 			if (chunk === null) controller.close();
 			else if (chunk instanceof Uint8Array) controller.enqueue(new Uint8Array(chunk));
 			else controller.error(fromNapi(chunk));
 		},
-		(err: unknown) => {
-			state.reading = false;
-			if (!state.cancelled) ref.deref()?.error(err);
+		cancel(reason) {
+			cancelled = true;
+			return recv.stop(resetCode(reason));
 		},
-	);
+	});
 }
 
 // A STOP_SENDING or session failure errors the stream even while nothing is being written.

@@ -22,3 +22,7 @@ web-transport-quinn = { path = "../web-transport-quinn", version = "0.13" }
 
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt"] }

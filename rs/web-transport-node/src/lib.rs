@@ -21,7 +21,10 @@ use tokio::sync::{watch, Mutex};
 // clones back into `self.inner.lock()` across an await -- that reintroduces the
 // crash.
 
-fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> Result<NapiCloseInfo> {
+fn session_error_to_close_info(
+    err: &web_transport_quinn::SessionError,
+    local: Option<NapiCloseInfo>,
+) -> Result<NapiCloseInfo> {
     match err {
         web_transport_quinn::SessionError::WebTransportError(
             web_transport_quinn::WebTransportError::Closed(code, reason),
@@ -29,6 +32,9 @@ fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> Resul
             close_code: *code,
             reason: reason.clone(),
         }),
+        web_transport_quinn::SessionError::ConnectionError(
+            web_transport_quinn::quinn::ConnectionError::LocallyClosed,
+        ) => local.ok_or_else(|| Error::from_reason(err.to_string())),
         other => Err(Error::from_reason(other.to_string())),
     }
 }
@@ -428,11 +434,10 @@ impl NapiSession {
         let session = self.inner.clone();
         let cache = self.closed.clone();
         let err = session.closed().await;
-        let closed = cache.lock().unwrap();
-        match closed.as_ref() {
-            Some(info) => Ok(info.clone()),
-            None => session_error_to_close_info(&err),
-        }
+        // Only LocallyClosed uses these details. A peer close or connection failure can
+        // win the backend's first-close race before the native connection is closed.
+        let local = cache.lock().unwrap().clone();
+        session_error_to_close_info(&err, local)
     }
 }
 
@@ -553,30 +558,59 @@ impl NapiSendClosed {
 /// A receive stream for reading data.
 #[napi]
 pub struct NapiRecvStream {
-    inner: Arc<Mutex<web_transport_quinn::RecvStream>>,
+    inner: Arc<Mutex<RecvStream>>,
     // Closing the sender cancels reads when the JS owner is collected. The read futures own
     // only receivers, so neither napi-rs nor the shared stream can keep that owner alive.
     stopped: watch::Sender<bool>,
+}
+
+struct RecvStream(web_transport_quinn::RecvStream);
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // Quinn's implicit drop uses raw QUIC code 0; the Node API needs WebTransport 0.
+        // An already finished/reset stream needs no further cleanup.
+        let _ = self.0.stop(0);
+    }
 }
 
 impl NapiRecvStream {
     fn new(recv: web_transport_quinn::RecvStream) -> Self {
         let (stopped, _) = watch::channel(false);
         Self {
-            inner: Arc::new(Mutex::new(recv)),
+            inner: Arc::new(Mutex::new(RecvStream(recv))),
             stopped,
         }
     }
 }
 
-impl Drop for NapiRecvStream {
-    fn drop(&mut self) {
-        // With no active read, stop now using the WebTransport code space. A pending read
-        // owns the lock and stops itself when dropping this sender closes its watch.
-        if let Ok(mut stream) = self.inner.try_lock() {
-            // An already finished/reset stream needs no further cleanup.
-            let _ = stream.stop(0);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use web_transport_quinn::{quinn::ConnectionError, SessionError, WebTransportError};
+
+    #[test]
+    fn backend_close_wins_over_a_racing_local_request() {
+        let local = || {
+            Some(NapiCloseInfo {
+                close_code: 42,
+                reason: "local".into(),
+            })
+        };
+        let peer = SessionError::WebTransportError(WebTransportError::Closed(7, "peer".into()));
+        let info = session_error_to_close_info(&peer, local()).unwrap();
+        assert_eq!((info.close_code, info.reason.as_str()), (7, "peer"));
+        assert!(session_error_to_close_info(
+            &SessionError::ConnectionError(ConnectionError::TimedOut),
+            local()
+        )
+        .is_err());
+        let info = session_error_to_close_info(
+            &SessionError::ConnectionError(ConnectionError::LocallyClosed),
+            local(),
+        )
+        .unwrap();
+        assert_eq!((info.close_code, info.reason.as_str()), (42, "local"));
     }
 }
 
@@ -603,13 +637,8 @@ impl NapiRecvStream {
             }
             let result = tokio::select! {
                 biased;
-                changed = stopped.changed() => {
-                    if changed.is_err() {
-                        stream.stop(0).map_err(|e| Error::from_reason(e.to_string()))?;
-                    }
-                    return Ok(Either3::C(Null));
-                },
-                result = stream.read_chunk(max_size as usize, true) => result,
+                _ = stopped.changed() => return Ok(Either3::C(Null)),
+                result = stream.0.read_chunk(max_size as usize, true) => result,
             };
             let err = match result {
                 Ok(chunk) => {
@@ -633,14 +662,14 @@ impl NapiRecvStream {
         })
     }
 
-    /// Tell the peer to stop sending with the given error code.
+    /// Tell the peer to stop sending with the given code; an already terminal stream is a no-op.
     #[napi]
     pub async fn stop(&self, code: u32) -> Result<()> {
         let inner = self.inner.clone();
         self.stopped.send_replace(true);
         let mut stream = inner.lock().await;
-        stream
-            .stop(code)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        // ClosedStream only means FIN, reset, or an earlier stop already made this terminal.
+        let _ = stream.0.stop(code);
+        Ok(())
     }
 }

@@ -58,6 +58,11 @@ Tokio works out of the box. To run on async-std or smol instead, enable quinn's 
 Resolving a hostname in `Client::connect` still uses tokio, so outside a tokio runtime connect to an IP address or resolve the name yourself.
 
 ## API
+`Session::closed` preserves the first close reason. A clean CONNECT-stream FIN without
+a close capsule reports `WebTransportError::Closed(0, "")`; malformed or interrupted
+capsules report `WebTransportError::CapsuleError` unless the underlying connection has
+already reported its own error. An explicit local close reports `ConnectionError::LocallyClosed`.
+
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
 
 When possible, `Deref` is used to expose the underlying Quinn API.

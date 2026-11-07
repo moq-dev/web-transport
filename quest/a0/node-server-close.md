@@ -14,6 +14,9 @@ Found while fixing [#470](https://github.com/moq-dev/web-transport/pull/470):
 hits. Find what both calls contend on (likely one lock held across the
 `accept` await) and let `close()` wake the waiter instead of waiting for it.
 
+Decided 2026-10-28 (maintainer): its own quest in a0, apart from
+[Node session and reader lifetime](/quest/a0/node-session-lifetime.md).
+
 Add a loopback regression that fails without the fix: start the README's
 accept loop, wait until its `accept()` is pending in native code, then close
 the server and require both to finish, with `accept()` resolving to `null`.

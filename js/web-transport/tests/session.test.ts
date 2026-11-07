@@ -1,7 +1,7 @@
 import { beforeAll, expect, test } from "bun:test";
 import { createSocket } from "node:dgram";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import napi from "../napi.cjs";
 import Session, { install, Server, WebTransportError } from "../src/index.ts";
 
 let url: string;
@@ -305,49 +305,85 @@ test("concurrent read requests keep pulling through data and FIN", async () => {
 	}
 });
 
-test("an abandoned reader stops its stream while a read is pending", async () => {
-	const { client, peer } = await connect();
-	try {
-		const writer = (await peer.createUnidirectionalStream()).getWriter();
-		await writer.write(new Uint8Array([1]));
-		await (async () => {
-			const { value: readable } = await client.incomingUnidirectionalStreams.getReader().read();
-			if (!readable) throw new Error("no stream");
-			const reader = readable.getReader();
-			expect((await reader.read()).value).toEqual(new Uint8Array([1]));
-			void reader.read();
-		})();
-
-		let stopped = false;
-		const closed = rejection(writer.closed).then((err) => {
-			expect(err.source).toBe("stream");
-			expect(err.streamErrorCode).toBe(0);
-			stopped = true;
-		});
-		// GC is only needed to trigger abandonment; the native drop/wakeup path is also
-		// exercised deterministically by cancelling a pending read above.
-		while (!stopped) {
-			Bun.gc(true);
-			await new Promise(setImmediate);
+test("native cancellation is idempotent after FIN and RESET_STREAM", async () => {
+	for (const reset of [false, true]) {
+		const client = await napi.NapiClient.disableVerify().connect(url);
+		const peer = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
+		try {
+			const writer = (await peer.createUnidirectionalStream()).getWriter();
+			await writer.write(new Uint8Array([1]));
+			const recv = await client.acceptUni();
+			await recv.read(65536);
+			if (reset) await writer.abort(new WebTransportError("reset", { streamErrorCode: 7 }));
+			else await writer.close();
+			await recv.read(65536);
+			await recv.stop(17);
+			await recv.stop(17);
+		} finally {
+			client.close(0, "done");
+			await client.closed();
 		}
-		await closed;
-	} finally {
-		client.close();
 	}
 });
 
-test("Node collects a reader with a pending native read", async () => {
-	const fixture = new URL("fixtures/abandoned-reader.ts", import.meta.url);
-	const child = Bun.spawn(["node", "--expose-gc", fileURLToPath(fixture), url], { stdout: "pipe", stderr: "pipe" });
+test("an awaited read and pipe retain an active receiver through collection", async () => {
+	for (const pipe of [false, true]) {
+		const { client, peer } = await connect();
+		try {
+			const writer = (await peer.createUnidirectionalStream()).getWriter();
+			await writer.write(new Uint8Array([1]));
+			const started = Promise.withResolvers<void>();
+			const result = (async () => {
+				const { value: readable } = await client.incomingUnidirectionalStreams.getReader().read();
+				if (!readable) throw new Error("no stream");
+				if (pipe) {
+					const observed = readable.pipeThrough(
+						new TransformStream<Uint8Array, Uint8Array>({
+							transform(chunk, controller) {
+								started.resolve();
+								controller.enqueue(chunk);
+							},
+						}),
+					);
+					return new Response(observed).arrayBuffer();
+				}
+				const reader = readable.getReader();
+				await reader.read();
+				started.resolve();
+				return reader.read();
+			})();
+			// Force collection while only the consumer's pending result is retained.
+			await started.promise;
+			await new Promise(setImmediate);
+			Bun.gc(true);
+			await new Promise(setImmediate);
+			await writer.write(new Uint8Array([2]));
+			await writer.close();
+			const value = await result;
+			if (pipe) expect(new Uint8Array(value as ArrayBuffer)).toEqual(new Uint8Array([1, 2]));
+			else expect((value as ReadableStreamReadResult<Uint8Array>).value).toEqual(new Uint8Array([2]));
+		} finally {
+			client.close();
+		}
+	}
+});
+
+test("Node retains an awaited read and pipe through collection", async () => {
+	const child = Bun.spawn(["node", "--expose-gc", join(import.meta.dir, "fixtures/active-reader.ts"), url], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 	let peer: Session | undefined;
 	try {
 		peer = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
-		const writer = (await peer.createUnidirectionalStream()).getWriter();
-		await writer.write(new Uint8Array([1]));
-		const err = await rejection(writer.closed);
-		expect(err.source).toBe("stream");
-		expect(err.streamErrorCode).toBe(0);
-		peer.close();
+		const datagrams = peer.datagrams.readable.getReader();
+		for (let i = 0; i < 2; i++) {
+			const writer = (await peer.createUnidirectionalStream()).getWriter();
+			await writer.write(new Uint8Array([1]));
+			await datagrams.read();
+			await writer.write(new Uint8Array([2]));
+			await writer.close();
+		}
 		expect(await child.exited).toBe(0);
 		expect(await new Response(child.stderr).text()).toBe("");
 	} finally {
