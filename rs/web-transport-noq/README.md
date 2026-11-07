@@ -34,14 +34,12 @@ then call `client.connect(url).await?` to establish a session. Clones share the
 client's endpoints. The first connection to each address family binds an
 IPv4 `0.0.0.0:0` or IPv6-only `[::]:0` socket. IPv4-mapped IPv6 destinations
 use IPv4. Socket setup failures are returned by `connect`, so building a client
-does not require IPv6 support or a running async runtime.
+does not require IPv6 support or a running async runtime. Both sockets use the
+runtime present at construction, or at the first connection if constructed
+outside a runtime. Keep that runtime alive while using the client.
 
 For an existing `noq::ClientConfig`, `Client::new(endpoint, config)` keeps
 the caller's endpoint and address handling. Set its ALPN to `h3`.
-
-`client.close(code, reason)` closes all bound endpoints and prevents new
-connections through any clone. Await `client.wait_idle()` after closing to
-wait for every bound endpoint to drain.
 
 See the [examples](examples) for certificate setup and server construction.
 

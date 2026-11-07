@@ -318,6 +318,7 @@ impl From<quinn::ClientConfig> for Client {
                 binding: Binding::Default {
                     ipv4: None,
                     ipv6: None,
+                    runtime: ClientRuntime::current(),
                 },
                 closed: false,
             })),
@@ -339,6 +340,7 @@ enum Binding {
     Default {
         ipv4: Option<quinn::Endpoint>,
         ipv6: Option<quinn::Endpoint>,
+        runtime: Option<ClientRuntime>,
     },
 }
 
@@ -347,7 +349,7 @@ impl Binding {
         match self {
             Self::Custom(endpoint) => [Some(endpoint), None],
             #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-            Self::Default { ipv4, ipv6 } => [ipv4.as_ref(), ipv6.as_ref()],
+            Self::Default { ipv4, ipv6, .. } => [ipv4.as_ref(), ipv6.as_ref()],
         }
         .into_iter()
         .flatten()
@@ -369,7 +371,11 @@ impl ClientEndpoints {
         let (endpoint, remote) = match &mut self.binding {
             Binding::Custom(endpoint) => (endpoint, remote),
             #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-            Binding::Default { ipv4, ipv6 } => {
+            Binding::Default {
+                ipv4,
+                ipv6,
+                runtime,
+            } => {
                 let remote = match remote {
                     SocketAddr::V6(addr) => addr
                         .ip()
@@ -380,8 +386,18 @@ impl ClientEndpoints {
                 };
                 let slot = if remote.is_ipv4() { ipv4 } else { ipv6 };
                 if slot.is_none() {
+                    if runtime.is_none() {
+                        *runtime = ClientRuntime::current();
+                    }
+                    let runtime = runtime.as_ref().ok_or_else(|| {
+                        ClientError::IoError(Arc::new(std::io::Error::other(
+                            "no async runtime found",
+                        )))
+                    })?;
                     *slot = Some(
-                        bind_endpoint(remote).map_err(|err| ClientError::IoError(Arc::new(err)))?,
+                        runtime
+                            .bind(remote)
+                            .map_err(|err| ClientError::IoError(Arc::new(err)))?,
                     );
                 }
                 (slot.as_mut().unwrap(), remote)
@@ -392,15 +408,39 @@ impl ClientEndpoints {
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-fn bind_endpoint(remote: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+#[derive(Debug)]
+struct ClientRuntime {
+    inner: Arc<dyn quinn::Runtime>,
+    tokio: Option<tokio::runtime::Handle>,
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl ClientRuntime {
+    fn current() -> Option<Self> {
+        Some(Self {
+            inner: quinn::default_runtime()?,
+            tokio: tokio::runtime::Handle::try_current().ok(),
+        })
+    }
+
+    fn bind(&self, remote: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+        // TokioRuntime registers sockets and spawns drivers in the current context.
+        let _guard = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
+        bind_endpoint(remote, self.inner.clone())
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_endpoint(
+    remote: SocketAddr,
+    runtime: Arc<dyn quinn::Runtime>,
+) -> std::io::Result<quinn::Endpoint> {
     let bind: SocketAddr = if remote.is_ipv4() {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let socket = bind_socket(bind)?;
-    let runtime =
-        quinn::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
     quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
 }
 

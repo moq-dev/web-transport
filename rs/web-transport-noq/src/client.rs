@@ -195,7 +195,7 @@ impl DangerousClientBuilder {
 /// A client for connecting to a WebTransport server.
 #[derive(Clone, Debug)]
 pub struct Client {
-    endpoints: Arc<Mutex<ClientEndpoints>>,
+    endpoints: Arc<Mutex<Binding>>,
     config: noq::ClientConfig,
 }
 
@@ -205,10 +205,7 @@ impl Client {
     /// The ALPN MUST be set to [ALPN].
     pub fn new(endpoint: noq::Endpoint, config: noq::ClientConfig) -> Self {
         Self {
-            endpoints: Arc::new(Mutex::new(ClientEndpoints {
-                binding: Binding::Custom(endpoint),
-                closed: false,
-            })),
+            endpoints: Arc::new(Mutex::new(Binding::Custom(endpoint))),
             config,
         }
     }
@@ -219,10 +216,6 @@ impl Client {
         request: impl Into<ConnectRequest>,
     ) -> Result<Session, ClientError> {
         let request = request.into();
-        if self.endpoints.lock().unwrap().closed {
-            return Err(noq::ConnectError::EndpointStopping.into());
-        }
-
         let port = request.url.port().unwrap_or(443);
 
         // TODO error on username:password in host
@@ -260,36 +253,7 @@ impl Client {
         let conn = conn.await?;
 
         // Connect with the connection we established.
-        let session = Session::connect(conn, request).await?;
-        if self.endpoints.lock().unwrap().closed {
-            return Err(noq::ConnectionError::LocallyClosed.into());
-        }
-        Ok(session)
-    }
-
-    /// Close all bound endpoints and reject future connections from every clone.
-    pub fn close(&self, code: noq::VarInt, reason: &[u8]) {
-        let mut endpoints = self.endpoints.lock().unwrap();
-        if endpoints.closed {
-            return;
-        }
-        endpoints.closed = true;
-        for endpoint in endpoints.binding.endpoints() {
-            endpoint.close(code, reason);
-        }
-    }
-
-    /// Wait for currently bound endpoints to become idle; close first to prevent new connections.
-    pub async fn wait_idle(&self) {
-        let endpoints: Vec<_> = self
-            .endpoints
-            .lock()
-            .unwrap()
-            .binding
-            .endpoints()
-            .cloned()
-            .collect();
-        futures::future::join_all(endpoints.iter().map(noq::Endpoint::wait_idle)).await;
+        Session::connect(conn, request).await
     }
 }
 
@@ -300,22 +264,14 @@ impl Client {
     /// The config must negotiate [`ALPN`]; socket setup errors are returned by [`Self::connect`].
     fn from_config(config: noq::ClientConfig) -> Self {
         Self {
-            endpoints: Arc::new(Mutex::new(ClientEndpoints {
-                binding: Binding::Default {
-                    ipv4: None,
-                    ipv6: None,
-                },
-                closed: false,
+            endpoints: Arc::new(Mutex::new(Binding::Default {
+                ipv4: None,
+                ipv6: None,
+                runtime: ClientRuntime::current(),
             })),
             config,
         }
     }
-}
-
-#[derive(Debug)]
-struct ClientEndpoints {
-    binding: Binding,
-    closed: bool,
 }
 
 #[derive(Debug)]
@@ -325,37 +281,38 @@ enum Binding {
     Default {
         ipv4: Option<noq::Endpoint>,
         ipv6: Option<noq::Endpoint>,
+        runtime: Option<ClientRuntime>,
     },
 }
 
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 impl Binding {
     fn endpoints(&self) -> impl Iterator<Item = &noq::Endpoint> {
         match self {
             Self::Custom(endpoint) => [Some(endpoint), None],
             #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-            Self::Default { ipv4, ipv6 } => [ipv4.as_ref(), ipv6.as_ref()],
+            Self::Default { ipv4, ipv6, .. } => [ipv4.as_ref(), ipv6.as_ref()],
         }
         .into_iter()
         .flatten()
     }
 }
 
-impl ClientEndpoints {
+impl Binding {
     fn connect(
         &mut self,
         config: noq::ClientConfig,
         remote: SocketAddr,
         host: &str,
     ) -> Result<noq::Connecting, ClientError> {
-        if self.closed {
-            return Err(noq::ConnectError::EndpointStopping.into());
-        }
-        // Binding and starting the connection share close's lock, so close
-        // cannot miss a newly created endpoint or an in-progress connection.
-        let (endpoint, remote) = match &mut self.binding {
+        let (endpoint, remote) = match self {
             Binding::Custom(endpoint) => (endpoint, remote),
             #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-            Binding::Default { ipv4, ipv6 } => {
+            Binding::Default {
+                ipv4,
+                ipv6,
+                runtime,
+            } => {
                 let remote = match remote {
                     SocketAddr::V6(addr) => addr
                         .ip()
@@ -366,8 +323,18 @@ impl ClientEndpoints {
                 };
                 let slot = if remote.is_ipv4() { ipv4 } else { ipv6 };
                 if slot.is_none() {
+                    if runtime.is_none() {
+                        *runtime = ClientRuntime::current();
+                    }
+                    let runtime = runtime.as_ref().ok_or_else(|| {
+                        ClientError::IoError(Arc::new(std::io::Error::other(
+                            "no async runtime found",
+                        )))
+                    })?;
                     *slot = Some(
-                        bind_endpoint(remote).map_err(|err| ClientError::IoError(Arc::new(err)))?,
+                        runtime
+                            .bind(remote)
+                            .map_err(|err| ClientError::IoError(Arc::new(err)))?,
                     );
                 }
                 (slot.as_mut().unwrap(), remote)
@@ -378,15 +345,39 @@ impl ClientEndpoints {
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-fn bind_endpoint(remote: SocketAddr) -> std::io::Result<noq::Endpoint> {
+#[derive(Debug)]
+struct ClientRuntime {
+    inner: Arc<dyn noq::Runtime>,
+    tokio: Option<tokio::runtime::Handle>,
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl ClientRuntime {
+    fn current() -> Option<Self> {
+        Some(Self {
+            inner: noq::default_runtime()?,
+            tokio: tokio::runtime::Handle::try_current().ok(),
+        })
+    }
+
+    fn bind(&self, remote: SocketAddr) -> std::io::Result<noq::Endpoint> {
+        // TokioRuntime registers sockets and spawns drivers in the current context.
+        let _guard = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
+        bind_endpoint(remote, self.inner.clone())
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_endpoint(
+    remote: SocketAddr,
+    runtime: Arc<dyn noq::Runtime>,
+) -> std::io::Result<noq::Endpoint> {
     let bind: SocketAddr = if remote.is_ipv4() {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let socket = bind_socket(bind)?;
-    let runtime =
-        noq::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
     noq::Endpoint::new(noq::EndpointConfig::default(), None, socket, runtime)
 }
 

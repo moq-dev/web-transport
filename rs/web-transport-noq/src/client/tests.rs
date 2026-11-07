@@ -17,10 +17,26 @@ fn bound(client: &Client) -> Vec<SocketAddr> {
         .endpoints
         .lock()
         .unwrap()
-        .binding
         .endpoints()
         .map(|endpoint| endpoint.local_addr().unwrap())
         .collect()
+}
+
+fn close(client: &Client, code: backend::VarInt, reason: &[u8]) {
+    for endpoint in client.endpoints.lock().unwrap().endpoints() {
+        endpoint.close(code, reason);
+    }
+}
+
+async fn wait_idle(client: &Client) {
+    let endpoints: Vec<_> = client
+        .endpoints
+        .lock()
+        .unwrap()
+        .endpoints()
+        .cloned()
+        .collect();
+    futures::future::join_all(endpoints.iter().map(backend::Endpoint::wait_idle)).await;
 }
 
 fn url(remote: SocketAddr) -> url::Url {
@@ -45,48 +61,13 @@ async fn default_ipv4_socket() {
     tokio::pin!(connect);
     assert!(futures::poll!(&mut connect).is_pending());
     assert!(bound(&client)[0].is_ipv4());
-    client.close(0u32.into(), b"");
+    close(&client, 0u32.into(), b"");
     assert!(connect.await.is_err());
-    client.wait_idle().await;
-}
-
-#[tokio::test]
-async fn close_prevents_binding_either_family() {
-    let client = client();
-    let clone = client.clone();
-    let pending = clone.connect(url("127.0.0.1:443".parse().unwrap()));
-    client.close(0u32.into(), b"");
-    assert!(pending.await.is_err());
-    for host in ["127.0.0.1", "[::1]", "localhost", "[::ffff:127.0.0.1]"] {
-        assert!(clone
-            .connect(url::Url::parse(&format!("https://{host}:443/")).unwrap())
-            .await
-            .is_err());
-    }
-    assert!(bound(&client).is_empty());
-    client.wait_idle().await;
-}
-
-#[tokio::test]
-async fn close_interrupts_connect_and_prevents_second_family() {
-    let client = client();
-    let clone = client.clone();
-    let connect = clone.connect(url("127.0.0.1:443".parse().unwrap()));
-    tokio::pin!(connect);
-    assert!(futures::poll!(&mut connect).is_pending());
-    let before = bound(&client);
-    client.close(0u32.into(), b"");
-    assert!(connect.await.is_err());
-    assert!(client
-        .connect(url("[::1]:443".parse().unwrap()))
-        .await
-        .is_err());
-    assert_eq!(bound(&client), before);
-    clone.wait_idle().await;
+    wait_idle(&client).await;
 }
 
 #[test]
-fn endpoint_failure_is_a_connect_error() {
+fn missing_runtime_is_a_connect_error_and_allows_later_connections() {
     // Poll an IP-literal connect without a runtime. Construction succeeds,
     // while the lazy endpoint reports its setup error instead of panicking.
     let client = client();
@@ -94,6 +75,17 @@ fn endpoint_failure_is_a_connect_error() {
         .unwrap_err();
     assert!(matches!(error, ClientError::IoError(_)));
     assert!(bound(&client).is_empty());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut server = server("127.0.0.1:0".parse().unwrap());
+        let remote = server.local_addr().unwrap();
+        let (_session, _peer) = pair(&client, &mut server, remote).await;
+        close(&client, 0u32.into(), b"");
+        wait_idle(&client).await;
+    });
 }
 
 #[tokio::test]
@@ -110,8 +102,8 @@ async fn caller_endpoint_keeps_its_address_and_remote_handling() {
         ClientError::NoqError(backend::ConnectError::InvalidRemoteAddress(_))
     ));
     assert_eq!(bound(&client), vec![addr]);
-    client.close(0u32.into(), b"");
-    client.wait_idle().await;
+    close(&client, 0u32.into(), b"");
+    wait_idle(&client).await;
 }
 
 fn server(addr: SocketAddr) -> crate::Server {
@@ -182,8 +174,7 @@ async fn families_mapped_addresses_and_clones_share_endpoints() {
     );
     assert_eq!(bound(&clone), both);
 
-    client.close(42u32.into(), b"all endpoints");
-    clone.close(43u32.into(), b"second close");
+    close(&client, 42u32.into(), b"all endpoints");
     for session in [&session4, &session6, &session_mapped] {
         let error = backend::Connection::closed(session).await;
         assert!(
@@ -194,12 +185,11 @@ async fn families_mapped_addresses_and_clones_share_endpoints() {
     for peer in [&peer4, &peer6, &peer_mapped] {
         backend::Connection::closed(peer).await;
     }
-    tokio::join!(client.wait_idle(), clone.wait_idle());
+    wait_idle(&client).await;
     assert!(client
         .endpoints
         .lock()
         .unwrap()
-        .binding
         .endpoints()
         .all(|endpoint| endpoint.open_connections() == 0));
     drop((session4, session6, session_mapped));
@@ -241,8 +231,8 @@ async fn simultaneous_first_connections_share_one_socket() {
             .remote_address()
             .unwrap()
     );
-    client.close(0u32.into(), b"");
-    client.wait_idle().await;
+    close(&client, 0u32.into(), b"");
+    wait_idle(&client).await;
     drop((first, second, peers));
 }
 
@@ -264,4 +254,45 @@ async fn dropping_native_client_keeps_returned_session_usable() {
     server.close(0u32.into(), b"");
     backend::Connection::closed(&session).await;
     server.wait_idle().await;
+}
+
+#[test]
+fn construction_runtime_survives_first_connect_on_transient_runtime() {
+    let owner = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = {
+        let _guard = owner.enter();
+        client()
+    };
+    let transient = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    transient.block_on(async {
+        for addr in ["127.0.0.1:443", "[::1]:443"] {
+            let connect = client.connect(url(addr.parse().unwrap()));
+            tokio::pin!(connect);
+            assert!(futures::poll!(&mut connect).is_pending());
+        }
+    });
+    drop(transient);
+    owner.block_on(async {
+        let mut ipv4 = server("127.0.0.1:0".parse().unwrap());
+        let mut ipv6 = server("[::1]:0".parse().unwrap());
+        for server in [&mut ipv4, &mut ipv6] {
+            let remote = server.local_addr().unwrap();
+            let (session, peer) = pair(&client, server, remote).await;
+            session
+                .send_datagram(bytes::Bytes::from_static(b"owner runtime"))
+                .unwrap();
+            assert_eq!(
+                peer.read_datagram().await.unwrap().as_ref(),
+                b"owner runtime"
+            );
+        }
+        close(&client, 0u32.into(), b"");
+        wait_idle(&client).await;
+    });
 }

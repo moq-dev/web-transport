@@ -141,6 +141,7 @@ impl Client {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(transport.into());
 
+        let _guard = RUNTIME.enter();
         Ok(Arc::new(Self {
             inner: web_transport_quinn::Client::from(client_config),
         }))

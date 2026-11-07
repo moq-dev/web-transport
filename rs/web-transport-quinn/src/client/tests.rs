@@ -86,7 +86,7 @@ async fn close_interrupts_connect_and_prevents_second_family() {
 }
 
 #[test]
-fn endpoint_failure_is_a_connect_error() {
+fn missing_runtime_is_a_connect_error_and_allows_later_connections() {
     // Poll an IP-literal connect without a runtime. Construction succeeds,
     // while the lazy endpoint reports its setup error instead of panicking.
     let client = client();
@@ -94,6 +94,17 @@ fn endpoint_failure_is_a_connect_error() {
         .unwrap_err();
     assert!(matches!(error, ClientError::IoError(_)));
     assert!(bound(&client).is_empty());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut server = server("127.0.0.1:0".parse().unwrap());
+        let remote = server.local_addr().unwrap();
+        let (_session, _peer) = pair(&client, &mut server, remote).await;
+        client.close(0u32.into(), b"");
+        client.wait_idle().await;
+    });
 }
 
 #[tokio::test]
@@ -235,4 +246,45 @@ async fn dropping_native_client_keeps_returned_session_usable() {
     server.close(0u32.into(), b"");
     backend::Connection::closed(&session).await;
     server.wait_idle().await;
+}
+
+#[test]
+fn construction_runtime_survives_first_connect_on_transient_runtime() {
+    let owner = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = {
+        let _guard = owner.enter();
+        client()
+    };
+    let transient = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    transient.block_on(async {
+        for addr in ["127.0.0.1:443", "[::1]:443"] {
+            let connect = client.connect(url(addr.parse().unwrap()));
+            tokio::pin!(connect);
+            assert!(futures::poll!(&mut connect).is_pending());
+        }
+    });
+    drop(transient);
+    owner.block_on(async {
+        let mut ipv4 = server("127.0.0.1:0".parse().unwrap());
+        let mut ipv6 = server("[::1]:0".parse().unwrap());
+        for server in [&mut ipv4, &mut ipv6] {
+            let remote = server.local_addr().unwrap();
+            let (session, peer) = pair(&client, server, remote).await;
+            session
+                .send_datagram(bytes::Bytes::from_static(b"owner runtime"))
+                .unwrap();
+            assert_eq!(
+                peer.read_datagram().await.unwrap().as_ref(),
+                b"owner runtime"
+            );
+        }
+        client.close(0u32.into(), b"");
+        client.wait_idle().await;
+    });
 }
