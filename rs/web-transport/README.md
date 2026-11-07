@@ -15,6 +15,52 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+## Configured native clients
+
+On native targets, `Client::from(web_transport::quinn::Client)` wraps a configured
+client, preserving its endpoint, TLS settings and transport configuration. This
+matches the existing native `Server` and `Session` conversions. The converted
+client initially offers no application subprotocols; use its native-only
+`with_protocols` method to replace the offers. An empty iterator clears them.
+Clones share the native client and keep independent protocol offers.
+
+Split setup by target, then share `Client::connect` and application code:
+
+```rust
+fn client() -> Result<web_transport::Client, web_transport::Error> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // For trusted development networks only: this disables server authentication.
+        let native = web_transport::quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()?;
+        Ok(web_transport::Client::from(native).with_protocols(["example"]))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_transport::ClientBuilder::new()
+            .with_protocols(["example"])
+            .with_system_roots()
+    }
+}
+
+async fn connect(url: url::Url) -> Result<web_transport::Session, web_transport::Error> {
+    client()?.connect(url).await
+}
+```
+
+Configure a native `quinn::Client` with its builder, or use `quinn::Client::new`
+with your own Quinn endpoint and configuration. Custom TLS configurations must
+offer `web_transport::quinn::ALPN` (`h3`). Offered application subprotocols are
+separate from ALPN; read the negotiated selection with `Session::protocol`.
+
+Browsers always authenticate the server. `ClientBuilder::with_system_roots`
+uses browser-managed certificate trust. `with_server_certificate_hashes` accepts
+SHA-256 certificate pins, subject to the browser's requirements for certificate
+lifetime and key type; see
+[serverCertificateHashes](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/WebTransport#servercertificatehashes).
+Browsers provide no certificate-verification bypass.
+
 
 ## Why no trait?
 

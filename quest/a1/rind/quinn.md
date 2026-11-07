@@ -18,5 +18,4 @@ Decided with the maintainer on 2026-11-06 (planning interview):
 
 ## Related
 
-- [Native client composition](/quest/a1/native-client-config.md) - converts a configured Quinn client into the router
 - [Dual-stack bind](/quest/a1/dual-stack-bind.md) - rebuilds the same builders' endpoints

@@ -43,29 +43,56 @@ impl ClientBuilder {
 
     /// Accept the server's certificate hashes (sha256) instead of using a root CA.
     pub fn with_server_certificate_hashes(self, hashes: Vec<Vec<u8>>) -> Result<Client, Error> {
-        Ok(Client {
-            inner: self.inner.with_server_certificate_hashes(hashes)?,
-            protocols: self.protocols,
-        })
+        Ok(
+            Client::from(self.inner.with_server_certificate_hashes(hashes)?)
+                .with_protocols(self.protocols),
+        )
     }
 
     /// Accept certificates using root CAs.
     pub fn with_system_roots(self) -> Result<Client, Error> {
-        Ok(Client {
-            inner: self.inner.with_system_roots()?,
-            protocols: self.protocols,
-        })
+        Ok(Client::from(self.inner.with_system_roots()?).with_protocols(self.protocols))
     }
 }
 
 /// Used to dial multiple [Session]s.
+///
+/// On native targets, convert a configured [`quinn::Client`] with [`Client::from`]
+/// to preserve its endpoint, TLS and transport configuration.
 #[derive(Clone, Debug)]
 pub struct Client {
     inner: quinn::Client,
     protocols: Vec<String>,
 }
 
+/// Wrap a configured native client without changing its endpoint or configuration.
+impl From<quinn::Client> for Client {
+    fn from(inner: quinn::Client) -> Self {
+        Self {
+            inner,
+            protocols: Vec::new(),
+        }
+    }
+}
+
 impl Client {
+    /// Replace the application protocols (subprotocols) offered by this native client.
+    ///
+    /// Conversion starts with no offers; an empty iterator clears them. Clones share
+    /// the native client, but retain independent offers. The server's selection is
+    /// available through [`Session::protocol`].
+    pub fn with_protocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.protocols = protocols
+            .into_iter()
+            .map(|p| p.as_ref().to_string())
+            .collect();
+        self
+    }
+
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, Error> {
         let request =
