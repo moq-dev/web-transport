@@ -158,3 +158,57 @@ async fn cancelled_session_calls_release_the_final_owner() {
             .expect("cancelled foreign call retained the final Session owner");
     }
 }
+
+#[tokio::test]
+async fn cancelled_stream_opens_release_the_final_owner() {
+    use std::{future::Future, sync::Arc, task::Poll};
+
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (chain, key) = self_signed_cert();
+    let cert = rustls::pki_types::CertificateDer::from(chain[0].clone());
+    let key = rustls::pki_types::PrivateKeyDer::try_from(key).unwrap();
+    let mut config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(None);
+    transport.max_concurrent_bidi_streams(0u32.into());
+    transport.max_concurrent_uni_streams(0u32.into());
+    config.transport_config(Arc::new(transport));
+    let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let mut config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(None);
+    config.transport_config(Arc::new(transport));
+    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(config);
+
+    for bidirectional in [false, true] {
+        let connecting = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let accepted = async { server.accept().await.unwrap().await.unwrap() };
+        let (conn, peer) = tokio::join!(connecting, accepted);
+        // Raw mode lets the peer grant zero credit without preventing HTTP/3 setup.
+        let session =
+            crate::session::Session::new(web_transport_quinn::Session::raw(conn.unwrap()));
+        let mut call = Box::pin(async {
+            if bidirectional {
+                let _ = session.open_bi().await;
+            } else {
+                let _ = session.open_uni().await;
+            }
+        });
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        drop(session);
+        tokio::time::timeout(TIMEOUT, peer.closed())
+            .await
+            .expect("cancelled stream open retained the final Session owner");
+    }
+}

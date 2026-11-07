@@ -16,6 +16,8 @@ For now, consume the package locally by downloading the `web-transport-ffi-${VER
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
 
+Swift can release a local after its last use, before its lexical scope ends. For async stream work, put `defer { withExtendedLifetime(session) {} }` in the scope that awaits the stream operations. This uses [`withExtendedLifetime`](https://docs.swift.org/documentation/swift/withextendedlifetime(_:_:)) at scope exit to retain the Session across those awaits. Close the Session explicitly when finished.
+
 ## Local development
 
 `swift/scripts/check.sh` builds `web-transport-ffi` for the host, regenerates the UniFFI Swift bindings, and (on macOS) assembles a single-slice `WebTransportFFI.xcframework` so `swift test` can run. Requires macOS with `xcodebuild` and `swift` on `$PATH`. Skips cleanly on non-macOS hosts.

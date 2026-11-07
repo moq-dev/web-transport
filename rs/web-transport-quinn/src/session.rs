@@ -1843,15 +1843,15 @@ mod tests {
         let (session, _settings, connect) = http3(client, &peer).await;
         let runtime = Arc::new(CapturedRuntime::default());
         session.close_on(42, &vec![b'x'; 65536], Some(runtime.clone()));
-        let mut task = runtime.take();
-        assert!(futures::poll!(&mut task).is_pending());
-        // A blocked write has not reached FIN. The peer retains its receive stream.
+        let task = runtime.take();
         (session, connect, peer, endpoints, task)
     }
 
     #[tokio::test]
     async fn cancelled_close_during_blocked_capsule_write() {
-        let (session, _connect, peer, _endpoints, task) = blocked_close().await;
+        let (session, _connect, peer, _endpoints, mut task) = blocked_close().await;
+        assert!(futures::poll!(&mut task).is_pending());
+        // A blocked write has not reached FIN. The peer retains its receive stream.
         let native = session.conn.clone();
         let reader = Arc::downgrade(&session.error);
         drop(session);
