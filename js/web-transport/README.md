@@ -147,6 +147,8 @@ await writer.abort(new WebTransportError("cancelled", { streamErrorCode: 7 }));
 
 ### Closing
 
+Always call `session.close()` when finished and await `session.closed`. The Node wrapper retains native Session handles while its close promise and incoming stream operations are pending. Garbage collecting the JavaScript Session does not close those handles, so it does not provide the Rust Session's final-handle cleanup contract.
+
 ```ts
 // Close gracefully
 session.close({ closeCode: 0, reason: "done" });

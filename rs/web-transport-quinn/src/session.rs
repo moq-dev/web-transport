@@ -64,6 +64,8 @@ struct Close {
     reader: Option<AbortHandle>,
     code: quinn::VarInt,
     reason: Vec<u8>,
+    // Drop only after the synchronous close, so an implicit FIN cannot race it.
+    send: Option<quinn::SendStream>,
     // HTTP/3 control and accepted QPACK streams must survive through graceful close.
     _settings: Option<Arc<Settings>>,
     _accept: Option<Arc<Mutex<SessionAccept>>>,
@@ -110,10 +112,6 @@ pub struct Session {
     header_uni: Bytes,
     header_bi: Bytes,
     header_datagram: Bytes,
-
-    // The send side of the CONNECT stream, used to write the CloseWebTransportSession capsule.
-    // Wrapped in Arc<Mutex<Option<...>>> so close() can take it exactly once.
-    connect_send: Arc<Mutex<Option<quinn::SendStream>>>,
 
     // Session error, set once by either local close() or the background task
     // when a remote CloseWebTransportSession capsule is received.
@@ -193,6 +191,7 @@ impl Session {
                 reader: Some(reader),
                 code: crate::error::encode_stream_code(0, false),
                 reason: Vec::new(),
+                send: Some(connect.send),
                 _settings: Some(Arc::new(settings)),
                 _accept: Some(accept.clone()),
             })),
@@ -206,7 +205,6 @@ impl Session {
             header_uni: header_uni.into(),
             header_bi: header_bi.into(),
             header_datagram: header_datagram.into(),
-            connect_send: Arc::new(Mutex::new(Some(connect.send))),
             error: error.clone(),
             request: Some(connect.request.clone()),
             response: Some(connect.response.clone()),
@@ -498,30 +496,26 @@ impl Session {
         close.code = crate::error::encode_stream_code(code, self.is_raw());
         close.reason = reason.to_vec();
 
-        if self.session_id.is_some() {
-            let send = self.connect_send.lock().unwrap().take();
-            if let Some(send) = send {
-                let Some(runtime) = runtime else {
-                    return; // `close` performs immediate teardown without a runtime.
-                };
-                let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
-                    code,
-                    reason: String::from_utf8_lossy(reason).into_owned(),
-                };
-                let timeout = (self.rtt() * 3).max(Duration::from_millis(100));
-                runtime.clone().spawn(Box::pin(Self::close_with_capsule(
-                    close, send, capsule, timeout, runtime,
-                )));
-            }
+        if close.send.is_none() {
+            return; // Raw sessions close synchronously without a capsule.
         }
-        // Raw sessions, or a missing CONNECT stream, close synchronously here.
+        let Some(runtime) = runtime else {
+            return; // `close` performs immediate teardown before dropping CONNECT.
+        };
+        let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
+            code,
+            reason: String::from_utf8_lossy(reason).into_owned(),
+        };
+        let timeout = (self.rtt() * 3).max(Duration::from_millis(100));
+        runtime.clone().spawn(Box::pin(Self::close_with_capsule(
+            close, capsule, timeout, runtime,
+        )));
     }
 
     /// Write the close capsule, finish CONNECT, then await the peer within one deadline.
     /// Dropping this future at any point performs the same synchronous teardown.
     async fn close_with_capsule(
-        close: Close,
-        mut send: quinn::SendStream,
+        mut close: Close,
         capsule: web_transport_proto::Capsule,
         timeout: Duration,
         runtime: Arc<dyn quinn::Runtime>,
@@ -541,6 +535,10 @@ impl Session {
         // Bound the write as well as the peer wait: flow control can block the
         // capsule indefinitely when the peer neither reads nor closes.
         let graceful = async {
+            let send = close
+                .send
+                .as_mut()
+                .expect("HTTP/3 close has a CONNECT stream");
             if let Err(e) = send.write_all(&frame).await {
                 tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
                 return;
@@ -631,6 +629,7 @@ impl Session {
                     reader: None,
                     code: 0u32.into(),
                     reason: Vec::new(),
+                    send: None,
                     _settings: None,
                     _accept: None,
                 })),
@@ -651,7 +650,6 @@ impl Session {
             op_closed: Default::default(),
             parked_accept_uni: Default::default(),
             parked_accept_bi: Default::default(),
-            connect_send: Arc::new(Mutex::new(None)),
             request: None,
             response: None,
             alpn: Default::default(),
@@ -1887,8 +1885,8 @@ mod tests {
             tokio::time::advance(Duration::from_secs(1)).await;
             task.await;
             assert!(native.close_reason().is_some());
-            reader_released(reader).await;
             tokio::time::resume();
+            reader_released(reader).await;
             tokio::time::timeout(Duration::from_secs(5), peer.closed())
                 .await
                 .unwrap();
@@ -2127,10 +2125,10 @@ mod tests {
                 reader: None,
                 code: crate::error::encode_stream_code(0, false),
                 reason: b"bye".to_vec(),
+                send: Some(send),
                 _settings: None,
                 _accept: None,
             },
-            send,
             capsule,
             Duration::from_millis(100),
             runtime.clone(),
