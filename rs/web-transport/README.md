@@ -10,20 +10,19 @@ Most importantly, QUIC supports multiple independent data streams.
 This crate provides a generic WebTransport implementation depending on the platform:
 
 -   Native: [web-transport-quinn](../web-transport-quinn)
--   WASM: [web-transport-wasm](../web-transport-wasm)
+-   Browser WASM (`wasm32`, excluding WASI): [web-transport-wasm](../web-transport-wasm)
 
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+## Platform API and traits
 
-## Why no trait?
+This crate exposes concrete types selected at compile time for the target platform.
+The backend crates also implement [web-transport-trait](../web-transport-trait)'s
+async and poll-based session and stream traits. Its `MaybeSend` and `MaybeSync`
+bounds require `Send` and `Sync` when `target_family` is not `wasm` and impose no
+such requirements on the `wasm` target family, including browser and WASI targets.
 
-See [web-transport-trait](https://docs.rs/web-transport-trait). 
-
-The biggest problem with async traits in Rust is `Send`.
-WASM is `!Send` and as far as I can tell, it's not possible to implement a trait that both can support.
-`web-transport-trait` requires `Send` which rules out WASM.
-
-This crate skirts the issue by switching the underlying implementation based on the platform.
-The compiler can then automatically apply `Send` bounds instead of explicitly requiring them.
-Unfortunate, I know.
+Use the backend types through this crate's `web_transport::quinn` or
+`web_transport::wasm` re-export when your code needs these trait implementations.
+The wrapper types exported by this crate do not implement them.
