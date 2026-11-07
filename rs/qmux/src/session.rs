@@ -2107,32 +2107,12 @@ impl Session {
             return Ok(());
         }
 
-        let wait = async { established.wait_for(|&done| done).await.is_ok() };
-        let timeout = self.config.handshake_timeout;
-        // A zero timeout disables the bound (wait indefinitely).
-        let outcome = if timeout.is_zero() {
-            Some(wait.await)
+        if established.wait_for(|&done| done).await.is_ok() {
+            Ok(())
         } else {
-            tokio::time::timeout(timeout, wait).await.ok()
-        };
-
-        match outcome {
-            // Established.
-            Some(true) => Ok(()),
-            // The backend task ended before establishing — surface the close reason.
-            Some(false) => Err(self.close_reason().await),
-            // Timed out waiting for the peer's parameters: abort the half-open
-            // handshake, notifying the peer, and fail rather than hang.
-            // If the session closed first, report that reason instead.
-            None => {
-                // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
-                // rather than seeing a graceful close.
-                let frame = ConnectionClose {
-                    code: VarInt::from(0u32),
-                    reason: "handshake timeout".to_string(),
-                };
-                Err(self.close_with(frame.into(), Error::HandshakeTimeout))
-            }
+            // The backend enforces the handshake deadline and records its error
+            // before dropping the establishment sender.
+            Err(self.close_reason().await)
         }
     }
 
@@ -2323,8 +2303,27 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
+        let handshake_deadline = (version.is_qmux() && !config.handshake_timeout.is_zero())
+            .then(|| base + config.handshake_timeout);
+        let mut established = established_rx.clone();
         tokio::spawn(async move {
-            let err = backend.run().await.err().unwrap_or(Error::Closed);
+            let handshake = async {
+                if let Some(deadline) = handshake_deadline {
+                    if tokio::time::timeout_at(deadline, established.wait_for(|&done| done))
+                        .await
+                        .is_err()
+                    {
+                        return Error::HandshakeTimeout;
+                    }
+                }
+                std::future::pending().await
+            };
+            // The deadline starts at construction and remains pollable even if
+            // the reader is parked on application backpressure.
+            let err = tokio::select! {
+                result = backend.run() => result.err().unwrap_or(Error::Closed),
+                err = handshake => err,
+            };
             // If we tore down because of a protocol/transport violation *we*
             // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
             // session rejects too, rather than seeing a bare drop. Enqueue on the
@@ -5004,6 +5003,60 @@ mod teardown_tests {
     impl Reader for WedgedReader {
         async fn recv(&mut self) -> Result<Bytes, Error> {
             std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_timeout_releases_wedged_writer_with_retained_session() {
+        use web_transport_trait::Session as _;
+
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+            let mut config = Config::new(version);
+            config.handshake_timeout = Duration::from_secs(1);
+            let session = Session::new(
+                WedgedTransport {
+                    entered_send: entered_tx,
+                    dropped: dropped_tx,
+                },
+                false,
+                config,
+            );
+            entered_rx.recv().await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), session.closed())
+                .await
+                .unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_entrypoints_report_shared_handshake_timeout() {
+        for is_server in [false, true] {
+            let (entered_send, _entered_rx) = mpsc::unbounded_channel();
+            let (dropped, _dropped_rx) = mpsc::unbounded_channel();
+            let transport = WedgedTransport {
+                entered_send,
+                dropped,
+            };
+            let mut config = Config::new(Version::QMux02);
+            config.handshake_timeout = Duration::from_secs(1);
+            let establish = async {
+                if is_server {
+                    Session::accept(transport, config).await
+                } else {
+                    Session::connect(transport, config).await
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), establish)
+                .await
+                .expect("establishment stayed pending");
+            assert!(matches!(result, Err(Error::HandshakeTimeout)));
         }
     }
 
