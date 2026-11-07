@@ -260,8 +260,9 @@ pub struct Session {
 
     // The transport's own view of the connection, when it has one. Preferred over
     // `rtt`: the kernel's estimate needs no round trip of ours, so it is available
-    // from the first moment rather than one probe interval in.
-    socket_stats: Option<crate::SharedSocketStats>,
+    // from the first moment rather than one probe interval in. Shared with terminal
+    // cleanup so retained Session clones cannot keep the socket descriptor alive.
+    socket_stats: Arc<Mutex<Option<crate::SharedSocketStats>>>,
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
@@ -2203,8 +2204,8 @@ impl Session {
         // the wire, pulling the outbound queues in priority order and sharing the
         // stream maps + scalars above with the reader (no message-passing handoff).
         // Read before the split: the halves go to separate tasks, and the stats
-        // source belongs to neither.
-        let socket_stats = transport.socket_stats();
+        // source is released by terminal cleanup, independently of Session clones.
+        let socket_stats = Arc::new(Mutex::new(transport.socket_stats()));
         let (writer_half, reader_half) = transport.split();
         let mut writer = WriterState {
             writer: writer_half,
@@ -2323,6 +2324,7 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
+        let teardown_socket_stats = socket_stats.clone();
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // If we tore down because of a protocol/transport violation *we*
@@ -2352,6 +2354,7 @@ impl Session {
             backend.conn_recv_credit.close();
             backend.outbound.close();
             backend.streams.lock().unwrap().close();
+            teardown_socket_stats.lock().unwrap().take();
             // Recorded last, so a `closed()` waiter sees credits and streams closed.
             // The reader often fails (EOF, WebSocket Close) right after an
             // APPLICATION_CLOSE, so keep the reason recorded first.
@@ -2395,7 +2398,6 @@ impl generic::Session for Session {
     type Error = Error;
 
     fn stats(&self) -> impl generic::Stats {
-        let socket = self.socket_stats.as_ref();
         let streams = if self.config.version.is_qmux() {
             let state = self.streams.lock().unwrap();
             let closed = self.closed.borrow();
@@ -2422,6 +2424,10 @@ impl generic::Session for Session {
         } else {
             None
         };
+        // Hold the lock through the reads so teardown cannot drop the descriptor
+        // during a read, and a reader cannot retain it after cleanup completes.
+        let socket = self.socket_stats.lock().unwrap();
+        let socket = socket.as_ref();
         SessionStats {
             streams,
             // Fall back to our own QX_PING measurement only when the transport

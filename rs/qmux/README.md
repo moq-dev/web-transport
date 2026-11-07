@@ -68,6 +68,13 @@ grow a response queue by sending more pings; inbound stream processing continues
 while the writer is blocked. Pending responses are discarded during teardown,
 and a close frame ends the writer's output.
 
+## Socket statistics
+
+Sessions release their socket statistics handle during teardown, even if the
+application retains a `Session` clone. Later `stats()` calls omit socket-derived
+metrics; QMux's own RTT estimate and stream counters remain available. A caller
+that retains its own `SharedSocketStats` copy keeps that handle alive.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
