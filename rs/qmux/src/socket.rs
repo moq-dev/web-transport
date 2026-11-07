@@ -12,16 +12,16 @@ use std::time::Duration;
 
 /// Live statistics for the connection underneath a QMux session.
 ///
-/// Implementations read through to the socket on each call rather than caching, so
-/// a caller polling this sees the transport's current view. Every metric is
-/// optional: `None` means this transport doesn't track it.
+/// Implementations sample the socket on each call and may filter measurements to
+/// estimate available capacity. Every metric is optional: `None` means this
+/// transport has no estimate for it.
 pub trait SocketStats: Send + Sync + 'static {
     /// Smoothed round-trip time, if the transport tracks one.
     fn rtt(&self) -> Option<Duration> {
         None
     }
 
-    /// Estimated delivery rate in **bits per second**, if the transport tracks one.
+    /// Estimated available send bandwidth in **bits per second**, if known.
     fn estimated_send_rate(&self) -> Option<u64> {
         None
     }
@@ -29,6 +29,40 @@ pub trait SocketStats: Send + Sync + 'static {
 
 /// A shared handle to a transport's statistics.
 pub type SharedSocketStats = Arc<dyn SocketStats>;
+
+/// Windowed maximum of delivery-rate samples, like BBR's bandwidth filter.
+///
+/// App-limited samples measure the sender rather than the path, so they may only
+/// raise the estimate. Only a usable sample can retire old maxima.
+#[derive(Debug, Default)]
+#[cfg(any(target_os = "linux", test))]
+struct RateFilter {
+    /// Strictly decreasing rates from front to back; the front is the maximum.
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl RateFilter {
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    fn update(&mut self, now: std::time::Instant, rate: u64, app_limited: bool) -> Option<u64> {
+        let expired = |at: &std::time::Instant| now.saturating_duration_since(*at) > Self::WINDOW;
+        let usable =
+            rate > 0 && (!app_limited || self.samples.front().is_none_or(|(_, max)| rate >= *max));
+        // A rejected sample changes nothing, not even expiry: it is no evidence
+        // that the path got slower. Zero is no sample at all.
+        if usable {
+            while self.samples.front().is_some_and(|(at, _)| expired(at)) {
+                self.samples.pop_front();
+            }
+            while self.samples.back().is_some_and(|(_, r)| *r <= rate) {
+                self.samples.pop_back();
+            }
+            self.samples.push_back((now, rate));
+        }
+        self.samples.front().map(|(_, max)| *max)
+    }
+}
 
 #[cfg(unix)]
 pub use unix::TcpStats;
@@ -52,14 +86,14 @@ mod unix {
     #[derive(Debug)]
     pub struct TcpStats {
         fd: OwnedFd,
+        #[cfg(target_os = "linux")]
+        rate: std::sync::Mutex<RateFilter>,
     }
 
     impl TcpStats {
         /// Duplicate `socket`'s descriptor and read statistics from the copy.
         pub fn new<S: AsFd>(socket: &S) -> io::Result<Self> {
-            Ok(Self {
-                fd: socket.as_fd().try_clone_to_owned()?,
-            })
+            Ok(Self::from_fd(socket.as_fd().try_clone_to_owned()?))
         }
 
         /// Take ownership of an already-duplicated descriptor.
@@ -67,7 +101,11 @@ mod unix {
         /// Use this when the socket itself has been moved somewhere unreachable (a
         /// type-erased HTTP upgrade, for instance) and only the descriptor was kept.
         pub fn from_fd(fd: OwnedFd) -> Self {
-            Self { fd }
+            Self {
+                fd,
+                #[cfg(target_os = "linux")]
+                rate: Default::default(),
+            }
         }
 
         fn borrow(&self) -> BorrowedFd<'_> {
@@ -143,6 +181,13 @@ mod unix {
 
         const IPPROTO_TCP: libc::c_int = 6;
         const TCP_INFO: libc::c_int = 11;
+
+        // `tcpi_delivery_rate_app_limited:1` is the first bitfield in its byte.
+        pub const APP_LIMITED: u8 = if cfg!(target_endian = "little") {
+            1
+        } else {
+            1 << 7
+        };
 
         /// Read `tcp_info`, returning it alongside the number of bytes the kernel
         /// filled in. `None` if the socket isn't TCP.
@@ -255,13 +300,21 @@ mod unix {
             // rather than a figure callers would mistake for a measurement.
             #[cfg(target_os = "linux")]
             {
+                // Serialize sampling as well as updates so concurrent callers
+                // cannot insert older measurements after newer ones.
+                let mut filter = self
+                    .rate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (info, len) = sys::tcp_info(self.borrow())?;
                 let offset = std::mem::offset_of!(sys::TcpInfo, delivery_rate);
-                if !sys::has_field(len, offset, size_of::<u64>()) || info.delivery_rate == 0 {
+                if !sys::has_field(len, offset, size_of::<u64>()) {
                     return None;
                 }
+                let app_limited = info.app_limited & sys::APP_LIMITED != 0;
                 // The kernel reports bytes per second; the trait wants bits.
-                Some(info.delivery_rate.saturating_mul(8))
+                let rate = info.delivery_rate.saturating_mul(8);
+                filter.update(std::time::Instant::now(), rate, app_limited)
             }
 
             #[cfg(not(target_os = "linux"))]
@@ -282,10 +335,36 @@ mod unix {
     /// would read a plausible-looking wrong number rather than fail.
     #[cfg(test)]
     mod tests {
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn zero_kernel_rate_keeps_the_last_estimate() {
+            use super::*;
+            use std::net::TcpListener;
+
+            // A listener has no ACK-derived samples, regardless of how a kernel
+            // accounts for SYNs on connected sockets.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stats = TcpStats::new(&listener).unwrap();
+            let (info, _) = sys::tcp_info(stats.borrow()).unwrap();
+            assert_eq!(info.delivery_rate, 0, "a listener has no rate samples");
+            assert_eq!(stats.estimated_send_rate(), None);
+            stats
+                .rate
+                .lock()
+                .unwrap()
+                .update(std::time::Instant::now(), 80_000_000, false);
+            assert_eq!(stats.estimated_send_rate(), Some(80_000_000));
+        }
+
         /// Offsets from `linux/tcp.h`.
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_tcp_info_layout() {
+            assert_eq!(std::mem::offset_of!(super::sys::TcpInfo, app_limited), 7);
+            #[cfg(target_endian = "little")]
+            assert_eq!(super::sys::APP_LIMITED, 0x01);
+            #[cfg(target_endian = "big")]
+            assert_eq!(super::sys::APP_LIMITED, 0x80);
             assert_eq!(std::mem::offset_of!(super::sys::TcpInfo, rtt), 68);
             assert_eq!(
                 std::mem::offset_of!(super::sys::TcpInfo, delivery_rate),
@@ -299,5 +378,84 @@ mod unix {
         fn macos_tcp_connection_info_layout() {
             assert_eq!(std::mem::offset_of!(super::sys::TcpInfo, srtt), 44);
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_filter_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn at(start: Instant, ms: u64) -> Instant {
+        start + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn app_limited_samples_only_raise_the_estimate() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        assert_eq!(f.update(t, 1_000_000, true), Some(1_000_000));
+        assert_eq!(f.update(at(t, 100), 80_000_000, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 200), 1_000_000, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 20_000), 1_000_000, true), Some(80_000_000));
+    }
+
+    #[test]
+    fn measured_samples_replace_maxima_only_after_the_window() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        assert_eq!(f.update(t, 80_000_000, false), Some(80_000_000));
+        assert_eq!(f.update(at(t, 1_000), 5_000_000, false), Some(80_000_000));
+        assert_eq!(
+            f.update(t + RateFilter::WINDOW, 4_000_000, false),
+            Some(80_000_000)
+        );
+        assert_eq!(f.update(at(t, 10_001), 3_000_000, false), Some(5_000_000));
+    }
+
+    #[test]
+    fn rejected_samples_change_nothing_including_expiry() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        f.update(t, 80_000_000, false);
+        f.update(at(t, 1_000), 5_000_000, false);
+        assert_eq!(f.update(at(t, 20_000), 1_000_000, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 30_000), 1_000_000, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 31_000), 4_000_000, false), Some(4_000_000));
+    }
+
+    #[test]
+    fn window_keeps_the_largest_recent_measurement() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        f.update(t, 30_000_000, false);
+        f.update(at(t, 4_000), 20_000_000, false);
+        f.update(at(t, 8_000), 10_000_000, false);
+        assert_eq!(f.update(at(t, 10_500), 9_000_000, false), Some(20_000_000));
+        assert_eq!(f.update(at(t, 14_500), 9_000_000, false), Some(10_000_000));
+        assert_eq!(f.update(at(t, 18_500), 9_000_000, false), Some(9_000_000));
+    }
+
+    #[test]
+    fn equal_app_limited_sample_refreshes_the_maximum() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        f.update(t, 80_000_000, false);
+        assert_eq!(f.update(at(t, 9_000), 80_000_000, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 11_000), 5_000_000, false), Some(80_000_000));
+        assert_eq!(f.update(at(t, 19_001), 4_000_000, false), Some(5_000_000));
+    }
+
+    #[test]
+    fn zero_rate_is_not_a_sample() {
+        let t = Instant::now();
+        let mut f = RateFilter::default();
+        assert_eq!(f.update(t, 0, false), None);
+        assert_eq!(f.update(t, 0, true), None);
+        f.update(at(t, 100), 80_000_000, false);
+        f.update(at(t, 1_000), 5_000_000, false);
+        assert_eq!(f.update(at(t, 20_000), 0, false), Some(80_000_000));
+        assert_eq!(f.update(at(t, 30_000), 0, true), Some(80_000_000));
+        assert_eq!(f.update(at(t, 31_000), 4_000_000, false), Some(4_000_000));
     }
 }

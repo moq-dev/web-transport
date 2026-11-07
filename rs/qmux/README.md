@@ -68,6 +68,14 @@ grow a response queue by sending more pings; inbound stream processing continues
 while the writer is blocked. Pending responses are discarded during teardown,
 and a close frame ends the writer's output.
 
+## Send-rate estimate
+
+On Linux, TCP and WebSocket sessions with `TcpStats` estimate available send
+bandwidth from a 10-second maximum of kernel delivery-rate samples. An
+application-limited sample can raise the estimate but cannot lower it, even after
+the window expires. Only a usable sample retires old measurements; a zero rate
+keeps the last estimate. macOS does not expose a delivery-rate estimate.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
