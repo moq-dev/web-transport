@@ -609,13 +609,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!((info.close_code, info.reason.as_str()), (42, "local"));
+        // A backend/endpoint teardown without Session.close() is a session failure,
+        // rather than an application close whose details we can report.
+        assert!(session_error_to_close_info(
+            &SessionError::ConnectionError(ConnectionError::LocallyClosed),
+            None
+        )
+        .is_err());
     }
 }
 
 #[napi]
 impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
-    /// peer reset the stream or the session failed.
+    /// peer reset the stream or the session failed. Local cancellation rejects the read.
     #[napi]
     pub async fn read(&self, max_size: u32) -> Result<Option<Either<Buffer, NapiStreamError>>> {
         use web_transport_quinn::ReadError;
@@ -625,11 +632,11 @@ impl NapiRecvStream {
         let mut stopped = self.stopped.subscribe();
         let mut stream = inner.lock().await;
         if *stopped.borrow() {
-            return Ok(None);
+            return Err(Error::from_reason(ReadError::ClosedStream.to_string()));
         }
         let result = tokio::select! {
             biased;
-            _ = stopped.changed() => return Ok(None),
+            _ = stopped.changed() => return Err(Error::from_reason(ReadError::ClosedStream.to_string())),
             result = stream.read_chunk(max_size as usize, true) => result,
         };
         let err = match result {

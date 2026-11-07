@@ -81,3 +81,7 @@ UTF-8 reason; the native fallback carries a prefix of at most 16 bytes at a char
 boundary. Already observed native errors are preserved. Peer delivery, endpoint
 draining and execution of awakened tasks require a live runtime. Forgotten
 futures, non-yielding tasks and process abort are outside this guarantee.
+
+Raw QUIC stream reset and stop codes are sent unchanged, matching Quinn and Iroh.
+Raw receivers also accept HTTP/3-mapped codes from older peers. HTTP/3 stream codes
+continue to use the reserved WebTransport mapping, including code 0 on receive drop.

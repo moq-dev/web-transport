@@ -152,6 +152,7 @@ including nonzero application codes. An orderly HTTP/3 connection shutdown (H3_N
 without application details resolves with code 0 and an empty reason. A failed connection or an underlying connection
 failure rejects it with a `WebTransportError` whose `source` is `"session"` and
 `streamErrorCode` is `null`. `session.ready` rejects with the same error if connecting fails.
+Backend teardown without an application `session.close()` also rejects `closed`.
 
 ```ts
 // Close gracefully

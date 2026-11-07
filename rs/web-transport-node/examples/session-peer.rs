@@ -45,12 +45,16 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("read trigger datagram")?;
     // H3_NO_ERROR is orderly shutdown; raw QUIC 0 is outside WebTransport's HTTP/3 space.
-    let code = if std::env::var_os("WEB_TRANSPORT_TEST_ORDERLY_CLOSE").is_some() {
-        0x100u32
+    let code: u64 = if std::env::var_os("WEB_TRANSPORT_TEST_WT_CLOSE").is_some() {
+        web_transport_proto::error_to_http3(42)
+    } else if std::env::var_os("WEB_TRANSPORT_TEST_ORDERLY_CLOSE").is_some() {
+        0x100
     } else {
         0
     };
-    session.deref().close(code.into(), b"connection shutdown");
+    session
+        .deref()
+        .close(code.try_into().unwrap(), b"connection shutdown");
     // Await a second signal on stdin to keep the runtime alive while QUIC sends the close.
     tokio::task::spawn_blocking(|| std::io::stdin().read(&mut [0]))
         .await

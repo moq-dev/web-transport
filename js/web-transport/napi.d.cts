@@ -27,7 +27,7 @@ export declare class NapiClient {
 export declare class NapiRecvStream {
 	/**
 	 * Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
-	 * peer reset the stream or the session failed.
+	 * peer reset the stream or the session failed. Local cancellation rejects the read.
 	 */
 	read(maxSize: number): Promise<Buffer | NapiStreamError | null>;
 	/** Tell the peer to stop sending with the given code; an already terminal stream is a no-op. */

@@ -120,13 +120,14 @@ test("local and peer closes preserve nonzero application codes and reasons", asy
 });
 
 for (const side of ["client", "server"] as const) {
-	for (const orderly of [false, true]) {
-		test(`${orderly ? "an orderly HTTP/3 shutdown resolves" : "an underlying connection failure rejects"} the ${side} Session.closed`, async () => {
+	for (const mode of ["failure", "orderly", "application"] as const) {
+		test(`${mode === "failure" ? "an underlying connection failure rejects" : `${mode} capsule-free shutdown resolves`} the ${side} Session.closed`, async () => {
 			const child = Bun.spawn([peerExecutable, ...(side === "server" ? [url] : [])], {
 				env: {
 					...process.env,
 					WEB_TRANSPORT_TEST_PEM: pem.toString(),
-					WEB_TRANSPORT_TEST_ORDERLY_CLOSE: orderly ? "1" : undefined,
+					WEB_TRANSPORT_TEST_ORDERLY_CLOSE: mode === "orderly" ? "1" : undefined,
+					WEB_TRANSPORT_TEST_WT_CLOSE: mode === "application" ? "1" : undefined,
 				},
 				stdin: "pipe",
 				stdout: "pipe",
@@ -144,9 +145,11 @@ for (const side of ["client", "server"] as const) {
 				} else {
 					session = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
 				}
-				const closed = orderly ? session.closed : rejection(session.closed);
+				const closed = mode === "failure" ? rejection(session.closed) : session.closed;
 				await session.datagrams.writable.getWriter().write(new Uint8Array([1]));
-				if (orderly) expect(await closed).toEqual({ closeCode: 0, reason: "" });
+				if (mode === "orderly") expect(await closed).toEqual({ closeCode: 0, reason: "" });
+				else if (mode === "application")
+					expect(await closed).toEqual({ closeCode: 42, reason: "connection shutdown" });
 				else {
 					const err = (await closed) as WebTransportError;
 					expect(err.source).toBe("session");
@@ -313,6 +316,35 @@ test("concurrent read requests keep pulling through data and FIN", async () => {
 		expect((await reader.read()).done).toBe(true);
 	} finally {
 		client.close();
+	}
+});
+
+test("native cancellation rejects pending and subsequent reads instead of reporting FIN", async () => {
+	const client = await napi.NapiClient.disableVerify().connect(url);
+	const peer = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
+	try {
+		const writer = (await peer.createUnidirectionalStream()).getWriter();
+		const closed = rejection(writer.closed);
+		await writer.write(new Uint8Array([1]));
+		const recv = await client.acceptUni();
+		await recv.read(65536);
+		const pending = recv.read(65536).then(
+			() => "unexpected FIN",
+			(err: Error) => err.message,
+		);
+		await Bun.sleep(0);
+		await recv.stop(17);
+		expect(await pending).toBe("stream already closed");
+		expect(
+			await recv.read(65536).then(
+				() => "unexpected FIN",
+				(err: Error) => err.message,
+			),
+		).toBe("stream already closed");
+		expect(((await closed) as WebTransportError).streamErrorCode).toBe(17);
+	} finally {
+		client.close(0, "done");
+		await client.closed();
 	}
 });
 

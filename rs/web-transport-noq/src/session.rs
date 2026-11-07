@@ -311,7 +311,7 @@ impl Session {
         } else {
             let (send, recv) = self.conn.accept_bi().await.map_err(|e| self.map_error(e))?;
             Ok((
-                SendStream::new(send, self.error.clone()),
+                SendStream::new(send, self.error.clone(), self.session_id.is_none()),
                 RecvStream::new(recv, self.error.clone(), true),
             ))
         }
@@ -331,7 +331,11 @@ impl Session {
 
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
-        Ok(SendStream::new(send, self.error.clone()))
+        Ok(SendStream::new(
+            send,
+            self.error.clone(),
+            self.session_id.is_none(),
+        ))
     }
 
     /// Open a new bidirectional stream. See [`noq::Connection::open_bi`].
@@ -349,7 +353,7 @@ impl Session {
         // Reset the stream priority back to the default of 0.
         send.set_priority(0).ok();
         Ok((
-            SendStream::new(send, self.error.clone()),
+            SendStream::new(send, self.error.clone(), self.session_id.is_none()),
             RecvStream::new(recv, self.error.clone(), self.session_id.is_none()),
         ))
     }
@@ -1004,7 +1008,7 @@ impl SessionAccept {
 
             if let Some((send, recv)) = res {
                 // Wrap the streams in our own types for correct error codes.
-                let send = SendStream::new(send, self.error.clone());
+                let send = SendStream::new(send, self.error.clone(), false);
                 let recv = RecvStream::new(recv, self.error.clone(), false);
                 return Poll::Ready(Ok((send, recv)));
             }
@@ -1303,6 +1307,54 @@ mod tests {
             SessionError::ConnectionError(noq::ConnectionError::ApplicationClosed(close))
                 if close.error_code.into_inner() == 0 && close.reason == b"failure"[..]
         ));
+    }
+
+    #[tokio::test]
+    async fn raw_stream_codes_round_trip() {
+        let (client, peer, _endpoints) = pair().await;
+        let client = Session::raw(client);
+        let peer = Session::raw(peer);
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"data").await.unwrap();
+        let mut recv = peer.accept_uni().await.unwrap();
+        recv.stop(17).unwrap();
+        assert_eq!(send.stopped().await.unwrap(), Some(17));
+        assert!(matches!(
+            send.write_all(b"more").await,
+            Err(crate::WriteError::Stopped(17))
+        ));
+
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"data").await.unwrap();
+        let mut recv = peer.accept_uni().await.unwrap();
+        let mut buf = [0; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        send.reset(7).unwrap();
+        assert!(matches!(
+            recv.read(&mut buf).await,
+            Err(crate::ReadError::Reset(7))
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_stop_uses_the_session_code_space() {
+        for raw in [false, true] {
+            let (client, peer, _endpoints) = pair().await;
+            let mut send = client.open_uni().await.unwrap();
+            send.write_all(b"data").await.unwrap();
+            let recv = peer.accept_uni().await.unwrap();
+            let mut recv = RecvStream::new(recv, Arc::new(OnceLock::new()), raw);
+            recv.stop(17).unwrap();
+            let code = if raw {
+                17
+            } else {
+                web_transport_proto::error_to_http3(17)
+            };
+            assert_eq!(
+                send.stopped().await.unwrap(),
+                Some(code.try_into().unwrap())
+            );
+        }
     }
 
     #[tokio::test]
