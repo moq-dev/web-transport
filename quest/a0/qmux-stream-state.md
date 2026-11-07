@@ -11,7 +11,3 @@ A locally initiated stream is unopened when its index is at or beyond the next i
 Read the next-index state without introducing a new lock order; the frame handlers already take the streams lock. Cover uni and bidi, opened, closed and unopened streams, and the TypeScript direction check with scripted-peer session tests in both languages.
 
 This is RFC-mandated validation that well-behaved peers never trigger. It is separate from the draft-02 receive-offset and terminal-size tolerance owned by [QMux draft readiness](/quest/a2/qmux-draft-readiness.md).
-
-## Related
-
-- [QMux initial stream-count bound](/quest/a0/qmux-max-streams-param.md) - the other RFC 9000 peer-input check planned alongside this one
