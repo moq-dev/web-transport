@@ -838,6 +838,7 @@ export default class Session implements WebTransport {
 	}
 
 	#onData(data: Uint8Array) {
+		if (this.#closed) return;
 		this.#lastRecvAt = Date.now();
 		try {
 			if (usesRecords(this.#version)) {
@@ -874,6 +875,7 @@ export default class Session implements WebTransport {
 	}
 
 	#recvFrame(frame: Frame.Any) {
+		if (this.#closed) return;
 		// Draft-02: QX_TRANSPORT_PARAMETERS MUST be the first frame, and only the
 		// first. A non-params frame before params, or a second params frame, is a
 		// PROTOCOL_VIOLATION. (decodeRecord drops leading PADDING before we get here.)

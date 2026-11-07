@@ -43,11 +43,14 @@ class FakePeer {
 	constructor(url: string, options?: { protocol?: string }) {
 		const protocol = options?.protocol ?? "qmux-01";
 		this.url = url;
-		this.version = protocol.startsWith("qmux-00")
-			? "qmux-00"
-			: protocol.startsWith("qmux-02")
-				? "qmux-02"
-				: "qmux-01";
+		this.version =
+			protocol === "webtransport"
+				? "webtransport"
+				: protocol.startsWith("qmux-00")
+					? "qmux-00"
+					: protocol.startsWith("qmux-02")
+						? "qmux-02"
+						: "qmux-01";
 		FakePeer.last = this;
 		const readable = new ReadableStream<Uint8Array | ArrayBuffer | string>({
 			start: (c) => {
@@ -113,7 +116,7 @@ class FakePeer {
 	/** All frames the Session has written so far, decoded. */
 	received(): Frame.Any[] {
 		return this.sent.flatMap((b) => {
-			if (this.version !== "qmux-00") return Frame.decodeRecord(b);
+			if (Frame.usesRecords(this.version)) return Frame.decodeRecord(b);
 			const frame = Frame.decode(b, this.version);
 			return frame ? [frame] : [];
 		});
@@ -584,21 +587,34 @@ describe("Session integration (scripted peer)", () => {
 	});
 
 	describe("send-control stream state", () => {
-		const controls = (id: Stream.Id): Frame.Any[] => [
-			{ type: "max_stream_data", id, max: 10n },
-			{ type: "stop_sending", id, code: VarInt.from(42) },
-		];
-
-		for (const version of ["qmux-00", "qmux-01", "qmux-02"] as const) {
+		for (const version of ["webtransport", "qmux-00", "qmux-01", "qmux-02"] as const) {
+			const controls = (id: Stream.Id): Frame.Any[] => [
+				...(version === "webtransport" ? [] : [{ type: "max_stream_data" as const, id, max: 10n }]),
+				{ type: "stop_sending", id, code: VarInt.from(42) },
+			];
 			for (const isServer of [false, true]) {
 				const setup = async () => {
 					const { session, peer } = isServer ? accept({ protocol: version }) : connect(undefined, version);
 					await session.ready;
-					peer.send({
-						type: "transport_parameters",
-						params: peerParams({ initialMaxStreamDataUni: 0n, initialMaxStreamDataBidiRemote: 0n }),
-					});
-					return { session, peer };
+					if (version !== "webtransport")
+						peer.send({
+							type: "transport_parameters",
+							params: peerParams({ initialMaxStreamDataUni: 0n, initialMaxStreamDataBidiRemote: 0n }),
+						});
+					const sync = async (sequence: bigint) => {
+						peer.send({
+							type: "stream",
+							id: Stream.Id.create(sequence, Stream.Dir.Uni, !isServer),
+							data: new Uint8Array(),
+							fin: true,
+						});
+						const incoming = session.incomingUnidirectionalStreams.getReader();
+						const { value } = await incoming.read();
+						incoming.releaseLock();
+						expect(value).toBeDefined();
+						await value?.cancel();
+					};
+					return { session, peer, sync };
 				};
 
 				for (const dir of [Stream.Dir.Uni, Stream.Dir.Bi]) {
@@ -629,44 +645,75 @@ describe("Session integration (scripted peer)", () => {
 					}
 
 					test(`${version} role=${isServer} dir=${dir} accepts controls on opened and retired streams`, async () => {
-						const { session, peer } = await setup();
+						const { session, peer, sync } = await setup();
 						const stream = await open(session);
 						const writer = stream.writable.getWriter();
 						const stopped = settleTo(writer.closed);
 						const id = Stream.Id.create(0n, dir, isServer);
-						peer.send(controls(id)[0]);
+						if (version !== "webtransport") peer.send({ type: "max_stream_data", id, max: 10n });
 						await writer.write(new Uint8Array([1]));
-						peer.send(controls(id)[1]);
+						peer.send({ type: "stop_sending", id, code: VarInt.from(42) });
 						expect(await stopped).toMatchObject({ streamErrorCode: 42 });
 						await peer.waitForFrame(
 							(f) => f.type === "reset_stream" && f.id.value.value === id.value.value,
 						);
 						if (stream.readable) await stream.readable.cancel();
 						for (const frame of controls(id)) peer.send(frame);
-						peer.send({ type: "ping_request", sequence: 0n });
-						await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === 0n);
+						await sync(0n);
 						expect(peer.has("connection_close")).toBe(false);
 						session.close();
 					});
 				}
 
-				test(`${version} role=${isServer} preserves peer bidi controls and rejects receive-only STOP_SENDING`, async () => {
-					const { session, peer } = await setup();
-					for (const frame of controls(Stream.Id.create(10n, Stream.Dir.Bi, !isServer))) peer.send(frame);
-					peer.send({ type: "ping_request", sequence: 0n });
-					await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === 0n);
-					expect(peer.has("connection_close")).toBe(false);
-					peer.send({
-						type: "stop_sending",
-						id: Stream.Id.create(0n, Stream.Dir.Uni, !isServer),
-						code: VarInt.from(42),
+				for (const frame of controls(Stream.Id.create(0n, Stream.Dir.Uni, !isServer))) {
+					test(`${version} role=${isServer} preserves peer bidi controls and rejects receive-only ${frame.type}`, async () => {
+						const { session, peer, sync } = await setup();
+						for (const frame of controls(Stream.Id.create(10n, Stream.Dir.Bi, !isServer))) peer.send(frame);
+						await sync(0n);
+						expect(peer.has("connection_close")).toBe(false);
+						peer.send(frame);
+						await expectSessionFailure(session);
+						const close = (await peer.waitForFrame(
+							(f) => f.type === "connection_close",
+						)) as Frame.ConnectionClose;
+						expect(close.code.value).toBe(1002n);
 					});
-					await expectSessionFailure(session);
-					const close = (await peer.waitForFrame(
-						(f) => f.type === "connection_close",
-					)) as Frame.ConnectionClose;
-					expect(close.code.value).toBe(1002n);
-				});
+				}
+			}
+		}
+	});
+
+	test("send controls after local or peer close are ignored", async () => {
+		for (const local of [false, true]) {
+			const { session, peer } = connect();
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+			await session.createUnidirectionalStream();
+			const errors = spyOn(console, "error");
+			const timers = spyOn(globalThis, "setTimeout");
+			try {
+				const close: Frame.ApplicationClose = {
+					type: "application_close",
+					code: VarInt.from(42),
+					reason: "done",
+				};
+				const frames: Frame.Any[] = [
+					{ type: "stop_sending", id: Stream.Id.create(1n, Stream.Dir.Uni, false), code: VarInt.from(0) },
+					{ type: "stop_sending", id: Stream.Id.create(0n, Stream.Dir.Uni, true), code: VarInt.from(0) },
+					{ type: "max_stream_data", id: Stream.Id.create(1n, Stream.Dir.Bi, false), max: 10n },
+				];
+				if (local) session.close({ closeCode: 42, reason: "done" });
+				const timersBefore = timers.mock.calls.length;
+				const record = (local ? frames : [close, ...frames]).flatMap((f) => [...Frame.encode(f, "qmux-01")]);
+				peer.sendRaw(Uint8Array.from(record));
+				expect(await session.closed).toEqual({ closeCode: 42, reason: "done" });
+				await flushMicrotasks();
+				expect(errors).not.toHaveBeenCalled();
+				expect(timers.mock.calls.length).toBe(timersBefore);
+				expect(peer.has("connection_close")).toBe(false);
+			} finally {
+				errors.mockRestore();
+				timers.mockRestore();
 			}
 		}
 	});

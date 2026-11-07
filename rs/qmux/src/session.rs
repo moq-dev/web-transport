@@ -5270,7 +5270,7 @@ mod credit_update_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
     use web_transport_trait::{SendStream as _, Session as _};
 
     use super::{Reader, Session, Transport, Writer};
@@ -5280,15 +5280,24 @@ mod credit_update_tests {
 
     const VERSIONS: [Version; 3] = [Version::QMux00, Version::QMux01, Version::QMux02];
 
+    const CONTROL_VERSIONS: [Version; 4] = [
+        Version::WebTransport,
+        Version::QMux00,
+        Version::QMux01,
+        Version::QMux02,
+    ];
+
     /// A transport whose inbound frames are scripted and whose outbound records
     /// are kept for inspection.
     struct ScriptedTransport {
         incoming: mpsc::UnboundedReceiver<Bytes>,
         outgoing: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     struct ScriptedWriter {
         outgoing: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     struct ScriptedReader {
@@ -5303,6 +5312,7 @@ mod credit_update_tests {
             (
                 ScriptedWriter {
                     outgoing: self.outgoing,
+                    written: self.written,
                 },
                 ScriptedReader {
                     incoming: self.incoming,
@@ -5314,6 +5324,7 @@ mod credit_update_tests {
     impl Writer for ScriptedWriter {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             self.outgoing.lock().unwrap().push(data);
+            self.written.notify_one();
             Ok(())
         }
 
@@ -5335,6 +5346,7 @@ mod credit_update_tests {
         version: Version,
         inbound: mpsc::UnboundedSender<Bytes>,
         outbound: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     impl Peer {
@@ -5360,6 +5372,19 @@ mod credit_update_tests {
                     }
                 })
                 .collect()
+        }
+
+        async fn wait_for(&self, predicate: impl Fn(&Frame) -> bool) -> Frame {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(frame) = self.received().into_iter().find(&predicate) {
+                        return frame;
+                    }
+                    self.written.notified().await;
+                }
+            })
+            .await
+            .expect("expected frame was not written")
         }
 
         async fn sync(&self, session: &Session, sequence: u64) {
@@ -5396,10 +5421,12 @@ mod credit_update_tests {
     ) -> (Session, Peer) {
         let (tx, rx) = mpsc::unbounded_channel();
         let outbound = Arc::new(Mutex::new(Vec::new()));
+        let written = Arc::new(Notify::new());
         let session = Session::new(
             ScriptedTransport {
                 incoming: rx,
                 outgoing: outbound.clone(),
+                written: written.clone(),
             },
             is_server,
             Config::new(version),
@@ -5408,8 +5435,11 @@ mod credit_update_tests {
             version,
             inbound: tx,
             outbound,
+            written,
         };
-        peer.send(Frame::TransportParameters(params));
+        if version.is_qmux() {
+            peer.send(Frame::TransportParameters(params));
+        }
         (session, peer)
     }
 
@@ -5504,24 +5534,28 @@ mod credit_update_tests {
             assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
         }
     }
-    fn send_controls(id: StreamId) -> [Frame; 2] {
-        [
-            Frame::MaxStreamData { id, max: 10 },
-            Frame::StopSending(StopSending {
-                id,
-                code: VarInt::from_u32(42),
-            }),
-        ]
+    fn send_controls(version: Version, id: StreamId) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        if version.is_qmux() {
+            frames.push(Frame::MaxStreamData { id, max: 10 });
+        }
+        frames.push(Frame::StopSending(StopSending {
+            id,
+            code: VarInt::from_u32(42),
+        }));
+        frames
     }
 
     #[tokio::test(start_paused = true)]
     async fn send_controls_on_unopened_local_streams_are_rejected() {
-        for version in VERSIONS {
+        for version in CONTROL_VERSIONS {
             for is_server in [false, true] {
                 for dir in [StreamDir::Uni, StreamDir::Bi] {
                     for opened in [0, 2] {
                         for index in [opened, opened + 10] {
-                            for frame in send_controls(StreamId::new(index, dir, is_server)) {
+                            for frame in
+                                send_controls(version, StreamId::new(index, dir, is_server))
+                            {
                                 let params = Config::new(version).to_transport_params();
                                 let (session, peer) = scripted_session(version, params, is_server);
                                 // Advancing the other direction must not open this ID.
@@ -5553,22 +5587,13 @@ mod credit_update_tests {
                                             panic!("{version:?} {frame:?} was accepted")
                                         });
                                 assert!(matches!(error, Error::InvalidStreamId), "{error:?}");
-                                tokio::time::timeout(Duration::from_secs(1), async {
-                                    loop {
-                                        if let Some(close) =
-                                            peer.received().into_iter().find_map(|f| match f {
-                                                Frame::ConnectionClose(close) => Some(close),
-                                                _ => None,
-                                            })
-                                        {
-                                            assert_eq!(close.code.into_inner(), 1002);
-                                            break;
-                                        }
-                                        tokio::task::yield_now().await;
-                                    }
-                                })
-                                .await
-                                .expect("missing CONNECTION_CLOSE");
+                                let close = peer
+                                    .wait_for(|f| matches!(f, Frame::ConnectionClose(_)))
+                                    .await;
+                                let Frame::ConnectionClose(close) = close else {
+                                    unreachable!()
+                                };
+                                assert_eq!(close.code.into_inner(), 1002);
                             }
                         }
                     }
@@ -5579,7 +5604,7 @@ mod credit_update_tests {
 
     #[tokio::test(start_paused = true)]
     async fn send_controls_on_opened_and_retired_local_streams_are_allowed() {
-        for version in VERSIONS {
+        for version in CONTROL_VERSIONS {
             for is_server in [false, true] {
                 for dir in [StreamDir::Uni, StreamDir::Bi] {
                     let mut params = Config::new(version).to_transport_params();
@@ -5594,7 +5619,9 @@ mod credit_update_tests {
                         }
                     };
                     let id = StreamId::new(0, dir, is_server);
-                    peer.send(send_controls(id)[0].clone());
+                    if version.is_qmux() {
+                        peer.send(Frame::MaxStreamData { id, max: 10 });
+                    }
                     assert_eq!(
                         tokio::time::timeout(Duration::from_secs(1), send.write(b"x"))
                             .await
@@ -5602,7 +5629,10 @@ mod credit_update_tests {
                             .unwrap(),
                         1
                     );
-                    peer.send(send_controls(id)[1].clone());
+                    peer.send(Frame::StopSending(StopSending {
+                        id,
+                        code: VarInt::from_u32(42),
+                    }));
                     peer.sync(&session, 0).await;
                     assert!(
                         matches!(tokio::time::timeout(Duration::from_secs(1), send.closed())
@@ -5610,14 +5640,10 @@ mod credit_update_tests {
                     );
                     drop(send);
                     drop(recv);
-                    tokio::time::timeout(Duration::from_secs(1), async {
-                        while session.streams.lock().unwrap().send.contains_key(&id) {
-                            tokio::task::yield_now().await;
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    for frame in send_controls(id) {
+                    peer.wait_for(|f| matches!(f, Frame::ResetStream(reset) if reset.id == id))
+                        .await;
+                    assert!(!session.streams.lock().unwrap().send.contains_key(&id));
+                    for frame in send_controls(version, id) {
                         peer.send(frame);
                     }
                     peer.sync(&session, 1).await;
@@ -5632,22 +5658,24 @@ mod credit_update_tests {
 
     #[tokio::test(start_paused = true)]
     async fn send_controls_on_peer_initiated_streams_keep_their_behavior() {
-        for version in VERSIONS {
+        for version in CONTROL_VERSIONS {
             for is_server in [false, true] {
-                let params = Config::new(version).to_transport_params();
-                let (session, peer) = scripted_session(version, params, is_server);
-                let id = StreamId::new(10, StreamDir::Bi, !is_server);
-                for frame in send_controls(id) {
-                    peer.send(frame);
-                }
-                peer.sync(&session, 0).await;
-                assert!(session.streams.lock().unwrap().send.is_empty());
                 let id = StreamId::new(0, StreamDir::Uni, !is_server);
-                peer.send(send_controls(id)[1].clone());
-                let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
-                    .await
-                    .expect("receive-only STOP_SENDING was accepted");
-                assert!(matches!(error, Error::InvalidStreamId), "{error:?}");
+                for frame in send_controls(version, id) {
+                    let params = Config::new(version).to_transport_params();
+                    let (session, peer) = scripted_session(version, params, is_server);
+                    let id = StreamId::new(10, StreamDir::Bi, !is_server);
+                    for frame in send_controls(version, id) {
+                        peer.send(frame);
+                    }
+                    peer.sync(&session, 0).await;
+                    assert!(session.streams.lock().unwrap().send.is_empty());
+                    peer.send(frame);
+                    let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                        .await
+                        .expect("receive-only send control was accepted");
+                    assert!(matches!(error, Error::InvalidStreamId), "{error:?}");
+                }
             }
         }
     }
