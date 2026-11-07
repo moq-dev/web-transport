@@ -93,7 +93,7 @@ async fn fragmented_connect_keeps_following_capsules_unread() {
         http::HeaderName::from_static("x-large"),
         http::HeaderValue::from_str(&"a".repeat(4096)).unwrap(),
     );
-    let response = ConnectResponse::OK.with_protocol("moq");
+    let response = ConnectResponse::default().with_protocol("moq");
     for fragment in [1, 7, 4096] {
         let mut stream = Fragmented::new(fragment);
         request.write(&mut stream).await.unwrap();

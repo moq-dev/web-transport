@@ -19,13 +19,15 @@ these paths report `ConnectError::FieldSectionTooLarge`.
 
 Encoding measures field sections and SETTINGS pairs before writing them directly
 into the destination. Async writes allocate one frame buffer at its measured size.
-Decoding keeps owned header strings; synchronous decoding borrows the frame, and
+Huffman decoding borrows contiguous encoded strings and coalesces fragmented
+ones for the existing decoder. Decoding keeps owned header strings; synchronous decoding borrows the frame, and
 async reads buffer only the bounded payload without consuming the next frame.
 
 Run `cargo bench -p web-transport-proto --bench buffering` to measure allocations,
 reallocations, requested allocation bytes and encode boundary copies for CONNECT
 and SETTINGS. It covers header count, value size, Huffman strings, borrowed and
 owned input, and partial async writes. Fixture and runtime setup are excluded.
+The CSV records allocation totals and the iteration count without rounding.
 `largest_encode_slice` is the largest `put_slice` into caller-provided storage,
 not a count of all internal memory copies. Requested bytes include every allocation
 and reallocation request, not peak live memory; header map order can affect buffer

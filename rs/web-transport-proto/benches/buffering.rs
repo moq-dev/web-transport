@@ -121,16 +121,13 @@ fn measure(name: &str, wire_size: usize, mut operation: impl FnMut() -> usize) {
     let mut observed = 0;
     const ITERATIONS: usize = 256;
     for _ in 0..ITERATIONS {
-        observed += black_box(operation());
+        observed = observed.max(black_box(operation()));
     }
     let elapsed = start.elapsed().as_nanos() / ITERATIONS as u128;
     let stats = ALLOCATIONS.with(|cell| cell.take().unwrap());
     println!(
-        "{name},{wire_size},{},{},{},{elapsed},{}",
-        stats.allocations / ITERATIONS,
-        stats.reallocations / ITERATIONS,
-        stats.requested / ITERATIONS,
-        observed / ITERATIONS,
+        "{name},{wire_size},{ITERATIONS},{},{},{},{elapsed},{observed}",
+        stats.allocations, stats.reallocations, stats.requested,
     );
 }
 
@@ -139,7 +136,7 @@ fn main() {
         .build()
         .unwrap();
     println!(
-        "path,wire_bytes,allocations,reallocations,requested_bytes,ns_per_op,largest_encode_slice"
+        "path,wire_bytes,iterations,allocations,reallocations,requested_bytes,ns_per_op,largest_encode_slice"
     );
     let mut storage = vec![0; 65560];
 
@@ -203,7 +200,7 @@ fn main() {
     }
     paths!(
         "response",
-        ConnectResponse::OK.with_protocol("moq"),
+        ConnectResponse::default().with_protocol("moq"),
         ConnectResponse
     );
 

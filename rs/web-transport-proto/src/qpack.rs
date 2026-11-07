@@ -207,13 +207,10 @@ impl Headers {
             budget.charge(name.len())?;
             budget.charge(value.len())?;
 
-            size += if let Some(index) = StaticTable::find(name, value) {
-                prefix_size(6, index)
-            } else if let Some(index) = StaticTable::find_name(name) {
-                prefix_size(4, index) + prefix_size(7, value.len()) + value.len()
-            } else {
-                prefix_size(3, name.len()) + name.len() + prefix_size(7, value.len()) + value.len()
-            };
+            size += Self::field_parts(name, value)
+                .iter()
+                .map(Part::size)
+                .sum::<usize>();
         }
         Ok(size)
     }
@@ -233,64 +230,55 @@ impl Headers {
             .chain(self.fields.iter().filter(|(key, _)| !key.starts_with(':')));
 
         for (name, value) in headers {
-            if let Some(index) = StaticTable::find(name, value) {
-                Self::encode_index(buf, index)
-            } else if let Some(index) = StaticTable::find_name(name) {
-                Self::encode_literal_value(buf, index, value)
-            } else {
-                Self::encode_literal(buf, name, value)
+            for part in Self::field_parts(name, value) {
+                part.encode(buf);
             }
         }
     }
 
-    fn encode_index<B: BufMut>(buf: &mut B, index: usize) {
-        /*
-            0   1   2   3   4   5   6   7
-        +---+---+---+---+---+---+---+---+
-        | 1 | 1 |      Index (6+)       |
-        +---+---+-----------------------+
-        */
+    // RFC 9204 section 4.5.2: choose the representation once for measurement and output.
+    fn field_parts<'a>(name: &'a str, value: &'a str) -> [Part<'a>; 4] {
+        let empty = Part::Bytes(&[]);
+        if let Some(index) = StaticTable::find(name, value) {
+            [Part::Prefix(6, 0b11, index), empty, empty, empty]
+        } else if let Some(index) = StaticTable::find_name(name) {
+            [
+                Part::Prefix(4, 0b0101, index),
+                empty,
+                Part::Prefix(7, 0, value.len()),
+                Part::Bytes(value.as_bytes()),
+            ]
+        } else {
+            [
+                Part::Prefix(3, 0b00100, name.len()),
+                Part::Bytes(name.as_bytes()),
+                Part::Prefix(7, 0, value.len()),
+                Part::Bytes(value.as_bytes()),
+            ]
+        }
+    }
+}
 
-        encode_prefix(buf, 6, 0b11, index);
+// Wire pieces shared by field-size measurement and encoding, without payload storage.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Prefix(u8, u8, usize),
+    Bytes(&'a [u8]),
+}
+
+impl Part<'_> {
+    fn size(&self) -> usize {
+        match self {
+            Self::Prefix(bits, _, value) => prefix_size(*bits, *value),
+            Self::Bytes(bytes) => bytes.len(),
+        }
     }
 
-    fn encode_literal_value<B: BufMut>(buf: &mut B, name: usize, value: &str) {
-        /*
-          0   1   2   3   4   5   6   7
-        +---+---+---+---+---+---+---+---+
-        | 0 | 1 | N | 1 |Name Index (4+)|
-        +---+---+---+---+---------------+
-        | H |     Value Length (7+)     |
-        +---+---------------------------+
-        |  Value String (Length bytes)  |
-        +-------------------------------+
-        */
-
-        encode_prefix(buf, 4, 0b0101, name);
-        encode_prefix(buf, 7, 0b0, value.len());
-
-        buf.put_slice(value.as_bytes());
-    }
-
-    fn encode_literal<B: BufMut>(buf: &mut B, name: &str, value: &str) {
-        /*
-          0   1   2   3   4   5   6   7
-        +---+---+---+---+---+---+---+---+
-        | 0 | 0 | 1 | N | H |NameLen(3+)|
-        +---+---+---+---+---+-----------+
-        |  Name String (Length bytes)   |
-        +---+---------------------------+
-        | H |     Value Length (7+)     |
-        +---+---------------------------+
-        |  Value String (Length bytes)  |
-        +-------------------------------+
-        */
-
-        encode_prefix(buf, 3, 0b00100, name.len());
-        buf.put_slice(name.as_bytes());
-
-        encode_prefix(buf, 7, 0b0, value.len());
-        buf.put_slice(value.as_bytes());
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        match self {
+            Self::Prefix(bits, flags, value) => encode_prefix(buf, *bits, *flags, *value),
+            Self::Bytes(bytes) => buf.put_slice(bytes),
+        }
     }
 }
 
@@ -407,17 +395,25 @@ fn decode_string<B: Buf>(
         let mut value = vec![0; len];
         buf.copy_to_slice(&mut value);
         value
+    } else if buf.chunk().len() >= len {
+        let result = decode_huffman(&buf.chunk()[..len], budget);
+        // Consume the encoded string even on a decoding or budget error.
+        buf.advance(len);
+        result?
     } else {
-        let encoded = buf.copy_to_bytes(len);
-        let mut decoded = Vec::new();
-        for byte in encoded.hpack_decode() {
-            let byte = byte.map_err(DecodeError::from)?;
-            budget.charge(1)?;
-            decoded.push(byte);
-        }
-        decoded
+        decode_huffman(&buf.copy_to_bytes(len), budget)?
     };
     String::from_utf8(value).map_err(|err| DecodeError::Utf8Error(err.utf8_error()).into())
+}
+
+fn decode_huffman(encoded: &[u8], budget: &mut Budget) -> Result<Vec<u8>, FieldSectionError> {
+    let mut decoded = Vec::new();
+    for byte in encoded.hpack_decode() {
+        let byte = byte.map_err(DecodeError::from)?;
+        budget.charge(1)?;
+        decoded.push(byte);
+    }
+    Ok(decoded)
 }
 
 // Based on https://github.com/hyperium/h3/blob/master/h3/src/qpack/static_.rs
@@ -717,6 +713,20 @@ const PREDEFINED_HEADERS: [(&str, &str); 99] = [
 mod tests {
     use super::*;
 
+    // Split every byte to exercise string copying across arbitrary Buf chunks.
+    struct Chunks<'a>(&'a [u8]);
+    impl Buf for Chunks<'_> {
+        fn remaining(&self) -> usize {
+            self.0.len()
+        }
+        fn chunk(&self) -> &[u8] {
+            &self.0[..self.0.len().min(1)]
+        }
+        fn advance(&mut self, cnt: usize) {
+            self.0 = &self.0[cnt..];
+        }
+    }
+
     #[test]
     fn measured_prefixes_match_wire_at_width_boundaries() {
         for bits in 1..=8 {
@@ -754,23 +764,35 @@ mod tests {
             assert_eq!(size, wire.len());
             assert_eq!(&wire[..3], &[0, 0, 0xd9], "pseudo-header is first");
 
-            // Split every byte to exercise string copying across arbitrary Buf chunks.
-            struct Chunks<'a>(&'a [u8]);
-            impl Buf for Chunks<'_> {
-                fn remaining(&self) -> usize {
-                    self.0.len()
-                }
-                fn chunk(&self) -> &[u8] {
-                    &self.0[..self.0.len().min(1)]
-                }
-                fn advance(&mut self, cnt: usize) {
-                    self.0 = &self.0[cnt..];
-                }
-            }
             let decoded = Headers::decode(&mut Chunks(&wire)).unwrap();
             assert_eq!(decoded.fields.len(), headers.fields.len());
             for (name, value) in &headers.fields {
                 assert_eq!(decoded.get(name), Some(value.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn huffman_contiguous_and_fragmented_inputs_consume_the_same_string_on_error() {
+        for padding in [0xff, 0xf8] {
+            for budget in [1, 2] {
+                // Two 'a' symbols and six padding bits, followed by another string.
+                let wire = [0x82, 0x18, padding, 0x01, b'x'];
+                let mut contiguous = wire.as_slice();
+                let mut fragmented = Chunks(&wire);
+                let result = decode_string(&mut contiguous, 8, &mut Budget(budget));
+                let other = decode_string(&mut fragmented, 8, &mut Budget(budget));
+                if padding == 0xff && budget == 2 {
+                    assert_eq!(result.unwrap(), "aa");
+                    assert_eq!(other.unwrap(), "aa");
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        other.unwrap_err().to_string()
+                    );
+                }
+                assert_eq!(contiguous, &wire[3..]);
+                assert_eq!(fragmented.0, &wire[3..]);
             }
         }
     }
@@ -812,7 +834,9 @@ mod tests {
         let headers = Headers::decode(&mut wire.as_slice()).unwrap();
         assert_eq!(headers.get(&name), Some(""));
         // A second occurrence still costs its own 32-byte overhead.
-        Headers::encode_literal(&mut wire, "x", "");
+        for part in Headers::field_parts("x", "") {
+            part.encode(&mut wire);
+        }
         assert!(matches!(
             Headers::decode(&mut wire.as_slice()),
             Err(FieldSectionError::TooLarge)
