@@ -13,7 +13,7 @@ Decided with the maintainer on 2026-11-06 (planning interview):
 - `TcpStats` gains a small lock around the filter. macOS still reports no rate.
 - Test the filter with controlled time: app-limited samples never lower the estimate, a real sample replaces expired maxima, and rejected samples retire nothing.
 - This quest lands on main. The `qmux-v0.5.x` backport is [its own quest](/quest/a1/qmux-rate-filter-0.5.md), which closes the issue, because published moq-relay (0.17.14) depends on `qmux ^0.5.3`.
-- Other backends are audited separately in [the quiche audit](/quest/a2/quiche-delivery-rate.md). Quinn and Noq report the pacing rate or cwnd/rtt, which don't have this flaw.
+- Quinn and Noq report the pacing rate or cwnd/rtt, which don't have this flaw.
 
 Decision prompts (✅ chosen):
 
