@@ -568,8 +568,7 @@ impl NapiSendClosed {
 #[napi]
 pub struct NapiRecvStream {
     inner: Arc<Mutex<web_transport_quinn::RecvStream>>,
-    // Closing the sender cancels reads when the JS owner is collected. The read futures own
-    // only receivers, so neither napi-rs nor the shared stream can keep that owner alive.
+    // Signal cancellation before stop waits for the receive-stream mutex.
     stopped: watch::Sender<bool>,
 }
 
@@ -618,47 +617,35 @@ impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
     /// peer reset the stream or the session failed.
     #[napi]
-    pub fn read<'env>(
-        &self,
-        env: &'env Env,
-        max_size: u32,
-    ) -> Result<PromiseRaw<'env, Either3<Buffer, NapiStreamError, Null>>> {
+    pub async fn read(&self, max_size: u32) -> Result<Option<Either<Buffer, NapiStreamError>>> {
         use web_transport_quinn::ReadError;
 
-        // A synchronous callback spawning an owned future avoids async fn's implicit JS
-        // receiver reference, which would prevent abandonment from cancelling this read.
+        // Own the shared stream and cancellation receiver for the future (see module note).
         let inner = self.inner.clone();
         let mut stopped = self.stopped.subscribe();
-        env.spawn_future(async move {
-            let mut stream = inner.lock().await;
-            if *stopped.borrow() {
-                return Ok(Either3::C(Null));
+        let mut stream = inner.lock().await;
+        if *stopped.borrow() {
+            return Ok(None);
+        }
+        let result = tokio::select! {
+            biased;
+            _ = stopped.changed() => return Ok(None),
+            result = stream.read_chunk(max_size as usize, true) => result,
+        };
+        let err = match result {
+            Ok(chunk) => {
+                return Ok(chunk.map(|chunk| Either::A(Buffer::from(chunk.bytes.to_vec()))))
             }
-            let result = tokio::select! {
-                biased;
-                _ = stopped.changed() => return Ok(Either3::C(Null)),
-                result = stream.read_chunk(max_size as usize, true) => result,
-            };
-            let err = match result {
-                Ok(chunk) => {
-                    return Ok(match chunk {
-                        Some(chunk) => Either3::A(Buffer::from(chunk.bytes.to_vec())),
-                        None => Either3::C(Null),
-                    })
-                }
-                Err(err @ ReadError::Reset(code)) => {
-                    NapiStreamError::stream(Some(code), err.to_string())
-                }
-                Err(err @ ReadError::InvalidReset(_)) => {
-                    NapiStreamError::stream(None, err.to_string())
-                }
-                Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
-                Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
-                    return Err(Error::from_reason(err.to_string()))
-                }
-            };
-            Ok(Either3::B(err))
-        })
+            Err(err @ ReadError::Reset(code)) => {
+                NapiStreamError::stream(Some(code), err.to_string())
+            }
+            Err(err @ ReadError::InvalidReset(_)) => NapiStreamError::stream(None, err.to_string()),
+            Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
+            Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
+                return Err(Error::from_reason(err.to_string()))
+            }
+        };
+        Ok(Some(Either::B(err)))
     }
 
     /// Tell the peer to stop sending with the given code; an already terminal stream is a no-op.
