@@ -167,6 +167,9 @@ impl ConnectRequest {
         let mut pseudo = std::collections::HashSet::new();
         let mut ordinary = false;
         for (name, _) in &headers.fields {
+            if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err(ConnectError::InvalidHttpHeaderName);
+            }
             if name.starts_with(':') {
                 if ordinary
                     || !matches!(
@@ -216,7 +219,8 @@ impl ConnectRequest {
             .map(|(_, value)| value.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        let protocols = protocol_negotiation::decode_list(&protocols)?;
+        let protocols = protocol_negotiation::decode_list(&protocols)
+            .map_err(|_| ConnectError::InvalidProtocol)?;
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
@@ -519,6 +523,9 @@ fn validate_response_header(
     name: &http::HeaderName,
     value: &http::HeaderValue,
 ) -> Result<(), ConnectError> {
+    value
+        .to_str()
+        .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
     // HTTP/3 forbids connection-specific fields; TE is only defined in requests.
     if matches!(
         name.as_str(),
@@ -843,13 +850,24 @@ mod tests {
             encode_headers_frame(&fields, &mut wire).unwrap();
             let result = ConnectRequest::decode(&mut wire.as_slice());
             if last != "\"b\", \"c\"" {
-                assert!(result.is_err());
+                assert!(matches!(result, Err(ConnectError::InvalidProtocol)));
             } else {
                 let request = result.unwrap();
                 assert_eq!(request.protocols, ["a", "b", "c"]);
                 assert!(!request.headers.contains_key("wt-available-protocols"));
             }
         }
+    }
+
+    #[test]
+    fn request_rejects_uppercase_reserved_names() {
+        let mut section = vec![0, 0];
+        append_literal(&mut section, b"WT-Available-Protocols", b"\"moq\"");
+        let wire = reframe(&section);
+        assert!(matches!(
+            ConnectRequest::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidHttpHeaderName)
+        ));
     }
 
     #[test]
@@ -1007,6 +1025,7 @@ mod tests {
             &[(b":status", b"200"), (b"x", b" leading")],
             &[(b":status", b"200"), (b"x", b"trailing\t")],
             &[(b":status", b"200"), (b"x", b"\xff")],
+            &[(b":status", b"403"), (b"x-reason", "café".as_bytes())],
             &[
                 (b":status", b"200"),
                 (b"sec-webtransport-http3-draft", b"draft02"),

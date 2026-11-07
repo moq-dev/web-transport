@@ -86,7 +86,8 @@ impl Connecting {
     /// Cancel the future to impose an application deadline.
     pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
         let mut connect = self.respond(response).await?;
-        connect.recv.stop(0);
+        // RFC 9114 §4.1.1: a complete response can stop the request with H3_NO_ERROR.
+        connect.recv.stop(0x100);
         match connect.send.rejected().await {
             Ok(()) | Err(ez::StreamError::Connection(ez::ConnectionError::Remote(..))) => (),
             Err(err) => return Err(err.into()),

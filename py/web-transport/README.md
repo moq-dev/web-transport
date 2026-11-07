@@ -75,6 +75,15 @@ asyncio.run(main())
 
 ## API overview
 
+Reject with ordinary response headers, retaining repeated values:
+
+```python
+await request.reject(403, headers=[("set-cookie", b"a=1"), ("set-cookie", b"b=2")])
+```
+
+`reject` also accepts keyword-only `protocol` when the peer offered a subprotocol.
+Malformed or reserved generic fields raise `ValueError` before consuming the request.
+
 | Name | Description |
 |---|---|
 | `Server` | Listens for incoming WebTransport sessions |

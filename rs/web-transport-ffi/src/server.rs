@@ -9,8 +9,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::client::{build_server_tls, CongestionControl};
-use crate::error::{map_server_error, WebTransportError};
-use crate::ffi::RUNTIME;
+use crate::error::{map_server_error, HttpHeader, WebTransportError};
+use crate::ffi::{spawn_abortable, RUNTIME};
 use crate::session::{RemoteAddress, Session};
 
 /// Server configuration record.
@@ -218,28 +218,36 @@ impl SessionRequest {
         Ok(Session::new(session))
     }
 
-    /// Reject the session request with an HTTP status code.
-    #[uniffi::method(default(status_code = 404))]
-    pub async fn reject(&self, status_code: u16) -> Result<(), WebTransportError> {
+    /// Reject with a status, repeated ordinary headers and an optional offered protocol.
+    #[uniffi::method(default(status_code = 404, headers = [], protocol = None))]
+    pub async fn reject(
+        &self,
+        status_code: u16,
+        headers: Vec<HttpHeader>,
+        protocol: Option<String>,
+    ) -> Result<(), WebTransportError> {
+        let status = http::StatusCode::from_u16(status_code)
+            .map_err(|e| WebTransportError::invalid(format!("invalid status code: {e}")))?;
+        let mut response = web_transport_quinn::proto::ConnectResponse::new(status);
+        response.protocol = protocol;
+        for header in headers {
+            let name = http::HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|e| WebTransportError::invalid(format!("invalid header name: {e}")))?;
+            let value = http::HeaderValue::from_bytes(&header.value)
+                .map_err(|e| WebTransportError::invalid(format!("invalid header value: {e}")))?;
+            response.headers.append(name, value);
+        }
+        // Validate reserved fields and size before consuming the request.
+        response
+            .encode(&mut Vec::new())
+            .map_err(|e| WebTransportError::invalid(format!("invalid response: {e}")))?;
         let request = {
             let mut guard = self.inner.lock().await;
             guard.take().ok_or_else(|| {
                 WebTransportError::protocol("request already accepted or rejected")
             })?
         };
-        let status = http::StatusCode::from_u16(status_code)
-            .map_err(|e| WebTransportError::invalid(format!("invalid status code: {e}")))?;
-        let handle = RUNTIME.spawn(async move {
-            // Use respond() rather than reject(): respond() keeps the QUIC
-            // connection alive long enough to transmit the rejection HTTP
-            // response, then we close() from our side.
-            let session = request.respond(status).await.map_err(map_server_error)?;
-            session.close(0, b"");
-            Ok::<_, WebTransportError>(())
-        });
-        handle
+        spawn_abortable(async move { request.reject(response).await.map_err(map_server_error) })
             .await
-            .map_err(|e| WebTransportError::Io(format!("reject task: {e}")))??;
-        Ok(())
     }
 }
