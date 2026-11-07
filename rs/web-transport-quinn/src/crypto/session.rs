@@ -413,9 +413,7 @@ impl crypto::ServerConfig for QuicServerConfig {
     }
 }
 
-fn initial_suite_from_provider(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
-) -> Option<Suite> {
+fn initial_suite_from_provider(provider: &Arc<rustls::crypto::CryptoProvider>) -> Option<Suite> {
     provider
         .cipher_suites
         .iter()
@@ -434,12 +432,7 @@ fn to_vec(params: &TransportParameters) -> Vec<u8> {
     bytes
 }
 
-fn initial_keys(
-    version: Version,
-    dst_cid: ConnectionId,
-    side: Side,
-    suite: &Suite,
-) -> Keys {
+fn initial_keys(version: Version, dst_cid: ConnectionId, side: Side, suite: &Suite) -> Keys {
     let keys = suite.keys(&dst_cid, rustls_side(side), version);
     Keys {
         header: KeyPair {
