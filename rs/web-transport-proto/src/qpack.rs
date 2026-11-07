@@ -195,28 +195,44 @@ impl Headers {
         Ok((name, value))
     }
 
-    /// Encodes the field section, refusing one the decoder would reject as too large.
+    /// Measures the field section, refusing one the decoder would reject as too large.
     ///
-    /// Nothing is written on error. Without Huffman coding, each encoded field line
-    /// is shorter than its decoded cost, so the encoded section also fits the limit.
-    pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), FieldSectionError> {
+    /// Without Huffman coding, each encoded field line is shorter than its decoded
+    /// cost, so the encoded section also fits the limit.
+    pub(crate) fn encoded_size(&self) -> Result<usize, FieldSectionError> {
         let mut budget = Budget::new();
+        let mut size = 2; // Required Insert Count and Delta Base.
         for (name, value) in &self.fields {
             budget.charge(FIELD_LINE_OVERHEAD)?;
             budget.charge(name.len())?;
             budget.charge(value.len())?;
-        }
 
+            size += if let Some(index) = StaticTable::find(name, value) {
+                prefix_size(6, index)
+            } else if let Some(index) = StaticTable::find_name(name) {
+                prefix_size(4, index) + prefix_size(7, value.len()) + value.len()
+            } else {
+                prefix_size(3, name.len()) + name.len() + prefix_size(7, value.len()) + value.len()
+            };
+        }
+        Ok(size)
+    }
+
+    /// Encodes a field section validated by `encoded_size`.
+    pub(crate) fn encode<B: BufMut>(&self, buf: &mut B) {
         // We don't support dynamic entries so we can skip these.
         encode_prefix(buf, 8, 0, 0);
         encode_prefix(buf, 7, 0, 0);
 
         // We must encode pseudo-headers first.
         // https://datatracker.ietf.org/doc/html/rfc9114#section-4.1.2
-        let mut headers: Vec<_> = self.fields.iter().collect();
-        headers.sort_by_key(|&(key, _)| !key.starts_with(':'));
+        let headers = self
+            .fields
+            .iter()
+            .filter(|(key, _)| key.starts_with(':'))
+            .chain(self.fields.iter().filter(|(key, _)| !key.starts_with(':')));
 
-        for (name, value) in headers.iter() {
+        for (name, value) in headers {
             if let Some(index) = StaticTable::find(name, value) {
                 Self::encode_index(buf, index)
             } else if let Some(index) = StaticTable::find_name(name) {
@@ -225,7 +241,6 @@ impl Headers {
                 Self::encode_literal(buf, name, value)
             }
         }
-        Ok(())
     }
 
     fn encode_index<B: BufMut>(buf: &mut B, index: usize) {
@@ -360,6 +375,20 @@ pub fn encode_prefix<B: BufMut>(buf: &mut B, size: u8, flags: u8, value: usize) 
     buf.put_u8(remaining as u8);
 }
 
+fn prefix_size(bits: u8, value: usize) -> usize {
+    let mask = (1 << bits) - 1;
+    if value < mask {
+        return 1;
+    }
+    let mut remaining = value - mask;
+    let mut size = 2;
+    while remaining >= 128 {
+        remaining /= 128;
+        size += 1;
+    }
+    size
+}
+
 fn decode_string<B: Buf>(
     buf: &mut B,
     size: u8,
@@ -375,9 +404,11 @@ fn decode_string<B: Buf>(
 
     let value = if flags & 1 == 0 {
         budget.charge(len)?;
-        buf.copy_to_bytes(len).to_vec()
+        let mut value = vec![0; len];
+        buf.copy_to_slice(&mut value);
+        value
     } else {
-        let encoded = buf.copy_to_bytes(len).to_vec();
+        let encoded = buf.copy_to_bytes(len);
         let mut decoded = Vec::new();
         for byte in encoded.hpack_decode() {
             let byte = byte.map_err(DecodeError::from)?;
@@ -685,6 +716,64 @@ const PREDEFINED_HEADERS: [(&str, &str); 99] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_prefixes_match_wire_at_width_boundaries() {
+        for bits in 1..=8 {
+            let mask = (1 << bits) - 1;
+            for value in [
+                0,
+                mask - 1,
+                mask,
+                mask + 1,
+                mask + 127,
+                mask + 128,
+                mask + 16383,
+                mask + 16384,
+                usize::MAX,
+            ] {
+                let mut wire = Vec::new();
+                encode_prefix(&mut wire, bits, 0, value);
+                assert_eq!(prefix_size(bits, value), wire.len());
+                assert_eq!(decode_prefix(&mut wire.as_slice(), bits).unwrap().1, value);
+            }
+        }
+    }
+
+    #[test]
+    fn measured_sections_cover_each_field_representation() {
+        for len in [0, 6, 7, 126, 127, 128, 254, 255, 256, 4096] {
+            let mut headers = Headers::default();
+            headers.set("x-first", "ordinary");
+            headers.set(":status", "200"); // Full static index.
+            headers.set("user-agent", &"a".repeat(len)); // Static name index > 15.
+            headers.set(&"b".repeat(len), &"c".repeat(len)); // Literal name and value.
+            let size = headers.encoded_size().unwrap();
+            let mut wire = Vec::new();
+            headers.encode(&mut wire);
+            assert_eq!(size, wire.len());
+            assert_eq!(&wire[..3], &[0, 0, 0xd9], "pseudo-header is first");
+
+            // Split every byte to exercise string copying across arbitrary Buf chunks.
+            struct Chunks<'a>(&'a [u8]);
+            impl Buf for Chunks<'_> {
+                fn remaining(&self) -> usize {
+                    self.0.len()
+                }
+                fn chunk(&self) -> &[u8] {
+                    &self.0[..self.0.len().min(1)]
+                }
+                fn advance(&mut self, cnt: usize) {
+                    self.0 = &self.0[cnt..];
+                }
+            }
+            let decoded = Headers::decode(&mut Chunks(&wire)).unwrap();
+            assert_eq!(decoded.fields.len(), headers.fields.len());
+            for (name, value) in &headers.fields {
+                assert_eq!(decoded.get(name), Some(value.as_str()));
+            }
+        }
+    }
 
     #[test]
     fn strings_charge_before_output_and_validate_at_exact_budget() {
