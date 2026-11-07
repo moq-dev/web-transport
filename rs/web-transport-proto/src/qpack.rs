@@ -406,6 +406,7 @@ fn decode_string<B: Buf>(
     String::from_utf8(value).map_err(|err| DecodeError::Utf8Error(err.utf8_error()).into())
 }
 
+#[inline]
 fn decode_huffman(encoded: &[u8], budget: &mut Budget) -> Result<Vec<u8>, FieldSectionError> {
     let mut decoded = Vec::new();
     for byte in encoded.hpack_decode() {
