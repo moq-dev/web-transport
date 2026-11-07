@@ -120,6 +120,10 @@ build-ffi:
 build-ffi-target target:
 	./rs/web-transport-ffi/build.sh --target {{target}} --output rs/web-transport-ffi/dist
 
+# Build and exercise generated Swift bindings against the native macOS host library.
+test-swift:
+	./swift/scripts/check.sh
+
 # Delete build artifacts and caches to reclaim disk space. web-transport keeps
 # a single root justfile (unlike moq's per-language modules), so the per-language
 # cleanups are inlined here. Sweeps the shared caches, then recurses into any
