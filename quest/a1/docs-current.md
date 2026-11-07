@@ -8,7 +8,7 @@ The root and Rust package documentation correctly link the workspace and describ
 
 Repair root crate links that omit `rs/`, the router README claim that WASM cannot implement the trait, and the trait README's obsolete Quiche/sans-I/O TODO descriptions. Check remaining package maps against Cargo workspace membership and actual exports. Preserve package-local detail rather than growing AGENTS.md.
 
-Binding-specific installation/build instructions are owned by the corresponding binding CI quests to avoid competing edits. Validate local links and examples against the source. This cleanup is independently shippable from the new package-selection guide.
+Binding-specific installation/build instructions are owned by the corresponding binding CI quests to avoid competing edits. Validate local links and examples against the source. Keep the [package-selection guide](/PACKAGE-SELECTION.md) separate from these architecture-map repairs.
 
 ## Related
 

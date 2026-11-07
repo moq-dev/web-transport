@@ -2,12 +2,14 @@
 
 Start with the API boundary your application needs, then choose a transport.
 The `web-transport` crate selects Quinn on native targets and the browser API on
-WASM. Other native backends and QMux are separate packages; selecting them means
+non-WASI `wasm32` targets. Other native backends and QMux are separate packages; selecting them means
 using their APIs directly or writing against `web-transport-trait`.
 
 This guide describes the code in this checkout. The external comparison was
 checked on 2026-11-07 against [wtransport 0.7.2][wt-manifest] and its public
 reference documentation. Recheck the linked sources when changing versions.
+The browser WASM paths below exclude WASI: the [router source][router-code] also
+selects Quinn for WASI, whose build support is unverified here.
 **Unsupported** means the cited API excludes a capability. **Unverified** means
 these sources do not establish support; it does not mean the capability is
 impossible or absent from every related project.
@@ -17,7 +19,7 @@ impossible or absent from every related project.
 | Package | Use it when | Boundary |
 | --- | --- | --- |
 | [`web-transport`](rs/web-transport) | You want one concrete client/session API for native Rust and browser WASM. | The [platform router][router-code] fixes the implementation at compile time. Native server setup comes from Quinn, with conversions into the router's types. There is no browser server API. |
-| [`web-transport-trait`](rs/web-transport-trait) | Your application should accept different session implementations. | The [async session/stream traits][traits-code] cover streams, datagrams, closure and metadata. They do not create endpoints or choose a backend. The [conditional bounds][trait-bounds] require native `Send`/`Sync` and relax those bounds on WASM. |
+| [`web-transport-trait`](rs/web-transport-trait) | Your application should accept different session implementations. | The [async session/stream traits][traits-code] cover streams, datagrams, closure and metadata. They do not create endpoints or choose a backend. The [conditional bounds][trait-bounds] require `Send`/`Sync` outside `target_family = "wasm"` and relax them within that family, including WASI. |
 | A native backend below | You need backend configuration or access to its connection and stream types. | Endpoint, TLS and runtime integration remain backend-specific. A shared trait does not make their builders interchangeable. |
 | [`qmux`](rs/qmux) | You need the session abstraction over an ordered byte transport such as TCP, TLS or WebSocket. | Implements the async traits using QMux framing, with its own setup and wire protocol. |
 | [`web-transport-proto`](rs/web-transport-proto) | You are implementing protocol integration inside a backend. | Shared HTTP/3/WebTransport framing; it is not an application client or server. |
@@ -43,8 +45,10 @@ networking stack you need to integrate, rather than assuming one is faster.
 The native HTTP/3 implementations use one WebTransport session per QUIC
 connection. General HTTP/3 serving and multiple WebTransport sessions pooled on
 one connection are unsupported by this design; see the
-[Quinn](rs/web-transport-quinn/src/lib.rs) and
-[Quiche](rs/web-transport-quiche/src/lib.rs) limitations. Use a stack with HTTP/3
+[Quinn](rs/web-transport-quinn/src/lib.rs),
+[Noq](rs/web-transport-noq/src/lib.rs),
+[Quiche](rs/web-transport-quiche/src/lib.rs) and
+[iroh](rs/web-transport-iroh/src/lib.rs) limitations. Use a stack with HTTP/3
 request routing if your application needs to share that connection with other
 HTTP traffic.
 
