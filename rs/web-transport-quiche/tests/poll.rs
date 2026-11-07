@@ -81,6 +81,12 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
     let mut send = poll_fn(|cx| client.poll_open_uni(cx)).await?;
     poll_fn(|cx| send.poll_write(cx, b"hello")).await?;
     send.finish()?;
+    assert_eq!(
+        web_transport_trait::SendStream::stats(&mut send)
+            .await?
+            .bytes_written,
+        Some(5)
+    );
 
     let mut recv = poll_fn(|cx| server.poll_accept_uni(cx)).await?;
 
@@ -89,6 +95,12 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
         .await?
         .context("stream ended early")?;
     assert_eq!(&dst[..size], b"hello");
+    assert_eq!(
+        web_transport_trait::RecvStream::stats(&mut recv)
+            .await?
+            .bytes_read,
+        Some(5)
+    );
 
     Ok(())
 }
@@ -206,5 +218,25 @@ async fn a_finished_poll_releases_the_poller() -> Result<()> {
         "the finished read is still holding the poller's waker"
     );
 
+    Ok(())
+}
+
+#[path = "../../web-transport-trait/tests/support/stream_stats.rs"]
+mod stream_stats;
+
+#[tokio::test]
+async fn stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    stream_stats::payload_stats(&client, &server).await;
+    Ok(())
+}
+
+#[path = "../../web-transport-trait/tests/support/tokio_stream_stats.rs"]
+mod tokio_stream_stats;
+
+#[tokio::test]
+async fn tokio_stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    tokio_stream_stats::payload_stats(&client, &server).await;
     Ok(())
 }

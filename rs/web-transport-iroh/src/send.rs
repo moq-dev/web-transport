@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use iroh::endpoint;
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
 /// WebTransport uses u32 error codes and they're mapped in a reserved HTTP/3 error space.
 #[derive(Debug)]
 pub struct SendStream {
+    bytes_written: u64,
     stream: endpoint::SendStream,
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
     raw: bool,
@@ -25,7 +26,18 @@ pub struct SendStream {
 
 impl SendStream {
     pub(crate) fn new(stream: endpoint::SendStream, raw: bool) -> Self {
-        Self { stream, raw }
+        Self {
+            stream,
+            raw,
+            bytes_written: 0,
+        }
+    }
+
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, WriteError> {
+        let mut stats = web_transport_trait::SendStreamStats::default();
+        stats.bytes_written = Some(self.bytes_written);
+        Ok(stats)
     }
 
     /// Decode the peer's stop code with the session's code space.
@@ -66,15 +78,23 @@ impl SendStream {
 
     /// Write some data to the stream, returning the size written. See [`iroh::endpoint::SendStream::write`].
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
-        self.stream.write(buf).await.map_err(|e| self.map_error(e))
+        let size = self
+            .stream
+            .write(buf)
+            .await
+            .map_err(|e| self.map_error(e))?;
+        self.bytes_written += size as u64;
+        Ok(size)
     }
 
     /// Write all of the data to the stream. See [`iroh::endpoint::SendStream::write_all`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
-        self.stream
-            .write_all(buf)
-            .await
-            .map_err(|e| self.map_error(e))
+        let mut buf = buf;
+        while !buf.is_empty() {
+            let size = self.write(buf).await?;
+            buf = &buf[size..];
+        }
+        Ok(())
     }
 
     /// Write chunks of data to the stream, returning the number of bytes written.
@@ -84,26 +104,27 @@ impl SendStream {
         &mut self,
         bufs: &mut &mut [Bytes],
     ) -> Result<usize, WriteError> {
-        self.stream
+        let size = self
+            .stream
             .write_many_chunks(bufs)
             .await
-            .map_err(|e| self.map_error(e))
+            .map_err(|e| self.map_error(e))?;
+        self.bytes_written += size as u64;
+        Ok(size)
     }
 
     /// Write a chunk of data to the stream. See [`iroh::endpoint::SendStream::write_chunk`].
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
-        self.stream
-            .write_chunk(buf)
-            .await
-            .map_err(|e| self.map_error(e))
+        self.write_all_chunks(&mut [buf]).await
     }
 
     /// Write all of the chunks of data to the stream. See [`iroh::endpoint::SendStream::write_all_chunks`].
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        self.stream
-            .write_all_chunks(bufs)
-            .await
-            .map_err(|e| self.map_error(e))
+        let mut bufs = bufs;
+        while !bufs.is_empty() {
+            self.write_many_chunks(&mut bufs).await?;
+        }
+        Ok(())
     }
 
     /// Mark the stream as finished, such that no more data can be written. See [`iroh::endpoint::SendStream::finish`].
@@ -129,7 +150,11 @@ impl tokio::io::AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // We have to use this syntax because iroh::endpoint added its own poll_write method.
-        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf)
+        let result = tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf);
+        if let Poll::Ready(Ok(size)) = &result {
+            self.bytes_written += *size as u64;
+        }
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
@@ -143,6 +168,10 @@ impl tokio::io::AsyncWrite for SendStream {
 
 impl web_transport_trait::SendStream for SendStream {
     type Error = WriteError;
+
+    async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, Self::Error> {
+        self.stats().await
+    }
 
     fn set_priority(&mut self, order: i32) {
         self.stream.set_priority(order).ok();
@@ -159,17 +188,6 @@ impl web_transport_trait::SendStream for SendStream {
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         Self::write(self, buf).await
-    }
-
-    async fn write_buf<B: Buf + web_transport_trait::MaybeSend>(
-        &mut self,
-        buf: &mut B,
-    ) -> Result<usize, Self::Error> {
-        // This can avoid making a copy when Buf is Bytes, as Quinn will allocate anyway.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.write_chunk(chunk).await?;
-        Ok(size)
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), Self::Error> {

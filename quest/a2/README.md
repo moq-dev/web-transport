@@ -10,7 +10,6 @@ The Required list is ordered by priority. Independent children may proceed concu
 
 ## Required
 
-- [Stream statistics](/quest/a2/stream-stats.md) - optional async metrics with exact semantics
 - [Native metric integration](/quest/a2/native-stream-stats.md) - actual native delivered-versus-queued progress
 - [Native metric availability](/quest/a2/native-stats-upstream.md) - advance external accessor prerequisites
 - [QMux draft readiness](/quest/a2/qmux-draft-readiness.md) - establish strict-validation compatibility boundary

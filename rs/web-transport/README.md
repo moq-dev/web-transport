@@ -16,6 +16,12 @@ WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
 
+## Stream statistics
+
+Both platform stream types expose `stats().await`, returning `SendStreamStats`
+or `RecvStreamStats` with optional payload measurements. See the
+[metric definitions, backend support and example](../web-transport-trait/README.md#stream-statistics).
+
 ## Why no trait?
 
 See [web-transport-trait](https://docs.rs/web-transport-trait). 

@@ -7,6 +7,37 @@ use std::time::Duration;
 pub use crate::util::{MaybeSend, MaybeSync};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// Application payload progress on one outgoing stream, excluding protocol headers.
+///
+/// These metrics follow the [W3C stream statistics](https://www.w3.org/TR/webtransport/#webtransportsendstreamstats).
+/// `None` means unavailable; `Some(0)` means measured zero. Counters never decrease,
+/// including after finish or reset. A successful write accepts data locally and
+/// does not prove transmission, acknowledgment, or peer application consumption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SendStreamStats {
+    /// Payload bytes accepted by writes, including partial progress before error or cancellation.
+    pub bytes_written: Option<u64>,
+    /// Payload bytes transmitted at least once, excluding retransmissions and overhead.
+    pub bytes_sent: Option<u64>,
+    /// Length of the contiguous payload prefix acknowledged by the peer's transport.
+    pub bytes_acknowledged: Option<u64>,
+}
+
+/// Application payload progress on one incoming stream, excluding protocol headers.
+///
+/// These metrics follow the [W3C stream statistics](https://www.w3.org/TR/webtransport/#webtransportreceivestreamstats).
+/// `None` means unavailable; `Some(0)` means measured zero. Counters never decrease,
+/// including after stop or end of stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecvStreamStats {
+    /// Length of the contiguous payload prefix received, ending at the first missing byte.
+    pub bytes_received: Option<u64>,
+    /// Payload bytes returned to the caller, including partial progress in cancelled helpers.
+    pub bytes_read: Option<u64>,
+}
+
 /// A snapshot of locally initiated transport streams.
 ///
 /// Counts describe backend protocol state, not application stream handles.
@@ -173,6 +204,15 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
 pub trait SendStream: MaybeSend {
     type Error: Error;
 
+    /// Collect current payload statistics; unsupported metrics default to unavailable.
+    ///
+    /// Collection may fail independently of I/O, for example if browser `getStats()` rejects.
+    /// Cancelling collection does not cancel stream I/O. When available,
+    /// `bytes_acknowledged <= bytes_sent <= bytes_written`.
+    fn stats(&mut self) -> impl Future<Output = Result<SendStreamStats, Self::Error>> + MaybeSend {
+        async { Ok(SendStreamStats::default()) }
+    }
+
     /// Write some of the buffer to the stream, returning how many bytes were
     /// written. See [`write_buf`](Self::write_buf) for the cancel-safety contract,
     /// which this shares.
@@ -293,6 +333,15 @@ pub trait SendStream: MaybeSend {
 /// The stream will be closed with STOP_SENDING code=0 when dropped.
 pub trait RecvStream: MaybeSend {
     type Error: Error;
+
+    /// Collect current payload statistics; unsupported metrics default to unavailable.
+    ///
+    /// Collection may fail independently of I/O. Cancelling collection does not
+    /// consume stream data. When available, `bytes_read <= bytes_received` for
+    /// ordered reads; backend-specific unordered reads count returned payload too.
+    fn stats(&mut self) -> impl Future<Output = Result<RecvStreamStats, Self::Error>> + MaybeSend {
+        async { Ok(RecvStreamStats::default()) }
+    }
 
     /// Read some data into the provided slice.
     ///

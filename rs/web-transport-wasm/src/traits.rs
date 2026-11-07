@@ -180,6 +180,10 @@ impl web_transport_trait::poll::SendStream for SendStream {
 impl web_transport_trait::SendStream for SendStream {
     type Error = Error;
 
+    async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, Error> {
+        self.stats().await
+    }
+
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         poll_fn(|cx| SendStream::poll_write(self, cx, buf)).await
     }
@@ -233,6 +237,10 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
 
 impl web_transport_trait::RecvStream for RecvStream {
     type Error = Error;
+
+    async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, Error> {
+        self.stats().await
+    }
 
     async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Error> {
         poll_fn(|cx| RecvStream::poll_read(self, cx, dst)).await

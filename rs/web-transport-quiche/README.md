@@ -63,3 +63,10 @@ sleep. Certificates are generated in memory; no fixture files are needed.
 For a focused run, use `cargo test -p web-transport-quiche --lib ez::driver::tests`.
 The pair pumps queued packets only; tests that need QUIC timer expiry require a
 separate clock-driving seam.
+
+## Stream statistics
+
+The async stream `stats()` methods report application payload accepted and read,
+excluding protocol headers, including partial progress in cancelled helpers.
+Sent, acknowledged and contiguous received progress remain unavailable. See the
+[metric definitions and example](../web-transport-trait/README.md#stream-statistics).
