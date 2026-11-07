@@ -243,6 +243,13 @@ impl SessionRequest {
             .map_err(|e| WebTransportError::invalid(format!("invalid response: {e}")))?;
         let request = {
             let mut guard = self.inner.lock().await;
+            if let (Some(protocol), Some(request)) = (&response.protocol, guard.as_ref()) {
+                if !request.protocols.contains(protocol) {
+                    return Err(WebTransportError::invalid(
+                        "protocol was not offered by the peer",
+                    ));
+                }
+            }
             guard.take().ok_or_else(|| {
                 WebTransportError::protocol("request already accepted or rejected")
             })?

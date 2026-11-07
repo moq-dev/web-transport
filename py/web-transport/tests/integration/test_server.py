@@ -148,18 +148,19 @@ async def test_reject_with_default_status(self_signed_cert, cert_hash):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "header",
+    "arguments",
     [
-        ("bad name", b"x"),
-        ("x-test", b"bad\x00value"),
-        ("x-test", "café".encode()),
-        ("wt-protocol", b'"moq"'),
-        ("sec-webtransport-http3-draft", b"draft02"),
-        ("x-test", b" leading"),
+        {"headers": [("bad name", b"x")]},
+        {"headers": [("x-test", b"bad\x00value")]},
+        {"headers": [("x-test", "café".encode())]},
+        {"headers": [("wt-protocol", b'"moq"')]},
+        {"headers": [("sec-webtransport-http3-draft", b"draft02")]},
+        {"headers": [("x-test", b" leading")]},
+        {"protocol": "not-offered"},
     ],
 )
-async def test_invalid_rejection_headers_leave_request_usable(
-    self_signed_cert, cert_hash, header
+async def test_invalid_rejection_arguments_leave_request_usable(
+    self_signed_cert, cert_hash, arguments
 ):
     cert, key = self_signed_cert
     async with web_transport.Server(
@@ -171,7 +172,7 @@ async def test_invalid_rejection_headers_leave_request_usable(
             request = await server.accept()
             assert request is not None
             with pytest.raises(ValueError):
-                await request.reject(403, headers=[header])
+                await request.reject(403, **arguments)
             await request.reject(403, headers=[("x-reason", b"retry")])
 
         async def client_task():
