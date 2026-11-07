@@ -17,6 +17,8 @@ class FakePeer {
 	static last: FakePeer | undefined;
 
 	readonly url: string;
+	readonly version: Frame.WireFormat;
+	#frameWaiters = new Set<() => void>();
 	readonly opened: Promise<{
 		readable: ReadableStream<Uint8Array | ArrayBuffer | string>;
 		writable: WritableStream<Uint8Array>;
@@ -41,6 +43,11 @@ class FakePeer {
 	constructor(url: string, options?: { protocol?: string }) {
 		const protocol = options?.protocol ?? "qmux-01";
 		this.url = url;
+		this.version = protocol.startsWith("qmux-00")
+			? "qmux-00"
+			: protocol.startsWith("qmux-02")
+				? "qmux-02"
+				: "qmux-01";
 		FakePeer.last = this;
 		const readable = new ReadableStream<Uint8Array | ArrayBuffer | string>({
 			start: (c) => {
@@ -51,6 +58,7 @@ class FakePeer {
 			write: async (chunk) => {
 				await this.#writeBlocked;
 				this.sent.push(chunk);
+				for (const notify of this.#frameWaiters) notify();
 			},
 		});
 		this.opened = Promise.resolve({ readable, writable, protocol, extensions: "" });
@@ -86,7 +94,7 @@ class FakePeer {
 	// --- test controls ---
 	/** Inject a frame as if sent by the peer. */
 	send(frame: Frame.Any) {
-		this.#recv.enqueue(Frame.encode(frame, "qmux-01"));
+		this.#recv.enqueue(Frame.encode(frame, this.version));
 	}
 	/** Inject a raw text frame (invalid for QMux). */
 	sendText(text: string) {
@@ -104,8 +112,26 @@ class FakePeer {
 	}
 	/** All frames the Session has written so far, decoded. */
 	received(): Frame.Any[] {
-		return this.sent.flatMap((b) => Frame.decodeRecord(b));
+		return this.sent.flatMap((b) => {
+			if (this.version !== "qmux-00") return Frame.decodeRecord(b);
+			const frame = Frame.decode(b, this.version);
+			return frame ? [frame] : [];
+		});
 	}
+	/** Wait for observable peer output without timers or fixed microtask drains. */
+	waitForFrame(predicate: (frame: Frame.Any) => boolean): Promise<Frame.Any> {
+		return new Promise((resolve) => {
+			const check = () => {
+				const frame = this.received().find(predicate);
+				if (!frame) return;
+				this.#frameWaiters.delete(check);
+				resolve(frame);
+			};
+			this.#frameWaiters.add(check);
+			check();
+		});
+	}
+
 	has(type: Frame.Any["type"]): boolean {
 		return this.received().some((f) => f.type === type);
 	}
@@ -220,8 +246,12 @@ function peerParams(overrides: Partial<TransportParams> = {}): TransportParams {
 	};
 }
 
-function connect(config?: Config): { session: Session; peer: FakePeer } {
-	(globalThis as { WebSocketStream?: unknown }).WebSocketStream = FakePeer;
+function connect(config?: Config, version: Frame.WireFormat = "qmux-01"): { session: Session; peer: FakePeer } {
+	(globalThis as { WebSocketStream?: unknown }).WebSocketStream = class extends FakePeer {
+		constructor(url: string) {
+			super(url, { protocol: version });
+		}
+	};
 	// Idle timer off so a stray interval can't interfere with the test.
 	// Bare version ALPNs are offered by default (requireProtocol defaults to false).
 	const session = new Session("https://example/test", {
@@ -551,6 +581,94 @@ describe("Session integration (scripted peer)", () => {
 
 		await expectSessionFailure(session);
 		await waitFor(() => sentCloseCode(peer) === 1002);
+	});
+
+	describe("send-control stream state", () => {
+		const controls = (id: Stream.Id): Frame.Any[] => [
+			{ type: "max_stream_data", id, max: 10n },
+			{ type: "stop_sending", id, code: VarInt.from(42) },
+		];
+
+		for (const version of ["qmux-00", "qmux-01", "qmux-02"] as const) {
+			for (const isServer of [false, true]) {
+				const setup = async () => {
+					const { session, peer } = isServer ? accept({ protocol: version }) : connect(undefined, version);
+					await session.ready;
+					peer.send({
+						type: "transport_parameters",
+						params: peerParams({ initialMaxStreamDataUni: 0n, initialMaxStreamDataBidiRemote: 0n }),
+					});
+					return { session, peer };
+				};
+
+				for (const dir of [Stream.Dir.Uni, Stream.Dir.Bi]) {
+					const open = async (session: Session) =>
+						dir === Stream.Dir.Uni
+							? { writable: await session.createUnidirectionalStream(), readable: undefined }
+							: session.createBidirectionalStream();
+					for (const opened of [0n, 2n]) {
+						for (const index of [opened, opened + 10n]) {
+							for (const frame of controls(Stream.Id.create(index, dir, isServer))) {
+								test(`${version} role=${isServer} dir=${dir} opened=${opened} index=${index} ${frame.type} rejects unopened local stream`, async () => {
+									const { session, peer } = await setup();
+									// The allocation counters are independent in each direction.
+									for (let i = 0; i < 3; i++) {
+										if (dir === Stream.Dir.Uni) await session.createBidirectionalStream();
+										else await session.createUnidirectionalStream();
+									}
+									for (let i = 0n; i < opened; i++) await open(session);
+									peer.send(frame);
+									await expectSessionFailure(session);
+									const close = (await peer.waitForFrame(
+										(f) => f.type === "connection_close",
+									)) as Frame.ConnectionClose;
+									expect(close.code.value).toBe(1002n);
+								});
+							}
+						}
+					}
+
+					test(`${version} role=${isServer} dir=${dir} accepts controls on opened and retired streams`, async () => {
+						const { session, peer } = await setup();
+						const stream = await open(session);
+						const writer = stream.writable.getWriter();
+						const stopped = settleTo(writer.closed);
+						const id = Stream.Id.create(0n, dir, isServer);
+						peer.send(controls(id)[0]);
+						await writer.write(new Uint8Array([1]));
+						peer.send(controls(id)[1]);
+						expect(await stopped).toMatchObject({ streamErrorCode: 42 });
+						await peer.waitForFrame(
+							(f) => f.type === "reset_stream" && f.id.value.value === id.value.value,
+						);
+						if (stream.readable) await stream.readable.cancel();
+						for (const frame of controls(id)) peer.send(frame);
+						peer.send({ type: "ping_request", sequence: 0n });
+						await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === 0n);
+						expect(peer.has("connection_close")).toBe(false);
+						session.close();
+					});
+				}
+
+				test(`${version} role=${isServer} preserves peer bidi controls and rejects receive-only STOP_SENDING`, async () => {
+					const { session, peer } = await setup();
+					for (const frame of controls(Stream.Id.create(10n, Stream.Dir.Bi, !isServer))) peer.send(frame);
+					peer.send({ type: "ping_request", sequence: 0n });
+					await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === 0n);
+					expect(peer.has("connection_close")).toBe(false);
+					peer.send({
+						type: "stop_sending",
+						id: Stream.Id.create(0n, Stream.Dir.Uni, !isServer),
+						code: VarInt.from(42),
+					});
+					await expectSessionFailure(session);
+					const close = (await peer.waitForFrame(
+						(f) => f.type === "connection_close",
+					)) as Frame.ConnectionClose;
+					expect(close.code.value).toBe(1002n);
+				});
+			}
+		}
 	});
 
 	test("draft-01 tolerates the legacy zero final_size after data", async () => {
