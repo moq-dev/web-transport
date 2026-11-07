@@ -283,8 +283,10 @@ async def test_server_close_all_connections(
         async def server_side() -> None:
             request = await server.accept()
             assert request is not None
-            await request.accept()
+            session = await request.accept()
+            assert session.close_reason is None
             server.close()
+            await session.wait_closed()
 
         setup = _webtransport_connect_js(port, hash_b64)
         async with asyncio.TaskGroup() as tg:

@@ -73,6 +73,10 @@ async def main():
 asyncio.run(main())
 ```
 
+## Session lifetime
+
+Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
+
 ## API overview
 
 | Name | Description |
