@@ -44,17 +44,29 @@ async fn main() -> anyhow::Result<()> {
     // Standard quinn setup, accepting only the given certificate.
     // You should use system roots in production.
     let mut config = rustls::ClientConfig::builder_with_provider(
-        web_transport_quinn::crypto::default_provider(),
+        web_transport_quinn::crypto::default_provider()?,
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_root_certificates(roots)
     .with_no_client_auth();
     config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()]; // this one is important
 
-    let config: quinn::crypto::rustls::QuicClientConfig = config.try_into()?;
+    let config: web_transport_quinn::crypto::QuicClientConfig = config.try_into()?;
     let config = quinn::ClientConfig::new(Arc::new(config));
 
-    let client = quinn::Endpoint::client("[::]:0".parse()?)?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(false)?;
+    socket.bind(&"[::]:0".parse::<std::net::SocketAddr>()?.into())?;
+    let client = quinn::Endpoint::new(
+        web_transport_quinn::crypto::endpoint_config()?,
+        None,
+        socket.into(),
+        quinn::default_runtime().context("no async runtime")?,
+    )?;
     let client = web_transport_quinn::Client::new(client, config);
 
     // Connect to the given URL.

@@ -17,4 +17,3 @@ Do not add a pretend browser certificate-verification bypass, a browser panic or
 ## Related
 
 - [Dual-stack bind](/quest/a1/dual-stack-bind.md) - edits the same Quinn client construction
-- [Quinn on rind](/quest/a1/rind/quinn.md) - replaces the crypto these builders configure

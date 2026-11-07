@@ -1,8 +1,4 @@
 //! WebTransport client wrapped for UniFFI.
-//!
-//! Mirrors `rs/web-transport-python/src/client.rs` with PyO3 replaced by
-//! `#[uniffi::export]` and the `ring` crypto provider replaced by either
-//! `aws-lc-rs` (default) or `ring` (feature-gated).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,7 +65,7 @@ impl Client {
             ));
         }
 
-        let provider = Arc::new(default_crypto_provider());
+        let provider = default_crypto_provider()?;
 
         let tls_builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -137,15 +133,20 @@ impl Client {
             }
         }
 
-        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        let quic_config = web_transport_quinn::crypto::QuicClientConfig::try_from(tls_config)
             .map_err(|e| WebTransportError::invalid(format!("QUIC config: {e}")))?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(transport.into());
 
         let _guard = RUNTIME.enter();
-        let endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
-            .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()))
-            .map_err(|e| WebTransportError::Io(format!("failed to create endpoint: {e}")))?;
+        let endpoint_config = web_transport_quinn::crypto::endpoint_config()
+            .map_err(|e| WebTransportError::invalid(e.to_string()))?;
+        let socket = client_socket("[::]:0".parse().unwrap())
+            .or_else(|_| client_socket("0.0.0.0:0".parse().unwrap()))
+            .map_err(|e| WebTransportError::Io(format!("failed to bind: {e}")))?;
+        let endpoint =
+            quinn::Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
+                .map_err(|e| WebTransportError::Io(format!("failed to create endpoint: {e}")))?;
 
         let client = web_transport_quinn::Client::new(endpoint.clone(), client_config);
 
@@ -199,23 +200,28 @@ impl Drop for Client {
     }
 }
 
+// Match Quinn's client sockets rather than platform-specific IPv6-only defaults.
+fn client_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if addr.is_ipv6() {
+        // IPv6-only operation is still valid, as in Quinn's convenience constructor.
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 // ---------------------------------------------------------------------------
-// Crypto provider selection (matches feature gates in Cargo.toml).
+// Crypto provider selection and CPU support.
 // ---------------------------------------------------------------------------
 
-fn default_crypto_provider() -> rustls::crypto::CryptoProvider {
-    #[cfg(feature = "aws-lc-rs")]
-    {
-        rustls::crypto::aws_lc_rs::default_provider()
-    }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    {
-        rustls::crypto::ring::default_provider()
-    }
-    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
-    {
-        compile_error!("web-transport-ffi requires one of: aws-lc-rs, ring");
-    }
+fn default_crypto_provider() -> Result<Arc<rustls::crypto::CryptoProvider>, WebTransportError> {
+    web_transport_quinn::crypto::default_provider()
+        .map_err(|e| WebTransportError::invalid(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +243,7 @@ impl ServerCertVerifier for ServerFingerprints {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let cert_hash = sha256(&self.provider, end_entity)?;
+        let cert_hash = web_transport_quinn::crypto::sha256(&self.provider, end_entity)?;
         if self.fingerprints.iter().any(|fp| fp == cert_hash.as_ref()) {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
@@ -329,25 +335,6 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-fn sha256(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
-    cert: &CertificateDer<'_>,
-) -> Result<rustls::crypto::hash::Output, rustls::Error> {
-    let hash_provider = provider
-        .cipher_suites
-        .iter()
-        .find_map(|suite| {
-            let hp = suite.tls13()?.common.hash_provider;
-            if hp.algorithm() == rustls::crypto::hash::HashAlgorithm::SHA256 {
-                Some(hp)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| rustls::Error::General("crypto provider missing SHA-256".into()))?;
-    Ok(hash_provider.hash(cert))
-}
-
 // ---------------------------------------------------------------------------
 // Helper used by server.rs for TLS configuration.
 // ---------------------------------------------------------------------------
@@ -363,8 +350,8 @@ pub(crate) fn build_server_tls(
     let key = rustls::pki_types::PrivateKeyDer::try_from(private_key)
         .map_err(|e| WebTransportError::invalid(format!("invalid private key: {e}")))?;
 
-    let provider = default_crypto_provider();
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+    let provider = default_crypto_provider()?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| WebTransportError::invalid(format!("TLS config: {e}")))?
         .with_no_client_auth()

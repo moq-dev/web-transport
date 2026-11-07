@@ -28,28 +28,63 @@ Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they m
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
 # Usage
-To use web-transport-quinn, first you need to create a [quinn::Endpoint](https://docs.rs/quinn/latest/quinn/struct.Endpoint.html); see the documentation and examples for more information.
-The only requirement is that the ALPN is set to `web_transport_quinn::ALPN` (aka `h3`).
+Use `ClientBuilder` and `ServerBuilder` for WebTransport defaults. Advanced callers
+can build a `quinn::Endpoint` and pass it to `Client::new` or `Server::new`; set the
+TLS ALPN to `web_transport_quinn::ALPN` (`h3`).
 
-Afterwards, you use [web_transport_quinn::accept](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.accept.html) (as a server) or [web_transport_quinn::connect](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.connect.html) (as a client) to establish a WebTransport session.
-This will take over the QUIC connection and perform the boring HTTP/3 handshake for you.
+## Crypto and migration
 
-See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/blob/main/moq-native/src/quic.rs) for a full setup.
+TLS uses the process-wide rustls provider if one is installed, otherwise
+[rind-rustls](https://github.com/moq-dev/rind/tree/main/rind-rustls). Retry integrity,
+stateless resets and handshake tokens always use rind. The normal and build
+dependency graph contains no ring or aws-lc-rs; aws-lc-rs is a development dependency
+for interop tests. The `ring` and `aws-lc-rs` crate features have been removed.
 
-```rust
-    // Create a QUIC client.
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-    endpoint.set_default_client_config(/* ... */);
+rind supports x86_64, aarch64 and 32-bit ARM. A CPU missing a required feature is
+rejected by the builders' finishing methods with `ClientError::UnsupportedCpu` or
+`ServerError::UnsupportedCpu`. `new()` stays infallible. This check also applies
+when the process installed another TLS provider, because endpoint keys use rind.
+`Client::default()` unwraps system-root setup and panics on an unsupported CPU;
+use `ClientBuilder::new().with_system_roots()` to handle the error.
 
-    // Connect to the given URL.
-    let session = web_transport_quinn::connect(&client, Url::parse("https://localhost")?).await?;
+For manually configured endpoints, replace `quinn::crypto::rustls::QuicClientConfig`,
+`QuicServerConfig` and `HandshakeData` with the same names under
+`web_transport_quinn::crypto`. `crypto::default_provider()` and `crypto::sha256()` now return a `Result`.
+Import rustls directly instead of through the feature-gated `quinn::rustls` re-export.
+Use `crypto::server_config(Arc::new(crypto))?` instead of
+`quinn::ServerConfig::with_crypto`, and `quinn::Endpoint::new` with
+`crypto::endpoint_config()?` instead of `Endpoint::client` or `Endpoint::server`.
+Those Quinn convenience methods require its ring or aws-lc-rs feature. For an IPv6
+client socket, disable `IPV6_V6ONLY` before binding to retain Quinn's dual-stack
+behavior; the advanced client example shows the socket2 setup.
 
-    // Create a bidirectional stream.
-    let (mut send, mut recv) = session.open_bi().await?;
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::{net::UdpSocket, sync::Arc};
+use web_transport_quinn::{crypto, quinn};
 
-    // Send a message.
-    send.write(b"hello").await?;
+let mut tls = rustls::ClientConfig::builder_with_provider(crypto::default_provider()?)
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+let config = quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls)?));
+let endpoint = quinn::Endpoint::new(
+    crypto::endpoint_config()?, None, UdpSocket::bind("0.0.0.0:0")?,
+    quinn::default_runtime().ok_or("no async runtime")?,
+)?;
+let client = web_transport_quinn::Client::new(endpoint, config);
+# Ok(())
+# }
 ```
+
+The adapter accepts any rustls provider exposing the QUIC AES-128-GCM-SHA256
+initial suite. Configure TLS 1.3, and set server `max_early_data_size` to zero or
+`u32::MAX`. `crypto::ResetKey` and `crypto::TokenKey` accept persistent secrets
+when endpoints need keys that survive restarts. `HandshakeData` is a distinct
+Rust type from Quinn's, so raw-session ALPN discovery requires this adapter.
+
+See the [advanced examples](examples) for custom TLS and WebTransport setup.
 
 ## Async runtimes
 Each WebTransport session runs a background task that reads capsules from the CONNECT stream, and `Session::close` runs the graceful close in another.

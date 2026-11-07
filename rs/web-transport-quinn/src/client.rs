@@ -1,17 +1,31 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use crate::crypto::QuicClientConfig;
 use crate::proto::ConnectRequest;
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-use quinn::crypto::rustls::QuicClientConfig;
 use rustls::{client::danger::ServerCertVerifier, pki_types::CertificateDer};
 use tokio::net::lookup_host;
 use url::Host;
 
 use crate::crypto;
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::ALPN;
 use crate::{ClientError, Session};
+
+// Match Quinn's client socket setup, including dual-stack operation on Windows.
+fn client_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if addr.is_ipv6() {
+        if let Err(error) = socket.set_only_v6(false) {
+            tracing::debug!(%error, "unable to make socket dual-stack");
+        }
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
 
 /// Congestion control algorithm to use for the connection.
 ///
@@ -25,12 +39,10 @@ pub enum CongestionControl {
     LowLatency,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) type ControllerFactory =
     Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>;
 
 /// Turn a [CongestionControl] choice into the factory quinn wants.
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) fn controller_factory(algorithm: CongestionControl) -> Option<ControllerFactory> {
     match algorithm {
         CongestionControl::LowLatency => Some(Arc::new(quinn::congestion::BbrConfig::default())),
@@ -42,7 +54,6 @@ pub(crate) fn controller_factory(algorithm: CongestionControl) -> Option<Control
 
 /// The transport config shared by both builders, so the client and server can't
 /// drift on which knobs actually get applied.
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) fn transport_config(
     congestion_controller: Option<&ControllerFactory>,
 ) -> Arc<quinn::TransportConfig> {
@@ -54,17 +65,15 @@ pub(crate) fn transport_config(
     Arc::new(transport)
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
 #[derive(Clone)]
 pub struct ClientBuilder {
-    provider: crypto::Provider,
+    provider: Result<crypto::Provider, crypto::UnsupportedCpu>,
     congestion_controller: Option<ControllerFactory>,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ClientBuilder {
     /// Create a Client builder, which can be used to establish multiple [Session]s.
     pub fn new() -> Self {
@@ -99,7 +108,7 @@ impl ClientBuilder {
         }
 
         let crypto = self
-            .builder()
+            .builder()?
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -111,12 +120,12 @@ impl ClientBuilder {
         self,
         certs: Vec<CertificateDer>,
     ) -> Result<Client, ClientError> {
-        let hashes = certs.iter().map({
-            let provider = self.provider.clone();
-            move |cert| crypto::sha256(&provider, cert).as_ref().to_vec()
-        });
+        let provider = self.provider.clone()?;
+        let hashes = certs
+            .iter()
+            .map(move |cert| crypto::sha256(&provider, cert).map(|hash| hash.as_ref().to_vec()));
 
-        self.with_server_certificate_hashes(hashes.collect())
+        self.with_server_certificate_hashes(hashes.collect::<Result<_, _>>()?)
     }
 
     /// Supply sha256 hashes for accepted certificates instead of using root CAs.
@@ -126,13 +135,13 @@ impl ClientBuilder {
     ) -> Result<Client, ClientError> {
         // Use a custom fingerprint verifier.
         let fingerprints = Arc::new(ServerFingerprints {
-            provider: self.provider.clone(),
+            provider: self.provider.clone()?,
             fingerprints: hashes,
         });
 
         // Configure the crypto client.
         let crypto = self
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(fingerprints.clone())
             .with_no_client_auth();
@@ -149,20 +158,33 @@ impl ClientBuilder {
         DangerousClientBuilder { inner: self }
     }
 
-    fn builder(&self) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
-        rustls::ClientConfig::builder_with_provider(self.provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+    fn builder(
+        &self,
+    ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ClientError>
+    {
+        Ok(
+            rustls::ClientConfig::builder_with_provider(self.provider.clone()?)
+                .with_protocol_versions(&[&rustls::version::TLS13])?,
+        )
     }
 
     fn build(self, mut crypto: rustls::ClientConfig) -> Result<Client, ClientError> {
         crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-        let client_config = QuicClientConfig::try_from(crypto).unwrap();
+        let client_config = QuicClientConfig::try_from(crypto)?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
         client_config.transport_config(transport_config(self.congestion_controller.as_ref()));
 
-        let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+        let client = quinn::Endpoint::new(
+            crypto::endpoint_config()?,
+            None,
+            client_socket("[::]:0".parse().unwrap())
+                .map_err(|e| ClientError::IoError(Arc::new(e)))?,
+            quinn::default_runtime().ok_or_else(|| {
+                ClientError::IoError(Arc::new(std::io::Error::other("no async runtime found")))
+            })?,
+        )
+        .map_err(|e| ClientError::IoError(Arc::new(e)))?;
         Ok(Client {
             endpoint: client,
             config: client_config,
@@ -170,14 +192,12 @@ impl ClientBuilder {
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Builder for dangerous TLS configuration options.
 ///
 /// This builder provides access to potentially insecure TLS configurations.
@@ -187,7 +207,6 @@ pub struct DangerousClientBuilder {
     inner: ClientBuilder,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl DangerousClientBuilder {
     /// Disable certificate verification entirely.
     ///
@@ -197,11 +216,11 @@ impl DangerousClientBuilder {
     /// This method is safe in the Rust sense (no memory unsafety), but dangerous in the
     /// security sense, hence the explicit `dangerous()` builder requirement.
     pub fn with_no_certificate_verification(self) -> Result<Client, ClientError> {
-        let noop = NoCertificateVerification(self.inner.provider.clone());
+        let noop = NoCertificateVerification(self.inner.provider.clone()?);
 
         let crypto = self
             .inner
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(noop))
             .with_no_client_auth();
@@ -271,14 +290,13 @@ impl Client {
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+/// Panics if system-root setup fails, including on a CPU rind does not support.
 impl Default for Client {
     fn default() -> Self {
         ClientBuilder::new().with_system_roots().unwrap()
     }
 }
 
-#[cfg_attr(not(any(feature = "aws-lc-rs", feature = "ring")), allow(dead_code))]
 #[derive(Debug)]
 struct ServerFingerprints {
     provider: crypto::Provider,
@@ -294,7 +312,7 @@ impl ServerCertVerifier for ServerFingerprints {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let cert_hash = crypto::sha256(&self.provider, end_entity);
+        let cert_hash = crypto::sha256(&self.provider, end_entity)?;
         if self
             .fingerprints
             .iter()
@@ -388,5 +406,16 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_socket_preserves_quinn_dual_stack_default() {
+        let socket = client_socket("[::]:0".parse().unwrap()).unwrap();
+        assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
     }
 }

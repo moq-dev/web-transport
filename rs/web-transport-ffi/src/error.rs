@@ -240,7 +240,9 @@ pub fn map_server_error(err: web_transport_quinn::ServerError) -> WebTransportEr
         | web_transport_quinn::ServerError::SettingsError(_)
         | web_transport_quinn::ServerError::ConnectError(_)
         | web_transport_quinn::ServerError::IoError(_)
-        | web_transport_quinn::ServerError::Rustls(_) => {
+        | web_transport_quinn::ServerError::Rustls(_)
+        | web_transport_quinn::ServerError::Crypto(_)
+        | web_transport_quinn::ServerError::UnsupportedCpu(_) => {
             WebTransportError::protocol(err.to_string())
         }
     }
