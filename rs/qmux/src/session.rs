@@ -1613,6 +1613,7 @@ impl<R: Reader> SessionState<R> {
                 };
 
                 let recv_frontend = RecvStream {
+                    bytes_read: 0,
                     id: stream.id,
                     inbound_data: rx,
                     inbound_reset: rx2,
@@ -2555,6 +2556,7 @@ impl generic::Session for Session {
             recv_offset: 0,
         };
         let recv_frontend = RecvStream {
+            bytes_read: 0,
             id,
             inbound_data: rx,
             inbound_reset: rx2,
@@ -2816,6 +2818,12 @@ impl Drop for SendStream {
 impl generic::SendStream for SendStream {
     type Error = Error;
 
+    async fn stats(&mut self) -> Result<generic::SendStreamStats, Error> {
+        let mut stats = generic::SendStreamStats::default();
+        stats.bytes_written = Some(self.offset);
+        Ok(stats)
+    }
+
     async fn write(&mut self, mut buf: &[u8]) -> Result<usize, Self::Error> {
         let size = buf.len();
         let b = &mut buf;
@@ -2964,6 +2972,7 @@ pub(crate) struct RecvState {
 
 /// The receive half of a multiplexed stream.
 pub struct RecvStream {
+    bytes_read: u64,
     id: StreamId,
     version: Version,
 
@@ -3024,6 +3033,7 @@ impl RecvStream {
         }
 
         // Report consumed bytes and send window updates if needed
+        self.bytes_read += to_read as u64;
         self.report_consumed(to_read as u64);
 
         Some(data)
@@ -3061,6 +3071,12 @@ impl Drop for RecvStream {
 
 impl generic::RecvStream for RecvStream {
     type Error = Error;
+
+    async fn stats(&mut self) -> Result<generic::RecvStreamStats, Error> {
+        let mut stats = generic::RecvStreamStats::default();
+        stats.bytes_read = Some(self.bytes_read);
+        Ok(stats)
+    }
 
     async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
         loop {

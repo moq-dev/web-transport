@@ -73,3 +73,10 @@ UTF-8 reason; the native fallback carries a prefix of at most 16 bytes at a char
 boundary. Already observed native errors are preserved. Peer delivery, endpoint
 draining and execution of awakened tasks require a live runtime. Forgotten
 futures, non-yielding tasks and process abort are outside this guarantee.
+
+## Stream statistics
+
+The async stream `stats()` methods report application payload accepted and read,
+excluding protocol headers, including partial progress in cancelled helpers.
+Sent, acknowledged and contiguous received progress remain unavailable. See the
+[metric definitions and example](../web-transport-trait/README.md#stream-statistics).

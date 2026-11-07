@@ -72,6 +72,12 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
     let size = poll_fn(|cx| send.poll_write(cx, b"hello")).await?;
     assert_eq!(size, 5);
     send.finish()?;
+    assert_eq!(
+        web_transport_trait::SendStream::stats(&mut send)
+            .await?
+            .bytes_written,
+        Some(5)
+    );
 
     let mut recv = poll_fn(|cx| server.poll_accept_uni(cx)).await?;
 
@@ -80,6 +86,12 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
         .await?
         .context("stream ended early")?;
     assert_eq!(&dst[..size], b"hello");
+    assert_eq!(
+        web_transport_trait::RecvStream::stats(&mut recv)
+            .await?
+            .bytes_read,
+        Some(5)
+    );
 
     // Drained and finished.
     assert_eq!(poll_fn(|cx| recv.poll_read(cx, &mut dst)).await?, None);
@@ -155,5 +167,47 @@ async fn a_pending_operation_is_resumed_not_restarted() -> Result<()> {
         "expected an application close, got {err:?}"
     );
 
+    Ok(())
+}
+
+#[path = "../../web-transport-trait/tests/support/stream_stats.rs"]
+mod stream_stats;
+
+#[tokio::test]
+async fn stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    stream_stats::payload_stats(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_read_exact_keeps_partial_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    let mut send = client.open_uni().await?;
+    send.write_all(b"abcd").await?;
+    let mut recv = server.accept_uni().await?;
+    recv.read_exact(&mut [0; 1]).await?;
+    {
+        let mut buffer = [0; 4];
+        let mut read = std::pin::pin!(recv.read_exact(&mut buffer));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    assert_eq!(recv.stats().await?.bytes_read, Some(4));
+    recv.stop(0)?;
+    assert_eq!(recv.stats().await?.bytes_read, Some(4));
+    Ok(())
+}
+
+#[path = "../../web-transport-trait/tests/support/tokio_stream_stats.rs"]
+mod tokio_stream_stats;
+
+#[tokio::test]
+async fn tokio_stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    tokio_stream_stats::payload_stats(&client, &server).await;
     Ok(())
 }

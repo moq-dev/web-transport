@@ -15,6 +15,8 @@ use crate::{
 
 /// A stream of bytes sent to the remote peer.
 pub struct SendStream {
+    stats: crate::stats::Collector,
+    bytes_written: u64,
     stream: WebTransportSendStream,
     writer: WritableStreamDefaultWriter,
 
@@ -29,15 +31,28 @@ pub struct SendStream {
 
 impl SendStream {
     pub(super) fn new(stream: WebTransportSendStream) -> Result<Self, Error> {
+        let stats = crate::stats::Collector::new(&stream);
         let writer = WritableStreamDefaultWriter::new(&stream)?;
 
         Ok(Self {
+            stats,
+            bytes_written: 0,
             stream,
             writer,
             write: Op::default(),
             closed: Op::default(),
             terminal: false,
         })
+    }
+
+    /// Collect payload progress, using browser delivery metrics when available.
+    pub async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, Error> {
+        let collected = self.stats.collect().await?;
+        let mut stats = web_transport_trait::SendStreamStats::default();
+        stats.bytes_written = Some(self.bytes_written);
+        stats.bytes_sent = crate::stats::metric(&collected, "bytesSent")?;
+        stats.bytes_acknowledged = crate::stats::metric(&collected, "bytesAcknowledged")?;
+        Ok(stats)
     }
 
     /// Poll to write `buf` to the stream, returning how many bytes were written.
@@ -64,6 +79,7 @@ impl SendStream {
         self.write
             .start(promise(self.writer.write_with_chunk(&chunk)));
 
+        self.bytes_written += buf.len() as u64;
         Poll::Ready(Ok(buf.len()))
     }
 

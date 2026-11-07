@@ -71,6 +71,46 @@ export function failingStreamTransport(reject) {
     };
 }
 
+export function streamStatsTransport(mode) {
+    const failure = new Error('controlled statistics failure');
+    const writable = new WritableStream();
+    const readable = new ReadableStream({ start(controller) {
+        controller.enqueue(new Uint8Array([97, 98, 99, 100, 101, 102]));
+        controller.close();
+    }});
+    if (mode !== 0) {
+        for (const stream of [writable, readable]) {
+            if (mode === 10) {
+                stream.getStats = null;
+                continue;
+            }
+            if (mode === 11) {
+                Object.defineProperty(stream, 'getStats', { get() { throw failure; } });
+                continue;
+            }
+            stream.getStats = function() {
+                if (this !== stream) throw new Error('wrong stats receiver');
+                if (mode === 3) return Promise.reject(failure);
+                if (mode === 4) throw failure;
+                const value = mode === 1 ? {} : {
+                    bytesWritten: 99, bytesSent: 2, bytesAcknowledged: 1,
+                    bytesReceived: 6, bytesRead: 6,
+                };
+                if (mode === 5) value.bytesSent = -1;
+                if (mode === 6) value.bytesReceived = 0.5;
+                if (mode === 7) value.bytesSent = Number.MAX_SAFE_INTEGER + 1;
+                if (mode === 8) { value.bytesSent = 0; value.bytesAcknowledged = 0; }
+                if (mode === 9) value.bytesAcknowledged = null;
+                return Promise.resolve(value);
+            };
+        }
+    }
+    return {
+        transport: { protocol: '', createBidirectionalStream: () => Promise.resolve({ writable, readable }) },
+        failure,
+    };
+}
+
 export async function flushMicrotasks() {
     for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -82,6 +122,8 @@ extern "C" {
     fn open_datagram_transport() -> Object;
     #[wasm_bindgen(js_name = failingStreamTransport)]
     fn failing_stream_transport(reject: bool) -> Object;
+    #[wasm_bindgen(js_name = streamStatsTransport)]
+    fn stream_stats_transport(mode: u32) -> Object;
     #[wasm_bindgen(js_name = flushMicrotasks)]
     async fn flush_microtasks();
 }
@@ -142,6 +184,20 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
         results.push(&outcome);
     }
 
+    let outcome = match stream_statistics().await {
+        Ok(detail) => row(
+            "optional stream statistics preserve payload semantics",
+            true,
+            &detail,
+        ),
+        Err(err) => row(
+            "optional stream statistics preserve payload semantics",
+            false,
+            &format!("{err}"),
+        ),
+    };
+    results.push(&outcome);
+
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
     macro_rules! check {
@@ -198,6 +254,79 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("session close code and reason survive", session_close);
 
     Ok(results)
+}
+
+async fn stream_statistics() -> Result<String, Error> {
+    for mode in 0..=11 {
+        let fixture = stream_stats_transport(mode);
+        let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
+        let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
+        let (mut send, mut recv) = session.open_bi().await?;
+        send.write(b"abc").await?;
+        let first = recv.read(1).await?;
+        expect(first.as_deref() == Some(b"a"), "first payload byte".into())?;
+        let sent = send.stats().await;
+        let received = recv.stats().await;
+        if mode == 3 || mode == 4 || mode == 11 {
+            let failure = Reflect::get(&fixture, &"failure".into())?;
+            for result in [sent.map(|_| ()), received.map(|_| ())] {
+                expect(
+                    matches!(result, Err(Error::Unknown(value)) if value == failure),
+                    "collection preserves thrown and rejected errors".into(),
+                )?;
+            }
+            continue;
+        }
+        if mode == 5 || mode == 7 || mode == 9 || mode == 10 {
+            expect(sent.is_err(), "invalid sent metric is rejected".into())?;
+            continue;
+        }
+        if mode == 6 {
+            expect(
+                received.is_err(),
+                "invalid received metric is rejected".into(),
+            )?;
+            continue;
+        }
+        let (sent, received) = (sent?, received?);
+        expect(
+            sent.bytes_written == Some(3) && received.bytes_read == Some(1),
+            "local acceptance and returned bytes exclude internal buffering".into(),
+        )?;
+        if mode < 2 {
+            expect(
+                sent.bytes_sent.is_none()
+                    && sent.bytes_acknowledged.is_none()
+                    && received.bytes_received.is_none(),
+                "absent metrics remain unavailable".into(),
+            )?;
+        } else {
+            expect(
+                sent.bytes_sent == Some(if mode == 8 { 0 } else { 2 })
+                    && sent.bytes_acknowledged == Some(if mode == 8 { 0 } else { 1 })
+                    && received.bytes_received == Some(6),
+                "browser delivery metrics preserve their values".into(),
+            )?;
+        }
+        let rest = recv.read(usize::MAX).await?;
+        expect(
+            rest.as_deref() == Some(b"bcdef"),
+            "stats do not consume buffered data".into(),
+        )?;
+        expect(
+            recv.stats().await?.bytes_read == Some(6),
+            "buffered reads counted exactly once".into(),
+        )?;
+        send.finish()?;
+        expect(
+            send.stats().await?.bytes_written == Some(3),
+            "finish preserves accepted payload".into(),
+        )?;
+    }
+    Ok(
+        "missing/omitted/zero metrics, payload buffering, collection failures and invalid values"
+            .into(),
+    )
 }
 
 /// A browser can throw before returning an open promise, or reject it later.

@@ -71,3 +71,10 @@ and a close frame ends the writer's output.
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+## Stream statistics
+
+The async stream `stats()` methods report application payload accepted and read,
+excluding protocol headers, including partial progress in cancelled helpers.
+Sent, acknowledged and contiguous received progress remain unavailable. See the
+[metric definitions and example](../web-transport-trait/README.md#stream-statistics).

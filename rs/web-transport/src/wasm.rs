@@ -132,6 +132,11 @@ impl From<web_transport_wasm::Session> for Session {
 pub struct SendStream(web_transport_wasm::SendStream);
 
 impl SendStream {
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<crate::SendStreamStats, Error> {
+        self.0.stats().await
+    }
+
     /// Write some of the given data to the stream.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
         // NOTE: web-transport-wasm writes the entire buffer.
@@ -170,6 +175,11 @@ impl SendStream {
 pub struct RecvStream(web_transport_wasm::RecvStream);
 
 impl RecvStream {
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<crate::RecvStreamStats, Error> {
+        self.0.stats().await
+    }
+
     /// Attempt to read a chunk of unbuffered data.
     pub async fn read(&mut self, max: usize) -> Result<Option<Bytes>, Error> {
         self.0.read(max).await

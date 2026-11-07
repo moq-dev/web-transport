@@ -225,3 +225,45 @@ async fn a_departing_accepter_does_not_strand_the_others() -> Result<()> {
     client.close(0, b"bye");
     Ok(())
 }
+
+#[path = "../../web-transport-trait/tests/support/stream_stats.rs"]
+mod stream_stats;
+
+#[tokio::test]
+async fn stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    stream_stats::payload_stats(&client, &server).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_read_exact_keeps_partial_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    let mut send = client.open_uni().await?;
+    send.write_all(b"abcd").await?;
+    let mut recv = server.accept_uni().await?;
+    recv.read_exact(&mut [0; 1]).await?;
+    {
+        let mut buffer = [0; 4];
+        let mut read = std::pin::pin!(recv.read_exact(&mut buffer));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+    assert_eq!(recv.stats().await?.bytes_read, Some(4));
+    recv.stop(0)?;
+    assert_eq!(recv.stats().await?.bytes_read, Some(4));
+    Ok(())
+}
+
+#[path = "../../web-transport-trait/tests/support/tokio_stream_stats.rs"]
+mod tokio_stream_stats;
+
+#[tokio::test]
+async fn tokio_stream_payload_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    tokio_stream_stats::payload_stats(&client, &server).await;
+    Ok(())
+}

@@ -14,7 +14,6 @@ Any required dependency release or pin bump is its own prerequisite quest once t
 
 ## Required
 
-- [Async stream-statistics API](/quest/a2/stream-stats.md) - shared semantics and optional async collection
 - [Native metric availability](/quest/a2/native-stats-upstream.md) - usable public upstream progress accessors
 
 ## Closes

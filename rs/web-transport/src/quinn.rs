@@ -204,6 +204,11 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<crate::SendStreamStats, Error> {
+        self.inner.stats().await.map_err(Into::into)
+    }
+
     fn new(inner: quinn::SendStream) -> Self {
         Self { inner }
     }
@@ -216,10 +221,8 @@ impl SendStream {
 
     /// Write some of the buffer to the stream, advancing the internal position.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, Error> {
-        // We use copy_to_bytes+write_chunk so if Bytes is provided, we can avoid allocating.
-        let size = buf.chunk().len();
-        let chunk = buf.copy_to_bytes(size);
-        self.inner.write_chunk(chunk).await?;
+        let size = self.inner.write(buf.chunk()).await?;
+        buf.advance(size);
         Ok(size)
     }
 
@@ -266,6 +269,11 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<crate::RecvStreamStats, Error> {
+        self.inner.stats().await.map_err(Into::into)
+    }
+
     fn new(inner: quinn::RecvStream) -> Self {
         Self { inner }
     }

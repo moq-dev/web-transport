@@ -64,3 +64,10 @@ When possible, `Deref` is used to expose the underlying Quinn API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
 - Stream IDs are not avaialble.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
+
+## Stream statistics
+
+The async stream `stats()` methods report application payload accepted and read,
+excluding protocol headers, including partial progress in cancelled helpers.
+Sent, acknowledged and contiguous received progress remain unavailable. See the
+[metric definitions and example](../web-transport-trait/README.md#stream-statistics).

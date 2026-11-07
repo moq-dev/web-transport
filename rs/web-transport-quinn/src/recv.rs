@@ -17,6 +17,7 @@ use crate::{
 /// A stream that can be used to recieve bytes. See [`quinn::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
+    bytes_read: u64,
     inner: quinn::RecvStream,
     error: Arc<CloseReason>,
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
@@ -27,9 +28,17 @@ impl RecvStream {
     pub(crate) fn new(stream: quinn::RecvStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             inner: stream,
+            bytes_read: 0,
             error,
             raw,
         }
+    }
+
+    /// Collect application payload statistics for this stream.
+    pub async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, ReadError> {
+        let mut stats = web_transport_trait::RecvStreamStats::default();
+        stats.bytes_read = Some(self.bytes_read);
+        Ok(stats)
     }
 
     /// Decode the peer's reset code, and replace connection-level errors with the stored
@@ -65,15 +74,21 @@ impl RecvStream {
 
     /// Read some data into the buffer and return the amount read. See [`quinn::RecvStream::read`].
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ReadError> {
-        self.inner.read(buf).await.map_err(|e| self.map_error(e))
+        let size = self.inner.read(buf).await.map_err(|e| self.map_error(e))?;
+        self.bytes_read += size.unwrap_or(0) as u64;
+        Ok(size)
     }
 
     /// Fill the entire buffer with data. See [`quinn::RecvStream::read_exact`].
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadExactError> {
-        self.inner.read_exact(buf).await.map_err(|e| match e {
-            quinn::ReadExactError::ReadError(e) => self.map_error(e).into(),
-            e => e.into(),
-        })
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read(&mut buf[filled..]).await? {
+                Some(size) => filled += size,
+                None => return Err(ReadExactError::FinishedEarly(filled)),
+            }
+        }
+        Ok(())
     }
 
     /// Read a chunk of data from the stream. See [`quinn::RecvStream::read_chunk`].
@@ -82,29 +97,52 @@ impl RecvStream {
         max_length: usize,
         ordered: bool,
     ) -> Result<Option<quinn::Chunk>, ReadError> {
-        self.inner
+        let chunk = self
+            .inner
             .read_chunk(max_length, ordered)
             .await
-            .map_err(|e| self.map_error(e))
+            .map_err(|e| self.map_error(e))?;
+        self.bytes_read += chunk.as_ref().map_or(0, |chunk| chunk.bytes.len()) as u64;
+        Ok(chunk)
     }
 
     /// Read chunks of data from the stream. See [`quinn::RecvStream::read_chunks`].
     pub async fn read_chunks(&mut self, bufs: &mut [Bytes]) -> Result<Option<usize>, ReadError> {
-        self.inner
+        let count = self
+            .inner
             .read_chunks(bufs)
             .await
-            .map_err(|e| self.map_error(e))
+            .map_err(|e| self.map_error(e))?;
+        self.bytes_read += bufs[..count.unwrap_or(0)]
+            .iter()
+            .map(|chunk| chunk.len() as u64)
+            .sum::<u64>();
+        Ok(count)
     }
 
     /// Read until the end of the stream or the limit is hit. See [`quinn::RecvStream::read_to_end`].
     pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
-        self.inner
-            .read_to_end(size_limit)
-            .await
-            .map_err(|e| match e {
-                quinn::ReadToEndError::Read(e) => self.map_error(e).into(),
-                e => e.into(),
-            })
+        // Unordered chunks retain the native helper's ability to fill gaps later.
+        let mut chunks = Vec::new();
+        let mut start = u64::MAX;
+        let mut end = 0;
+        while let Some(chunk) = self.read_chunk(usize::MAX, false).await? {
+            start = start.min(chunk.offset);
+            end = end.max(chunk.offset + chunk.bytes.len() as u64);
+            if end - start > size_limit as u64 {
+                return Err(ReadToEndError::TooLong);
+            }
+            chunks.push(chunk);
+        }
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut data = vec![0; (end - start) as usize];
+        for chunk in chunks {
+            let offset = (chunk.offset - start) as usize;
+            data[offset..offset + chunk.bytes.len()].copy_from_slice(&chunk.bytes);
+        }
+        Ok(data)
     }
 
     /// Block until the stream has been reset and return the error code. See [`quinn::RecvStream::received_reset`].
@@ -141,12 +179,19 @@ impl tokio::io::AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.bytes_read += (buf.filled().len() - before) as u64;
+        result
     }
 }
 
 impl web_transport_trait::RecvStream for RecvStream {
     type Error = ReadError;
+
+    async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, Self::Error> {
+        self.stats().await
+    }
 
     fn stop(&mut self, code: u32) {
         Self::stop(self, code).ok();
@@ -183,6 +228,8 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
 
         let size = ready!(quinn::RecvStream::poll_read(&mut self.inner, cx, dst))
             .map_err(|e| self.map_error(e))?;
+
+        self.bytes_read += size as u64;
 
         // Quinn reports a finished stream as zero bytes into a non-empty buffer.
         Poll::Ready(Ok((size != 0).then_some(size)))

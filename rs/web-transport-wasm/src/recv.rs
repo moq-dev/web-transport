@@ -17,6 +17,8 @@ use crate::{
 ///
 /// This can be closed by either side with an error code, or closed by the remote with a FIN.
 pub struct RecvStream {
+    stats: crate::stats::Collector,
+    bytes_read: u64,
     reader: ReadableStreamDefaultReader,
 
     /// The `read()` in flight, retained so a caller that gives up on a poll does not
@@ -33,15 +35,27 @@ pub struct RecvStream {
 
 impl RecvStream {
     pub(super) fn new(stream: WebTransportReceiveStream) -> Result<Self, Error> {
+        let stats = crate::stats::Collector::new(&stream);
         let reader = ReadableStreamDefaultReader::new(&stream)?;
 
         Ok(Self {
+            stats,
+            bytes_read: 0,
             reader,
             read: Op::default(),
             closed: Op::default(),
             buffer: Bytes::new(),
             fin: false,
         })
+    }
+
+    /// Collect payload progress, using browser delivery metrics when available.
+    pub async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, Error> {
+        let collected = self.stats.collect().await?;
+        let mut stats = web_transport_trait::RecvStreamStats::default();
+        stats.bytes_read = Some(self.bytes_read);
+        stats.bytes_received = crate::stats::metric(&collected, "bytesReceived")?;
+        Ok(stats)
     }
 
     /// Poll for the next chunk of data, up to `max` bytes.
@@ -60,6 +74,7 @@ impl RecvStream {
         loop {
             if !self.buffer.is_empty() {
                 let size = max.min(self.buffer.len());
+                self.bytes_read += size as u64;
                 return Poll::Ready(Ok(Some(self.buffer.split_to(size))));
             }
 
@@ -87,6 +102,7 @@ impl RecvStream {
         loop {
             if !self.buffer.is_empty() {
                 let size = dst.len().min(self.buffer.len());
+                self.bytes_read += size as u64;
                 dst[..size].copy_from_slice(&self.buffer.split_to(size));
                 return Poll::Ready(Ok(Some(size)));
             }
