@@ -1,36 +1,30 @@
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use std::sync::Arc;
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
     Connecting, ServerError, Session, Settings,
 };
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Server] using sane defaults.
 ///
 /// This is optional; advanced users may use [Server::new] directly.
 pub struct ServerBuilder {
-    provider: crypto::Provider,
+    provider: Result<crypto::Provider, crypto::UnsupportedCpu>,
     addr: std::net::SocketAddr,
     congestion_controller:
         Option<Arc<dyn noq::congestion::ControllerFactory + Send + Sync + 'static>>,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ServerBuilder {
     /// Create a server builder with sane defaults.
     pub fn new() -> Self {
@@ -68,18 +62,22 @@ impl ServerBuilder {
         key: PrivateKeyDer<'static>,
     ) -> Result<Server, ServerError> {
         // Standard Noq setup
-        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone()?)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // this one is important
 
-        let config: noq::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = noq::ServerConfig::with_crypto(Arc::new(config));
+        let config = noq::crypto::rustls::QuicServerConfig::with_initial(
+            Arc::new(config),
+            crypto::initial_suite()?,
+        )
+        .expect("rind initial suite is AES-128-GCM-SHA256");
+        let config = crypto::server_config(Arc::new(config))?;
 
-        let server =
-            noq::Endpoint::server(config, self.addr).map_err(|e| ServerError::IoError(e.into()))?;
+        let server = crate::endpoint(crypto::endpoint_config()?, Some(config), self.addr)
+            .map_err(|e| ServerError::IoError(e.into()))?;
 
         Ok(Server::new(server))
     }

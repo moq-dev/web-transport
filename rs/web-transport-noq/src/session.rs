@@ -23,25 +23,11 @@ use crate::{
 ///
 /// Noq only exposes the ALPN via a downcast of the boxed handshake data, so the result
 /// is owned rather than borrowed from the connection.
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 fn negotiated_alpn(conn: &noq::Connection) -> Option<String> {
     let data = conn.handshake_data()?;
     let data = data.downcast::<noq::crypto::rustls::HandshakeData>().ok()?;
 
     String::from_utf8(data.protocol?).ok()
-}
-
-/// `noq::crypto::rustls` only exists once a TLS backend is enabled, so there is no
-/// handshake data type to name here.
-///
-/// This crate's own builders are gated the same way, so normally there is no connection
-/// to read an ALPN from either. A caller that enables a provider on `noq` directly and
-/// brings its own endpoint can still establish one, and [`Session::protocol`] reports
-/// `None` for those raw sessions. Enable this crate's `aws-lc-rs` or `ring` feature to
-/// get the ALPN.
-#[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
-fn negotiated_alpn(_conn: &noq::Connection) -> Option<String> {
-    None
 }
 
 /// An established WebTransport session, acting like a full QUIC connection. See [`noq::Connection`].
@@ -1151,7 +1137,7 @@ impl web_transport_trait::Session for Session {
     }
 }
 
-#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+#[cfg(test)]
 mod tests {
     use std::{
         net::Ipv4Addr,
@@ -1194,25 +1180,53 @@ mod tests {
         transport: noq::TransportConfig,
         peer_transport: noq::TransportConfig,
     ) -> [noq::Endpoint; 2] {
-        #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
         let CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KeyPair::serialize_der(
             &signing_key,
         )));
 
-        let mut server_config =
-            noq::ServerConfig::with_single_cert(vec![cert.der().clone()], key).unwrap();
+        let provider = crate::crypto::default_provider().unwrap();
+        let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .unwrap();
+        let crypto = noq::crypto::rustls::QuicServerConfig::with_initial(
+            Arc::new(tls),
+            crate::crypto::initial_suite().unwrap(),
+        )
+        .unwrap();
+        let mut server_config = crate::crypto::server_config(Arc::new(crypto)).unwrap();
         server_config.transport_config(Arc::new(peer_transport));
-        let server = noq::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let server = crate::endpoint(
+            crate::crypto::endpoint_config().unwrap(),
+            Some(server_config),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+        )
+        .unwrap();
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let mut client_config = noq::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let crypto = noq::crypto::rustls::QuicClientConfig::with_initial(
+            Arc::new(tls),
+            crate::crypto::initial_suite().unwrap(),
+        )
+        .unwrap();
+        let mut client_config = noq::ClientConfig::new(Arc::new(crypto));
         client_config.transport_config(Arc::new(transport));
-        let client = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let client = crate::endpoint(
+            crate::crypto::endpoint_config().unwrap(),
+            None,
+            (Ipv4Addr::LOCALHOST, 0).into(),
+        )
+        .unwrap();
         client.set_default_client_config(client_config);
         [client, server]
     }

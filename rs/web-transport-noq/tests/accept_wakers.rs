@@ -57,19 +57,8 @@ impl Wake for FlagWaker {
     }
 }
 
-/// With both crypto features enabled — as `--all-features` does — the crate cannot
-/// pick a provider for us, so the test installs one.
-fn install_crypto_provider() {
-    #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
-    {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-}
-
 /// A client and server session, already connected.
 async fn pair() -> Result<(web_transport_noq::Session, web_transport_noq::Session)> {
-    install_crypto_provider();
-
     let CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
     let chain = vec![cert.der().clone()];

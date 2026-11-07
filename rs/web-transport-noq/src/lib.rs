@@ -69,3 +69,25 @@ pub use web_transport_trait as generic;
 
 /// Re-export the WebTransport protocol implementation.
 pub use web_transport_proto as proto;
+
+// Match Noq's socket setup while supplying provider-independent endpoint keys.
+fn endpoint(
+    config: noq::EndpointConfig,
+    server: Option<noq::ServerConfig>,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<noq::Endpoint> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if addr.is_ipv6() {
+        if let Err(error) = socket.set_only_v6(false) {
+            tracing::debug!(%error, "unable to make socket dual-stack");
+        }
+    }
+    socket.bind(&addr.into())?;
+    let runtime =
+        noq::default_runtime().ok_or_else(|| std::io::Error::other("no async runtime found"))?;
+    noq::Endpoint::new(config, server, socket.into(), runtime)
+}
