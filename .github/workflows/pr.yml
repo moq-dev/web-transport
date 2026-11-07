@@ -13,6 +13,9 @@ jobs:
   kotlin:
     name: Kotlin/JVM artifact
     runs-on: ubuntu-latest
+    concurrency:
+      group: kotlin-jvm-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
 
     steps:
       - uses: actions/checkout@v7
@@ -24,6 +27,9 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: gradle/actions/setup-gradle@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kotlin-jvm
       - name: Exercise packaged Kotlin/JVM binding
         run: nix develop --command just test-kotlin
       - name: Upload JVM test results

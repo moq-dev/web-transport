@@ -46,8 +46,12 @@ class ArtifactSmokeTest {
 
                 try {
                     Server(ServerConfig(
-                        certificateChain = listOf(File(System.getenv("WEB_TRANSPORT_TEST_CERT")).readBytes()),
-                        privateKey = File(System.getenv("WEB_TRANSPORT_TEST_KEY")).readBytes(),
+                        certificateChain = listOf(File(requireNotNull(System.getenv("WEB_TRANSPORT_TEST_CERT")) {
+                            "Missing WEB_TRANSPORT_TEST_CERT; run just test-kotlin to generate test credentials"
+                        }).readBytes()),
+                        privateKey = File(requireNotNull(System.getenv("WEB_TRANSPORT_TEST_KEY")) {
+                            "Missing WEB_TRANSPORT_TEST_KEY; run just test-kotlin to generate test credentials"
+                        }).readBytes(),
                         bind = "127.0.0.1:0",
                         congestionControl = CongestionControl.DEFAULT,
                     )).use { server ->
@@ -81,15 +85,13 @@ class ArtifactSmokeTest {
                                                 }
                                             }
                                         }
-                                        outgoing.close(0u, "smoke complete")
-                                        outgoing.waitClosed()
-                                        incoming.waitClosed()
-                                        assertTrue(outgoing.isClosed())
-                                        assertTrue(incoming.isClosed())
                                     } finally {
                                         outgoing.close(0u, "smoke complete")
-                                        incoming.close(0u, "smoke cleanup")
                                     }
+                                    outgoing.waitClosed()
+                                    incoming.waitClosed()
+                                    assertTrue(outgoing.isClosed())
+                                    assertTrue(incoming.isClosed())
                                 }
                             }
                         } finally {

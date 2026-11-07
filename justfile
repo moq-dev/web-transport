@@ -120,7 +120,7 @@ build-ffi:
 build-ffi-target target:
 	./rs/web-transport-ffi/build.sh --target {{target}} --output rs/web-transport-ffi/dist
 
-# Build and exercise the host Kotlin/JVM JAR, including its packaged native library.
+# Build and exercise the Linux Kotlin/JVM JAR, including its packaged native library.
 test-kotlin:
 	./kt/scripts/check.sh
 
