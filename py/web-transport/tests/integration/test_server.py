@@ -30,7 +30,8 @@ async def test_server_async_iterator(self_signed_cert, cert_hash):
         async def iterate():
             async for request in server:
                 requests.append(request)
-                await request.accept()
+                session = await request.accept()
+                await session.wait_closed()
 
         async def connect_and_close():
             async with web_transport.Client(
@@ -152,9 +153,10 @@ async def test_double_accept_raises(self_signed_cert, cert_hash):
         async def server_task():
             request = await server.accept()
             assert request is not None
-            await request.accept()
+            session = await request.accept()
             with pytest.raises(web_transport.SessionError, match="already"):
                 await request.accept()
+            session.close()
 
         async def client_task():
             async with web_transport.Client(
