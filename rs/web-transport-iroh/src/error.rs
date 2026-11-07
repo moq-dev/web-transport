@@ -5,6 +5,15 @@ use n0_error::stack_error;
 
 use crate::{ConnectError, SettingsError};
 
+/// An error selecting cryptography for an iroh endpoint.
+#[stack_error(derive, from_sources)]
+#[derive(Clone)]
+pub enum CryptoError {
+    /// The CPU lacks a feature required by rind.
+    #[error("unsupported CPU")]
+    UnsupportedCpu(#[error(source, std_err)] Arc<rind_rustls::MissingFeature>),
+}
+
 /// An error returned when connecting to a WebTransport endpoint.
 #[stack_error(derive, from_sources)]
 #[derive(Clone)]
