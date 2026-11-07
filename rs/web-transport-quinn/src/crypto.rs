@@ -110,6 +110,20 @@ mod tests {
 
     #[test]
     fn installed_provider_and_cpu_refusal() {
+        // Isolate the process-wide provider from every other test in this binary.
+        const CHILD: &str = "WEB_TRANSPORT_QUINN_PROVIDER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "crypto::tests::installed_provider_and_cpu_refusal",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .expect("only this test installs a provider");

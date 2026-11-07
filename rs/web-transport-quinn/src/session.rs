@@ -1336,17 +1336,43 @@ mod tests {
             &signing_key,
         )));
 
-        let server_config =
-            quinn::ServerConfig::with_single_cert(vec![cert.der().clone()], key).unwrap();
-        let server =
-            quinn::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let provider = crate::crypto::default_provider().unwrap();
+        let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .unwrap();
+        let server_config = crate::crypto::server_config(Arc::new(
+            crate::crypto::QuicServerConfig::try_from(server_tls).unwrap(),
+        ))
+        .unwrap();
+        let server = quinn::Endpoint::new(
+            crate::crypto::endpoint_config().unwrap(),
+            Some(server_config),
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            quinn::default_runtime().unwrap(),
+        )
+        .unwrap();
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let mut client_config =
-            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            crate::crypto::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
         client_config.transport_config(Arc::new(transport));
-        let client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let client = quinn::Endpoint::new(
+            crate::crypto::endpoint_config().unwrap(),
+            None,
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+            quinn::default_runtime().unwrap(),
+        )
+        .unwrap();
 
         let connecting = client
             .connect_with(client_config, server.local_addr().unwrap(), "localhost")

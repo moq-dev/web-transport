@@ -243,7 +243,7 @@ impl ServerCertVerifier for ServerFingerprints {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let cert_hash = sha256(&self.provider, end_entity)?;
+        let cert_hash = web_transport_quinn::crypto::sha256(&self.provider, end_entity)?;
         if self.fingerprints.iter().any(|fp| fp == cert_hash.as_ref()) {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
@@ -333,25 +333,6 @@ impl ServerCertVerifier for NoCertificateVerification {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
-}
-
-fn sha256(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
-    cert: &CertificateDer<'_>,
-) -> Result<rustls::crypto::hash::Output, rustls::Error> {
-    let hash_provider = provider
-        .cipher_suites
-        .iter()
-        .find_map(|suite| {
-            let hp = suite.tls13()?.common.hash_provider;
-            if hp.algorithm() == rustls::crypto::hash::HashAlgorithm::SHA256 {
-                Some(hp)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| rustls::Error::General("crypto provider missing SHA-256".into()))?;
-    Ok(hash_provider.hash(cert))
 }
 
 // ---------------------------------------------------------------------------
