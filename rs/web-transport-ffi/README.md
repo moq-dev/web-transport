@@ -15,3 +15,14 @@ For an ergonomic Python API (async context managers, legacy exception hierarchy)
 ```
 
 Artifacts land in `dist/`.
+
+
+## Rejection diagnostics
+
+`WebTransportError::SessionRejected` preserves `status_code`, `protocol`, and
+`headers`, a sequence of `HttpHeader { name, value }` field lines. Names are
+lowercase and values are bytes; repeated names retain all values. `detail`
+contains the diagnostic message without dumping credentials from the headers.
+This extends the exported error record and changes the UniFFI ABI: regenerate
+Python, Kotlin, and Swift bindings together with the native library. Existing
+Rust matches should include `..` or bind the new fields.

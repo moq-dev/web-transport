@@ -92,7 +92,7 @@ async fn run_conn(
     }
 
     // Accept the session.
-    let mut response = ConnectResponse::OK;
+    let mut response = ConnectResponse::default();
     if let Some(protocol) = negotiated {
         response = response.with_protocol(protocol);
     }

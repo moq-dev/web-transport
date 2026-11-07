@@ -13,7 +13,3 @@ Preserve size limits, partial-I/O behavior and exact frame consumption so follow
 ## Closes
 
 - [#169](https://github.com/moq-dev/web-transport/issues/169) - the implementation completes this report
-
-## Related
-
-- [Response headers](/quest/a1/response-headers.md) - overlapping codec surface; no hard dependency

@@ -49,3 +49,12 @@ kt/
 ## Publishing
 
 Publishing to Maven Central is CI-only via `.github/workflows/release-kt.yml`, which runs on every `web-transport-ffi-v*` tag. See the moq-dev org docs for Sonatype credentials.
+
+
+## Rejection diagnostics
+
+The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
+lowercase names and byte values. Repeated names retain all values. Regenerate
+the bindings and native library together when migrating to this expanded error
+record; update exhaustive matches or constructors for the new fields.

@@ -146,3 +146,23 @@ uv run pytest
 ## License
 
 MIT OR Apache-2.0
+
+
+## Rejection diagnostics
+
+`SessionRejected` exposes `status_code`, `protocol`, and
+`headers: list[tuple[str, bytes]]`. The list preserves repeated field names;
+convert it to a dictionary only when losing repeated values is acceptable.
+
+```python
+try:
+    session = await client.connect(url)
+except web_transport.SessionRejected as error:
+    print(error.status_code)
+    for name, value in error.headers:
+        if name == "www-authenticate":
+            print(value.decode("ascii"))
+```
+
+Rebuild the wheel when updating the UniFFI native library; the generated
+rejection error now carries protocol and header fields.

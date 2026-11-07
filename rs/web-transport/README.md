@@ -27,3 +27,36 @@ WASM is `!Send` and as far as I can tell, it's not possible to implement a trait
 This crate skirts the issue by switching the underlying implementation based on the platform.
 The compiler can then automatically apply `Send` bounds instead of explicitly requiring them.
 Unfortunate, I know.
+
+
+## Native CONNECT diagnostics
+
+On native builds, `Session::response()` exposes the CONNECT response and
+ordinary headers. `Error::response()` exposes the complete rejection response:
+
+```rust,ignore
+match client.connect(url).await {
+    Ok(session) => {
+        if let Some(response) = session.response() {
+            for value in response.headers.get_all("x-request-id") {
+                eprintln!("request id: {value:?}");
+            }
+        }
+    }
+    Err(error) => {
+        if let Some(response) = error.response() {
+            eprintln!("CONNECT rejected: {}", response.status);
+            for value in response.headers.get_all("www-authenticate") {
+                eprintln!("challenge: {value:?}");
+            }
+        }
+        return Err(error);
+    }
+}
+```
+
+These accessors are native-only. The WASM wrapper exposes what its browser
+bindings provide and does not synthesize HTTP response or rejection headers.
+The [W3C API](https://www.w3.org/TR/webtransport/) is evolving independently;
+its draft response-header features do not imply support in this wrapper or in
+every browser. Raw QUIC sessions have no CONNECT response.

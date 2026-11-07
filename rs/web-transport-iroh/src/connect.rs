@@ -23,8 +23,9 @@ pub enum ConnectError {
     #[error("write error")]
     WriteError(#[error(source, from, std_err)] endpoint::WriteError),
 
-    #[error("http error status: {_0}")]
-    ErrorStatus(http::StatusCode),
+    #[error("http error status: {}", _0.status)]
+    /// The peer rejected the session; includes its status, protocol and headers.
+    ErrorStatus(Box<ConnectResponse>),
 
     #[error("server returned protocol not in request: {_0}")]
     ProtocolMismatch(String),
@@ -86,10 +87,20 @@ impl Connecting {
         })
     }
 
-    /// Rejects the CONNECT request with the given status code.
-    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let mut connect = self.respond(status).await?;
-        connect.send.finish().ok();
+    /// Reject the CONNECT request with a status code or a response containing headers.
+    pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
+        let mut connect = self.respond(response).await?;
+        connect
+            .send
+            .finish()
+            .map_err(|_| endpoint::WriteError::ClosedStream)?;
+        // Keep the final connection handle alive until the response is acknowledged
+        // or the peer stops reading, instead of closing with queued response bytes.
+        connect
+            .send
+            .stopped()
+            .await
+            .map_err(endpoint::WriteError::from)?;
         Ok(())
     }
 }
@@ -138,7 +149,7 @@ impl Connected {
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
-            return Err(ConnectError::ErrorStatus(response.status));
+            return Err(ConnectError::ErrorStatus(Box::new(response)));
         }
 
         // Validate that the server's protocol was in our request.

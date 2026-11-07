@@ -2,8 +2,6 @@
 // By refusing to acknowledge the QPACK encoder, we can avoid implementing the dynamic table altogether.
 // This is not recommended for a full HTTP/3 implementation but it's literally more efficient for handling a single WebTransport CONNECT request.
 
-use std::collections::HashMap;
-
 use bytes::{Buf, BufMut};
 
 use super::huffman::{self, HpackStringDecode};
@@ -60,16 +58,19 @@ impl Budget {
 // Simple QPACK implementation that ONLY supports the static table and literals.
 #[derive(Debug, Default)]
 pub struct Headers {
-    pub fields: HashMap<String, String>,
+    pub fields: Vec<(String, String)>,
 }
 
 impl Headers {
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.fields.get(name).map(|v| v.as_str())
+        self.fields
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
     }
 
-    pub fn set(&mut self, name: &str, value: &str) {
-        self.fields.insert(name.to_string(), value.to_string());
+    pub fn append(&mut self, name: &str, value: &str) {
+        self.fields.push((name.to_string(), value.to_string()));
     }
 
     pub(crate) fn decode<B: Buf>(mut buf: &mut B) -> Result<Self, FieldSectionError> {
@@ -78,9 +79,9 @@ impl Headers {
         let (_, _insert_count) = decode_prefix(buf, 8)?;
         let (_sign, _delta_base) = decode_prefix(buf, 7)?;
 
-        let mut fields = HashMap::new();
+        let mut fields = Vec::new();
         while buf.has_remaining() {
-            // Every field line counts, including one that overwrites a previous name.
+            // Every field line counts, including repeated names.
             budget.charge(FIELD_LINE_OVERHEAD)?;
             // Read the first byte;
             let peek = buf.get_u8();
@@ -123,7 +124,7 @@ impl Headers {
                 },
             };
 
-            fields.insert(name, value);
+            fields.push((name, value));
 
             // Get the buffer back.
             (_, buf) = chain.into_inner();

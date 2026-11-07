@@ -33,3 +33,12 @@ swift/
   Tests/WebTransportTests/            Smoke tests
   scripts/                            check.sh, package.sh
 ```
+
+
+## Rejection diagnostics
+
+The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
+lowercase names and byte values. Repeated names retain all values. Regenerate
+the bindings and native library together when migrating to this expanded error
+record; update exhaustive matches or constructors for the new fields.
