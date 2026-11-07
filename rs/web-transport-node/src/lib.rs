@@ -3,7 +3,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 // Teardown safety: every `#[napi] async fn` below runs on napi-rs's global tokio
 // runtime. On `process.exit()` napi tears that runtime down with
@@ -157,6 +157,7 @@ pub struct NapiConnectOptions {
 #[napi]
 pub struct NapiServer {
     inner: Arc<Mutex<Option<web_transport_quinn::Server>>>,
+    closed: watch::Sender<bool>,
 }
 
 #[napi]
@@ -183,6 +184,7 @@ impl NapiServer {
 
             Ok(Self {
                 inner: Arc::new(Mutex::new(Some(server))),
+                closed: watch::channel(false).0,
             })
         })
     }
@@ -192,12 +194,18 @@ impl NapiServer {
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
         // Own the shared state for the duration of the future (see module note).
         let inner = self.inner.clone();
+        let mut closed = self.closed.subscribe();
         let mut guard = inner.lock().await;
         let server = match guard.as_mut() {
             Some(server) => server,
             None => return Ok(None),
         };
-        match server.accept().await {
+        let request = tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => None,
+            request = server.accept() => request,
+        };
+        match request {
             Some(request) => Ok(Some(NapiRequest {
                 inner: Arc::new(Mutex::new(Some(request))),
             })),
@@ -212,8 +220,93 @@ impl NapiServer {
     #[napi]
     pub fn close(&self) {
         within_runtime_if_available(|| {
-            self.inner.blocking_lock().take();
+            // A pending accept owns the lock. Wake it to drop the server; otherwise drop it now.
+            self.closed.send_replace(true);
+            if let Ok(mut server) = self.inner.try_lock() {
+                server.take();
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn bind() -> NapiServer {
+        // Workspace all-features tests enable both TLS backends; choose one for this process.
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            web_transport_quinn::quinn::rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .expect("install test TLS provider");
+        });
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = web_transport_quinn::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(
+                vec![cert.cert.der().clone()],
+                web_transport_quinn::quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    cert.signing_key.serialize_der(),
+                )
+                .into(),
+            )
+            .unwrap();
+        NapiServer {
+            inner: Arc::new(Mutex::new(Some(server))),
+            closed: watch::channel(false).0,
+        }
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending_and_queued_accepts() {
+        let server = bind();
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(server.accept());
+        let mut queued = std::pin::pin!(server.accept());
+
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        // Prove that accept is suspended in native code holding the server, without a sleep.
+        assert!(server.inner.try_lock().is_err());
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        wake.0.store(false, Ordering::SeqCst);
+
+        server.close();
+        server.close();
+        assert!(wake.0.load(Ordering::SeqCst));
+        assert!(matches!(
+            pending.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(None))
+        ));
+        assert!(matches!(
+            queued.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(None))
+        ));
+        assert!(server.inner.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drops_an_idle_server() {
+        let server = bind();
+        server.close();
+        assert!(server.inner.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
     }
 }
 
