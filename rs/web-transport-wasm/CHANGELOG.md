@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.8...web-transport-wasm-v0.8.9) - 2026-11-07
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.8.8](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.7...web-transport-wasm-v0.8.8) - 2026-11-03
 
 ### Other
