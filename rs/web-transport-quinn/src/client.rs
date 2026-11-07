@@ -17,7 +17,7 @@ use crate::{ClientError, Session};
 ///
 /// Different algorithms make different tradeoffs between throughput and latency.
 pub enum CongestionControl {
-    /// Use the default congestion control algorithm (typically CUBIC).
+    /// Keep the transport configuration's controller (Quinn defaults to CUBIC).
     Default,
     /// Optimize for throughput (typically CUBIC).
     Throughput,
@@ -44,9 +44,9 @@ pub(crate) fn controller_factory(algorithm: CongestionControl) -> Option<Control
 /// drift on which knobs actually get applied.
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) fn transport_config(
+    mut transport: quinn::TransportConfig,
     congestion_controller: Option<&ControllerFactory>,
 ) -> Arc<quinn::TransportConfig> {
-    let mut transport = quinn::TransportConfig::default();
     if let Some(cc) = congestion_controller {
         transport.congestion_controller_factory(cc.clone());
     }
@@ -58,9 +58,10 @@ pub(crate) fn transport_config(
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
-#[derive(Clone)]
+/// Build a client before cloning it to share its endpoint and configuration.
 pub struct ClientBuilder {
     provider: crypto::Provider,
+    transport: quinn::TransportConfig,
     congestion_controller: Option<ControllerFactory>,
 }
 
@@ -70,11 +71,24 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
+            transport: quinn::TransportConfig::default(),
             congestion_controller: None,
         }
     }
 
-    /// Enable the specified congestion controller.
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// An explicit [`Self::with_congestion_control`] choice overrides only its
+    /// congestion controller, regardless of the order these methods are called.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Override the transport configuration's congestion controller.
+    ///
+    /// [`CongestionControl::Default`] preserves the supplied configuration's
+    /// controller, or Quinn's default when no configuration is supplied.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = controller_factory(algorithm);
         self
@@ -160,7 +174,10 @@ impl ClientBuilder {
 
         let client_config = QuicClientConfig::try_from(crypto).unwrap();
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
-        client_config.transport_config(transport_config(self.congestion_controller.as_ref()));
+        client_config.transport_config(transport_config(
+            self.transport,
+            self.congestion_controller.as_ref(),
+        ));
 
         let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
         Ok(Client {
@@ -388,5 +405,144 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+pub(crate) mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    pub(crate) fn builder() -> ClientBuilder {
+        // Avoid a process-wide provider when both features are enabled.
+        #[cfg(feature = "aws-lc-rs")]
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        ClientBuilder {
+            provider,
+            transport: quinn::TransportConfig::default(),
+            congestion_controller: None,
+        }
+    }
+
+    struct CountingController(Arc<AtomicUsize>);
+
+    impl quinn::congestion::ControllerFactory for CountingController {
+        fn build(
+            self: Arc<Self>,
+            now: std::time::Instant,
+            mtu: u16,
+        ) -> Box<dyn quinn::congestion::Controller> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Arc::new(quinn::congestion::NewRenoConfig::default()).build(now, mtu)
+        }
+    }
+
+    pub(crate) fn custom_transport() -> (quinn::TransportConfig, Arc<AtomicUsize>) {
+        let built = Arc::new(AtomicUsize::new(0));
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_idle_timeout(Some(Duration::from_secs(12).try_into().unwrap()))
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .congestion_controller_factory(Arc::new(CountingController(built.clone())));
+        (transport, built)
+    }
+
+    pub(crate) fn assert_transport(config: &impl std::fmt::Debug, custom: bool) {
+        // Quinn exposes these settings only through Debug.
+        let config = format!("{config:?}");
+        let (idle, keepalive) = if custom {
+            (
+                "max_idle_timeout: Some(12000)",
+                "keep_alive_interval: Some(3s)",
+            )
+        } else {
+            ("max_idle_timeout: Some(30000)", "keep_alive_interval: None")
+        };
+        assert!(config.contains(idle), "{config}");
+        assert!(config.contains(keepalive), "{config}");
+    }
+
+    fn finish(builder: ClientBuilder, path: u8) -> Client {
+        match path {
+            0 => builder.with_system_roots(),
+            1 => builder.with_server_certificate_hashes(vec![]),
+            2 => builder.with_server_certificates(vec![]),
+            3 => builder.dangerous().with_no_certificate_verification(),
+            _ => unreachable!(),
+        }
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn builder_transport_reaches_every_client_config() {
+        for path in 0..4 {
+            let client = finish(builder(), path);
+            assert_transport(&client.config, false);
+
+            for transport_first in [false, true] {
+                for algorithm in [
+                    CongestionControl::Default,
+                    CongestionControl::LowLatency,
+                    CongestionControl::Throughput,
+                ] {
+                    let overridden = !matches!(algorithm, CongestionControl::Default);
+                    let (transport, built) = custom_transport();
+                    let builder = builder();
+                    let builder = if transport_first {
+                        builder
+                            .with_transport_config(transport)
+                            .with_congestion_control(algorithm)
+                    } else {
+                        builder
+                            .with_congestion_control(algorithm)
+                            .with_transport_config(transport)
+                    };
+                    let client = finish(builder, path);
+                    assert_transport(&client.config, true);
+
+                    // Controller construction happens before any network/TLS result,
+                    // so the system-root path needs no publicly trusted test server.
+                    let connecting = client
+                        .endpoint
+                        .connect_with(
+                            client.config.clone(),
+                            "[::1]:9".parse().unwrap(),
+                            "localhost",
+                        )
+                        .unwrap();
+                    assert_eq!(built.load(Ordering::SeqCst), usize::from(!overridden));
+                    drop(connecting);
+                    client.endpoint.close(0u32.into(), b"done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_congestion_control_removes_only_the_overlay() {
+        let (transport, built) = custom_transport();
+        let client = builder()
+            .with_transport_config(transport)
+            .with_congestion_control(CongestionControl::LowLatency)
+            .with_congestion_control(CongestionControl::Default)
+            .dangerous()
+            .with_no_certificate_verification()
+            .unwrap();
+        assert_transport(&client.config, true);
+        let connecting = client
+            .endpoint
+            .connect_with(
+                client.config.clone(),
+                "[::1]:9".parse().unwrap(),
+                "localhost",
+            )
+            .unwrap();
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+        drop(connecting);
+        client.endpoint.close(0u32.into(), b"done");
     }
 }
