@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::proto::ConnectRequest;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -162,11 +162,7 @@ impl ClientBuilder {
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
         client_config.transport_config(transport_config(self.congestion_controller.as_ref()));
 
-        let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
-        Ok(Client {
-            endpoint: client,
-            config: client_config,
-        })
+        Ok(Client::from(client_config))
     }
 }
 
@@ -213,7 +209,7 @@ impl DangerousClientBuilder {
 /// A client for connecting to a WebTransport server.
 #[derive(Clone, Debug)]
 pub struct Client {
-    endpoint: quinn::Endpoint,
+    endpoints: Arc<Mutex<ClientEndpoints>>,
     config: quinn::ClientConfig,
 }
 
@@ -222,7 +218,13 @@ impl Client {
     ///
     /// The ALPN MUST be set to [ALPN].
     pub fn new(endpoint: quinn::Endpoint, config: quinn::ClientConfig) -> Self {
-        Self { endpoint, config }
+        Self {
+            endpoints: Arc::new(Mutex::new(ClientEndpoints {
+                binding: Binding::Custom(endpoint),
+                closed: false,
+            })),
+            config,
+        }
     }
 
     /// Connect to the server.
@@ -231,6 +233,9 @@ impl Client {
         request: impl Into<ConnectRequest>,
     ) -> Result<Session, ClientError> {
         let request = request.into();
+        if self.endpoints.lock().unwrap().closed {
+            return Err(quinn::ConnectError::EndpointStopping.into());
+        }
 
         let port = request.url.port().unwrap_or(443);
 
@@ -262,13 +267,195 @@ impl Client {
 
         // Connect to the server using the addr we just resolved.
         let conn = self
-            .endpoint
-            .connect_with(self.config.clone(), remote, &host)?;
+            .endpoints
+            .lock()
+            .unwrap()
+            .connect(self.config.clone(), remote, &host)?;
         let conn = conn.await?;
 
         // Connect with the connection we established.
-        Session::connect(conn, request).await
+        let session = Session::connect(conn, request).await?;
+        if self.endpoints.lock().unwrap().closed {
+            return Err(quinn::ConnectionError::LocallyClosed.into());
+        }
+        Ok(session)
     }
+
+    /// Close all bound endpoints and reject future connections from every clone.
+    pub fn close(&self, code: quinn::VarInt, reason: &[u8]) {
+        let mut endpoints = self.endpoints.lock().unwrap();
+        if endpoints.closed {
+            return;
+        }
+        endpoints.closed = true;
+        for endpoint in endpoints.binding.endpoints() {
+            endpoint.close(code, reason);
+        }
+    }
+
+    /// Wait for currently bound endpoints to become idle; close first to prevent new connections.
+    pub async fn wait_idle(&self) {
+        let endpoints: Vec<_> = self
+            .endpoints
+            .lock()
+            .unwrap()
+            .binding
+            .endpoints()
+            .cloned()
+            .collect();
+        futures::future::join_all(endpoints.iter().map(quinn::Endpoint::wait_idle)).await;
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl From<quinn::ClientConfig> for Client {
+    /// Create a client that lazily binds one socket for each server address family.
+    ///
+    /// The config must negotiate [`ALPN`]; socket setup errors are returned by [`Self::connect`].
+    fn from(config: quinn::ClientConfig) -> Self {
+        Self {
+            endpoints: Arc::new(Mutex::new(ClientEndpoints {
+                binding: Binding::Default {
+                    ipv4: None,
+                    ipv6: None,
+                    runtime: ClientRuntime::current(),
+                },
+                closed: false,
+            })),
+            config,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientEndpoints {
+    binding: Binding,
+    closed: bool,
+}
+
+#[derive(Debug)]
+enum Binding {
+    Custom(quinn::Endpoint),
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    Default {
+        ipv4: Option<quinn::Endpoint>,
+        ipv6: Option<quinn::Endpoint>,
+        runtime: Option<ClientRuntime>,
+    },
+}
+
+impl Binding {
+    fn endpoints(&self) -> impl Iterator<Item = &quinn::Endpoint> {
+        match self {
+            Self::Custom(endpoint) => [Some(endpoint), None],
+            #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+            Self::Default { ipv4, ipv6, .. } => [ipv4.as_ref(), ipv6.as_ref()],
+        }
+        .into_iter()
+        .flatten()
+    }
+}
+
+impl ClientEndpoints {
+    fn connect(
+        &mut self,
+        config: quinn::ClientConfig,
+        remote: SocketAddr,
+        host: &str,
+    ) -> Result<quinn::Connecting, ClientError> {
+        if self.closed {
+            return Err(quinn::ConnectError::EndpointStopping.into());
+        }
+        // Binding and starting the connection share close's lock, so close
+        // cannot miss a newly created endpoint or an in-progress connection.
+        let (endpoint, remote) = match &mut self.binding {
+            Binding::Custom(endpoint) => (endpoint, remote),
+            #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+            Binding::Default {
+                ipv4,
+                ipv6,
+                runtime,
+            } => {
+                let remote = match remote {
+                    SocketAddr::V6(addr) => addr
+                        .ip()
+                        .to_ipv4_mapped()
+                        .map(|ip| SocketAddr::from((ip, addr.port())))
+                        .unwrap_or(remote),
+                    _ => remote,
+                };
+                let slot = if remote.is_ipv4() { ipv4 } else { ipv6 };
+                if slot.is_none() {
+                    if runtime.is_none() {
+                        *runtime = ClientRuntime::current();
+                    }
+                    let runtime = runtime.as_ref().ok_or_else(|| {
+                        ClientError::IoError(Arc::new(std::io::Error::other(
+                            "no async runtime found",
+                        )))
+                    })?;
+                    *slot = Some(
+                        runtime
+                            .bind(remote)
+                            .map_err(|err| ClientError::IoError(Arc::new(err)))?,
+                    );
+                }
+                (slot.as_mut().unwrap(), remote)
+            }
+        };
+        Ok(endpoint.connect_with(config, remote, host)?)
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[derive(Debug)]
+struct ClientRuntime {
+    inner: Arc<dyn quinn::Runtime>,
+    tokio: Option<tokio::runtime::Handle>,
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl ClientRuntime {
+    fn current() -> Option<Self> {
+        Some(Self {
+            inner: quinn::default_runtime()?,
+            tokio: tokio::runtime::Handle::try_current().ok(),
+        })
+    }
+
+    fn bind(&self, remote: SocketAddr) -> std::io::Result<quinn::Endpoint> {
+        // TokioRuntime registers sockets and spawns drivers in the current context.
+        let _guard = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
+        bind_endpoint(remote, self.inner.clone())
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_endpoint(
+    remote: SocketAddr,
+    runtime: Arc<dyn quinn::Runtime>,
+) -> std::io::Result<quinn::Endpoint> {
+    let bind: SocketAddr = if remote.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = bind_socket(bind)?;
+    quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if bind.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&bind.into())?;
+    Ok(socket.into())
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -390,3 +577,6 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+mod tests;

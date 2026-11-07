@@ -28,28 +28,25 @@ Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they m
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
 # Usage
-To use web-transport-quinn, first you need to create a [quinn::Endpoint](https://docs.rs/quinn/latest/quinn/struct.Endpoint.html); see the documentation and examples for more information.
-The only requirement is that the ALPN is set to `web_transport_quinn::ALPN` (aka `h3`).
 
-Afterwards, you use [web_transport_quinn::accept](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.accept.html) (as a server) or [web_transport_quinn::connect](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/fn.connect.html) (as a client) to establish a WebTransport session.
-This will take over the QUIC connection and perform the boring HTTP/3 handshake for you.
+Use `ClientBuilder::new().with_system_roots()?` to build a reusable client,
+then call `client.connect(url).await?` to establish a session. Clones share the
+client's endpoints. The first connection to each address family binds an
+IPv4 `0.0.0.0:0` or IPv6-only `[::]:0` socket. IPv4-mapped IPv6 destinations
+use IPv4. Socket setup failures are returned by `connect`, so building a client
+does not require IPv6 support or a running async runtime. Both sockets use the
+runtime present at construction, or at the first connection if constructed
+outside a runtime. Keep that runtime alive while using the client.
 
-See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/blob/main/moq-native/src/quic.rs) for a full setup.
+For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
+lazy sockets. Set its ALPN to `h3`. `Client::new(endpoint, config)` instead keeps
+the caller's endpoint and address handling.
 
-```rust
-    // Create a QUIC client.
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
-    endpoint.set_default_client_config(/* ... */);
+`client.close(code, reason)` closes all bound endpoints and prevents new
+connections through any clone. Await `client.wait_idle()` after closing to
+wait for every bound endpoint to drain.
 
-    // Connect to the given URL.
-    let session = web_transport_quinn::connect(&client, Url::parse("https://localhost")?).await?;
-
-    // Create a bidirectional stream.
-    let (mut send, mut recv) = session.open_bi().await?;
-
-    // Send a message.
-    send.write(b"hello").await?;
-```
+See the [examples](examples) for certificate setup and server construction.
 
 ## Async runtimes
 Each WebTransport session runs a background task that reads capsules from the CONNECT stream, and `Session::close` runs the graceful close in another.
