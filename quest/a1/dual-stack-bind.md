@@ -29,4 +29,3 @@ Decision prompts (✅ chosen):
 ## Related
 
 - [Native client composition](/quest/a1/native-client-config.md) - edits the same Quinn client construction
-- [Quinn on rind](/quest/a1/rind/quinn.md) - rebuilds the same builders' crypto
