@@ -101,6 +101,13 @@ fn wss_native_roots_and_caller_config() {
             .join("../../.tmp")
             .join(format!("qmux-wss-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::create_dir_all(dir.join("roots")).unwrap();
+        std::fs::write(dir.join("roots/root.pem"), &pem).unwrap();
+        std::fs::write(
+            dir.join("partial.pem"),
+            format!("{pem}-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        )
+        .unwrap();
         std::fs::write(dir.join("root.pem"), pem).unwrap();
         std::fs::write(dir.join("key.der"), key.secret_pkcs8_der()).unwrap();
         std::fs::write(dir.join("empty.pem"), "").unwrap();
@@ -109,7 +116,7 @@ fn wss_native_roots_and_caller_config() {
             "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
-        for case in [
+        let results = [
             "default",
             "installed",
             "invalid-provider",
@@ -119,7 +126,11 @@ fn wss_native_roots_and_caller_config() {
             "empty",
             "missing",
             "malformed",
-        ] {
+            "partial-load",
+            "partial-parse",
+        ]
+        .into_iter()
+        .map(|case| {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -132,17 +143,29 @@ fn wss_native_roots_and_caller_config() {
                     "SSL_CERT_FILE",
                     dir.join(match case {
                         "custom" | "empty" => "empty.pem",
-                        "missing" => "missing.pem",
+                        "missing" | "partial-load" => "missing.pem",
+                        "partial-parse" => "partial.pem",
                         "malformed" => "malformed.pem",
                         _ => "root.pem",
                     }),
                 )
-                .env("SSL_CERT_DIR", dir.join("empty"))
-                .output()
-                .unwrap();
+                .env(
+                    "SSL_CERT_DIR",
+                    dir.join(if case == "partial-load" {
+                        "roots"
+                    } else {
+                        "empty"
+                    }),
+                )
+                .output();
+            (case, output)
+        })
+        .collect::<Vec<_>>();
+        std::fs::remove_dir_all(dir).unwrap();
+        for (case, output) in results {
+            let output = output.unwrap();
             assert!(output.status.success(), "{case}: {output:?}");
         }
-        std::fs::remove_dir_all(dir).unwrap();
         return;
     }
     tokio::runtime::Builder::new_current_thread()
@@ -187,14 +210,7 @@ async fn wss_handshake() {
         let qmux::Error::Io(err) = err else {
             panic!("{case}: {err:?}")
         };
-        assert_eq!(
-            err.kind(),
-            if case == "empty" {
-                std::io::ErrorKind::NotFound
-            } else {
-                std::io::ErrorKind::InvalidData
-            }
-        );
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         return;
     }
     let dir = std::path::PathBuf::from(std::env::var_os("QMUX_WSS_TEST_DIR").unwrap());

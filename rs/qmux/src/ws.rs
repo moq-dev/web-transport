@@ -288,19 +288,22 @@ impl Client {
         use std::{io, sync::Arc};
         let provider = default_provider()?;
         let loaded = rustls_native_certs::load_native_certs();
-        if let Some(err) = loaded.errors.into_iter().next() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, err).into());
+        if !loaded.errors.is_empty() {
+            tracing::warn!(errors = ?loaded.errors, "native root CA certificate loading errors");
         }
         let mut roots = rustls::RootCertStore::empty();
-        for cert in loaded.certs {
-            roots
-                .add(cert)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        // OS stores can contain unusable entries; retain every valid trust anchor.
+        let (_, ignored) = roots.add_parsable_certificates(loaded.certs);
+        if ignored != 0 {
+            tracing::warn!(ignored, "ignored malformed native root CA certificates");
         }
         if roots.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "no native root CA certificates found",
+                format!(
+                    "no native root CA certificates found (errors: {:?})",
+                    loaded.errors
+                ),
             )
             .into());
         }

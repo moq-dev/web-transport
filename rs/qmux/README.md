@@ -32,9 +32,10 @@ its config to set QMux ALPNs, leaving the caller's original unchanged.
 
 For WSS without an explicit `ws::Client::with_connector`, QMux uses native
 certificate roots and the process's installed rustls provider, otherwise rind
-through rind-rustls. It does not install a process-wide provider. Root-loading
-or configuration errors fail the connection. Plain WebSockets do not load roots
-or select a TLS provider.
+through rind-rustls. It does not install a process-wide provider. Native roots
+load on a best-effort basis: loading errors and unusable certificates are logged,
+and the connection fails if no usable root remains or the provider configuration
+is invalid. Plain WebSockets do not load roots or select a TLS provider.
 
 The `wss` feature builds on x86_64, aarch64, and 32-bit ARM and requires Rust
 1.90 or newer. `ws::Client::new()` stays infallible; `connect()` returns
