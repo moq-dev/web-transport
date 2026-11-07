@@ -17,8 +17,8 @@ pub use tokio_tungstenite;
 /// The `tungstenite` version this crate is built against, matching
 /// [`tokio_tungstenite`].
 ///
-/// [`Client::with_config`] and [`Upgraded`] name `tungstenite` types, and
-/// [`Error::WebSocket`] wraps a `tungstenite::Error`.
+/// [`Client::with_config`], [`Server::with_config`], and [`Upgraded`] name
+/// `tungstenite` types, and [`Error::WebSocket`] wraps a `tungstenite::Error`.
 pub use tokio_tungstenite::tungstenite;
 
 /// Keep-alive configuration for WebSocket transports.
@@ -108,7 +108,8 @@ where
     /// WebSocket handshake already settled the protocol, so the session starts
     /// without awaiting the peer's transport parameters. Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// frame and message limits, since each record is one message. QMux cannot
+    /// inspect these limits on an externally upgraded WebSocket.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -218,6 +219,9 @@ impl Client {
     }
 
     /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    ///
+    /// The advertised record size is clamped to these limits; a limit below
+    /// [`crate::DEFAULT_MAX_RECORD_SIZE`] fails establishment locally.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
         self
@@ -237,9 +241,11 @@ impl Client {
     ///
     /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
     /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
-    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// without awaiting the peer's transport parameters. The advertised
+    /// [`max_record_size`](Config::max_record_size) is clamped to the WebSocket's
+    /// frame and message limits (16 MiB and 64 MiB by default), since each
+    /// record is one message. Establishment fails with [`Error::TransportParameter`]
+    /// if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -259,6 +265,8 @@ impl Client {
         for (a, _) in &self.protocols {
             validate_protocol(a)?;
         }
+
+        let config = session_config(self.session.clone(), self.config)?;
 
         let mut request = url.into_client_request().map_err(Error::from)?;
 
@@ -308,7 +316,7 @@ impl Client {
             ));
         }
 
-        let config = self.session.clone().with_negotiated(version, protocol);
+        let config = config.with_negotiated(version, protocol);
         let transport = WsTransport::new(ws_stream, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -333,6 +341,7 @@ impl Client {
 pub struct Server {
     protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
+    config: Option<tungstenite::protocol::WebSocketConfig>,
     keep_alive: Option<KeepAlive>,
     session: Config,
 }
@@ -374,6 +383,15 @@ impl Server {
         self
     }
 
+    /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    ///
+    /// The advertised record size is clamped to these limits; a limit below
+    /// [`crate::DEFAULT_MAX_RECORD_SIZE`] fails establishment locally.
+    pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     /// Send periodic Pings and close the session if the peer goes silent.
     ///
     /// WebSocket has no built-in idle timeout, so without this a crashed peer
@@ -388,9 +406,11 @@ impl Server {
     ///
     /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
     /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
-    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// without awaiting the peer's transport parameters. The advertised
+    /// [`max_record_size`](Config::max_record_size) is clamped to the WebSocket's
+    /// frame and message limits (16 MiB and 64 MiB by default), since each
+    /// record is one message. Establishment fails with [`Error::TransportParameter`]
+    /// if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -407,6 +427,8 @@ impl Server {
         for (a, _) in &self.protocols {
             validate_protocol(a)?;
         }
+
+        let config = session_config(self.session.clone(), self.config)?;
 
         let negotiated = Arc::new(Mutex::new(None::<(Version, Option<String>)>));
         let negotiated_clone = negotiated.clone();
@@ -469,7 +491,8 @@ impl Server {
                 .unwrap())
         };
 
-        let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
+        let ws =
+            tokio_tungstenite::accept_hdr_async_with_config(socket, callback, self.config).await?;
 
         let (version, protocol) = negotiated
             .lock()
@@ -477,7 +500,7 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
-        let config = self.session.clone().with_negotiated(version, protocol);
+        let config = config.with_negotiated(version, protocol);
         let transport = WsTransport::new(ws, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -485,5 +508,257 @@ impl Server {
         };
         // Protocol came from the negotiated subprotocol, so no in-band wait.
         Ok(Session::new(transport, true, config))
+    }
+}
+
+fn session_config(
+    mut session: Config,
+    websocket: Option<tungstenite::protocol::WebSocketConfig>,
+) -> Result<Config, Error> {
+    let websocket = websocket.unwrap_or_default();
+    for limit in [websocket.max_frame_size, websocket.max_message_size]
+        .into_iter()
+        .flatten()
+    {
+        session.max_record_size = session.max_record_size.min(limit as u64);
+    }
+    if session.max_record_size < crate::DEFAULT_MAX_RECORD_SIZE {
+        return Err(Error::TransportParameter);
+    }
+    Ok(session)
+}
+
+#[cfg(test)]
+mod record_size_tests {
+    use super::*;
+    use crate::proto::{Frame, TransportParams, DEFAULT_MAX_RECORD_SIZE};
+    use bytes::Bytes;
+    use futures::{FutureExt, SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::WebSocketStream;
+    use tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message};
+    use web_transport_trait::Session as _;
+
+    /// Exercise either builder against a raw peer that can inspect its parameters.
+    async fn session_peer(
+        server: bool,
+        websocket: Option<WebSocketConfig>,
+        config: Config,
+        version: Version,
+    ) -> (Session, WebSocketStream<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        if server {
+            let mut builder = Server::new().with_session_config(config);
+            if let Some(websocket) = websocket {
+                builder = builder.with_config(websocket);
+            }
+            let accept = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                builder.accept(socket).await.unwrap()
+            };
+            let connect = async {
+                let socket = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let mut request = url.into_client_request().unwrap();
+                request
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", version.alpn().parse().unwrap());
+                tokio_tungstenite::client_async(request, socket)
+                    .await
+                    .unwrap()
+                    .0
+            };
+            tokio::join!(accept, connect)
+        } else {
+            let mut builder = Client::new()
+                .with_protocol("test", &[version])
+                .require_protocol()
+                .with_session_config(config);
+            if let Some(websocket) = websocket {
+                builder = builder.with_config(websocket);
+            }
+            let accept = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    |_: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        response.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            format!("{}test", version.prefix()).parse().unwrap(),
+                        );
+                        Ok(response)
+                    };
+                tokio_tungstenite::accept_hdr_async(socket, callback)
+                    .await
+                    .unwrap()
+            };
+            let (session, peer) = tokio::join!(builder.connect(&url), accept);
+            (session.unwrap(), peer)
+        }
+    }
+
+    async fn advertised(
+        peer: &mut WebSocketStream<TcpStream>,
+        version: Version,
+    ) -> TransportParams {
+        let message = peer.next().await.unwrap().unwrap().into_data();
+        let Some(Frame::TransportParameters(params)) = Frame::decode(message, version).unwrap()
+        else {
+            panic!("expected transport parameters");
+        };
+        params
+    }
+
+    #[tokio::test]
+    async fn builders_advertise_the_effective_record_and_datagram_limits() {
+        let min = DEFAULT_MAX_RECORD_SIZE;
+        let unlimited = WebSocketConfig::default()
+            .max_frame_size(None)
+            .max_message_size(None);
+        let limits =
+            |frame, message| Some(unlimited.max_frame_size(frame).max_message_size(message));
+        let bytes = min as usize;
+        let cases = [
+            // Defaults cap a raised session limit at the 16 MiB frame limit.
+            (None, 32 << 20, 16 << 20),
+            (None, min, min),
+            (Some(unlimited), 32 << 20, 32 << 20),
+            (limits(Some(bytes), None), 2 * min, min),
+            (limits(None, Some(bytes)), 2 * min, min),
+            (limits(Some(2 * bytes), Some(bytes)), 3 * min, min),
+            (limits(Some(bytes), Some(2 * bytes)), 3 * min, min),
+            (limits(Some(3 * bytes), Some(2 * bytes)), min, min),
+        ];
+        for server in [false, true] {
+            for version in [Version::QMux01, Version::QMux02] {
+                for (websocket, requested, expected) in cases {
+                    let mut config = Config::new(version);
+                    config.max_record_size = requested;
+                    config.max_datagram_frame_size = requested;
+                    let (session, mut peer) =
+                        session_peer(server, websocket, config, version).await;
+                    let params = advertised(&mut peer, version).await;
+                    assert_eq!(
+                        params.max_record_size, expected,
+                        "server={server}, {websocket:?}"
+                    );
+                    assert_eq!(params.max_datagram_frame_size, expected);
+                    session.close(0, "done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn records_at_the_websocket_limit_are_delivered() {
+        let min = DEFAULT_MAX_RECORD_SIZE as usize;
+        for server in [false, true] {
+            for version in [Version::QMux01, Version::QMux02] {
+                // Exercise both tungstenite bounds, including a fragmented message.
+                for frame_limit in [true, false] {
+                    let websocket = WebSocketConfig::default()
+                        .max_frame_size(frame_limit.then_some(min))
+                        .max_message_size((!frame_limit).then_some(min));
+                    let mut config = Config::new(version);
+                    config.max_record_size = 2 * min as u64;
+                    config.max_datagram_frame_size = 2 * min as u64;
+                    let (session, mut peer) =
+                        session_peer(server, Some(websocket), config, version).await;
+                    let params = advertised(&mut peer, version).await;
+                    assert_eq!(params.max_record_size, min as u64);
+                    peer.send(Message::Binary(
+                        Frame::TransportParameters(Config::new(version).to_transport_params())
+                            .encode(version)
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                    // A lengthless DATAGRAM fills exactly one advertised record.
+                    let mut record = vec![0x5a; min];
+                    record[0] = 0x30;
+                    if frame_limit {
+                        peer.send(Message::Binary(Bytes::from(record)))
+                            .await
+                            .unwrap();
+                    } else {
+                        use tungstenite::protocol::frame::{
+                            coding::{Data, OpCode},
+                            Frame as WsFrame,
+                        };
+                        peer.send(Message::Frame(WsFrame::message(
+                            record[..min / 2].to_vec(),
+                            OpCode::Data(Data::Binary),
+                            false,
+                        )))
+                        .await
+                        .unwrap();
+                        peer.send(Message::Frame(WsFrame::message(
+                            record[min / 2..].to_vec(),
+                            OpCode::Data(Data::Continue),
+                            true,
+                        )))
+                        .await
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        session.recv_datagram().await.unwrap(),
+                        Bytes::from(vec![0x5a; min - 1])
+                    );
+                    // One byte beyond the effective bound must still be rejected by
+                    // the actual WebSocket config, including on the server.
+                    let mut record = vec![0x5a; min + 1];
+                    record[0] = 0x30;
+                    peer.send(Message::Binary(Bytes::from(record)))
+                        .await
+                        .unwrap();
+                    let error = session.closed().await;
+                    assert!(
+                        matches!(&error, Error::WebSocket(e) if matches!(e.as_ref(), tungstenite::Error::Capacity(_))),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_limits_fail_before_websocket_io() {
+        let min = DEFAULT_MAX_RECORD_SIZE as usize;
+        for limit in [0, min - 1] {
+            for websocket in [
+                WebSocketConfig::default().max_frame_size(Some(limit)),
+                WebSocketConfig::default().max_message_size(Some(limit)),
+            ] {
+                let client = Client::new().with_config(websocket);
+                assert!(matches!(
+                    client.connect("ws://127.0.0.1:1/").now_or_never(),
+                    Some(Err(Error::TransportParameter))
+                ));
+                let (socket, _peer) = tokio::io::duplex(1024);
+                let server = Server::new().with_config(websocket);
+                assert!(matches!(
+                    server.accept(socket).now_or_never(),
+                    Some(Err(Error::TransportParameter))
+                ));
+            }
+        }
+        let config = Config {
+            max_record_size: DEFAULT_MAX_RECORD_SIZE - 1,
+            ..Config::default()
+        };
+        let client = Client::new().with_session_config(config.clone());
+        assert!(matches!(
+            client.connect("ws://127.0.0.1:1/").now_or_never(),
+            Some(Err(Error::TransportParameter))
+        ));
+        let (socket, _peer) = tokio::io::duplex(1024);
+        let server = Server::new().with_session_config(config);
+        assert!(matches!(
+            server.accept(socket).now_or_never(),
+            Some(Err(Error::TransportParameter))
+        ));
     }
 }

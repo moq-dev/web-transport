@@ -55,6 +55,15 @@ builder or the handshake. The default grants a peer 100 concurrent streams in
 each direction; raise `max_streams_bidi` and `max_streams_uni` if your
 application holds more streams open at once.
 
+`ws::Client` and `ws::Server` accept a tungstenite `WebSocketConfig` through
+`with_config`. They clamp the advertised `max_record_size` to the WebSocket's
+frame and message limits (16 MiB and 64 MiB by default); the advertised datagram
+limit is also bounded by that record size. `connect` and `accept` return
+`Error::TransportParameter` before WebSocket I/O if the resulting record size is
+below the protocol minimum of 16382 bytes. A `None` WebSocket limit is unbounded.
+For `ws::Upgraded`, the caller must keep `max_record_size` within the externally
+configured frame and message limits, which QMux cannot inspect.
+
 To run QMux over something the built-in modules don't cover, wrap any
 `AsyncRead + AsyncWrite` byte stream in `transport::Stream`, or implement
 `transport::Transport` yourself, then pass it to `Session::connect` /
