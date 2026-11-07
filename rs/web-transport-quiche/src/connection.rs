@@ -1112,7 +1112,6 @@ mod tests {
 
     #[tokio::test]
     async fn data_framed_close_capsule_preserves_application_details() -> Result<()> {
-        use tokio::io::AsyncWriteExt;
         let mut pair = http_pair().await?;
         let mut capsule = BytesMut::new();
         web_transport_proto::Capsule::CloseWebTransportSession {
@@ -1133,7 +1132,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_capsule_is_a_protocol_error() -> Result<()> {
-        use tokio::io::AsyncWriteExt;
         let mut pair = http_pair().await?;
         // The first byte of a two-byte capsule type, with no second byte.
         pair._connect.send.write_all(&[0x68]).await?;
