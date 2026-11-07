@@ -1,8 +1,7 @@
 #!/usr/bin/env just --justfile
 #
 # Language-specific recipes for the Kotlin Multiplatform package under
-# kt/. Invoked from the repo root as `just kt <recipe>` via the `mod kt`
-# import.
+# kt/. Invoked from the repo root as `just --justfile kt/justfile <recipe>`.
 
 set working-directory := '.'
 
@@ -10,7 +9,7 @@ default:
 	just check
 
 # Build web-transport-ffi for the host, regenerate uniffi bindings, run :web-transport:jvmTest.
-# Skips cleanly if cargo, java, or gradle is missing.
+# Requires cargo, a JDK, and OpenSSL; uses the pinned Gradle wrapper.
 check:
 	bash scripts/check.sh
 
