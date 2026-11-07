@@ -138,10 +138,11 @@ impl RecvStream {
         self.inner.id()
     }
 
-    /// Returns the number of bytes read from this stream.
+    /// Return the native QUIC read offset, including any WebTransport stream header.
     ///
-    /// This is the offset of the next byte to be read, i.e. the length of the contiguous
-    /// prefix of the stream consumed by the application.
+    /// This offset can become unavailable after transport closure. Use
+    /// [`Self::stats`] for the cumulative application payload count without headers,
+    /// which remains available after closure.
     pub fn bytes_read(&self) -> Result<u64, ClosedStream> {
         self.inner.bytes_read().map_err(|_| ClosedStream)
     }

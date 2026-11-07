@@ -31,7 +31,7 @@ pub struct SendStream {
 
 impl SendStream {
     pub(super) fn new(stream: WebTransportSendStream) -> Result<Self, Error> {
-        let stats = crate::stats::Collector::new(&stream)?;
+        let stats = crate::stats::Collector::new(&stream);
         let writer = WritableStreamDefaultWriter::new(&stream)?;
 
         Ok(Self {

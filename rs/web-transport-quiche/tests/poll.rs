@@ -240,3 +240,18 @@ async fn tokio_stream_payload_statistics() -> Result<()> {
     tokio_stream_stats::payload_stats(&client, &server).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn empty_inherent_read_buffer_preserves_completion_and_statistics() -> Result<()> {
+    let (client, server) = pair().await?;
+    let mut send = client.open_uni().await?;
+    send.write_all(b"payload").await?;
+    send.finish()?;
+    let mut recv = server.accept_uni().await?;
+    let mut empty: &mut [u8] = &mut [];
+    assert_eq!(recv.read_buf(&mut empty).await?, None);
+    assert_eq!(recv.stats().await?.bytes_read, Some(0));
+    assert_eq!(recv.read_all(7).await?.as_ref(), b"payload");
+    assert_eq!(recv.stats().await?.bytes_read, Some(7));
+    Ok(())
+}

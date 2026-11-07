@@ -7,31 +7,25 @@ use crate::Error;
 /// Feature detection is per stream: older browsers expose ordinary Streams.
 pub(crate) struct Collector {
     stream: JsValue,
-    get_stats: Option<Function>,
 }
 
 impl Collector {
-    pub(crate) fn new(stream: &JsValue) -> Result<Self, Error> {
-        let method = Reflect::get(stream, &"getStats".into())?;
-        let get_stats = if method.is_undefined() {
-            None
-        } else {
-            Some(
-                method
-                    .dyn_into()
-                    .map_err(|_| invalid("getStats is not callable"))?,
-            )
-        };
-        Ok(Self {
+    pub(crate) fn new(stream: &JsValue) -> Self {
+        Self {
             stream: stream.clone(),
-            get_stats,
-        })
+        }
     }
 
     pub(crate) async fn collect(&self) -> Result<JsValue, Error> {
-        let Some(method) = &self.get_stats else {
+        // Optional statistics must not add a failure mode to opening or accepting
+        // a stream. Surface broken collectors only when collection is requested.
+        let method = Reflect::get(&self.stream, &"getStats".into())?;
+        if method.is_undefined() {
             return Ok(JsValue::UNDEFINED);
-        };
+        }
+        let method = method
+            .dyn_into::<Function>()
+            .map_err(|_| invalid("getStats is not callable"))?;
         let result = method.call0(&self.stream)?;
         let promise = result
             .dyn_into::<js_sys::Promise>()
@@ -52,8 +46,8 @@ pub(crate) fn metric(stats: &JsValue, name: &str) -> Result<Option<u64>, Error> 
     if value.is_undefined() {
         return Ok(None);
     }
-    // WebIDL uses JS Numbers here. Do not silently round an unsafe integer or
-    // cast malformed values to zero; either would invent measured progress.
+    // W3C fields are non-nullable unsigned long long values, omitted when
+    // unavailable. Do not round unsafe JS Numbers or cast malformed values to zero.
     let number = value
         .as_f64()
         .filter(|n| n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0 && n.fract() == 0.0)

@@ -80,6 +80,14 @@ export function streamStatsTransport(mode) {
     }});
     if (mode !== 0) {
         for (const stream of [writable, readable]) {
+            if (mode === 10) {
+                stream.getStats = null;
+                continue;
+            }
+            if (mode === 11) {
+                Object.defineProperty(stream, 'getStats', { get() { throw failure; } });
+                continue;
+            }
             stream.getStats = function() {
                 if (this !== stream) throw new Error('wrong stats receiver');
                 if (mode === 3) return Promise.reject(failure);
@@ -92,6 +100,7 @@ export function streamStatsTransport(mode) {
                 if (mode === 6) value.bytesReceived = 0.5;
                 if (mode === 7) value.bytesSent = Number.MAX_SAFE_INTEGER + 1;
                 if (mode === 8) { value.bytesSent = 0; value.bytesAcknowledged = 0; }
+                if (mode === 9) value.bytesAcknowledged = null;
                 return Promise.resolve(value);
             };
         }
@@ -248,7 +257,7 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
 }
 
 async fn stream_statistics() -> Result<String, Error> {
-    for mode in 0..=8 {
+    for mode in 0..=11 {
         let fixture = stream_stats_transport(mode);
         let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
         let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
@@ -258,7 +267,7 @@ async fn stream_statistics() -> Result<String, Error> {
         expect(first.as_deref() == Some(b"a"), "first payload byte".into())?;
         let sent = send.stats().await;
         let received = recv.stats().await;
-        if mode == 3 || mode == 4 {
+        if mode == 3 || mode == 4 || mode == 11 {
             let failure = Reflect::get(&fixture, &"failure".into())?;
             for result in [sent.map(|_| ()), received.map(|_| ())] {
                 expect(
@@ -268,7 +277,7 @@ async fn stream_statistics() -> Result<String, Error> {
             }
             continue;
         }
-        if mode == 5 || mode == 7 {
+        if mode == 5 || mode == 7 || mode == 9 || mode == 10 {
             expect(sent.is_err(), "invalid sent metric is rejected".into())?;
             continue;
         }

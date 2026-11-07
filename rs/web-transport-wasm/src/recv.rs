@@ -35,7 +35,7 @@ pub struct RecvStream {
 
 impl RecvStream {
     pub(super) fn new(stream: WebTransportReceiveStream) -> Result<Self, Error> {
-        let stats = crate::stats::Collector::new(&stream)?;
+        let stats = crate::stats::Collector::new(&stream);
         let reader = ReadableStreamDefaultReader::new(&stream)?;
 
         Ok(Self {

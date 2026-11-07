@@ -63,12 +63,13 @@ impl RecvStream {
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>, StreamError> {
-        let chunk = self.read_chunk(buf.remaining_mut()).await?;
-        Ok(chunk.map(|chunk| {
-            let size = chunk.len();
-            buf.put(chunk);
-            size
-        }))
+        let chunk = match self.read_chunk(buf.remaining_mut()).await? {
+            Some(chunk) if !chunk.is_empty() => chunk,
+            _ => return Ok(None),
+        };
+        let size = chunk.len();
+        buf.put(chunk);
+        Ok(Some(size))
     }
 
     /// Read until the end of the stream or the limit is hit.
