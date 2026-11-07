@@ -36,9 +36,12 @@ and structured errors, and explicitly close sessions and endpoints. Test-only
 credentials are generated for each run; verification is disabled only for the
 loopback client.
 
-Staged packages and credentials are removed on success or failure. Test output
-and xUnit results remain in `.tmp/swift-test-results/`; runtime execution fails
-after 120 seconds if a native call hangs. The command leaves `Package.swift` and
+Staged packages and credentials are removed on success, failure or runtime
+cancellation after stopping the test process group. Test output remains in
+`.tmp/swift-test-results/`, with xUnit results for completed runs. Runtime execution
+fails after 120 seconds if a native call hangs, allowing five seconds for graceful
+termination before forcing exit. Interrupted runs may have partial logs and no XML;
+unbuffered phase messages identify the last lifecycle operation. The command leaves `Package.swift` and
 developer-generated bindings untouched. The independent `Swift runtime` PR job
 runs this command on macOS for every PR, including shared Rust and build changes.
 It does not publish or test the release XCFramework platform matrix or iOS simulators.
@@ -57,6 +60,7 @@ swift/
   Sources/
     WebTransport/                     Ergonomic shim re-exporting WebTransportFFI
     WebTransportFFI/                  UniFFI-generated Swift (populated in release packages, gitignored)
-  Tests/WebTransportTests/            Host runtime tests
+  Tests/WebTransportTests/            Package tests (included in release archives)
+  Tests/HostTests/                    macOS host runtime tests (check.sh only)
   scripts/                            check.sh, package.sh
 ```

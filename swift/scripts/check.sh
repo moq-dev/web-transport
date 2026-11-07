@@ -71,7 +71,8 @@ let package = Package(
             linkerSettings: [.linkedLibrary("web_transport_ffi"), .unsafeFlags(["-L", libraryPath])]
         ),
         .target(name: "WebTransport", dependencies: ["WebTransportFFI"]),
-        .testTarget(name: "WebTransportTests", dependencies: ["WebTransport", "web_transportFFI"]),
+        .testTarget(name: "WebTransportTests", dependencies: ["WebTransport"]),
+        .testTarget(name: "HostTests", dependencies: ["WebTransport", "web_transportFFI"]),
     ]
 )
 EOF
@@ -88,22 +89,60 @@ export WEB_TRANSPORT_TEST_KEY="$STAGING/key.der"
 swift build --package-path "$STAGING" --build-tests
 # Only runtime execution has a deadline, separate from compilation. A stuck
 # UniFFI future must fail CI and kill the whole test process group.
-python3 - "$STAGING" "$RESULTS" <<'PY' 2>&1 | tee "$RESULTS/tests.log"
+exec python3 - "$STAGING" "$RESULTS" <<'PY'
 import os
+from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
 
-command = ["swift", "test", "--package-path", sys.argv[1], "--skip-build",
-           "--xunit-output", os.path.join(sys.argv[2], "tests.xml")]
-process = subprocess.Popen(command, start_new_session=True)
+stage, results = sys.argv[1:]
+log = Path(results) / "tests.log"
+process = None
+
+
+def interrupted(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+command = ["swift", "test", "--package-path", stage, "--skip-build",
+           "--xunit-output", str(Path(results) / "tests.xml")]
 try:
-    status = process.wait(timeout=120)
-except subprocess.TimeoutExpired:
-    print("swift check: runtime tests exceeded 120s; terminating test process group", flush=True)
-    os.killpg(process.pid, signal.SIGKILL)
-    process.wait()
-    status = 1
+    with log.open("w") as output:
+        process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            status = process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            print("swift check: runtime tests exceeded 120s; terminating test process group", flush=True)
+            status = 1
+finally:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # exec makes this supervisor receive signals sent directly to check.sh too.
+    # Stop descendants before removing their package, including on cancellation.
+    if process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # The test process group has already exited.
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # Force termination below after the diagnostic grace period.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # No remaining test descendants.
+        process.wait()
+    try:
+        if log.exists():
+            print(log.read_text(errors="replace"), end="", flush=True)
+    finally:
+        shutil.rmtree(stage)
+if status == 0:
+    print(f"swift check: passed (reports: {results})")
 sys.exit(status if status >= 0 else 1)
 PY
-echo "swift check: passed (reports: $RESULTS)"

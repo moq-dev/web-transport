@@ -154,7 +154,7 @@ clean:
 		kt/web-transport/src/jvmMain/resources \
 		kt/web-transport/src/androidMain/jniLibs
 
-	# Swift: SPM build dir + generated bindings/xcframework.
+	# Swift: SPM caches and optional developer-generated bindings/XCFramework.
 	rm -rf swift/.build swift/.swiftpm swift/Package.resolved \
 		swift/Sources/WebTransportFFI/Generated.swift swift/WebTransportFFI.xcframework
 
