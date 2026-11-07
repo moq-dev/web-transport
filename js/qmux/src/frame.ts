@@ -656,6 +656,9 @@ function decodeTransportParams(buffer: Uint8Array): TransportParams {
 			throw new Error(`transport parameter 0x${id.toString(16)} has trailing bytes`);
 		}
 		const paramValue = paramValueVarInt.value;
+		if ((id === 0x08n || id === 0x09n) && paramValue > MAX_STREAM_COUNT) {
+			throw new Error("initial_max_streams transport parameter exceeds 2^60");
+		}
 
 		switch (id) {
 			case 0x01n:
