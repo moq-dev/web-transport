@@ -26,4 +26,3 @@ Decision prompts (✅ chosen):
 ## Related
 
 - [#460](https://github.com/moq-dev/web-transport/issues/460) - closed by the 0.5 backport
-- [QMux socket teardown](/quest/a0/qmux-socket-teardown.md) - edits the same `TcpStats` ownership
