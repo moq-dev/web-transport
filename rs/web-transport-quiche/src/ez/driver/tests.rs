@@ -229,3 +229,60 @@ fn accepting_a_live_send_half_registers_it() {
     );
     assert_eq!(&response, b"response");
 }
+
+#[test]
+fn rejection_drain_waits_for_acknowledgment_or_peer_stop() {
+    for stopped in [false, true] {
+        let mut pair = Pair::new();
+        let mut driver = driver(true);
+        let id = StreamId::CLIENT_BI;
+        pair.client
+            .stream_send(id.into(), b"request", true)
+            .unwrap();
+        pair.pump();
+        driver.read(&mut pair.server).unwrap();
+
+        // Consume the receive half so collection can report send completion.
+        pair.server
+            .stream_shutdown(id.into(), quiche::Shutdown::Read, 0)
+            .unwrap();
+        pair.server
+            .stream_send(id.into(), b"response", true)
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        driver.state.lock().drain(id, sender);
+        driver.check_drained(&mut pair.server);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        if stopped {
+            pair.client
+                .stream_shutdown(id.into(), quiche::Shutdown::Read, 42)
+                .unwrap();
+        }
+        // Force two ack-eliciting packets, avoiding an ACK timer or sleeps.
+        for _ in 0..2 {
+            pair.server.send_ack_eliciting().unwrap();
+            pair.pump();
+        }
+        driver.read(&mut pair.server).unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Ok(Ok(()))),
+            "rejection was not retired (stopped={stopped})"
+        );
+        assert!(driver.state.lock().draining.is_empty());
+    }
+}
+
+#[test]
+fn cancelled_rejection_drain_is_removed() {
+    let mut pair = Pair::new();
+    let mut driver = driver(true);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    driver.state.lock().drain(StreamId::CLIENT_BI, sender);
+    drop(receiver);
+    driver.check_drained(&mut pair.server);
+    assert!(driver.state.lock().draining.is_empty());
+}

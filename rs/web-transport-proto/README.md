@@ -73,6 +73,14 @@ for diagnostics. Their server `reject` methods now accept
 header-bearing response can be passed directly. Quinn, Noq and Iroh wait for
 response acknowledgement or the peer to stop reading before releasing the
 handshake, preventing a final connection drop from discarding queued headers.
+Quiche waits for the rejected stream to retire. All native rejection futures
+also complete if the peer terminates the connection; an unresponsive peer can
+hold them until the transport idle timeout, so cancel the future to impose an
+application deadline.
+
+Request decoding rejects duplicate, unknown and misplaced pseudo-headers.
+Repeated `wt-available-protocols` lines are combined as a structured list before
+parsing, retaining all offered protocols in order.
 
 The wire format remains standard HTTP/3 HEADERS with static/literal QPACK, no
 new extension or setting. Repeated ordinary lines are preserved instead of

@@ -81,10 +81,17 @@ impl Connecting {
     }
 
     /// Reject the CONNECT request with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination, subject to the QUIC idle timeout.
+    /// Cancel the future to impose an application deadline.
     pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
         let mut connect = self.respond(response).await?;
+        connect.recv.stop(0);
         connect.send.finish()?;
-        connect.send.closed().await?;
+        match connect.send.rejected().await {
+            Ok(()) | Err(ez::StreamError::Connection(ez::ConnectionError::Remote(..))) => (),
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
 }

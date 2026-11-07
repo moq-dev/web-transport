@@ -88,6 +88,9 @@ impl Connecting {
     }
 
     /// Reject the CONNECT request with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination, subject to the QUIC idle timeout.
+    /// Cancel the future to impose an application deadline.
     pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
         let mut connect = self.respond(response).await?;
         connect
@@ -96,11 +99,16 @@ impl Connecting {
             .map_err(|_| endpoint::WriteError::ClosedStream)?;
         // Keep the final connection handle alive until the response is acknowledged
         // or the peer stops reading, instead of closing with queued response bytes.
-        connect
-            .send
-            .stopped()
-            .await
-            .map_err(endpoint::WriteError::from)?;
+        match connect.send.stopped().await {
+            Ok(_) => (),
+            // A client may close immediately after reading the rejection, before
+            // its delayed ACK. Peer termination needs no further response bytes.
+            Err(endpoint::StoppedError::ConnectionLost(
+                endpoint::ConnectionError::ApplicationClosed(_)
+                | endpoint::ConnectionError::ConnectionClosed(_),
+            )) => (),
+            Err(err) => return Err(endpoint::WriteError::from(err).into()),
+        }
         Ok(())
     }
 }

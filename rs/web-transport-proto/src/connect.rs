@@ -164,6 +164,24 @@ impl ConnectRequest {
     fn decode_headers<B: Buf>(data: &mut B) -> Result<Self, ConnectError> {
         let headers = qpack::Headers::decode(data)?;
 
+        let mut pseudo = std::collections::HashSet::new();
+        let mut ordinary = false;
+        for (name, _) in &headers.fields {
+            if name.starts_with(':') {
+                if ordinary
+                    || !matches!(
+                        name.as_str(),
+                        ":scheme" | ":authority" | ":path" | ":method" | ":protocol"
+                    )
+                    || !pseudo.insert(name)
+                {
+                    return Err(ConnectError::InvalidPseudoHeader);
+                }
+            } else {
+                ordinary = true;
+            }
+        }
+
         let scheme = match headers.get(":scheme") {
             Some("https") => "https",
             Some(scheme) => Err(ConnectError::WrongScheme(Some(scheme.to_string())))?,
@@ -190,12 +208,15 @@ impl ConnectRequest {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
+        // Structured lists combine all field lines before parsing (RFC 8941 §4.2).
         let protocols = headers
-            .get(protocol_negotiation::AVAILABLE_NAME)
-            .map(protocol_negotiation::decode_list)
-            .transpose()
-            .map_err(|_| ConnectError::InvalidProtocol)?
-            .unwrap_or_default();
+            .fields
+            .iter()
+            .filter(|(name, _)| name == protocol_negotiation::AVAILABLE_NAME)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let protocols = protocol_negotiation::decode_list(&protocols)?;
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
@@ -438,7 +459,7 @@ impl ConnectResponse {
                 );
             } else if name == LEGACY_DRAFT_HEADER {
                 if draft {
-                    return Err(ConnectError::ReservedHeader(name));
+                    return Err(ConnectError::InvalidHttpHeaderValue);
                 }
                 draft = true;
             } else {
@@ -505,15 +526,7 @@ fn validate_response_header(
     ) {
         return Err(ConnectError::InvalidHttpHeaderName);
     }
-    if value
-        .as_bytes()
-        .first()
-        .is_some_and(|b| matches!(b, b' ' | b'\t'))
-        || value
-            .as_bytes()
-            .last()
-            .is_some_and(|b| matches!(b, b' ' | b'\t'))
-    {
+    if matches!(value.as_bytes(), [b' ' | b'\t', ..] | [.., b' ' | b'\t']) {
         return Err(ConnectError::InvalidHttpHeaderValue);
     }
     Ok(())
@@ -771,6 +784,86 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn request_rejects_duplicate_unknown_and_late_pseudo_headers() {
+        for extra in [
+            ":scheme",
+            ":authority",
+            ":path",
+            ":method",
+            ":protocol",
+            ":status",
+        ] {
+            let mut fields = qpack::Headers::default();
+            for (name, value) in [
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", "/"),
+                (":method", "CONNECT"),
+                (":protocol", "webtransport"),
+            ] {
+                fields.append(name, value);
+            }
+            fields.append(extra, "invalid");
+            let mut wire = Vec::new();
+            encode_headers_frame(&fields, &mut wire).unwrap();
+            assert!(matches!(
+                ConnectRequest::decode(&mut wire.as_slice()),
+                Err(ConnectError::InvalidPseudoHeader)
+            ));
+        }
+        let mut section = vec![0, 0];
+        append_literal(&mut section, b"x-first", b"value");
+        append_literal(&mut section, b":scheme", b"https");
+        let wire = reframe(&section);
+        assert!(matches!(
+            ConnectRequest::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidPseudoHeader)
+        ));
+    }
+
+    #[test]
+    fn request_combines_repeated_protocol_lists_and_validates_each_line() {
+        for last in ["\"b\", \"c\"", "unquoted", ""] {
+            let mut fields = qpack::Headers::default();
+            for (name, value) in [
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", "/"),
+                (":method", "CONNECT"),
+                (":protocol", "webtransport"),
+                ("wt-available-protocols", "\"a\""),
+                ("wt-available-protocols", last),
+            ] {
+                fields.append(name, value);
+            }
+            let mut wire = Vec::new();
+            encode_headers_frame(&fields, &mut wire).unwrap();
+            let result = ConnectRequest::decode(&mut wire.as_slice());
+            if last != "\"b\", \"c\"" {
+                assert!(result.is_err());
+            } else {
+                let request = result.unwrap();
+                assert_eq!(request.protocols, ["a", "b", "c"]);
+                assert!(!request.headers.contains_key("wt-available-protocols"));
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_draft_is_malformed_peer_input() {
+        let mut fields = qpack::Headers::default();
+        fields.append(":status", "403");
+        fields.append(LEGACY_DRAFT_HEADER, "draft02");
+        fields.append(LEGACY_DRAFT_HEADER, "draft02");
+        let mut wire = Vec::new();
+        encode_headers_frame(&fields, &mut wire).unwrap();
+        assert!(matches!(
+            ConnectResponse::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidHttpHeaderValue)
+        ));
     }
 
     fn assert_response_headers(response: &ConnectResponse) {

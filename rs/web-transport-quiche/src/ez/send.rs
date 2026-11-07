@@ -475,6 +475,26 @@ impl SendStream {
         kio::wait(|waiter| self.poll_closed(waiter)).await
     }
 
+    // Used only after rejecting CONNECT and stopping its receive half. Unlike
+    // `closed`, this keeps the connection alive while quiche still owns bytes.
+    pub(crate) async fn rejected(&mut self) -> Result<(), StreamError> {
+        match self.closed().await {
+            Ok(()) => (),
+            Err(StreamError::Stop(_) | StreamError::Closed) => return Ok(()),
+            Err(err) => return Err(err),
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let waker = self.driver.lock().drain(self.id, sender);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        tokio::select! {
+            result = receiver => result.map_err(|_| StreamError::Closed)?
+                .map_err(|err| StreamError::Connection(err.into())),
+            err = kio::wait(|waiter| self.driver.lock().error(waiter)) => Err(err.into()),
+        }
+    }
+
     /// Set the priority of this stream.
     ///
     /// Streams with a **higher** value are sent first, but are not guaranteed to

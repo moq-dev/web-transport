@@ -79,6 +79,8 @@ impl H3Request {
     }
 
     /// Reject the session with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination; cancel to impose an application deadline.
     pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ServerError> {
         self.connect.reject(response).await?;
         Ok(())
