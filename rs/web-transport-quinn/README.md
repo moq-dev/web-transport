@@ -51,6 +51,11 @@ See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/b
     send.write(b"hello").await?;
 ```
 
+## Session lifetime
+Only `Session` clones keep the session alive. Dropping the final clone immediately closes the QUIC connection and cancels the CONNECT capsule reader, even when the peer keeps CONNECT open. Streams and native `quinn::Connection` handles do not extend this lifetime, including for `Session::raw`. Keep a Session clone while using its streams.
+
+Calling `Session::close` first transfers teardown to the bounded graceful-close task, so dropping the final Session does not interrupt capsule delivery or replace the first close reason. Cancellation, including before the task's first poll, synchronously closes the native connection and requests reader cancellation without spawning another task. Runtime shutdown releases resources as futures are dropped; peer delivery, driver draining and execution of awakened futures still require a live runtime. Keep the runtime alive and await `Session::closed` to allow graceful close to finish; its timeout can prevent capsule delivery.
+
 ## Async runtimes
 Each WebTransport session runs a background task that reads capsules from the CONNECT stream, and `Session::close` runs the graceful close in another.
 Both are spawned on the runtime that [quinn::default_runtime](https://docs.rs/quinn/latest/quinn/fn.default_runtime.html) detects, the same way `quinn::Endpoint::client` and `quinn::Endpoint::server` pick theirs.

@@ -11,7 +11,10 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use futures::stream::{FuturesUnordered, Stream, StreamExt};
+use futures::{
+    future::{AbortHandle, Abortable},
+    stream::{FuturesUnordered, Stream, StreamExt},
+};
 use kio::{Fan, Waiter};
 
 use crate::{
@@ -48,6 +51,35 @@ fn negotiated_alpn(_conn: &quinn::Connection) -> Option<String> {
     None
 }
 
+// Only frontend Session clones own this guard. Taking `close` transfers teardown
+// to the graceful-close future, so final Session drop cannot interrupt its capsule.
+struct SessionOwner {
+    close: Mutex<Option<Close>>,
+}
+
+// Captured before constructing the close future: even cancellation before its
+// first poll must close locally and wake the capsule reader without spawning.
+struct Close {
+    conn: quinn::Connection,
+    reader: Option<AbortHandle>,
+    code: quinn::VarInt,
+    reason: Vec<u8>,
+    // The HTTP/3 control stream must survive final Session drop during graceful close.
+    _settings: Option<Arc<Settings>>,
+}
+
+impl Drop for Close {
+    fn drop(&mut self) {
+        // Preserve a closure already observed from the peer or another terminal path.
+        if self.conn.close_reason().is_none() {
+            self.conn.close(self.code, &self.reason);
+        }
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+    }
+}
+
 /// An established WebTransport session, acting like a full QUIC connection. See [`quinn::Connection`].
 ///
 /// It is important to remember that WebTransport is layered on top of QUIC:
@@ -55,10 +87,16 @@ fn negotiated_alpn(_conn: &quinn::Connection) -> Option<String> {
 ///   2. Errors codes are encoded with the session ID, so they aren't full QUIC error codes.
 ///   3. Stream IDs may have gaps in them, used by HTTP/3 transparant to the application.
 ///
+/// Dropping the final Session clone closes the connection immediately, even if streams or
+/// native connection handles remain. An explicit [`Self::close`] already in progress keeps
+/// its bounded graceful close instead. Internal tasks do not own the session's lifetime.
+///
 /// Deref is used to expose non-overloaded methods on [`quinn::Connection`].
 /// These should be safe to use with WebTransport, but file a PR if you find one that isn't.
 #[derive(Clone)]
 pub struct Session {
+    owner: Arc<SessionOwner>,
+
     conn: quinn::Connection,
 
     // The session ID, as determined by the stream ID of the connect request.
@@ -71,10 +109,6 @@ pub struct Session {
     header_uni: Bytes,
     header_bi: Bytes,
     header_datagram: Bytes,
-
-    // Keep a reference to the settings and connect stream to avoid closing them until dropped.
-    #[allow(dead_code)]
-    settings: Option<Arc<Settings>>,
 
     // The send side of the CONNECT stream, used to write the CloseWebTransportSession capsule.
     // Wrapped in Arc<Mutex<Option<...>>> so close() can take it exactly once.
@@ -147,14 +181,25 @@ impl Session {
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
 
+        let (reader, registration) = AbortHandle::new_pair();
+        let owner = Arc::new(SessionOwner {
+            close: Mutex::new(Some(Close {
+                conn: conn.clone(),
+                reader: Some(reader),
+                code: crate::error::encode_stream_code(0, false),
+                reason: Vec::new(),
+                _settings: Some(Arc::new(settings)),
+            })),
+        });
+
         let this = Self {
+            owner,
             conn,
             accept: Some(Arc::new(Mutex::new(accept))),
             session_id: Some(session_id),
             header_uni: header_uni.into(),
             header_bi: header_bi.into(),
             header_datagram: header_datagram.into(),
-            settings: Some(Arc::new(settings)),
             connect_send: Arc::new(Mutex::new(Some(connect.send))),
             error: error.clone(),
             request: Some(connect.request.clone()),
@@ -175,7 +220,10 @@ impl Session {
         // runtime quinn detects, as quinn's own Endpoint::client and Endpoint::server do.
         let runtime = quinn::default_runtime().expect("no async runtime found");
         let conn2 = this.conn.clone();
-        runtime.spawn(Box::pin(Self::run_recv(conn2, connect.recv, error)));
+        let recv = Abortable::new(Self::run_recv(conn2, connect.recv, error), registration);
+        runtime.spawn(Box::pin(async move {
+            let _ = recv.await;
+        }));
 
         this
     }
@@ -395,13 +443,22 @@ impl Session {
     ///
     /// The capsule write and connection close happen asynchronously in a task spawned on
     /// the runtime [`quinn::default_runtime`] detects. Callers should `await`
-    /// [`Session::closed()`] to ensure the capsule has been delivered. Session operations
-    /// will fail once the QUIC connection is closed.
+    /// [`Session::closed()`] to wait for peer closure or the bounded timeout. Session
+    /// operations will fail once the QUIC connection is closed.
+    ///
+    /// Final Session drop preserves this graceful close. Cancelling its task closes the
+    /// native connection and requests capsule-reader cancellation synchronously, even
+    /// before the task's first poll. Runtime shutdown releases dropped task resources;
+    /// peer delivery and execution of awakened futures require a live runtime.
     ///
     /// When called where no runtime can be detected, such as outside a tokio runtime with
     /// only quinn's tokio support enabled, the capsule is skipped and the QUIC connection is
     /// closed immediately with the same code and reason.
     pub fn close(&self, code: u32, reason: &[u8]) {
+        self.close_on(code, reason, quinn::default_runtime());
+    }
+
+    fn close_on(&self, code: u32, reason: &[u8], runtime: Option<Arc<dyn quinn::Runtime>>) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
         // this is a no-op. A raw peer close that already arrived is latched first.
@@ -413,54 +470,46 @@ impl Session {
             return;
         }
 
+        // Move the synchronous fallback into the future itself, never into an async
+        // wrapper that would construct it only on the task's first poll.
+        let mut close = self
+            .owner
+            .close
+            .lock()
+            .unwrap()
+            .take()
+            .expect("first close");
+        close.code = crate::error::encode_stream_code(code, self.is_raw());
+        close.reason = reason.to_vec();
+
         if self.session_id.is_some() {
-            // Take the send stream for the capsule write.
             let send = self.connect_send.lock().unwrap().take();
-
             if let Some(send) = send {
-                // Without a runtime to run the graceful close on, such as when called from
-                // outside one, close the connection now and carry the reason there instead.
-                let Some(runtime) = quinn::default_runtime() else {
-                    let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
-                        .try_into()
-                        .unwrap();
-                    self.conn.close(http3_code, reason);
-                    return;
+                let Some(runtime) = runtime else {
+                    return; // `close` performs immediate teardown without a runtime.
                 };
-
-                let reason = String::from_utf8_lossy(reason).into_owned();
-                let conn = self.conn.clone();
-                let capsule =
-                    web_transport_proto::Capsule::CloseWebTransportSession { code, reason };
+                let capsule = web_transport_proto::Capsule::CloseWebTransportSession {
+                    code,
+                    reason: String::from_utf8_lossy(reason).into_owned(),
+                };
                 let timeout = (self.rtt() * 3).max(Duration::from_millis(100));
-
-                runtime.clone().spawn(Box::pin(async move {
-                    Self::close_with_capsule(conn, send, capsule, code, timeout, runtime).await;
-                }));
+                runtime.clone().spawn(Box::pin(Self::close_with_capsule(
+                    close, send, capsule, timeout, runtime,
+                )));
             }
-        } else {
-            // Raw QUIC mode: no capsule needed.
-            self.conn.close(code.into(), reason);
         }
+        // Raw sessions, or a missing CONNECT stream, close synchronously here.
     }
 
-    /// Write the CloseWebTransportSession capsule, finish the stream, wait for
-    /// the peer to close the connection (or timeout), then force-close.
+    /// Write the close capsule, finish CONNECT, then await the peer within one deadline.
+    /// Dropping this future at any point performs the same synchronous teardown.
     async fn close_with_capsule(
-        conn: quinn::Connection,
+        close: Close,
         mut send: quinn::SendStream,
         capsule: web_transport_proto::Capsule,
-        code: u32,
-        timeout: std::time::Duration,
+        timeout: Duration,
         runtime: Arc<dyn quinn::Runtime>,
     ) {
-        let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
-            .try_into()
-            .unwrap();
-
-        // Encode the capsule, then wrap it in an HTTP/3 DATA frame.
-        // In HTTP/3, capsule data is carried inside DATA frames on the CONNECT
-        // stream (RFC 9297 Section 3.2).
         let mut capsule_bytes = Vec::new();
         capsule.encode(&mut capsule_bytes);
 
@@ -468,45 +517,32 @@ impl Session {
         Frame::DATA.encode(&mut frame);
         let Ok(len) = VarInt::try_from(capsule_bytes.len()) else {
             tracing::warn!("capsule too large to encode as DATA frame");
-            conn.close(http3_code, b"");
             return;
         };
         len.encode(&mut frame);
         frame.extend_from_slice(&capsule_bytes);
 
-        // Bound the entire graceful-close sequence (capsule write, FIN,
-        // waiting for the peer) with a single timeout.  Without this, an
-        // unresponsive peer can cause write_all to block indefinitely when
-        // the send buffer fills up and no idle timeout is configured.
+        // Bound the write as well as the peer wait: flow control can block the
+        // capsule indefinitely when the peer neither reads nor closes.
         let graceful = async {
-            // Write the DATA frame to the CONNECT send stream.
             if let Err(e) = send.write_all(&frame).await {
                 tracing::warn!(?e, "failed to write CloseWebTransportSession capsule");
-                conn.close(http3_code, b"");
                 return;
             }
-
-            // FIN the send stream so the peer knows no more capsules are coming.
             if let Err(e) = send.finish() {
                 tracing::warn!(?e, "failed to finish CONNECT send stream");
-                conn.close(http3_code, b"");
                 return;
             }
-
-            // Wait for the peer to close the CONNECT stream after receiving the capsule.
-            conn.closed().await;
+            close.conn.closed().await;
         };
 
         // Timer deadlines are on the runtime's clock, which need not match Instant::now.
         let mut timer = runtime.new_timer(runtime.now() + timeout);
         let expired = poll_fn(|cx| timer.as_mut().poll(cx));
-
         futures::pin_mut!(graceful, expired);
-
         if let futures::future::Either::Right(_) = futures::future::select(graceful, expired).await
         {
             tracing::debug!("timeout waiting for peer to close; force-closing connection");
-            conn.close(http3_code, b"");
         }
     }
 
@@ -517,8 +553,9 @@ impl Session {
     ///
     /// Unlike [`quinn::Connection::closed`], this does **not** return early when
     /// [`close()`](Self::close) has been called. It waits for the underlying QUIC
-    /// connection to shut down, ensuring the `CloseWebTransportSession` capsule has
-    /// been delivered. Use [`close_reason()`](Self::close_reason) for a non-blocking check.
+    /// connection to shut down after peer closure or the bounded graceful-close timeout.
+    /// A timeout or task cancellation can prevent capsule delivery.
+    /// Use [`close_reason()`](Self::close_reason) for a non-blocking check.
     pub async fn closed(&self) -> SessionError {
         self.map_error(self.conn.closed().await)
     }
@@ -560,6 +597,9 @@ impl Session {
 
     /// Create a new session from a raw QUIC connection.
     ///
+    /// The final Session clone closes the connection even if native connection handles
+    /// or streams remain. Retain a Session clone to keep the connection alive.
+    ///
     /// This is used to pretend like a QUIC connection is a WebTransport session,
     /// making it easier to support WebTransport and raw QUIC simultaneously.
     ///
@@ -569,6 +609,15 @@ impl Session {
     /// (from `into_0rtt`, say) is fine, it just has no ALPN to report until it is done.
     pub fn raw(conn: quinn::Connection) -> Self {
         Self {
+            owner: Arc::new(SessionOwner {
+                close: Mutex::new(Some(Close {
+                    conn: conn.clone(),
+                    reader: None,
+                    code: 0u32.into(),
+                    reason: Vec::new(),
+                    _settings: None,
+                })),
+            }),
             error: Arc::new(CloseReason::raw(conn.clone())),
             conn,
             session_id: None,
@@ -585,7 +634,6 @@ impl Session {
             op_closed: Default::default(),
             parked_accept_uni: Default::default(),
             parked_accept_bi: Default::default(),
-            settings: None,
             connect_send: Arc::new(Mutex::new(None)),
             request: None,
             response: None,
@@ -1346,6 +1394,13 @@ mod tests {
     async fn pair_with(
         transport: quinn::TransportConfig,
     ) -> (quinn::Connection, quinn::Connection, [quinn::Endpoint; 2]) {
+        pair_with_transports(transport, Default::default()).await
+    }
+
+    async fn pair_with_transports(
+        transport: quinn::TransportConfig,
+        server_transport: quinn::TransportConfig,
+    ) -> (quinn::Connection, quinn::Connection, [quinn::Endpoint; 2]) {
         #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -1355,8 +1410,9 @@ mod tests {
             &signing_key,
         )));
 
-        let server_config =
+        let mut server_config =
             quinn::ServerConfig::with_single_cert(vec![cert.der().clone()], key).unwrap();
+        server_config.transport_config(Arc::new(server_transport));
         let server =
             quinn::Endpoint::server(server_config, (Ipv4Addr::LOCALHOST, 0).into()).unwrap();
 
@@ -1365,15 +1421,455 @@ mod tests {
         let mut client_config =
             quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
         client_config.transport_config(Arc::new(transport));
-        let client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        let mut client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+        client.set_default_client_config(client_config);
+        let endpoints = [client, server];
+        let (client_conn, server_conn) = reconnect(&endpoints).await;
+        (client_conn, server_conn, endpoints)
+    }
 
-        let connecting = client
-            .connect_with(client_config, server.local_addr().unwrap(), "localhost")
+    async fn reconnect(endpoints: &[quinn::Endpoint; 2]) -> (quinn::Connection, quinn::Connection) {
+        let connecting = endpoints[0]
+            .connect(endpoints[1].local_addr().unwrap(), "localhost")
             .unwrap();
-        let accept = async { server.accept().await.unwrap().await.unwrap() };
-        let (client_conn, server_conn) = tokio::join!(async { connecting.await.unwrap() }, accept);
+        let accept = async { endpoints[1].accept().await.unwrap().await.unwrap() };
+        tokio::join!(async { connecting.await.unwrap() }, accept)
+    }
 
-        (client_conn, server_conn, [client, server])
+    /// A peer that retains CONNECT without running a capsule reader.
+    async fn http3(
+        client: quinn::Connection,
+        server: &quinn::Connection,
+    ) -> (Session, Settings, Connected) {
+        let peer = async {
+            let settings = Settings::connect(server).await.unwrap();
+            let connect = crate::Connecting::accept(server)
+                .await
+                .unwrap()
+                .respond(http::StatusCode::OK)
+                .await
+                .unwrap();
+            (settings, connect)
+        };
+        let (session, (settings, connect)) = tokio::join!(
+            Session::connect(client, url::Url::parse("https://localhost/").unwrap()),
+            peer
+        );
+        (session.unwrap(), settings, connect)
+    }
+
+    async fn http3_pair() -> (Session, Connected, quinn::Connection, [quinn::Endpoint; 2]) {
+        let (client, server, endpoints) = pair().await;
+        let (session, _settings, connect) = http3(client, &server).await;
+        (session, connect, server, endpoints)
+    }
+
+    // The error is held by the capsule reader, but not its cancellation handle.
+    // Once frontend handles and streams are gone, its weak ownership proves task completion.
+    async fn reader_released<T>(error: std::sync::Weak<T>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while error.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capsule reader retained the connection's state");
+    }
+
+    #[tokio::test]
+    async fn final_http3_session_drop_closes_with_connect_open() {
+        let (session, _connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        drop(session);
+        assert!(
+            native.close_reason().is_some(),
+            "final Session drop did not close"
+        );
+        reader_released(reader).await;
+        tokio::time::timeout(Duration::from_secs(5), peer.closed())
+            .await
+            .expect("peer did not observe final Session drop");
+    }
+
+    #[tokio::test]
+    async fn final_raw_session_drop_closes_with_native_handle_retained() {
+        let (native, peer, _endpoints) = pair().await;
+        let session = Session::raw(native.clone());
+        drop(session);
+        assert!(
+            native.close_reason().is_some(),
+            "native handles kept the Session alive"
+        );
+        tokio::time::timeout(Duration::from_secs(5), peer.closed())
+            .await
+            .expect("peer did not observe final Session drop");
+    }
+
+    #[tokio::test]
+    async fn only_session_clones_own_the_connection() {
+        for raw in [false, true] {
+            let (client, peer, _endpoints) = pair().await;
+            let (session, _http3) = if raw {
+                (Session::raw(client), None)
+            } else {
+                let (session, settings, connect) = http3(client, &peer).await;
+                (session, Some((settings, connect)))
+            };
+            let clone = session.clone();
+            let native = session.conn.clone();
+            let reader = Arc::downgrade(&session.error);
+            drop(session);
+            assert!(native.close_reason().is_none());
+            clone.send_datagram(Bytes::from_static(b"alive")).unwrap();
+            let datagram = tokio::time::timeout(Duration::from_secs(5), peer.read_datagram())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(datagram.ends_with(b"alive"));
+
+            // Both stream halves and a native connection outlive the final Session.
+            let (mut send, recv) = clone.open_bi().await.unwrap();
+            send.write_all(b"alive").await.unwrap();
+            let (_peer_send, mut peer_recv) = peer.accept_bi().await.unwrap();
+            let mut bytes = vec![0; if raw { 5 } else { 8 }];
+            peer_recv.read_exact(&mut bytes).await.unwrap();
+            assert!(bytes.ends_with(b"alive"));
+            drop(clone);
+            assert!(native.close_reason().is_some());
+            assert!(send.write_all(b"closed").await.is_err());
+            drop((send, recv));
+            reader_released(reader).await;
+            tokio::time::timeout(Duration::from_secs(5), peer.closed())
+                .await
+                .unwrap();
+        }
+    }
+
+    type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    // Holds spawned close tasks so tests choose exactly when they are polled or cancelled.
+    #[derive(Default)]
+    struct CapturedRuntime {
+        tasks: Mutex<Vec<Task>>,
+    }
+
+    impl fmt::Debug for CapturedRuntime {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("CapturedRuntime")
+        }
+    }
+
+    impl CapturedRuntime {
+        fn take(&self) -> Task {
+            let mut tasks = self.tasks.lock().unwrap();
+            assert_eq!(tasks.len(), 1, "close started more than once");
+            tasks.pop().unwrap()
+        }
+    }
+
+    impl quinn::Runtime for CapturedRuntime {
+        fn new_timer(&self, deadline: std::time::Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+            quinn::TokioRuntime.new_timer(deadline)
+        }
+        fn spawn(&self, future: Task) {
+            self.tasks.lock().unwrap().push(future);
+        }
+        fn wrap_udp_socket(
+            &self,
+            socket: std::net::UdpSocket,
+        ) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+            quinn::TokioRuntime.wrap_udp_socket(socket)
+        }
+        fn now(&self) -> std::time::Instant {
+            quinn::TokioRuntime.now()
+        }
+    }
+
+    fn assert_peer_close(error: quinn::ConnectionError, code: u32, reason: &[u8]) {
+        let quinn::ConnectionError::ApplicationClosed(close) = error else {
+            panic!("unexpected peer error: {error:?}");
+        };
+        assert_eq!(
+            close.error_code,
+            crate::error::encode_stream_code(code, false)
+        );
+        assert_eq!(close.reason, reason);
+    }
+
+    #[tokio::test]
+    async fn close_without_detectable_runtime_closes_synchronously() {
+        let (session, _connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        session.close_on(42, b"first", None);
+        assert!(native.close_reason().is_some());
+        drop(session);
+        reader_released(reader).await;
+        assert_peer_close(peer.closed().await, 42, b"first");
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_before_first_poll_preserves_first_reason() {
+        let (session, _connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(42, b"first", Some(runtime.clone()));
+        session.close_on(43, b"second", Some(runtime.clone()));
+        let task = runtime.take();
+        drop(session);
+        assert!(
+            native.close_reason().is_none(),
+            "final drop interrupted graceful close"
+        );
+        drop(task); // Never polled, including the first statement of its async body.
+        assert!(native.close_reason().is_some());
+        reader_released(reader).await;
+        let error = tokio::time::timeout(Duration::from_secs(5), peer.closed())
+            .await
+            .unwrap();
+        assert_peer_close(error, 42, b"first");
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_while_waiting_for_peer() {
+        let (session, connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(42, b"first", Some(runtime.clone()));
+        let mut task = runtime.take();
+        assert!(futures::poll!(&mut task).is_pending());
+        let capsule =
+            tokio::time::timeout(Duration::from_secs(5), Session::read_capsules(connect.recv))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(capsule, (42, "first".into()));
+        drop(session);
+        assert!(native.close_reason().is_none());
+        drop(task);
+        assert!(native.close_reason().is_some());
+        reader_released(reader).await;
+        assert_peer_close(peer.closed().await, 42, b"first");
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_observed_peer_error() {
+        let (session, _connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(42, b"local", Some(runtime.clone()));
+        let task = runtime.take();
+        peer.close(crate::error::encode_stream_code(99, false), b"peer");
+        let observed = native.closed().await;
+        assert_peer_close(observed.clone(), 99, b"peer");
+        drop(task);
+        assert_eq!(
+            native.close_reason().unwrap().to_string(),
+            observed.to_string()
+        );
+        drop(session);
+        reader_released(reader).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_close_survives_final_drop_and_delivers_capsule() {
+        let (session, connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        let settings = Arc::downgrade(
+            session
+                .owner
+                .close
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                ._settings
+                .as_ref()
+                .unwrap(),
+        );
+        session.close(42, b"first");
+        session.close(43, b"second");
+        drop(session);
+        assert!(native.close_reason().is_none());
+        assert!(
+            settings.strong_count() > 0,
+            "final drop closed the HTTP/3 control stream"
+        );
+        let capsule =
+            tokio::time::timeout(Duration::from_secs(5), Session::read_capsules(connect.recv))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(capsule, (42, "first".into()));
+        peer.close(0u32.into(), b"ack");
+        native.closed().await;
+        reader_released(reader).await;
+        reader_released(settings).await;
+    }
+
+    // The capsule is larger than the peer's CONNECT receive credit and the peer never reads it.
+    async fn blocked_close() -> (
+        Session,
+        Connected,
+        quinn::Connection,
+        [quinn::Endpoint; 2],
+        Task,
+    ) {
+        let mut transport = quinn::TransportConfig::default();
+        transport.send_window(4096);
+        let mut peer_transport = quinn::TransportConfig::default();
+        peer_transport.stream_receive_window(4096u32.into());
+        let (client, peer, endpoints) = pair_with_transports(transport, peer_transport).await;
+        let (session, _settings, connect) = http3(client, &peer).await;
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(42, &vec![b'x'; 65536], Some(runtime.clone()));
+        let mut task = runtime.take();
+        assert!(futures::poll!(&mut task).is_pending());
+        // A blocked write has not reached FIN. The peer retains its receive stream.
+        (session, connect, peer, endpoints, task)
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_during_blocked_capsule_write() {
+        let (session, _connect, peer, _endpoints, task) = blocked_close().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        drop(session);
+        assert!(native.close_reason().is_none());
+        drop(task);
+        assert!(native.close_reason().is_some());
+        reader_released(reader).await;
+        tokio::time::timeout(Duration::from_secs(5), peer.closed())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_close_timeout_covers_blocked_write_and_peer_wait() {
+        for blocked in [false, true] {
+            let (session, _connect, peer, _endpoints, mut task) = if blocked {
+                blocked_close().await
+            } else {
+                let (session, connect, peer, endpoints) = http3_pair().await;
+                let runtime = Arc::new(CapturedRuntime::default());
+                session.close_on(42, b"first", Some(runtime.clone()));
+                (session, connect, peer, endpoints, runtime.take())
+            };
+            let native = session.conn.clone();
+            let reader = Arc::downgrade(&session.error);
+            tokio::time::pause();
+            assert!(futures::poll!(&mut task).is_pending());
+            drop(session);
+            assert!(native.close_reason().is_none());
+            // The production timeout is max(3 * RTT, 100ms); advance controlled time beyond it.
+            tokio::time::advance(Duration::from_secs(1)).await;
+            task.await;
+            assert!(native.close_reason().is_some());
+            reader_released(reader).await;
+            tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(5), peer.closed())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_drop_cancels_yielded_close_and_releases_reader() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (native, reader, abort, endpoints) = runtime.block_on(async {
+            let (session, _connect, _peer, endpoints) = http3_pair().await;
+            let native = session.conn.clone();
+            let reader = Arc::downgrade(&session.error);
+            let abort = session
+                .owner
+                .close
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .reader
+                .clone()
+                .unwrap();
+            session.close(42, b"first");
+            drop(session);
+            // Let the spawned task yield while waiting for peer closure.
+            tokio::task::yield_now().await;
+            assert!(native.close_reason().is_none());
+            (native, reader, abort, endpoints)
+        });
+        // The close future is pending before runtime shutdown. Its drop must both
+        // wake connection waiters and request reader cancellation locally.
+        let mut closed = Box::pin(native.closed());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        assert!(!abort.is_aborted());
+        drop(runtime);
+        assert!(abort.is_aborted());
+        assert!(closed.as_mut().poll(&mut cx).is_ready());
+        drop(closed);
+        assert!(native.close_reason().is_some());
+        assert_eq!(reader.strong_count(), 0, "runtime retained the reader");
+        drop((native, endpoints));
+    }
+
+    #[tokio::test]
+    async fn repeated_close_cycles_return_endpoints_to_baseline() {
+        let (client, peer, endpoints) = pair().await;
+        drop((client, peer));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(endpoints[0].wait_idle(), endpoints[1].wait_idle());
+        })
+        .await
+        .unwrap();
+        let baseline = endpoints.each_ref().map(|e| e.open_connections());
+        for _ in 0..3 {
+            for mode in 0..3 {
+                let (client, peer) = reconnect(&endpoints).await;
+                let (session, settings, connect) = http3(client, &peer).await;
+                let mut connect = Some(connect);
+                let native = session.conn.clone();
+                let reader = Arc::downgrade(&session.error);
+                match mode {
+                    0 => drop(session),
+                    1 => {
+                        session.close(42, b"bye");
+                        drop(session);
+                        assert_eq!(
+                            Session::read_capsules(connect.take().unwrap().recv).await,
+                            Some((42, "bye".into()))
+                        );
+                        peer.close(0u32.into(), b"ack");
+                    }
+                    2 => {
+                        let runtime = Arc::new(CapturedRuntime::default());
+                        session.close_on(42, b"cancel", Some(runtime.clone()));
+                        let task = runtime.take();
+                        drop(session);
+                        drop(task);
+                    }
+                    _ => unreachable!(),
+                }
+                tokio::time::timeout(Duration::from_secs(5), native.closed())
+                    .await
+                    .unwrap();
+                reader_released(reader).await;
+                drop((native, settings, connect, peer));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(endpoints[0].wait_idle(), endpoints[1].wait_idle());
+                })
+                .await
+                .expect("endpoint retained a closed session");
+                assert_eq!(endpoints.each_ref().map(|e| e.open_connections()), baseline);
+            }
+        }
     }
 
     fn assert_reset(err: SessionError) {
@@ -1471,7 +1967,7 @@ mod tests {
 
             // Move the deadline onto the real clock; one already in this clock's past fires at once.
             let remaining = deadline.saturating_duration_since(self.now());
-            quinn::TokioRuntime.new_timer(std::time::Instant::now() + remaining)
+            quinn::TokioRuntime.new_timer(quinn::TokioRuntime.now() + remaining)
         }
 
         fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -1486,7 +1982,7 @@ mod tests {
         }
 
         fn now(&self) -> std::time::Instant {
-            std::time::Instant::now() + OFFSET
+            quinn::TokioRuntime.now() + OFFSET
         }
     }
 
@@ -1499,6 +1995,7 @@ mod tests {
         let (client, _server, _endpoints) = pair().await;
         let (send, _recv) = client.open_bi().await.unwrap();
 
+        tokio::time::pause();
         let runtime = Arc::new(OffsetRuntime::default());
         let before = runtime.now();
 
@@ -1508,10 +2005,15 @@ mod tests {
             reason: "bye".into(),
         };
         Session::close_with_capsule(
-            client.clone(),
+            Close {
+                conn: client.clone(),
+                reader: None,
+                code: crate::error::encode_stream_code(0, false),
+                reason: b"bye".to_vec(),
+                _settings: None,
+            },
             send,
             capsule,
-            0,
             Duration::from_millis(100),
             runtime.clone(),
         )
