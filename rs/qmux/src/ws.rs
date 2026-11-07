@@ -223,6 +223,9 @@ impl Client {
     /// On record-framed drafts (QMux01+), the advertised record size is clamped
     /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
     /// establishment locally, before any QMux parameters are sent.
+    /// For bare-frame versions, callers must allow the peer's frame sizes:
+    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// negotiates no size bound.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
         self
@@ -283,7 +286,7 @@ impl Client {
         );
 
         #[cfg(feature = "wss")]
-        let (ws_stream, response) = {
+        let (mut ws_stream, response) = {
             tokio_tungstenite::connect_async_tls_with_config(
                 request,
                 self.config,
@@ -295,7 +298,7 @@ impl Client {
         };
 
         #[cfg(not(feature = "wss"))]
-        let (ws_stream, response) =
+        let (mut ws_stream, response) =
             tokio_tungstenite::connect_async_with_config(request, self.config, false)
                 .await
                 .map_err(Error::from)?;
@@ -319,7 +322,9 @@ impl Client {
         let config = session_config(
             self.session.clone().with_negotiated(version, protocol),
             self.config,
-        )?;
+            &mut ws_stream,
+        )
+        .await?;
         let transport = WsTransport::new(ws_stream, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -391,6 +396,9 @@ impl Server {
     /// On record-framed drafts (QMux01+), the advertised record size is clamped
     /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
     /// establishment locally, before any QMux parameters are sent.
+    /// For bare-frame versions, callers must allow the peer's frame sizes:
+    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// negotiates no size bound.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
         self
@@ -494,7 +502,7 @@ impl Server {
                 .unwrap())
         };
 
-        let ws =
+        let mut ws =
             tokio_tungstenite::accept_hdr_async_with_config(socket, callback, self.config).await?;
 
         let (version, protocol) = negotiated
@@ -506,7 +514,9 @@ impl Server {
         let config = session_config(
             self.session.clone().with_negotiated(version, protocol),
             self.config,
-        )?;
+            &mut ws,
+        )
+        .await?;
         let transport = WsTransport::new(ws, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -517,9 +527,10 @@ impl Server {
     }
 }
 
-fn session_config(
+async fn session_config<T: AsyncRead + AsyncWrite + Unpin>(
     mut session: Config,
     websocket: Option<tungstenite::protocol::WebSocketConfig>,
+    stream: &mut tokio_tungstenite::WebSocketStream<T>,
 ) -> Result<Config, Error> {
     if !session.version.uses_records() {
         return Ok(session);
@@ -532,6 +543,12 @@ fn session_config(
         session.max_record_size = session.max_record_size.min(limit as u64);
     }
     if session.max_record_size < crate::DEFAULT_MAX_RECORD_SIZE {
+        stream
+            .close(Some(tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::Error,
+                reason: "QMux record limit below minimum".into(),
+            }))
+            .await?;
         return Err(Error::TransportParameter);
     }
     Ok(session)
@@ -737,6 +754,17 @@ mod record_size_tests {
         }
     }
 
+    async fn assert_local_config_close(peer: &mut WebSocketStream<TcpStream>) {
+        let Message::Close(Some(close)) = peer.next().await.unwrap().unwrap() else {
+            panic!("expected a WebSocket Close without QMux parameters");
+        };
+        assert_eq!(
+            close.code,
+            tungstenite::protocol::frame::coding::CloseCode::Error
+        );
+        assert_eq!(close.reason.as_str(), "QMux record limit below minimum");
+    }
+
     #[tokio::test]
     async fn invalid_record_limits_fail_without_advertising_parameters() {
         let min = DEFAULT_MAX_RECORD_SIZE as usize;
@@ -752,14 +780,14 @@ mod record_size_tests {
                         assert!(matches!(session, Err(Error::TransportParameter)));
                         // The WebSocket negotiated a record-framed draft, but no
                         // invalid QMux transport parameters were put on the wire.
-                        assert!(!matches!(peer.next().await, Some(Ok(Message::Binary(_)))));
+                        assert_local_config_close(&mut peer).await;
                     }
                 }
                 let mut config = Config::new(version);
                 config.max_record_size = DEFAULT_MAX_RECORD_SIZE - 1;
                 let (session, mut peer) = session_peer(server, None, config).await;
                 assert!(matches!(session, Err(Error::TransportParameter)));
-                assert!(!matches!(peer.next().await, Some(Ok(Message::Binary(_)))));
+                assert_local_config_close(&mut peer).await;
             }
         }
     }
