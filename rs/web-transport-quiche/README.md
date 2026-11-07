@@ -58,12 +58,12 @@ final drop preserves an explicit close already in progress. Await
 `web_transport_trait::Stats::estimated_send_rate()` expose the same estimate in
 bits per second. The driver snapshots Quiche's public `PathStats::delivery_rate`
 and converts bytes per second with saturating multiplication by eight.
-`None` means the snapshot has no path; `Some(0)` is possible before a usable
-sample. The estimate is not a guarantee of link capacity or application throughput,
+`None` means no path statistics have been sampled yet; `Some(0)` is possible
+before a usable sample. The estimate is not a guarantee of link capacity or application throughput,
 and it can remain stale while the application sends too little to measure capacity.
 
-With tokio-quiche 0.20 and Quiche 0.30, both client and server use the
-[default `cubic` controller][cc-default]. Pass `Settings` to either builder's
+For the audited tokio-quiche 0.20.1 and Quiche 0.30.0 releases, both client and
+server use the [default `cubic` controller][cc-default]. Pass `Settings` to either builder's
 `with_settings` method to select another `cc_algorithm`:
 
 | `Settings::cc_algorithm` | Meaning of the reported estimate |
@@ -77,14 +77,16 @@ before replacing its stored rate, so this value is not an unfiltered raw sample.
 Its per-sample flag is internal, and `PathStats::max_bandwidth` is `None` for
 these controllers. The public statistics therefore cannot support a separate
 application-side windowed filter that distinguishes app-limited samples.
+Deriving `cwnd / rtt` would give a send-window heuristic rather than a measured
+delivery rate, and would not recover that missing flag.
 
 For BBR2, [the network model][bbr-model] reports
 `min(max_bandwidth, bandwidth_lo)` when the congestion bound exists, and
 `max_bandwidth` otherwise. Using the public `PathStats::max_bandwidth` instead
 would discard that bound. Keeping `delivery_rate` preserves both upstream sample
-filtering and the controller's response to congestion. Quiche also requires
-respecting pacing hints for accurate delivery-rate estimates; tokio-quiche drives
-packet transmission here.
+filtering and the controller's response to congestion. Delivery-rate accuracy
+also depends on respecting Quiche's pacing hints: disabling pacing or ignoring
+those hints in the transport or platform can distort the estimate.
 
 [cc-default]: https://github.com/cloudflare/quiche/blob/925b225825e2188f8e58e359114150500557bf61/tokio-quiche/src/settings/quic.rs
 [cc-selector]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/mod.rs

@@ -48,7 +48,8 @@ pub struct ConnectionStats {
     ///
     /// This is not a guarantee of link capacity or application throughput.
     /// Estimates can remain stale while the sender is app-limited. `Some(0)`
-    /// is possible before a usable sample; `None` means the snapshot has no path.
+    /// is possible before a usable sample; `None` means no path statistics have
+    /// been sampled yet.
     pub send_rate: Option<u64>,
 }
 
@@ -66,8 +67,6 @@ impl ConnectionStats {
             packets_received: stats.recv as u64,
             packets_lost: stats.lost as u64,
             rtt: path.as_ref().map(|p| p.rtt),
-            // Both recovery implementations filter app-limited samples upstream.
-            // BBR2's delivery_rate also honors its congestion bound; max_bandwidth does not.
             // Quiche reports bytes/sec; the trait wants bits/sec.
             send_rate: path.as_ref().map(|p| p.delivery_rate.saturating_mul(8)),
         }
