@@ -11,6 +11,8 @@ It implements the [`web-transport-trait`] traits for iroh connections and stream
 
 The crate was originally derived from [`web-transport-quinn`].
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## License
 
 Copyright 2025 N0, INC.

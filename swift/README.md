@@ -2,6 +2,8 @@
 
 A Swift wrapper around the [web-transport-ffi](../rs/web-transport-ffi) UniFFI bindings for [WebTransport over HTTP/3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/).
 
+See the [package and backend selection guide](../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 The package is distributed as a GitHub Release asset on the [moq-dev/web-transport](https://github.com/moq-dev/web-transport) repo. There is **no SPM mirror yet**, so SPM cannot resolve a `https://github.com/...` URL directly until one is set up.

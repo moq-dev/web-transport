@@ -5,6 +5,8 @@
 # web-transport-wasm
 A wrapper around the WebTransport browser API.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Poll and async
 
 The browser API is a set of promises, but the surface here is a state machine. Every operation is a

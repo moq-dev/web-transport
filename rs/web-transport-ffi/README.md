@@ -4,6 +4,8 @@ Low-level UniFFI bindings for WebTransport over HTTP/3 (QUIC). Generates Python,
 
 For an ergonomic Python API (async context managers, legacy exception hierarchy), see [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) which wraps this package.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Building
 
 ```bash

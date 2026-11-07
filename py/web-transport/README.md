@@ -5,6 +5,8 @@
 
 Python bindings for [web-transport-quinn](https://docs.rs/web-transport-quinn/) — a pure-Rust WebTransport library built on QUIC.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Features
 
 - **Server and client** — one session per connection, no HTTP/3 pooling complexity

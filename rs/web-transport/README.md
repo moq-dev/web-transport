@@ -15,6 +15,7 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
 
 ## Why no trait?
 
