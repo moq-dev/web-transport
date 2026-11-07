@@ -246,14 +246,21 @@ impl Session {
                 if error.set(err.into()).is_err() {
                     return;
                 }
-                conn.close(http3_code, reason.as_bytes());
+                if conn.close_reason().is_none() {
+                    conn.close(http3_code, reason.as_bytes());
+                }
             }
             None => {
-                let err = quinn::ConnectionError::LocallyClosed.into();
+                let err = conn
+                    .close_reason()
+                    .unwrap_or(quinn::ConnectionError::LocallyClosed)
+                    .into();
                 if error.set(err).is_err() {
                     return;
                 }
-                conn.close(http3_code, b"");
+                if conn.close_reason().is_none() {
+                    conn.close(http3_code, b"");
+                }
             }
         };
     }
@@ -1653,6 +1660,26 @@ mod tests {
         assert!(native.close_reason().is_some());
         reader_released(reader).await;
         assert_peer_close(peer.closed().await, 42, b"first");
+    }
+
+    #[tokio::test]
+    async fn reader_preserves_observed_peer_error() {
+        let (client, peer, _endpoints) = pair().await;
+        let (mut send, recv) = client.open_bi().await.unwrap();
+        send.write_all(b"connect").await.unwrap();
+        let _connect = peer.accept_bi().await.unwrap();
+        let error = Arc::new(CloseReason::http3());
+        peer.close(crate::error::encode_stream_code(99, false), b"peer");
+        let observed = client.closed().await;
+        Session::run_recv(client.clone(), recv, error.clone()).await;
+        assert_peer_close(client.close_reason().unwrap(), 99, b"peer");
+        assert!(
+            matches!(error.get(), Some(SessionError::WebTransportError(WebTransportError::Closed(99, reason))) if reason == "peer")
+        );
+        assert_eq!(
+            client.close_reason().unwrap().to_string(),
+            observed.to_string()
+        );
     }
 
     #[tokio::test]
