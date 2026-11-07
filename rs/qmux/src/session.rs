@@ -186,7 +186,26 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Releases the transport stats even if the reader task is cancelled or unwinds.
+struct SocketStatsGuard(Arc<Mutex<Option<crate::SharedSocketStats>>>);
+
+impl Drop for SocketStatsGuard {
+    fn drop(&mut self) {
+        // A custom stats provider may have panicked during a read. Its poisoned
+        // lock must not prevent descriptor release or the rest of teardown.
+        let stats = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(stats);
+    }
+}
+
 /// A multiplexed session over a reliable transport.
+///
+/// Closing signals the terminal reason immediately; `closed()` does not wait for
+/// asynchronous transport cleanup to finish.
 #[derive(Clone)]
 pub struct Session {
     is_server: bool,
@@ -1428,32 +1447,24 @@ impl<R: Reader> SessionState<R> {
     async fn run(&mut self) -> Result<(), Error> {
         let mut closed = self.closed.subscribe();
 
-        loop {
-            // The idle timeout and keep-alive ping are owned by the timer task,
-            // which reads the `last_recv_at` we publish below. Keeping the deadline
-            // off this select is what stops application backpressure — parking in
-            // `recv_frame`'s `accept_*.send().await` — from starving the deadline
-            // and firing a spurious idle close on re-entry.
-            tokio::select! {
-                biased;
-                result = self.reader.recv() => {
-                    let data = result?;
-                    // Publish receive progress for the timer's idle deadline.
+        // Race the whole loop, including delivery to bounded accept queues,
+        // against closure so a retained Session cannot strand terminal cleanup.
+        tokio::select! {
+            biased;
+            result = async {
+                loop {
+                    let data = self.reader.recv().await?;
                     self.last_recv_at.store(
                         millis_since(self.base, tokio::time::Instant::now()),
                         Ordering::Release,
                     );
                     if self.config.version.uses_records() {
-                        // Record-framed drafts: data is a record containing one or more frames
                         for frame in Frame::decode_record(data)? {
                             self.recv_frame(frame).await?;
                         }
                     } else {
-                        // draft-00 §5.2: `max_frame_size` bounds the whole frame,
-                        // header included, and may only be raised from its initial
-                        // value — which we never do, so the initial value is what a
-                        // peer may send. Each message is one frame here. The legacy
-                        // binding predates the parameter and bounds nothing.
+                        // Draft-00 bounds the whole frame; the legacy binding
+                        // predates max_frame_size and has no such bound.
                         if self.config.version == Version::QMux00 && data.len() > MAX_FRAME_SIZE {
                             return Err(Error::FrameTooLarge);
                         }
@@ -1462,9 +1473,9 @@ impl<R: Reader> SessionState<R> {
                         }
                     }
                 }
-                _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
-                    return Err(closed.borrow().clone().unwrap_or(Error::Closed))
-                }
+            } => result,
+            _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => {
+                Err(closed.borrow().clone().unwrap_or(Error::Closed))
             }
         }
     }
@@ -2324,7 +2335,7 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
-        let teardown_socket_stats = socket_stats.clone();
+        let teardown_socket_stats = SocketStatsGuard(socket_stats.clone());
         tokio::spawn(async move {
             let err = backend.run().await.err().unwrap_or(Error::Closed);
             // If we tore down because of a protocol/transport violation *we*
@@ -2354,10 +2365,10 @@ impl Session {
             backend.conn_recv_credit.close();
             backend.outbound.close();
             backend.streams.lock().unwrap().close();
-            teardown_socket_stats.lock().unwrap().take();
-            // Recorded last, so a `closed()` waiter sees credits and streams closed.
-            // The reader often fails (EOF, WebSocket Close) right after an
-            // APPLICATION_CLOSE, so keep the reason recorded first.
+            drop(teardown_socket_stats);
+            // Publish the backend's reason after cleanup, preserving an earlier
+            // close signal such as APPLICATION_CLOSE rather than replacing it
+            // with the transport's subsequent EOF or WebSocket Close.
             note_closed(&backend.closed, err);
         });
 
@@ -2426,8 +2437,15 @@ impl generic::Session for Session {
         };
         // Hold the lock through the reads so teardown cannot drop the descriptor
         // during a read, and a reader cannot retain it after cleanup completes.
-        let socket = self.socket_stats.lock().unwrap();
-        let socket = socket.as_ref();
+        let socket = self
+            .socket_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let socket = if self.closed.borrow().is_none() {
+            socket.as_ref()
+        } else {
+            None
+        };
         SessionStats {
             streams,
             // Fall back to our own QX_PING measurement only when the transport
@@ -5468,5 +5486,193 @@ mod credit_update_tests {
         for err in closed_with(Frame::MaxStreamData { id, max: 10 }).await {
             assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_stats_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use web_transport_trait::{Session as _, Stats as _};
+
+    struct Stats {
+        panic: AtomicBool,
+        _released: oneshot::Sender<()>,
+    }
+
+    impl crate::SocketStats for Stats {
+        fn rtt(&self) -> Option<Duration> {
+            assert!(!self.panic.swap(false, Ordering::Relaxed), "stats panic");
+            Some(Duration::from_millis(1))
+        }
+    }
+
+    struct TestTransport {
+        stats: crate::SharedSocketStats,
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        received: mpsc::UnboundedSender<()>,
+        failed: oneshot::Receiver<()>,
+    }
+
+    struct TestReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        received: mpsc::UnboundedSender<()>,
+    }
+
+    struct TestWriter(oneshot::Receiver<()>);
+
+    impl Transport for TestTransport {
+        type Reader = TestReader;
+        type Writer = TestWriter;
+
+        fn socket_stats(&self) -> Option<crate::SharedSocketStats> {
+            Some(self.stats.clone())
+        }
+
+        fn split(self) -> (Self::Writer, Self::Reader) {
+            (
+                TestWriter(self.failed),
+                TestReader {
+                    incoming: self.incoming,
+                    received: self.received,
+                },
+            )
+        }
+    }
+
+    impl Reader for TestReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            let data = self.incoming.recv().await.ok_or(Error::Closed)?;
+            self.received.send(()).unwrap();
+            Ok(data)
+        }
+    }
+
+    impl Writer for TestWriter {
+        async fn send(&mut self, _: Bytes) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn maintain(&mut self) -> Result<(), Error> {
+            let _ = (&mut self.0).await;
+            Err(Error::Closed)
+        }
+    }
+
+    struct Fixture {
+        session: Session,
+        incoming: mpsc::UnboundedSender<Bytes>,
+        received: mpsc::UnboundedReceiver<()>,
+        fail: oneshot::Sender<()>,
+        released: oneshot::Receiver<()>,
+    }
+
+    fn fixture(panic: bool) -> Fixture {
+        let (released, done) = oneshot::channel();
+        let stats = Arc::new(Stats {
+            panic: AtomicBool::new(panic),
+            _released: released,
+        });
+        let (incoming, reader) = mpsc::unbounded_channel();
+        let (received, received_rx) = mpsc::unbounded_channel();
+        let (fail, failed) = oneshot::channel();
+        let session = Session::new(
+            TestTransport {
+                stats,
+                incoming: reader,
+                received,
+                failed,
+            },
+            false,
+            Config::new(Version::WebTransport),
+        );
+        Fixture {
+            session,
+            incoming,
+            received: received_rx,
+            fail,
+            released: done,
+        }
+    }
+
+    async fn released(done: oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .expect("stats retained after termination")
+            .expect_err("stats signal by dropping");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_accept_queue_does_not_retain_stats_on_close_or_writer_failure() {
+        for dir in [StreamDir::Uni, StreamDir::Bi] {
+            for writer_failure in [false, true] {
+                let mut f = fixture(false);
+                for index in 0..=1024 {
+                    let frame = Frame::Stream(Stream {
+                        id: StreamId::new(index, dir, true),
+                        offset: 0,
+                        data: Bytes::new(),
+                        fin: false,
+                    });
+                    f.incoming
+                        .send(frame.encode(Version::WebTransport).unwrap())
+                        .unwrap();
+                    // On this single-threaded runtime the reader processes the
+                    // frame until it yields before this notification is observed.
+                    f.received.recv().await.unwrap();
+                }
+                if writer_failure {
+                    f.fail.send(()).unwrap();
+                } else {
+                    f.session.close(0, "done");
+                }
+                released(f.released).await;
+                assert_eq!(f.session.stats().rtt(), None);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panicking_stats_do_not_poison_future_reads_or_teardown() {
+        let f = fixture(true);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.session.stats())).is_err()
+        );
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(1)));
+        drop(f.incoming);
+        released(f.released).await;
+        assert!(matches!(f.session.closed().await, Error::Closed));
+        assert_eq!(f.session.stats().rtt(), None);
+    }
+
+    #[test]
+    fn runtime_shutdown_releases_stats_with_retained_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut f = runtime.block_on(async { fixture(false) });
+        drop(runtime);
+        assert!(matches!(
+            f.released.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(f.session.stats().rtt(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_hides_socket_metrics_and_preserves_qmux_rtt() {
+        let f = fixture(false);
+        let sent = tokio::time::Instant::now();
+        f.session.rtt.sent(0, sent);
+        f.session.rtt.received(0, sent + Duration::from_millis(2));
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(1)));
+        f.session.close(0, "done");
+        f.session.closed().await;
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(2)));
+        released(f.released).await;
     }
 }

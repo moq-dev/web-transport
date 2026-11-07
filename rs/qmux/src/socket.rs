@@ -15,7 +15,7 @@ use std::time::Duration;
 /// Implementations read through to the socket on each call rather than caching, so
 /// a caller polling this sees the transport's current view. Every metric is
 /// optional: `None` means this transport doesn't track it. Sessions release their
-/// statistics handle during teardown; subsequent session stats omit these metrics.
+/// statistics handle during teardown and omit these metrics once closure is signalled.
 pub trait SocketStats: Send + Sync + 'static {
     /// Smoothed round-trip time, if the transport tracks one.
     fn rtt(&self) -> Option<Duration> {
