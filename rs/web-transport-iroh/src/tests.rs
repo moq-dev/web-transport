@@ -44,14 +44,17 @@ impl Wake for FlagWaker {
 #[tokio::test]
 #[traced_test]
 async fn h3_smoke() -> n0_error::Result<()> {
-    let client = Endpoint::bind(presets::Minimal)
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
         .instrument(tracing::error_span!("client-ep"))
         .await
         .unwrap();
     let client_id = client.id();
     let client = Client::new(client);
 
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .instrument(tracing::error_span!("server-ep"))
@@ -126,10 +129,15 @@ async fn h3_smoke() -> n0_error::Result<()> {
 #[tokio::test]
 #[traced_test]
 async fn concurrent_accept_wakes_every_accepter() -> n0_error::Result<()> {
-    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
+        .await
+        .unwrap();
     let client = Client::new(client);
 
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .await
@@ -207,11 +215,16 @@ async fn concurrent_accept_wakes_every_accepter() -> n0_error::Result<()> {
 async fn quic_smoke() -> n0_error::Result<()> {
     const ALPN: &str = "moql";
 
-    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
+        .await
+        .unwrap();
     let client_id = client.id();
     let client = Client::new(client);
 
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN.as_bytes().to_vec()])
         .bind()
         .await
@@ -272,10 +285,15 @@ async fn quic_smoke() -> n0_error::Result<()> {
 #[tokio::test]
 #[traced_test]
 async fn two_tasks_can_accept_concurrently() -> n0_error::Result<()> {
-    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
+        .await
+        .unwrap();
     let client = Client::new(client);
 
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .await
@@ -349,10 +367,15 @@ async fn abandoned_accepters_release_their_wakers() -> n0_error::Result<()> {
     /// Well past any plausible bound on concurrent accepters.
     const ABANDONED: usize = 256;
 
-    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
+        .await
+        .unwrap();
     let client = Client::new(client);
 
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .await
@@ -437,9 +460,14 @@ async fn raw_stream_codes() -> n0_error::Result<()> {
     const ALPN: &str = "moql";
     const CODE: u32 = 5;
 
-    let client = Endpoint::bind(presets::Minimal).await.unwrap();
+    let client = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
+        .bind()
+        .await
+        .unwrap();
     let client = Client::new(client);
-    let server = Endpoint::builder(presets::Minimal)
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN.as_bytes().to_vec()])
         .bind()
         .await
@@ -531,8 +559,15 @@ async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
     use web_transport_proto::{Capsule, ConnectResponse, Frame};
     use web_transport_trait::Error as _;
 
-    let client = Client::new(Endpoint::bind(presets::Minimal).await.unwrap());
-    let server = Endpoint::builder(presets::Minimal)
+    let client = Client::new(
+        Endpoint::builder(presets::Empty)
+            .crypto_provider(crate::crypto::default_provider().unwrap())
+            .bind()
+            .await
+            .unwrap(),
+    );
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .await
@@ -607,8 +642,15 @@ async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
 #[tokio::test]
 #[traced_test]
 async fn h3_local_close_reason() -> n0_error::Result<()> {
-    let client = Client::new(Endpoint::bind(presets::Minimal).await.unwrap());
-    let server = Endpoint::builder(presets::Minimal)
+    let client = Client::new(
+        Endpoint::builder(presets::Empty)
+            .crypto_provider(crate::crypto::default_provider().unwrap())
+            .bind()
+            .await
+            .unwrap(),
+    );
+    let server = Endpoint::builder(presets::Empty)
+        .crypto_provider(crate::crypto::default_provider().unwrap())
         .alpns(vec![ALPN_H3.as_bytes().to_vec()])
         .bind()
         .await

@@ -11,6 +11,42 @@ It implements the [`web-transport-trait`] traits for iroh connections and stream
 
 The crate was originally derived from [`web-transport-quinn`].
 
+## TLS provider
+
+Configure the iroh endpoint before passing it to `Client` or accepting connections:
+
+```rust,no_run
+use web_transport_iroh::{Client, crypto, iroh::{Endpoint, endpoint::presets}};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let endpoint = Endpoint::builder(presets::Empty)
+    .crypto_provider(crypto::default_provider()?)
+    .bind()
+    .await?;
+let client = Client::new(endpoint);
+# client.close().await;
+# Ok(())
+# }
+```
+
+`crypto::default_provider()` uses the installed rustls provider first, otherwise
+[rind-rustls](https://github.com/moq-dev/rind/tree/main/rind-rustls). It does not
+install a process-wide provider. An unsupported CPU returns
+`CryptoError::UnsupportedCpu` during provider selection, before binding the endpoint.
+`Client::new()` still accepts an already configured endpoint and is infallible.
+
+rind supports x86_64, aarch64 and 32-bit ARM; aarch64 requires NEON. Other
+architectures, including WASM, cannot compile rind. An installed provider is used
+without invoking rind.
+
+The `aws-lc-rs` and `ring` features are removed. Remove them from your dependency
+declaration and configure endpoints as above. iroh's `Minimal` and `N0` presets
+require its built-in TLS provider features, so use `presets::Empty` and configure
+relays and address lookup services as needed. The remaining features are
+`metrics` and `portmapper` (both enabled by default), and optional `qlog`.
+iroh's default features and iroh-relay's `server` feature remain disabled; no
+test fixture needs a relay server or a separate crypto provider.
+
 ## License
 
 Copyright 2025 N0, INC.
