@@ -72,6 +72,9 @@ const key = fs.readFileSync("key.pem");
 
 const server = Server.bind("[::]:4443", cert, key);
 
+// Stop accepting new connections when shutting down.
+process.once("SIGINT", () => server.close());
+
 while (true) {
 	const request = await server.accept();
 	if (!request) break;
@@ -84,10 +87,11 @@ while (true) {
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
 }
-
-// Stop accepting new connections
-server.close();
 ```
+
+`server.close()` is synchronous and safe to call repeatedly. Pending and future
+`accept()` calls resolve to `null`; sessions already accepted remain open until
+they are closed separately.
 
 ## W3C WebTransport API
 
