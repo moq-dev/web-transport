@@ -2303,8 +2303,12 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
-        let handshake_deadline = (version.is_qmux() && !config.handshake_timeout.is_zero())
-            .then(|| base + config.handshake_timeout);
+        let handshake_deadline = if version.is_qmux() && !config.handshake_timeout.is_zero() {
+            // A deadline beyond the clock's range cannot expire.
+            base.checked_add(config.handshake_timeout)
+        } else {
+            None
+        };
         let mut established = established_rx.clone();
         tokio::spawn(async move {
             let handshake = async {
@@ -2319,8 +2323,10 @@ impl Session {
                 std::future::pending().await
             };
             // The deadline starts at construction and remains pollable even if
-            // the reader is parked on application backpressure.
+            // the reader is parked on application backpressure. Already-readable
+            // peer input wins over an expired deadline.
             let err = tokio::select! {
+                biased;
                 result = backend.run() => result.err().unwrap_or(Error::Closed),
                 err = handshake => err,
             };
@@ -3673,6 +3679,48 @@ mod recv_open_tests {
 
     fn scripted_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
         scripted_session_with_config(Config::new(Version::QMux01))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_handshake_frames_win_after_delayed_poll() {
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            for peer_closed in [false, true] {
+                let mut config = Config::new(version);
+                config.handshake_timeout = Duration::from_secs(1);
+                config.max_idle_timeout = 0;
+                config.rtt_interval = Duration::ZERO;
+                let params = config.to_transport_params();
+                let (session, incoming) = scripted_session_with_config(config);
+                incoming
+                    .send(Frame::TransportParameters(params).encode(version).unwrap())
+                    .unwrap();
+                if peer_closed {
+                    let frame = Frame::ConnectionClose(crate::proto::ConnectionClose {
+                        code: VarInt::from_u32(42),
+                        reason: "peer closed".into(),
+                    });
+                    incoming.send(frame.encode(version).unwrap()).unwrap();
+                }
+                // No spawned session task is polled until the clock has passed
+                // its deadline, with the peer's frame already readable.
+                tokio::time::advance(Duration::from_secs(2)).await;
+                if peer_closed {
+                    let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(error, Error::ConnectionReset { code, .. } if code.into_inner() == 42)
+                    );
+                } else {
+                    session.established().await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), session.closed())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
 
     /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and

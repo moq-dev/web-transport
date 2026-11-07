@@ -488,7 +488,7 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{Sink, SinkExt, Stream};
+    use futures::{Sink, SinkExt, Stream, StreamExt};
     use std::{future::Future, task::Context};
     use tokio::time::{advance, timeout};
     use tokio_tungstenite::{tungstenite::client::IntoClientRequest, WebSocketStream};
@@ -604,6 +604,19 @@ mod tests {
             .is_pending());
     }
 
+    async fn network_io<F: Future>(builder: Builder, io: F) -> F::Output {
+        // Real socket delivery must not race paused time's automatic advance.
+        let real_time = matches!(builder, Builder::Client);
+        if real_time {
+            tokio::time::resume();
+        }
+        let output = io.await;
+        if real_time {
+            tokio::time::pause();
+        }
+        output
+    }
+
     #[tokio::test(start_paused = true)]
     async fn silent_peer_hits_handshake_deadline() {
         for &builder in BUILDERS {
@@ -643,6 +656,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn oversized_handshake_deadline_stays_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let mut config = config();
+                config.handshake_timeout = Duration::MAX;
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_sends_connection_close() {
+        for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+            let (session, mut peer) = start(Builder::UpgradedClient, version, config()).await;
+            // Drain our parameters so the writer is idle when the deadline fires.
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                tungstenite::Message::Binary(_)
+            ));
+            let error = timeout(DEADLINE * 2, session.closed()).await.unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout));
+            let message = timeout(DEADLINE, peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let tungstenite::Message::Binary(data) = message else {
+                panic!("expected a QMux CONNECTION_CLOSE, got {message:?}");
+            };
+            let Some(crate::Frame::ConnectionClose(close)) =
+                crate::Frame::decode(data, version).unwrap()
+            else {
+                panic!("expected a QMux CONNECTION_CLOSE");
+            };
+            assert_eq!(close.code.into_inner(), 0);
+            assert_eq!(close.reason, Error::HandshakeTimeout.to_string());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn receiving_parameters_cancels_handshake_deadline() {
         for &builder in BUILDERS {
             for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
@@ -653,12 +708,14 @@ mod tests {
                 let params = crate::Frame::TransportParameters(peer_config.to_transport_params())
                     .encode(version)
                     .unwrap();
-                peer.send(tungstenite::Message::Binary(params))
-                    .await
-                    .unwrap();
-                // Opening needs the peer's stream credit, so this acknowledges
-                // that its parameters were applied before advancing time.
-                let _stream = session.open_uni().await.unwrap();
+                let _stream = network_io(builder, async {
+                    peer.send(tungstenite::Message::Binary(params))
+                        .await
+                        .unwrap();
+                    // Opening acknowledges that the parameters were applied.
+                    session.open_uni().await.unwrap()
+                })
+                .await;
                 advance(DEADLINE * 2).await;
                 assert_open(&session);
             }
@@ -669,8 +726,11 @@ mod tests {
     async fn disconnect_before_parameters_preserves_error() {
         for &builder in BUILDERS {
             let (session, peer) = start(builder, Version::QMux02, config()).await;
-            drop(peer);
-            let error = timeout(DEADLINE / 2, session.closed()).await.unwrap();
+            let error = network_io(builder, async {
+                drop(peer);
+                timeout(DEADLINE / 2, session.closed()).await.unwrap()
+            })
+            .await;
             assert!(!matches!(error, Error::HandshakeTimeout), "{error:?}");
         }
     }
