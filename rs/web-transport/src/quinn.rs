@@ -43,15 +43,18 @@ impl ClientBuilder {
 
     /// Accept the server's certificate hashes (sha256) instead of using a root CA.
     pub fn with_server_certificate_hashes(self, hashes: Vec<Vec<u8>>) -> Result<Client, Error> {
-        Ok(
-            Client::from(self.inner.with_server_certificate_hashes(hashes)?)
-                .with_protocols(self.protocols),
-        )
+        Ok(Client {
+            inner: self.inner.with_server_certificate_hashes(hashes)?,
+            protocols: self.protocols,
+        })
     }
 
     /// Accept certificates using root CAs.
     pub fn with_system_roots(self) -> Result<Client, Error> {
-        Ok(Client::from(self.inner.with_system_roots()?).with_protocols(self.protocols))
+        Ok(Client {
+            inner: self.inner.with_system_roots()?,
+            protocols: self.protocols,
+        })
     }
 }
 
