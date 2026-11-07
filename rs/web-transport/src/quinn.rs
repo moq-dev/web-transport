@@ -7,13 +7,16 @@ pub use web_transport_quinn as quinn;
 pub use web_transport_quinn::CongestionControl;
 
 /// Create a [Client] that can be used to dial multiple [Session]s.
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 #[derive(Default, Clone)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,
     protocols: Vec<String>,
 }
 
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ClientBuilder {
+    /// Create a client builder using the selected crypto provider.
     pub fn new() -> Self {
         Self::default()
     }

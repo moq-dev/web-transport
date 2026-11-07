@@ -15,6 +15,24 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+## Crypto providers
+
+Native builds use aws-lc-rs by default. To use ring without aws-lc-rs:
+
+```toml
+web-transport = { version = "0.13", default-features = false, features = ["ring"] }
+```
+
+The `aws-lc-rs` and `ring` features forward to `web-transport-quinn`.
+An installed process-wide rustls crypto provider takes precedence. When both
+features are enabled, install one with `CryptoProvider::install_default()` before
+constructing a `ClientBuilder`; otherwise construction panics.
+When neither feature is enabled, the native `ClientBuilder` is unavailable;
+`Session` and `Server` conversions remain available for callers configuring the
+backend directly, for example through `web_transport_quinn::Client::new`.
+
+These features have no effect on WASM. The browser handles TLS, and
+`ClientBuilder` is available with every feature combination.
 
 ## Why no trait?
 
