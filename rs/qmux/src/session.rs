@@ -28,6 +28,9 @@ use crate::shared::SharedRecv;
 /// applying backpressure to the whole session.
 const DATAGRAM_RECV_BUFFER: usize = 1024;
 
+/// Maximum peer-initiated streams awaiting application acceptance per direction.
+const ACCEPT_QUEUE_CAPACITY: usize = 1024;
+
 /// How many outbound datagrams to buffer before dropping. The writer pulls from
 /// this lane; when it stalls on transport backpressure it stops pulling, the lane
 /// fills, and `send_datagram` drops on a full lane. Kept small so shedding tracks
@@ -186,7 +189,26 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Releases the transport stats even if the reader task is cancelled or unwinds.
+struct SocketStatsGuard(Arc<Mutex<Option<crate::SharedSocketStats>>>);
+
+impl Drop for SocketStatsGuard {
+    fn drop(&mut self) {
+        // A custom stats provider may have panicked during a read. Its poisoned
+        // lock must not prevent descriptor release or the rest of teardown.
+        let stats = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(stats);
+    }
+}
+
 /// A multiplexed session over a reliable transport.
+///
+/// Closing signals the terminal reason immediately; `closed()` does not wait for
+/// asynchronous transport cleanup to finish.
 #[derive(Clone)]
 pub struct Session {
     is_server: bool,
@@ -260,8 +282,9 @@ pub struct Session {
 
     // The transport's own view of the connection, when it has one. Preferred over
     // `rtt`: the kernel's estimate needs no round trip of ours, so it is available
-    // from the first moment rather than one probe interval in.
-    socket_stats: Option<crate::SharedSocketStats>,
+    // from the first moment rather than one probe interval in. Shared with terminal
+    // cleanup so retained Session clones cannot keep the socket descriptor alive.
+    socket_stats: Arc<Mutex<Option<crate::SharedSocketStats>>>,
 
     // Closes the connection when the last `Session` clone drops. Never read.
     _guard: Arc<SessionGuard>,
@@ -2145,8 +2168,8 @@ impl Session {
         let version = config.version;
         let our_params = config.to_transport_params();
 
-        let (accept_bi_tx, accept_bi_rx) = mpsc::channel(1024);
-        let (accept_uni_tx, accept_uni_rx) = mpsc::channel(1024);
+        let (accept_bi_tx, accept_bi_rx) = mpsc::channel(ACCEPT_QUEUE_CAPACITY);
+        let (accept_uni_tx, accept_uni_rx) = mpsc::channel(ACCEPT_QUEUE_CAPACITY);
 
         let outbound = PriorityQueue::new(8);
         // Control lane (lossless): RESET/STOP/CLOSE, window updates, ping requests,
@@ -2203,8 +2226,8 @@ impl Session {
         // the wire, pulling the outbound queues in priority order and sharing the
         // stream maps + scalars above with the reader (no message-passing handoff).
         // Read before the split: the halves go to separate tasks, and the stats
-        // source belongs to neither.
-        let socket_stats = transport.socket_stats();
+        // source is released by terminal cleanup, independently of Session clones.
+        let socket_stats = Arc::new(Mutex::new(transport.socket_stats()));
         let (writer_half, reader_half) = transport.split();
         let mut writer = WriterState {
             writer: writer_half,
@@ -2323,8 +2346,27 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
+        let teardown_socket_stats = SocketStatsGuard(socket_stats.clone());
         tokio::spawn(async move {
-            let err = backend.run().await.err().unwrap_or(Error::Closed);
+            let mut closed = backend.closed.subscribe();
+            let err = {
+                let run = backend.run();
+                tokio::pin!(run);
+                // Release stats on closure even when the reader is parked on an
+                // accept queue. Keep polling the same future afterwards so streams
+                // and frames already received can still reach the application.
+                let result = tokio::select! {
+                    result = &mut run => Some(result),
+                    _ = async { closed.wait_for(|err| err.is_some()).await.ok(); } => None,
+                };
+                drop(teardown_socket_stats);
+                match result {
+                    Some(result) => result,
+                    None => run.await,
+                }
+            }
+            .err()
+            .unwrap_or(Error::Closed);
             // If we tore down because of a protocol/transport violation *we*
             // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
             // session rejects too, rather than seeing a bare drop. Enqueue on the
@@ -2352,9 +2394,9 @@ impl Session {
             backend.conn_recv_credit.close();
             backend.outbound.close();
             backend.streams.lock().unwrap().close();
-            // Recorded last, so a `closed()` waiter sees credits and streams closed.
-            // The reader often fails (EOF, WebSocket Close) right after an
-            // APPLICATION_CLOSE, so keep the reason recorded first.
+            // Publish the backend's reason after cleanup, preserving an earlier
+            // close signal such as APPLICATION_CLOSE rather than replacing it
+            // with the transport's subsequent EOF or WebSocket Close.
             note_closed(&backend.closed, err);
         });
 
@@ -2395,7 +2437,6 @@ impl generic::Session for Session {
     type Error = Error;
 
     fn stats(&self) -> impl generic::Stats {
-        let socket = self.socket_stats.as_ref();
         let streams = if self.config.version.is_qmux() {
             let state = self.streams.lock().unwrap();
             let closed = self.closed.borrow();
@@ -2419,6 +2460,17 @@ impl generic::Session for Session {
                     available: uni,
                 },
             })
+        } else {
+            None
+        };
+        // Hold the lock through the reads so teardown cannot drop the descriptor
+        // during a read, and a reader cannot retain it after cleanup completes.
+        let socket = self
+            .socket_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let socket = if self.closed.borrow().is_none() {
+            socket.as_ref()
         } else {
             None
         };
@@ -5462,5 +5514,239 @@ mod credit_update_tests {
         for err in closed_with(Frame::MaxStreamData { id, max: 10 }).await {
             assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_stats_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use web_transport_trait::{RecvStream as _, Session as _, Stats as _};
+
+    struct Stats {
+        panic: AtomicBool,
+        _released: oneshot::Sender<()>,
+    }
+
+    impl crate::SocketStats for Stats {
+        fn rtt(&self) -> Option<Duration> {
+            assert!(!self.panic.swap(false, Ordering::Relaxed), "stats panic");
+            Some(Duration::from_millis(1))
+        }
+    }
+
+    struct TestTransport {
+        stats: crate::SharedSocketStats,
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        received: mpsc::UnboundedSender<()>,
+        failed: oneshot::Receiver<()>,
+        closing: oneshot::Sender<()>,
+    }
+
+    struct TestReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        received: mpsc::UnboundedSender<()>,
+    }
+
+    struct TestWriter {
+        failed: oneshot::Receiver<()>,
+        closing: Option<oneshot::Sender<()>>,
+    }
+
+    impl Transport for TestTransport {
+        type Reader = TestReader;
+        type Writer = TestWriter;
+
+        fn socket_stats(&self) -> Option<crate::SharedSocketStats> {
+            Some(self.stats.clone())
+        }
+
+        fn split(self) -> (Self::Writer, Self::Reader) {
+            (
+                TestWriter {
+                    failed: self.failed,
+                    closing: Some(self.closing),
+                },
+                TestReader {
+                    incoming: self.incoming,
+                    received: self.received,
+                },
+            )
+        }
+    }
+
+    impl Reader for TestReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            let data = self.incoming.recv().await.ok_or(Error::Closed)?;
+            self.received.send(()).unwrap();
+            Ok(data)
+        }
+    }
+
+    impl Writer for TestWriter {
+        async fn send(&mut self, _: Bytes) -> Result<(), Error> {
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), Error> {
+            self.closing.take().unwrap().send(()).ok();
+            std::future::pending().await
+        }
+        async fn maintain(&mut self) -> Result<(), Error> {
+            let _ = (&mut self.failed).await;
+            Err(Error::Closed)
+        }
+    }
+
+    struct Fixture {
+        session: Session,
+        incoming: mpsc::UnboundedSender<Bytes>,
+        received: mpsc::UnboundedReceiver<()>,
+        fail: oneshot::Sender<()>,
+        released: oneshot::Receiver<()>,
+        closing: oneshot::Receiver<()>,
+    }
+
+    fn fixture(panic: bool) -> Fixture {
+        let (released, done) = oneshot::channel();
+        let stats = Arc::new(Stats {
+            panic: AtomicBool::new(panic),
+            _released: released,
+        });
+        let (incoming, reader) = mpsc::unbounded_channel();
+        let (received, received_rx) = mpsc::unbounded_channel();
+        let (fail, failed) = oneshot::channel();
+        let (closing, close_started) = oneshot::channel();
+        let session = Session::new(
+            TestTransport {
+                stats,
+                incoming: reader,
+                received,
+                failed,
+                closing,
+            },
+            false,
+            Config::new(Version::WebTransport),
+        );
+        Fixture {
+            session,
+            incoming,
+            received: received_rx,
+            fail,
+            released: done,
+            closing: close_started,
+        }
+    }
+
+    async fn released(done: oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .expect("stats retained after termination")
+            .expect_err("stats signal by dropping");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_accept_queue_releases_stats_without_losing_received_streams() {
+        for dir in [StreamDir::Uni, StreamDir::Bi] {
+            for writer_failure in [false, true] {
+                let mut f = fixture(false);
+                let frame = |index| {
+                    Frame::Stream(Stream {
+                        id: StreamId::new(index as u64, dir, true),
+                        offset: 0,
+                        data: Bytes::from_static(b"received"),
+                        fin: true,
+                    })
+                    .encode(Version::WebTransport)
+                    .unwrap()
+                };
+                for index in 0..=ACCEPT_QUEUE_CAPACITY {
+                    f.incoming.send(frame(index)).unwrap();
+                    tokio::time::timeout(Duration::from_secs(1), f.received.recv())
+                        .await
+                        .expect("reader stopped before accept queue filled")
+                        .unwrap();
+                }
+                // A further frame cannot reach recv() while delivery of the
+                // preceding stream is parked on the full accept queue.
+                f.incoming.send(frame(ACCEPT_QUEUE_CAPACITY + 1)).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), f.received.recv())
+                        .await
+                        .is_err()
+                );
+                if writer_failure {
+                    f.fail.send(()).unwrap();
+                } else {
+                    f.session.close(0, "done");
+                }
+                released(f.released).await;
+                assert_eq!(f.session.stats().rtt(), None);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    for _ in 0..ACCEPT_QUEUE_CAPACITY + 2 {
+                        let mut recv = match dir {
+                            StreamDir::Uni => f.session.accept_uni().await.unwrap(),
+                            StreamDir::Bi => f.session.accept_bi().await.unwrap().1,
+                        };
+                        assert_eq!(recv.read_all().await.unwrap(), b"received"[..]);
+                    }
+                })
+                .await
+                .expect("received streams did not drain after closure");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_transport_close_does_not_retain_socket_stats() {
+        let f = fixture(false);
+        f.session.close(0, "done");
+        tokio::time::timeout(Duration::from_secs(1), f.closing)
+            .await
+            .expect("writer did not enter close")
+            .unwrap();
+        released(f.released).await;
+        assert_eq!(f.session.stats().rtt(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panicking_stats_do_not_poison_future_reads_or_teardown() {
+        let f = fixture(true);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.session.stats())).is_err()
+        );
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(1)));
+        drop(f.incoming);
+        released(f.released).await;
+        assert!(matches!(f.session.closed().await, Error::Closed));
+        assert_eq!(f.session.stats().rtt(), None);
+    }
+
+    #[test]
+    fn runtime_shutdown_releases_stats_with_retained_session() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut f = runtime.block_on(async { fixture(false) });
+        drop(runtime);
+        assert!(matches!(
+            f.released.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert_eq!(f.session.stats().rtt(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_hides_socket_metrics_and_preserves_qmux_rtt() {
+        let f = fixture(false);
+        let sent = tokio::time::Instant::now();
+        f.session.rtt.sent(0, sent);
+        f.session.rtt.received(0, sent + Duration::from_millis(2));
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(1)));
+        f.session.close(0, "done");
+        f.session.closed().await;
+        assert_eq!(f.session.stats().rtt(), Some(Duration::from_millis(2)));
+        released(f.released).await;
     }
 }
