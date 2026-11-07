@@ -55,7 +55,6 @@ impl Default for ClientConfig {
 #[derive(uniffi::Object)]
 pub struct Client {
     inner: web_transport_quinn::Client,
-    endpoint: quinn::Endpoint,
 }
 
 #[uniffi::export]
@@ -142,16 +141,8 @@ impl Client {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(transport.into());
 
-        let _guard = RUNTIME.enter();
-        let endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
-            .or_else(|_| quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()))
-            .map_err(|e| WebTransportError::Io(format!("failed to create endpoint: {e}")))?;
-
-        let client = web_transport_quinn::Client::new(endpoint.clone(), client_config);
-
         Ok(Arc::new(Self {
-            inner: client,
-            endpoint,
+            inner: web_transport_quinn::Client::from(client_config),
         }))
     }
 
@@ -178,15 +169,15 @@ impl Client {
         let var_code = quinn::VarInt::from_u64(code)
             .map_err(|_| WebTransportError::invalid("code must be < 2^62"))?;
         let _guard = RUNTIME.enter();
-        self.endpoint.close(var_code, reason.as_bytes());
+        self.inner.close(var_code, reason.as_bytes());
         Ok(())
     }
 
-    /// Wait until all connections have shut down cleanly.
+    /// Wait for bound endpoints to drain; close first to prevent new connections.
     pub async fn wait_closed(&self) {
-        let endpoint = self.endpoint.clone();
+        let client = self.inner.clone();
         let handle = RUNTIME.spawn(async move {
-            endpoint.wait_idle().await;
+            client.wait_idle().await;
         });
         let _ = handle.await;
     }
@@ -195,7 +186,7 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let _guard = RUNTIME.enter();
-        self.endpoint.close(quinn::VarInt::from_u32(0), b"");
+        self.inner.close(quinn::VarInt::from_u32(0), b"");
     }
 }
 
