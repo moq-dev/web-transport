@@ -209,25 +209,36 @@ impl Settings {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) {
+        self.encode_frame(self.payload_size(), buf);
+    }
+
+    fn payload_size(&self) -> VarInt {
+        let size: usize = self
+            .0
+            .iter()
+            .map(|(id, value)| id.0.size() + value.size())
+            .sum();
+        VarInt::try_from(size).expect("settings size fits a varint")
+    }
+
+    fn encode_frame<B: BufMut>(&self, size: VarInt, buf: &mut B) {
         StreamUni::CONTROL.encode(buf);
         Frame::SETTINGS.encode(buf);
-
-        // Encode to a temporary buffer so we can learn the length.
-        // TODO avoid doing this, just use a fixed size varint.
-        let mut tmp = Vec::new();
+        size.encode(buf);
         for (id, value) in &self.0 {
-            id.encode(&mut tmp);
-            value.encode(&mut tmp);
+            id.encode(buf);
+            value.encode(buf);
         }
-
-        VarInt::from_u32(tmp.len() as u32).encode(buf);
-        buf.put_slice(&tmp);
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), SettingsError> {
-        // TODO avoid allocating to the heap
-        let mut buf = BytesMut::new();
-        self.encode(&mut buf);
+        let size = self.payload_size();
+        let capacity = StreamUni::CONTROL.0.size()
+            + Frame::SETTINGS.0.size()
+            + size.size()
+            + size.into_inner() as usize;
+        let mut buf = BytesMut::with_capacity(capacity);
+        self.encode_frame(size, &mut buf);
         stream.write_all_buf(&mut buf).await?;
         Ok(())
     }
