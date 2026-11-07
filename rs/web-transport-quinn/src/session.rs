@@ -184,52 +184,54 @@ impl Session {
     // then record the close error and tear down the connection.
     async fn run_recv(conn: quinn::Connection, recv: quinn::RecvStream, error: Arc<CloseReason>) {
         let close_info = Self::read_capsules(recv).await;
-        let code = close_info.as_ref().map_or(0, |(c, _)| *c);
-
-        let http3_code: quinn::VarInt = web_transport_proto::error_to_http3(code)
-            .try_into()
-            .unwrap();
-
-        // Try to record the remote close error. If close() already set
-        // the error, it owns the connection teardown, so we bail out.
         match close_info {
-            Some((code, reason)) => {
+            Ok((code, reason)) => {
                 let err = WebTransportError::Closed(code, reason.clone());
                 if error.set(err.into()).is_err() {
                     return;
                 }
-                conn.close(http3_code, reason.as_bytes());
+                if conn.close_reason().is_none() {
+                    conn.close(
+                        crate::error::encode_stream_code(code, false),
+                        reason.as_bytes(),
+                    );
+                }
             }
-            None => {
-                let err = quinn::ConnectionError::LocallyClosed.into();
+            Err(cause) => {
+                let err = conn.close_reason().map(Into::into).unwrap_or_else(|| {
+                    SessionError::WebTransportError(WebTransportError::CapsuleError(
+                        cause.to_string(),
+                    ))
+                });
                 if error.set(err).is_err() {
                     return;
                 }
-                conn.close(http3_code, b"");
+                if conn.close_reason().is_none() {
+                    // H3_MESSAGE_ERROR: the CONNECT stream did not contain valid capsules.
+                    conn.close(0x10eu32.into(), b"invalid CONNECT capsule stream");
+                }
             }
         };
     }
 
     // Keep reading capsules from the CONNECT recv stream until it's closed.
-    // Returns Some((code, reason)) if a CloseWebTransportSession capsule was received,
-    // or None if the stream closed without a capsule.
-    async fn read_capsules(recv: quinn::RecvStream) -> Option<(u32, String)> {
+    // A clean FIN without a close capsule is the default successful close.
+    async fn read_capsules(
+        recv: quinn::RecvStream,
+    ) -> Result<(u32, String), web_transport_proto::CapsuleError> {
         let mut reader = web_transport_proto::Http3CapsuleReader::new(recv);
         loop {
             match reader.read().await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
                     code,
                     reason,
-                })) => return Some((code, reason)),
+                })) => return Ok((code, reason)),
                 Ok(Some(web_transport_proto::Capsule::Grease { .. })) => {}
                 Ok(Some(web_transport_proto::Capsule::Unknown { typ, payload })) => {
                     tracing::warn!(%typ, size = payload.len(), "unknown capsule");
                 }
-                Ok(None) => return None,
-                Err(e) => {
-                    tracing::warn!(?e, "failed to read capsule");
-                    return None;
-                }
+                Ok(None) => return Ok((0, String::new())),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -404,9 +406,11 @@ impl Session {
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
-        // this is a no-op. A raw peer close that already arrived is latched first.
+        // this is a no-op. A native failure that already arrived is latched first.
         if let Some(err) = self.conn.close_reason() {
-            self.map_error(err);
+            // A capsule task may not have observed it yet; preserve the first reason.
+            let _ = self.error.set(self.map_error(err));
+            return;
         }
         let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
         if self.error.set(err).is_err() {
@@ -1374,6 +1378,91 @@ mod tests {
         let (client_conn, server_conn) = tokio::join!(async { connecting.await.unwrap() }, accept);
 
         (client_conn, server_conn, [client, server])
+    }
+
+    #[tokio::test]
+    async fn local_close_preserves_a_native_failure_before_the_capsule_reader_runs() {
+        let (client, peer, _endpoints) = pair().await;
+        let mut session = Session::raw(client);
+        // Model an HTTP/3 session whose capsule task has not recorded the failure yet.
+        session.session_id = Some(SESSION);
+        session.error = Arc::new(CloseReason::http3());
+        peer.close(0u32.into(), b"failure");
+        session.conn.closed().await;
+        session.close(7, b"local");
+        assert!(matches!(
+            session.closed().await,
+            SessionError::ConnectionError(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code.into_inner() == 0 && close.reason == b"failure"[..]
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_drop_uses_the_session_code_space() {
+        for raw in [false, true] {
+            let (client, peer, _endpoints) = pair().await;
+            let mut send = client.open_uni().await.unwrap();
+            send.write_all(b"data").await.unwrap();
+            let recv = peer.accept_uni().await.unwrap();
+            let recv = RecvStream::new(recv, Arc::new(CloseReason::http3()), raw);
+            drop(recv);
+            assert_eq!(
+                send.stopped().await.unwrap(),
+                Some(crate::error::encode_stream_code(0, raw))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_connect_fin_is_a_default_close() {
+        let (client, peer, _endpoints) = pair().await;
+        let (mut send, recv) = client.open_bi().await.unwrap();
+        send.write_all(b"connect").await.unwrap();
+        let (mut peer_send, _peer_recv) = peer.accept_bi().await.unwrap();
+        peer_send.finish().unwrap();
+        let error = Arc::new(CloseReason::http3());
+        Session::run_recv(client, recv, error.clone()).await;
+        assert!(matches!(
+            error.get(),
+            Some(SessionError::WebTransportError(WebTransportError::Closed(0, reason)))
+                if reason.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn truncated_connect_data_is_a_capsule_error() {
+        let (client, peer, _endpoints) = pair().await;
+        let (mut send, recv) = client.open_bi().await.unwrap();
+        send.write_all(b"connect").await.unwrap();
+        let (mut peer_send, _peer_recv) = peer.accept_bi().await.unwrap();
+        // DATA frame type, missing the frame length.
+        peer_send.write_all(&[0]).await.unwrap();
+        peer_send.finish().unwrap();
+        let error = Arc::new(CloseReason::http3());
+        Session::run_recv(client, recv, error.clone()).await;
+        assert!(matches!(
+            error.get(),
+            Some(SessionError::WebTransportError(
+                WebTransportError::CapsuleError(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_connect_stream_preserves_the_connection_failure() {
+        let (client, peer, _endpoints) = pair().await;
+        let (mut send, recv) = client.open_bi().await.unwrap();
+        send.write_all(b"connect").await.unwrap();
+        let _connect = peer.accept_bi().await.unwrap();
+        peer.close(0u32.into(), b"failure");
+        client.closed().await;
+        let error = Arc::new(CloseReason::http3());
+        Session::run_recv(client, recv, error.clone()).await;
+        assert!(matches!(
+            error.get(),
+            Some(SessionError::ConnectionError(quinn::ConnectionError::ApplicationClosed(close)))
+                if close.error_code.into_inner() == 0 && close.reason == b"failure"[..]
+        ));
     }
 
     fn assert_reset(err: SessionError) {

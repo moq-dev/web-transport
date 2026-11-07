@@ -207,8 +207,9 @@ impl Connection {
 
     // Keep reading from the control stream until it's closed.
     async fn run_closed(conn: ez::Connection, mut connect: h3::Connected) {
+        let mut reader = web_transport_proto::Http3CapsuleReader::new(&mut connect.recv);
         loop {
-            match web_transport_proto::Capsule::read(&mut connect.recv).await {
+            match reader.read().await {
                 Ok(Some(web_transport_proto::Capsule::CloseWebTransportSession {
                     code,
                     reason,
@@ -223,11 +224,14 @@ impl Connection {
                     tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
                 }
                 Ok(None) => {
-                    // Stream closed without capsule
+                    conn.close(web_transport_proto::error_to_http3(0), "");
                     return;
                 }
                 Err(_) => {
-                    conn.close(web_transport_proto::error_to_http3(500), "capsule error");
+                    if !conn.is_closed() {
+                        // H3_MESSAGE_ERROR: the CONNECT stream did not contain valid capsules.
+                        conn.close(0x10e, "invalid CONNECT capsule stream");
+                    }
                     return;
                 }
             }
@@ -1095,6 +1099,49 @@ mod tests {
             _settings: settings,
             _connect: connect,
         })
+    }
+
+    #[tokio::test]
+    async fn clean_connect_fin_is_a_default_close() -> Result<()> {
+        let mut pair = http_pair().await?;
+        pair._connect.send.finish()?;
+        let closed = timeout(TIMEOUT, pair.session.closed()).await?;
+        assert!(matches!(closed, SessionError::Local(0, reason) if reason.is_empty()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn data_framed_close_capsule_preserves_application_details() -> Result<()> {
+        let mut pair = http_pair().await?;
+        let mut capsule = BytesMut::new();
+        web_transport_proto::Capsule::CloseWebTransportSession {
+            code: 7,
+            reason: "done".into(),
+        }
+        .encode(&mut capsule);
+        let mut frame = BytesMut::new();
+        web_transport_proto::Frame::DATA.encode(&mut frame);
+        VarInt::try_from(capsule.len())?.encode(&mut frame);
+        frame.extend_from_slice(&capsule);
+        pair._connect.send.write_all(&frame).await?;
+        pair._connect.send.finish()?;
+        let closed = timeout(TIMEOUT, pair.session.closed()).await?;
+        assert!(matches!(closed, SessionError::Local(7, reason) if reason == "done"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn truncated_capsule_is_a_protocol_error() -> Result<()> {
+        let mut pair = http_pair().await?;
+        // The first byte of a two-byte capsule type, with no second byte.
+        pair._connect.send.write_all(&[0x68]).await?;
+        pair._connect.send.finish()?;
+        let closed = timeout(TIMEOUT, pair.session.closed()).await?;
+        assert!(matches!(
+            closed,
+            SessionError::Connection(ez::ConnectionError::Local(0x10e, _))
+        ));
+        Ok(())
     }
 
     #[tokio::test]

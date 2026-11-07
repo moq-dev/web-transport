@@ -12,12 +12,19 @@ use crate::{
     error::{decode_stream_code, encode_stream_code},
 };
 
-/// A stream that can be used to receive bytes. See [`iroh::endpoint::RecvStream`].
+/// A stream that can receive bytes, stopping with application code 0 on drop. See [`iroh::endpoint::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: endpoint::RecvStream,
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
     raw: bool,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // FIN, reset, or an earlier stop can already have made the stream terminal.
+        let _ = self.stop(0);
+    }
 }
 
 impl RecvStream {

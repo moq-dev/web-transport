@@ -27,10 +27,10 @@ export declare class NapiClient {
 export declare class NapiRecvStream {
 	/**
 	 * Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
-	 * peer reset the stream or the session failed.
+	 * peer reset the stream or the session failed. Local cancellation rejects the read.
 	 */
 	read(maxSize: number): Promise<Buffer | NapiStreamError | null>;
-	/** Tell the peer to stop sending with the given error code. */
+	/** Tell the peer to stop sending with the given code; an already terminal stream is a no-op. */
 	stop(code: number): Promise<void>;
 }
 
@@ -102,7 +102,7 @@ export declare class NapiSession {
 	maxDatagramSize(): number;
 	/** Close the session with a code and reason. */
 	close(code: number, reason: string): void;
-	/** Wait for the session to close, returning close info matching W3C WebTransportCloseInfo. */
+	/** Wait for normal closure with its application details, or reject on a connection failure. */
 	closed(): Promise<NapiCloseInfo>;
 }
 

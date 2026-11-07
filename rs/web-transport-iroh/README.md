@@ -11,6 +11,19 @@ It implements the [`web-transport-trait`] traits for iroh connections and stream
 
 The crate was originally derived from [`web-transport-quinn`].
 
+## Session closure
+
+A peer close capsule reports `WebTransportError::Closed` with its application code
+and reason. A clean CONNECT FIN without a capsule reports code 0 and an empty reason.
+Malformed capsule data reports `WebTransportError::CapsuleError(String)` and closes
+HTTP/3 with H3_MESSAGE_ERROR (0x10e). An existing connection failure keeps its cause.
+
+`CapsuleError(String)` is a new public enum variant; downstream exhaustive matches
+must handle it when upgrading.
+
+Dropping a receive stream sends application code 0 in the session's code space:
+HTTP/3 maps the code, while raw QUIC sends it unchanged.
+
 ## License
 
 Copyright 2025 N0, INC.

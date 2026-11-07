@@ -147,6 +147,13 @@ await writer.abort(new WebTransportError("cancelled", { streamErrorCode: 7 }));
 
 ### Closing
 
+`session.closed` resolves with the application code and reason after a local or peer close,
+including nonzero application codes. An orderly HTTP/3 connection shutdown (H3_NO_ERROR)
+without application details resolves with code 0 and an empty reason. A failed connection or an underlying connection
+failure rejects it with a `WebTransportError` whose `source` is `"session"` and
+`streamErrorCode` is `null`. `session.ready` rejects with the same error if connecting fails.
+Backend teardown without an application `session.close()` also rejects `closed`.
+
 ```ts
 // Close gracefully
 session.close({ closeCode: 0, reason: "done" });
@@ -155,6 +162,10 @@ session.close({ closeCode: 0, reason: "done" });
 const info = await session.closed;
 console.log(info.closeCode, info.reason);
 ```
+
+Cancel a reader when finished to release its receive stream immediately, even during a
+pending read. Pending reads retain their receive stream until data, closure, or cancellation
+settles them, so garbage collection alone does not cancel an abandoned pending read.
 
 ## License
 

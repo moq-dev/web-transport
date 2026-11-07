@@ -99,10 +99,25 @@ impl Session {
             }
             let (code, reason) = match closed {
                 Ok(Some(close)) => close,
-                Ok(None) => (0, "stream closed".to_string()),
+                Ok(None) => {
+                    peer_close.send_replace(Some(
+                        WebTransportError::Closed {
+                            code: 0,
+                            reason: String::new(),
+                        }
+                        .into(),
+                    ));
+                    (0, String::new())
+                }
                 Err(err) => {
                     tracing::warn!(?err, "failed to read capsule");
-                    (1, "capsule error".to_string())
+                    peer_close.send_replace(Some(
+                        WebTransportError::CapsuleError(err.to_string()).into(),
+                    ));
+                    this2
+                        .conn
+                        .close(0x10eu32.into(), b"invalid CONNECT capsule stream");
+                    return;
                 }
             };
             // TODO We shouldn't be closing the QUIC connection with the same error.
@@ -269,7 +284,9 @@ impl Session {
 
     /// Wait until the session is closed, returning the error. See [`iroh::endpoint::Connection::closed`].
     ///
-    /// A peer's `CloseWebTransportSession` capsule is reported as [`WebTransportError::Closed`].
+    /// A peer's `CloseWebTransportSession` capsule, or a clean CONNECT FIN without a
+    /// capsule, is reported as [`WebTransportError::Closed`]. Malformed capsule data
+    /// returns [`WebTransportError::CapsuleError`].
     pub async fn closed(&self) -> SessionError {
         let err = self.conn.closed().await;
         if let Some(h3) = &self.h3 {
@@ -884,6 +901,76 @@ mod tests {
         );
 
         (client_conn, server_conn, [client, server])
+    }
+
+    async fn http3_pair() -> (Session, Connection, Connected, Settings, [Endpoint; 2]) {
+        let (client, peer, endpoints) = pair().await;
+        let establish = Session::connect_h3(client, url::Url::parse("https://localhost/").unwrap());
+        let accept = async {
+            let settings = Settings::connect(&peer).await.unwrap();
+            let connect = crate::Connecting::accept(&peer)
+                .await
+                .unwrap()
+                .respond(http::StatusCode::OK)
+                .await
+                .unwrap();
+            (connect, settings)
+        };
+        let (session, (connect, settings)) = tokio::join!(establish, accept);
+        (session.unwrap(), peer, connect, settings, endpoints)
+    }
+
+    #[tokio::test]
+    async fn clean_connect_fin_is_a_default_close() {
+        let (session, _peer, mut connect, _settings, _endpoints) = http3_pair().await;
+        connect.send.finish().unwrap();
+        let err = session.closed().await;
+        assert!(
+            matches!(&err, SessionError::WebTransportError(WebTransportError::Closed { code: 0, reason }) if reason.is_empty()),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_connect_data_is_a_protocol_failure() {
+        let (session, peer, mut connect, _settings, _endpoints) = http3_pair().await;
+        connect.send.write_all(&[0]).await.unwrap();
+        connect.send.finish().unwrap();
+        let err = peer.closed().await;
+        assert!(
+            matches!(&err, endpoint::ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 0x10e),
+            "{err:?}"
+        );
+        assert!(matches!(
+            session.closed().await,
+            SessionError::WebTransportError(WebTransportError::CapsuleError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_connect_stream_preserves_the_connection_failure() {
+        let (session, peer, _connect, _settings, _endpoints) = http3_pair().await;
+        peer.close(0u32.into(), b"failure");
+        let err = session.closed().await;
+        assert!(
+            matches!(&err, SessionError::ConnectionError(endpoint::ConnectionError::ApplicationClosed(close)) if close.error_code.into_inner() == 0 && close.reason == b"failure"[..]),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_drop_uses_the_session_code_space() {
+        for raw in [false, true] {
+            let (client, peer, _endpoints) = pair().await;
+            let mut send = client.open_uni().await.unwrap();
+            send.write_all(b"data").await.unwrap();
+            let recv = peer.accept_uni().await.unwrap();
+            drop(RecvStream::new(recv, raw));
+            assert_eq!(
+                send.stopped().await.unwrap(),
+                Some(crate::error::encode_stream_code(0, raw))
+            );
+        }
     }
 
     fn assert_reset(err: SessionError) {
