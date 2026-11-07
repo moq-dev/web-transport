@@ -37,7 +37,3 @@ Decision prompts (✅ chosen):
 - [Noq on rind](/quest/a1/rind/noq.md) - Noq's rustls without ring, with rind keys
 - [iroh on rind](/quest/a1/rind/iroh.md) - iroh endpoint built with rind's provider
 - [QMux on rind](/quest/a1/rind/qmux.md) - TLS and WSS paths with no aws-lc-rs
-
-## Related
-
-- [Router crypto features](/quest/a1/router-crypto-features.md) - interim features that the Quinn child removes

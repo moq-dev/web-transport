@@ -12,13 +12,18 @@ keywords = ["quic", "http3", "webtransport"]
 categories = ["network-programming", "web-programming"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["aws-lc-rs"]
+aws-lc-rs = ["web-transport-quinn/aws-lc-rs"]
+ring = ["web-transport-quinn/ring"]
+
 [dependencies]
 bytes = "1"
 thiserror = "2"
 url = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-web-transport-quinn = { version = "0.13.6", path = "../web-transport-quinn" }
+web-transport-quinn = { version = "0.13.6", path = "../web-transport-quinn", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-transport-wasm = { version = "0.8.8", path = "../web-transport-wasm" }
