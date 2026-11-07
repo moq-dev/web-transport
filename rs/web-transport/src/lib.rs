@@ -12,9 +12,11 @@
 //! forward to `web-transport-quinn`. To use ring without aws-lc-rs, disable
 //! default features and enable only `ring`.
 //!
-//! An installed process-wide rustls crypto provider takes precedence. With both
-//! features enabled, install a provider with `CryptoProvider::install_default()`
-//! before constructing a `ClientBuilder`; otherwise construction panics.
+//! An installed process-wide rustls crypto provider takes precedence. Cargo
+//! unifies backend features across dependencies, so another dependency can enable
+//! an additional provider. With both backend providers enabled, install one with
+//! `CryptoProvider::install_default()` before constructing a `ClientBuilder`;
+//! otherwise construction panics.
 //! With neither feature enabled, the native `ClientBuilder` is unavailable.
 //! `Session` and `Server` conversions remain available for callers that configure
 //! `web-transport-quinn` themselves, for example through its `Client::new`.

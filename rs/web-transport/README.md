@@ -24,9 +24,11 @@ web-transport = { version = "0.13", default-features = false, features = ["ring"
 ```
 
 The `aws-lc-rs` and `ring` features forward to `web-transport-quinn`.
-An installed process-wide rustls crypto provider takes precedence. When both
-features are enabled, install one with `CryptoProvider::install_default()` before
-constructing a `ClientBuilder`; otherwise construction panics.
+An installed process-wide rustls crypto provider takes precedence. Cargo unifies
+backend features across dependencies, so another dependency can enable an
+additional provider. When both backend providers are enabled, install one with
+`CryptoProvider::install_default()` before constructing a `ClientBuilder`;
+otherwise construction panics.
 When neither feature is enabled, the native `ClientBuilder` is unavailable;
 `Session` and `Server` conversions remain available for callers configuring the
 backend directly, for example through `web_transport_quinn::Client::new`.
