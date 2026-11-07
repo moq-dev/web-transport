@@ -3,7 +3,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 // Teardown safety: every `#[napi] async fn` below runs on napi-rs's global tokio
 // runtime. On `process.exit()` napi tears that runtime down with
@@ -21,18 +21,15 @@ use tokio::sync::Mutex;
 // clones back into `self.inner.lock()` across an await -- that reintroduces the
 // crash.
 
-fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiCloseInfo {
+fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> Result<NapiCloseInfo> {
     match err {
         web_transport_quinn::SessionError::WebTransportError(
             web_transport_quinn::WebTransportError::Closed(code, reason),
-        ) => NapiCloseInfo {
+        ) => Ok(NapiCloseInfo {
             close_code: *code,
             reason: reason.clone(),
-        },
-        other => NapiCloseInfo {
-            close_code: 0,
-            reason: other.to_string(),
-        },
+        }),
+        other => Err(Error::from_reason(other.to_string())),
     }
 }
 
@@ -141,7 +138,7 @@ impl NapiClient {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
             inner: session.clone(),
-            closed: Arc::new(Mutex::new(None)),
+            closed: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }
@@ -252,7 +249,7 @@ impl NapiRequest {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(NapiSession {
             inner: session.clone(),
-            closed: Arc::new(Mutex::new(None)),
+            closed: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -279,8 +276,8 @@ impl NapiRequest {
 #[napi]
 pub struct NapiSession {
     inner: web_transport_quinn::Session,
-    // Cache the closed future result so multiple callers can await it.
-    closed: Arc<Mutex<Option<NapiCloseInfo>>>,
+    // The backend reports local closes as LocallyClosed, without their application details.
+    closed: Arc<std::sync::Mutex<Option<NapiCloseInfo>>>,
 }
 
 /// Info about why a session was closed, matching W3C WebTransportCloseInfo.
@@ -334,9 +331,7 @@ impl NapiSession {
             .accept_uni()
             .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiRecvStream {
-            inner: Arc::new(Mutex::new(recv)),
-        })
+        Ok(NapiRecvStream::new(recv))
     }
 
     /// Accept an incoming bidirectional stream.
@@ -351,9 +346,7 @@ impl NapiSession {
             send: Some(NapiSendStream {
                 inner: Arc::new(Mutex::new(send)),
             }),
-            recv: Some(NapiRecvStream {
-                inner: Arc::new(Mutex::new(recv)),
-            }),
+            recv: Some(NapiRecvStream::new(recv)),
         })
     }
 
@@ -382,9 +375,7 @@ impl NapiSession {
             send: Some(NapiSendStream {
                 inner: Arc::new(Mutex::new(send)),
             }),
-            recv: Some(NapiRecvStream {
-                inner: Arc::new(Mutex::new(recv)),
-            }),
+            recv: Some(NapiRecvStream::new(recv)),
         })
     }
 
@@ -419,36 +410,29 @@ impl NapiSession {
     #[napi]
     pub fn close(&self, code: u32, reason: String) {
         within_runtime_if_available(|| {
+            let mut closed = self.closed.lock().unwrap();
+            if closed.is_none() && self.inner.close_reason().is_none() {
+                *closed = Some(NapiCloseInfo {
+                    close_code: code,
+                    reason: reason.clone(),
+                });
+            }
             self.inner.close(code, reason.as_bytes());
         });
     }
 
-    /// Wait for the session to close, returning close info matching W3C WebTransportCloseInfo.
+    /// Wait for normal closure with its application details, or reject on a connection failure.
     #[napi]
     pub async fn closed(&self) -> Result<NapiCloseInfo> {
-        // Own the session handle and the cache for the duration of the future
-        // (see module note).
+        // Own both handles for the duration of the future (see module note).
         let session = self.inner.clone();
         let cache = self.closed.clone();
-
-        // Check if we already have a cached result.
-        {
-            let cached = cache.lock().await;
-            if let Some(info) = cached.as_ref() {
-                return Ok(info.clone());
-            }
-        }
-
         let err = session.closed().await;
-        let info = session_error_to_close_info(&err);
-
-        // Cache the result.
-        {
-            let mut cached = cache.lock().await;
-            *cached = Some(info.clone());
+        let closed = cache.lock().unwrap();
+        match closed.as_ref() {
+            Some(info) => Ok(info.clone()),
+            None => session_error_to_close_info(&err),
         }
-
-        Ok(info)
     }
 }
 
@@ -570,6 +554,30 @@ impl NapiSendClosed {
 #[napi]
 pub struct NapiRecvStream {
     inner: Arc<Mutex<web_transport_quinn::RecvStream>>,
+    // Closing the sender cancels reads when the JS owner is collected. The read futures own
+    // only receivers, so neither napi-rs nor the shared stream can keep that owner alive.
+    stopped: watch::Sender<bool>,
+}
+
+impl NapiRecvStream {
+    fn new(recv: web_transport_quinn::RecvStream) -> Self {
+        let (stopped, _) = watch::channel(false);
+        Self {
+            inner: Arc::new(Mutex::new(recv)),
+            stopped,
+        }
+    }
+}
+
+impl Drop for NapiRecvStream {
+    fn drop(&mut self) {
+        // With no active read, stop now using the WebTransport code space. A pending read
+        // owns the lock and stops itself when dropping this sender closes its watch.
+        if let Ok(mut stream) = self.inner.try_lock() {
+            // An already finished/reset stream needs no further cleanup.
+            let _ = stream.stop(0);
+        }
+    }
 }
 
 #[napi]
@@ -577,32 +585,59 @@ impl NapiRecvStream {
     /// Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
     /// peer reset the stream or the session failed.
     #[napi]
-    pub async fn read(&self, max_size: u32) -> Result<Option<Either<Buffer, NapiStreamError>>> {
+    pub fn read<'env>(
+        &self,
+        env: &'env Env,
+        max_size: u32,
+    ) -> Result<PromiseRaw<'env, Either3<Buffer, NapiStreamError, Null>>> {
         use web_transport_quinn::ReadError;
 
-        // Own the shared stream for the duration of the future (see module note).
+        // A synchronous callback spawning an owned future avoids async fn's implicit JS
+        // receiver reference, which would prevent abandonment from cancelling this read.
         let inner = self.inner.clone();
-        let mut stream = inner.lock().await;
-        let err = match stream.read_chunk(max_size as usize, true).await {
-            Ok(chunk) => {
-                return Ok(chunk.map(|chunk| Either::A(Buffer::from(chunk.bytes.to_vec()))))
+        let mut stopped = self.stopped.subscribe();
+        env.spawn_future(async move {
+            let mut stream = inner.lock().await;
+            if *stopped.borrow() {
+                return Ok(Either3::C(Null));
             }
-            Err(err @ ReadError::Reset(code)) => {
-                NapiStreamError::stream(Some(code), err.to_string())
-            }
-            Err(err @ ReadError::InvalidReset(_)) => NapiStreamError::stream(None, err.to_string()),
-            Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
-            Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
-                return Err(Error::from_reason(err.to_string()))
-            }
-        };
-        Ok(Some(Either::B(err)))
+            let result = tokio::select! {
+                biased;
+                changed = stopped.changed() => {
+                    if changed.is_err() {
+                        stream.stop(0).map_err(|e| Error::from_reason(e.to_string()))?;
+                    }
+                    return Ok(Either3::C(Null));
+                },
+                result = stream.read_chunk(max_size as usize, true) => result,
+            };
+            let err = match result {
+                Ok(chunk) => {
+                    return Ok(match chunk {
+                        Some(chunk) => Either3::A(Buffer::from(chunk.bytes.to_vec())),
+                        None => Either3::C(Null),
+                    })
+                }
+                Err(err @ ReadError::Reset(code)) => {
+                    NapiStreamError::stream(Some(code), err.to_string())
+                }
+                Err(err @ ReadError::InvalidReset(_)) => {
+                    NapiStreamError::stream(None, err.to_string())
+                }
+                Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
+                Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
+                    return Err(Error::from_reason(err.to_string()))
+                }
+            };
+            Ok(Either3::B(err))
+        })
     }
 
     /// Tell the peer to stop sending with the given error code.
     #[napi]
     pub async fn stop(&self, code: u32) -> Result<()> {
         let inner = self.inner.clone();
+        self.stopped.send_replace(true);
         let mut stream = inner.lock().await;
         stream
             .stop(code)

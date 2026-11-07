@@ -102,7 +102,7 @@ export declare class NapiSession {
 	maxDatagramSize(): number;
 	/** Close the session with a code and reason. */
 	close(code: number, reason: string): void;
-	/** Wait for the session to close, returning close info matching W3C WebTransportCloseInfo. */
+	/** Wait for normal closure with its application details, or reject on a connection failure. */
 	closed(): Promise<NapiCloseInfo>;
 }
 

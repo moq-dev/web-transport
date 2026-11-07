@@ -6,21 +6,42 @@ import { fromNapi, resetCode, sessionError } from "./error.ts";
 const { NapiClient } = napi;
 
 function wrapRecvStream(recv: NapiRecvStream): ReadableStream<Uint8Array> {
+	const state = { reading: false, cancelled: false };
 	return new ReadableStream({
-		async pull(controller) {
-			const chunk = await recv.read(65536);
-			if (chunk === null) {
-				controller.close();
-			} else if (chunk instanceof Uint8Array) {
-				controller.enqueue(new Uint8Array(chunk));
-			} else {
-				controller.error(fromNapi(chunk));
-			}
+		pull(controller) {
+			if (state.reading) return;
+			state.reading = true;
+			readChunk(recv.read(65536), controller, state);
 		},
 		cancel(reason) {
-			recv.stop(resetCode(reason)).catch(() => {});
+			state.cancelled = true;
+			return recv.stop(resetCode(reason));
 		},
 	});
+}
+
+// Returning the pending native promise from pull would let the Web Streams machinery
+// retain the controller and its stream. Only this weak callback waits for the read.
+function readChunk(
+	read: ReturnType<NapiRecvStream["read"]>,
+	controller: ReadableStreamDefaultController<Uint8Array>,
+	state: { reading: boolean; cancelled: boolean },
+) {
+	const ref = new WeakRef(controller);
+	void read.then(
+		(chunk) => {
+			state.reading = false;
+			const controller = ref.deref();
+			if (!controller || state.cancelled) return;
+			if (chunk === null) controller.close();
+			else if (chunk instanceof Uint8Array) controller.enqueue(new Uint8Array(chunk));
+			else controller.error(fromNapi(chunk));
+		},
+		(err: unknown) => {
+			state.reading = false;
+			if (!state.cancelled) ref.deref()?.error(err);
+		},
+	);
 }
 
 // A STOP_SENDING or session failure errors the stream even while nothing is being written.
@@ -77,6 +98,13 @@ export default class Session implements WebTransport {
 		const closed = Promise.withResolvers<WebTransportCloseInfo>();
 		this.ready = ready.promise;
 		this.closed = closed.promise;
+		// The spec marks lifecycle promises handled; callers can still await their rejections.
+		void this.ready.catch(() => {});
+		void this.closed.catch(() => {});
+
+		const watchSession = (session: NapiSession) => {
+			void session.closed().then(closed.resolve, (err: unknown) => closed.reject(sessionError(err)));
+		};
 
 		// Check if we got an existing NapiSession (server-side path)
 		if (typeof urlOrSession === "object" && !(urlOrSession instanceof URL)) {
@@ -85,9 +113,7 @@ export default class Session implements WebTransport {
 
 			ready.resolve();
 
-			urlOrSession.closed().then((info) => {
-				closed.resolve({ closeCode: info.closeCode, reason: info.reason });
-			});
+			watchSession(urlOrSession);
 		} else {
 			// Client-side: create NapiClient and connect
 			const url = typeof urlOrSession === "string" ? urlOrSession : urlOrSession.toString();
@@ -131,14 +157,13 @@ export default class Session implements WebTransport {
 					(this.datagrams as DeferredDatagrams).bind(session);
 					ready.resolve();
 
-					session.closed().then((info) => {
-						closed.resolve({ closeCode: info.closeCode, reason: info.reason });
-					});
+					watchSession(session);
 				})
 				.catch((err) => {
-					(this.datagrams as DeferredDatagrams).fail(err instanceof Error ? err : new Error(String(err)));
-					ready.reject(err instanceof Error ? err : new Error(String(err)));
-					closed.resolve({ closeCode: 0, reason: String(err) });
+					const error = sessionError(err);
+					(this.datagrams as DeferredDatagrams).fail(error);
+					ready.reject(error);
+					closed.reject(error);
 				});
 		}
 	}
