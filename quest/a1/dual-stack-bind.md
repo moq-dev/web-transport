@@ -9,11 +9,12 @@ Native clients' default sockets match the server's address family, so a macOS du
 Decided with the maintainer on 2026-11-06 (planning interview):
 
 - Every native default, not only the router's Quinn path. A bind option alone would leave the default broken.
-- Quinn and Noq `ClientBuilder` clients (and FFI, which builds its own Quinn endpoint) hold an IPv4 `0.0.0.0:0` endpoint and an IPv6-only `[::]:0` endpoint (`IPV6_V6ONLY`). Each is bound lazily on the first connect to that family and shared by later sessions and clones. Bind failures become a `ClientError` from `connect()`, replacing today's `unwrap()` in `build()`. Hosts with IPv6 disabled fail only IPv6 connects.
+- Quinn and Noq `ClientBuilder` clients (and FFI, which builds its own Quinn endpoint) hold an IPv4 `0.0.0.0:0` endpoint and an IPv6-only `[::]:0` endpoint (`IPV6_V6ONLY`). Each is bound lazily on the first connect to that family and shared by later sessions and clones. Bind failures become a `ClientError` from `connect()`, replacing today's `unwrap()` in `build()`. Hosts with IPv6 disabled fail only IPv6 connects. An IPv4-mapped remote (`::ffff:a.b.c.d`) uses the IPv4 endpoint and its unmapped address.
+- `close`, `wait_closed` and `Drop` (in FFI and elsewhere) cover every endpoint bound so far. A connect after `close` fails rather than binding a new endpoint.
 - `Client::new(endpoint, config)` keeps using the single endpoint it is given.
 - The Quiche ez client already binds once per connect. Without `with_bind`, it binds after DNS resolution, using the chosen remote's family.
 - No new public bind API. Keep it private until a consumer needs it.
-- Regression tests assert the bound family per remote (IPv4 server: IPv4 socket; IPv6 server: v6-only socket) and fail on today's dual-stack bind. The macOS collision itself is the reporter's repro and isn't run in CI.
+- Regression tests assert the bound family per remote (IPv4 server: IPv4 socket; IPv6 server: v6-only socket) and an IPv4-mapped remote. They fail on today's dual-stack bind. The macOS collision itself is the reporter's repro and isn't run in CI.
 
 Decision prompts (✅ chosen):
 

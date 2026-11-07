@@ -6,7 +6,7 @@ web-transport-quinn uses quinn's own provider-neutral `rustls` support and delet
 
 ## Plan
 
-Bump the quinn pin to the release that closes [quinn-rs/quinn#2341](https://github.com/quinn-rs/quinn/issues/2341) and delete the ported session. Keep `web_transport_quinn::crypto`'s public types as thin re-exports or deprecate them; decide that with the maintainer at the time. Keep the interop tests and the CI guard green.
+Bump the quinn pin in web-transport-quinn and web-transport-ffi together (FFI hands its own `quinn` types to `Client::new`) to the release that closes [quinn-rs/quinn#2341](https://github.com/quinn-rs/quinn/issues/2341) and delete the ported session. Keep `web_transport_quinn::crypto`'s public types as thin re-exports or deprecate them; decide that with the maintainer at the time. Keep the interop tests and the CI guard green.
 
 ## Required
 

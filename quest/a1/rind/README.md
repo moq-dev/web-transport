@@ -12,7 +12,7 @@ Decided with the maintainer on 2026-11-06 (planning interview, following moq's [
 
 - rind only: one provider, no exclusion gate. rind's MIGRATE.md advises libraries to keep their old backend as the default. The maintainer chose rind only anyway, and planned rind support for every target ring or aws-lc-rs builds (except wasm) in rind's own tree instead.
 - Switch now, without waiting on rind's new targets. Every target this repo releases (Linux, macOS, Windows, iOS and Android on x86_64/aarch64/armv7) is one rind supports today.
-- A CPU rind refuses is an error at a builder's finishing method (a new `UnsupportedCpu` variant), not a panic. `new()` stays infallible. A rustls provider the process already installed is still used first.
+- A CPU rind refuses is an error at a builder's finishing method (a new `UnsupportedCpu` variant), not a panic. `new()` stays infallible. A rustls provider the process already installed is still used first, but the CPU check runs before any rind primitive the crate uses directly.
 - One child per crate. Each removes its own crate's features and updates its README, feature docs and CPU requirements inline. There is no separate docs page.
 - iroh-relay's `server` feature still enables ring. web-transport-iroh doesn't use it.
 
