@@ -453,17 +453,14 @@ pub(crate) mod tests {
 
     pub(crate) fn assert_transport(config: &impl std::fmt::Debug, custom: bool) {
         // Quinn exposes these settings only through Debug.
-        let config = format!("{config:?}");
-        let (idle, keepalive) = if custom {
-            (
-                "max_idle_timeout: Some(12000)",
-                "keep_alive_interval: Some(3s)",
-            )
+        let expected = if custom {
+            custom_transport().0
         } else {
-            ("max_idle_timeout: Some(30000)", "keep_alive_interval: None")
+            quinn::TransportConfig::default()
         };
-        assert!(config.contains(idle), "{config}");
-        assert!(config.contains(keepalive), "{config}");
+        let expected = format!("{expected:?}");
+        let config = format!("{config:?}");
+        assert!(config.contains(&expected), "{config}");
     }
 
     fn finish(builder: ClientBuilder, path: u8) -> Client {

@@ -15,7 +15,9 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
-The native `ClientBuilder` owns Quinn's transport configuration and does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings. For native transport settings, use the [Quinn builders](../web-transport-quinn/README.md#transport-configuration) directly.
+The native `ClientBuilder::with_transport_config` accepts Quinn's owned `TransportConfig`, available through `web_transport::quinn::quinn::TransportConfig`. Explicit congestion control overrides only its controller, regardless of setter order; see the [Quinn configuration documentation](../web-transport-quinn/README.md#transport-configuration) for defaults and examples.
+
+The native `ClientBuilder` does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings.
 
 
 ## Why no trait?

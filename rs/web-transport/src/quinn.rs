@@ -19,6 +19,17 @@ impl ClientBuilder {
         Self::default()
     }
 
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// Explicit congestion control overrides only its controller, regardless of
+    /// the order this method and [`Self::with_congestion_control`] are called.
+    pub fn with_transport_config(self, transport: quinn::quinn::TransportConfig) -> Self {
+        Self {
+            inner: self.inner.with_transport_config(transport),
+            ..self
+        }
+    }
+
     /// Allow a lower latency congestion controller.
     pub fn with_congestion_control(self, cc: CongestionControl) -> Self {
         Self {
