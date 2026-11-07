@@ -88,6 +88,11 @@ pub enum Error {
     #[error("invalid server name")]
     InvalidServerName,
 
+    /// A CPU feature required by the default WSS crypto provider is unavailable.
+    #[cfg(feature = "wss")]
+    #[error("unsupported CPU: {0}")]
+    UnsupportedCpu(String),
+
     /// The server rejected the handshake with a non-success HTTP status.
     ///
     /// Surfaced from the WebSocket upgrade response so callers can distinguish

@@ -21,6 +21,27 @@ pub use tokio_tungstenite;
 /// [`Error::WebSocket`] wraps a `tungstenite::Error`.
 pub use tokio_tungstenite::tungstenite;
 
+#[cfg(feature = "wss")]
+fn default_provider() -> Result<std::sync::Arc<rustls::crypto::CryptoProvider>, Error> {
+    if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
+        return Ok(provider.clone());
+    }
+    #[cfg(test)]
+    if REFUSE_CPU.get() {
+        return Err(Error::UnsupportedCpu(
+            "simulated missing CPU feature".into(),
+        ));
+    }
+    rind_rustls::default_provider()
+        .map(std::sync::Arc::new)
+        .map_err(|err| Error::UnsupportedCpu(err.to_string()))
+}
+
+#[cfg(all(test, feature = "wss"))]
+thread_local! {
+    static REFUSE_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Keep-alive configuration for WebSocket transports.
 ///
 /// WebSocket has no built-in idle timeout: when the peer's host crashes
@@ -246,10 +267,49 @@ impl Client {
     }
 
     /// Set the TLS connector for secure WebSocket connections.
+    ///
+    /// The connector and its TLS config are used unchanged. Without one, WSS
+    /// uses native roots and the installed rustls provider, otherwise rind.
     #[cfg(feature = "wss")]
     pub fn with_connector(mut self, connector: tokio_tungstenite::Connector) -> Self {
         self.connector = Some(connector);
         self
+    }
+
+    #[cfg(feature = "wss")]
+    fn connector(
+        &self,
+        uri: &tungstenite::http::Uri,
+    ) -> Result<Option<tokio_tungstenite::Connector>, Error> {
+        if self.connector.is_some() || uri.scheme_str() != Some("wss") {
+            return Ok(self.connector.clone());
+        }
+
+        use std::{io, sync::Arc};
+        let provider = default_provider()?;
+        let loaded = rustls_native_certs::load_native_certs();
+        if let Some(err) = loaded.errors.into_iter().next() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, err).into());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in loaded.certs {
+            roots
+                .add(cert)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        }
+        if roots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no native root CA certificates found",
+            )
+            .into());
+        }
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(config))))
     }
 
     /// Connect to a WebSocket server, negotiating an advertised `(alpn, version)`.
@@ -276,14 +336,10 @@ impl Client {
 
         #[cfg(feature = "wss")]
         let (ws_stream, response) = {
-            tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                self.config,
-                false,
-                self.connector.clone(),
-            )
-            .await
-            .map_err(Error::from)?
+            let connector = self.connector(request.uri())?;
+            tokio_tungstenite::connect_async_tls_with_config(request, self.config, false, connector)
+                .await
+                .map_err(Error::from)?
         };
 
         #[cfg(not(feature = "wss"))]
@@ -485,5 +541,86 @@ impl Server {
         };
         // Protocol came from the negotiated subprotocol, so no in-band wait.
         Ok(Session::new(transport, true, config))
+    }
+}
+
+#[cfg(all(test, feature = "wss"))]
+mod crypto_tests {
+    use super::*;
+    use std::sync::Arc;
+    use web_transport_trait::Session as _;
+
+    #[tokio::test]
+    async fn installed_provider_and_cpu_refusal() {
+        const CHILD: &str = "QMUX_PROVIDER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ws::crypto_tests::installed_provider_and_cpu_refusal",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let provider = default_provider().unwrap();
+        let config = Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                REFUSE_CPU.set(false);
+            }
+        }
+        let _reset = Reset;
+        REFUSE_CPU.set(true);
+        assert!(matches!(
+            Client::new().connect("wss://localhost:1/").await,
+            Err(Error::UnsupportedCpu(_))
+        ));
+        let uri = "wss://localhost/".parse().unwrap();
+        let client =
+            Client::new().with_connector(tokio_tungstenite::Connector::Rustls(config.clone()));
+        let Some(tokio_tungstenite::Connector::Rustls(preserved)) = client.connector(&uri).unwrap()
+        else {
+            panic!("caller connector was replaced");
+        };
+        assert!(Arc::ptr_eq(&preserved, &config));
+        let client = Client::new().with_connector(tokio_tungstenite::Connector::Plain);
+        assert!(matches!(
+            client.connector(&uri).unwrap(),
+            Some(tokio_tungstenite::Connector::Plain)
+        ));
+
+        // Plain WS must still connect without consulting the refused fallback.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            Server::new().accept(socket).await.unwrap()
+        });
+        let session = Client::new()
+            .connect(&format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let server = accept.await.unwrap();
+        session.close(0, "done");
+        server.close(0, "done");
+
+        (*provider).clone().install_default().unwrap();
+        let installed = rustls::crypto::CryptoProvider::get_default().unwrap();
+        assert!(Arc::ptr_eq(&default_provider().unwrap(), installed));
+        assert!(
+            REFUSE_CPU.get(),
+            "installed provider bypasses the rind CPU check"
+        );
     }
 }

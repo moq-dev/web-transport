@@ -23,6 +23,26 @@ qmux = "0.6"
 
 Default features: `tls`, `wss`
 
+### TLS crypto
+
+TLS and WSS dependencies enable no ring or aws-lc-rs provider. `tls::Client`
+and `tls::Server` require caller-built rustls configs; their provider, trust
+store, and client authentication settings are preserved. The TLS client clones
+its config to set QMux ALPNs, leaving the caller's original unchanged.
+
+For WSS without an explicit `ws::Client::with_connector`, QMux uses native
+certificate roots and the process's installed rustls provider, otherwise rind
+through rind-rustls. It does not install a process-wide provider. Root-loading
+or configuration errors fail the connection. Plain WebSockets do not load roots
+or select a TLS provider.
+
+The `wss` feature builds on x86_64, aarch64, and 32-bit ARM and requires Rust
+1.90 or newer. `ws::Client::new()` stays infallible; `connect()` returns
+`Error::UnsupportedCpu` when rind refuses the CPU. An installed provider or an
+explicit connector bypasses the fallback and its runtime CPU check. Code that
+previously relied on QMux enabling a rustls provider feature must build its
+configs with `rustls::ClientConfig::builder_with_provider` or install a provider.
+
 ## Usage
 
 The crate root holds the transport-independent session API — `Session`,
