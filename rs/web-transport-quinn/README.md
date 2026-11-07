@@ -63,6 +63,10 @@ a close capsule reports `WebTransportError::Closed(0, "")`; malformed or interru
 capsules report `WebTransportError::CapsuleError` unless the underlying connection has
 already reported its own error. An explicit local close reports `ConnectionError::LocallyClosed`.
 
+`WebTransportError::CapsuleError(String)` adds a diagnostic variant to the public
+enum; exhaustive matches must handle it. Dropping a receive stream sends
+application code 0 in the session's code space, preserving raw QUIC code 0 for raw sessions.
+
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
 
 When possible, `Deref` is used to expose the underlying Quinn API.

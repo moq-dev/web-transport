@@ -120,40 +120,51 @@ test("local and peer closes preserve nonzero application codes and reasons", asy
 });
 
 for (const side of ["client", "server"] as const) {
-	test(`an underlying connection failure rejects the ${side} Session.closed`, async () => {
-		const child = Bun.spawn([peerExecutable, ...(side === "server" ? [url] : [])], {
-			env: { ...process.env, WEB_TRANSPORT_TEST_PEM: pem.toString() },
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		let session: Session | undefined;
-		try {
-			if (side === "client") {
-				const { value } = await child.stdout.getReader().read();
-				if (!value) throw new Error("peer did not print its address");
-				session = new Session(new TextDecoder().decode(value).trim(), { serverCertificateDisableVerify: true });
-				await session.ready;
-			} else {
-				session = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
+	for (const orderly of [false, true]) {
+		test(`${orderly ? "an orderly HTTP/3 shutdown resolves" : "an underlying connection failure rejects"} the ${side} Session.closed`, async () => {
+			const child = Bun.spawn([peerExecutable, ...(side === "server" ? [url] : [])], {
+				env: {
+					...process.env,
+					WEB_TRANSPORT_TEST_PEM: pem.toString(),
+					WEB_TRANSPORT_TEST_ORDERLY_CLOSE: orderly ? "1" : undefined,
+				},
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			let session: Session | undefined;
+			try {
+				if (side === "client") {
+					const { value } = await child.stdout.getReader().read();
+					if (!value) throw new Error("peer did not print its address");
+					session = new Session(new TextDecoder().decode(value).trim(), {
+						serverCertificateDisableVerify: true,
+					});
+					await session.ready;
+				} else {
+					session = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
+				}
+				const closed = orderly ? session.closed : rejection(session.closed);
+				await session.datagrams.writable.getWriter().write(new Uint8Array([1]));
+				if (orderly) expect(await closed).toEqual({ closeCode: 0, reason: "" });
+				else {
+					const err = (await closed) as WebTransportError;
+					expect(err.source).toBe("session");
+					expect(err.streamErrorCode).toBeNull();
+					// A late local close must not turn an already observed failure into success.
+					session.close();
+					expect(await rejection(session.closed)).toBe(err);
+				}
+				child.stdin.end();
+				expect(await child.exited).toBe(0);
+				expect(await new Response(child.stderr).text()).toBe("");
+			} finally {
+				session?.close();
+				child.kill();
+				await child.exited;
 			}
-			const closed = rejection(session.closed);
-			await session.datagrams.writable.getWriter().write(new Uint8Array([1]));
-			const err = await closed;
-			expect(err.source).toBe("session");
-			expect(err.streamErrorCode).toBeNull();
-			// A late local close must not turn an already observed failure into success.
-			session.close();
-			expect(await rejection(session.closed)).toBe(err);
-			child.stdin.end();
-			expect(await child.exited).toBe(0);
-			expect(await new Response(child.stderr).text()).toBe("");
-		} finally {
-			session?.close();
-			child.kill();
-			await child.exited;
-		}
-	});
+		});
+	}
 }
 
 test("a peer's RESET_STREAM errors the reader with its code", async () => {

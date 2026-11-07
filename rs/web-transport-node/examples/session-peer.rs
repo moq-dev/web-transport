@@ -44,8 +44,13 @@ async fn main() -> anyhow::Result<()> {
         .read_datagram()
         .await
         .context("read trigger datagram")?;
-    // QUIC application code 0 is outside WebTransport's HTTP/3 code space.
-    session.deref().close(0u32.into(), b"connection failure");
+    // H3_NO_ERROR is orderly shutdown; raw QUIC 0 is outside WebTransport's HTTP/3 space.
+    let code = if std::env::var_os("WEB_TRANSPORT_TEST_ORDERLY_CLOSE").is_some() {
+        0x100u32
+    } else {
+        0
+    };
+    session.deref().close(code.into(), b"connection shutdown");
     // Await a second signal on stdin to keep the runtime alive while QUIC sends the close.
     tokio::task::spawn_blocking(|| std::io::stdin().read(&mut [0]))
         .await

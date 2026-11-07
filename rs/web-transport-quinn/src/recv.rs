@@ -14,13 +14,21 @@ use crate::{
     ReadError, ReadExactError, ReadToEndError, SessionError,
 };
 
-/// A stream that can be used to recieve bytes. See [`quinn::RecvStream`].
+/// A stream that can receive bytes, stopping with application code 0 on drop. See [`quinn::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: quinn::RecvStream,
     error: Arc<CloseReason>,
     // Raw QUIC carries stream codes as is; HTTP/3 maps them into its own code space.
     raw: bool,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // Use the session's code space rather than Quinn's implicit raw QUIC code 0.
+        // FIN, reset, or an earlier stop can already have made the stream terminal.
+        let _ = self.stop(0);
+    }
 }
 
 impl RecvStream {

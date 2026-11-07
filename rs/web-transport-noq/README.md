@@ -59,6 +59,14 @@ However some of the API is wrapped or unavailable due to WebTransport limitation
 - Stream IDs are not available.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
 
+A clean FIN on the HTTP/3 CONNECT stream without a close capsule reports
+`WebTransportError::Closed(0, "")`. Malformed or interrupted capsule data reports
+`WebTransportError::CapsuleError`, while an already closed native connection retains
+its connection error. Explicit local `close` remains `ConnectionError::LocallyClosed`.
+`WebTransportError::CapsuleError(String)` adds a diagnostic variant to the public
+enum; exhaustive matches must handle it. Dropping a receive stream sends
+application code 0 in the session's code space, preserving raw QUIC code 0 for raw sessions.
+
 Session clones share ownership of the connection. Dropping the final `Session`
 closes it immediately, including raw QUIC sessions, even if streams or native
 `noq::Connection` handles remain. Keep a `Session` clone while using those handles.

@@ -9,18 +9,37 @@ use bytes::Bytes;
 
 use crate::{ClosedStream, ReadError, ReadExactError, ReadToEndError, SessionError};
 
-/// A stream that can be used to receive bytes. See [`noq::RecvStream`].
+/// A stream that can receive bytes, stopping with application code 0 on drop. See [`noq::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: noq::RecvStream,
     error: Arc<OnceLock<SessionError>>,
+    raw: bool,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // Preserve the raw backend's default; HTTP/3 needs its mapped application code 0.
+        // FIN, reset, or an earlier stop can already have made the stream terminal.
+        let code = if self.raw {
+            0
+        } else {
+            web_transport_proto::error_to_http3(0)
+        };
+        let _ = self.inner.stop(code.try_into().unwrap());
+    }
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: noq::RecvStream, error: Arc<OnceLock<SessionError>>) -> Self {
+    pub(crate) fn new(
+        stream: noq::RecvStream,
+        error: Arc<OnceLock<SessionError>>,
+        raw: bool,
+    ) -> Self {
         Self {
             inner: stream,
             error,
+            raw,
         }
     }
 

@@ -33,6 +33,15 @@ fn session_error_to_close_info(
             reason: reason.clone(),
         }),
         web_transport_quinn::SessionError::ConnectionError(
+            web_transport_quinn::quinn::ConnectionError::ApplicationClosed(close),
+        ) if close.error_code.into_inner() == 0x100 => {
+            // H3_NO_ERROR is an orderly HTTP/3 shutdown without application close details.
+            Ok(NapiCloseInfo {
+                close_code: 0,
+                reason: String::new(),
+            })
+        }
+        web_transport_quinn::SessionError::ConnectionError(
             web_transport_quinn::quinn::ConnectionError::LocallyClosed,
         ) => local.ok_or_else(|| Error::from_reason(err.to_string())),
         other => Err(Error::from_reason(other.to_string())),
@@ -558,27 +567,17 @@ impl NapiSendClosed {
 /// A receive stream for reading data.
 #[napi]
 pub struct NapiRecvStream {
-    inner: Arc<Mutex<RecvStream>>,
+    inner: Arc<Mutex<web_transport_quinn::RecvStream>>,
     // Closing the sender cancels reads when the JS owner is collected. The read futures own
     // only receivers, so neither napi-rs nor the shared stream can keep that owner alive.
     stopped: watch::Sender<bool>,
-}
-
-struct RecvStream(web_transport_quinn::RecvStream);
-
-impl Drop for RecvStream {
-    fn drop(&mut self) {
-        // Quinn's implicit drop uses raw QUIC code 0; the Node API needs WebTransport 0.
-        // An already finished/reset stream needs no further cleanup.
-        let _ = self.0.stop(0);
-    }
 }
 
 impl NapiRecvStream {
     fn new(recv: web_transport_quinn::RecvStream) -> Self {
         let (stopped, _) = watch::channel(false);
         Self {
-            inner: Arc::new(Mutex::new(RecvStream(recv))),
+            inner: Arc::new(Mutex::new(recv)),
             stopped,
         }
     }
@@ -638,7 +637,7 @@ impl NapiRecvStream {
             let result = tokio::select! {
                 biased;
                 _ = stopped.changed() => return Ok(Either3::C(Null)),
-                result = stream.0.read_chunk(max_size as usize, true) => result,
+                result = stream.read_chunk(max_size as usize, true) => result,
             };
             let err = match result {
                 Ok(chunk) => {
@@ -669,7 +668,7 @@ impl NapiRecvStream {
         self.stopped.send_replace(true);
         let mut stream = inner.lock().await;
         // ClosedStream only means FIN, reset, or an earlier stop already made this terminal.
-        let _ = stream.0.stop(code);
+        let _ = stream.stop(code);
         Ok(())
     }
 }

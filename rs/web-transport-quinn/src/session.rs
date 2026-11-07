@@ -406,9 +406,11 @@ impl Session {
     pub fn close(&self, code: u32, reason: &[u8]) {
         // Record the local close error. First writer wins — if the background
         // task already set a remote close error, or close() was already called,
-        // this is a no-op. A raw peer close that already arrived is latched first.
+        // this is a no-op. A native failure that already arrived is latched first.
         if let Some(err) = self.conn.close_reason() {
-            self.map_error(err);
+            // A capsule task may not have observed it yet; preserve the first reason.
+            let _ = self.error.set(self.map_error(err));
+            return;
         }
         let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
         if self.error.set(err).is_err() {
@@ -1376,6 +1378,39 @@ mod tests {
         let (client_conn, server_conn) = tokio::join!(async { connecting.await.unwrap() }, accept);
 
         (client_conn, server_conn, [client, server])
+    }
+
+    #[tokio::test]
+    async fn local_close_preserves_a_native_failure_before_the_capsule_reader_runs() {
+        let (client, peer, _endpoints) = pair().await;
+        let mut session = Session::raw(client);
+        // Model an HTTP/3 session whose capsule task has not recorded the failure yet.
+        session.session_id = Some(SESSION);
+        session.error = Arc::new(CloseReason::http3());
+        peer.close(0u32.into(), b"failure");
+        session.conn.closed().await;
+        session.close(7, b"local");
+        assert!(matches!(
+            session.closed().await,
+            SessionError::ConnectionError(quinn::ConnectionError::ApplicationClosed(close))
+                if close.error_code.into_inner() == 0 && close.reason == b"failure"[..]
+        ));
+    }
+
+    #[tokio::test]
+    async fn receive_drop_uses_the_session_code_space() {
+        for raw in [false, true] {
+            let (client, peer, _endpoints) = pair().await;
+            let mut send = client.open_uni().await.unwrap();
+            send.write_all(b"data").await.unwrap();
+            let recv = peer.accept_uni().await.unwrap();
+            let recv = RecvStream::new(recv, Arc::new(CloseReason::http3()), raw);
+            drop(recv);
+            assert_eq!(
+                send.stopped().await.unwrap(),
+                Some(crate::error::encode_stream_code(0, raw))
+            );
+        }
     }
 
     #[tokio::test]

@@ -52,6 +52,11 @@ Call `Connection::close` before dropping to choose the close code and reason;
 final drop preserves an explicit close already in progress. Await
 `Connection::closed` when the application needs the driver to complete teardown.
 
+The CONNECT reader decodes capsules inside HTTP/3 DATA frames. A clean FIN
+without a close capsule closes the session with application code 0 and an empty
+reason. Malformed capsules fail with H3_MESSAGE_ERROR, preserving any native
+connection failure already observed.
+
 ## Testing
 
 Run `cargo test -p web-transport-quiche` for the unit tests and socket integration
