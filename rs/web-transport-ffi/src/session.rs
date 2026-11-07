@@ -13,6 +13,10 @@ use crate::send_stream::SendStream;
 
 /// One peer of a WebTransport session.
 ///
+/// Keep this object alive while using its streams. Releasing the final Session
+/// reference closes the connection even if stream objects remain. Calling close
+/// first allows its bounded graceful close to finish after the Session is released.
+///
 /// All async methods drive their futures on the FFI runtime so the foreign
 /// language can poll them without setting up a tokio context of its own.
 #[derive(uniffi::Object)]

@@ -64,8 +64,9 @@ struct Close {
     reader: Option<AbortHandle>,
     code: quinn::VarInt,
     reason: Vec<u8>,
-    // The HTTP/3 control stream must survive final Session drop during graceful close.
+    // HTTP/3 control and accepted QPACK streams must survive through graceful close.
     _settings: Option<Arc<Settings>>,
+    _accept: Option<Arc<Mutex<SessionAccept>>>,
 }
 
 impl Drop for Close {
@@ -179,7 +180,11 @@ impl Session {
         let error = Arc::new(CloseReason::http3());
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
-        let accept = SessionAccept::new(conn.clone(), session_id, error.clone());
+        let accept = Arc::new(Mutex::new(SessionAccept::new(
+            conn.clone(),
+            session_id,
+            error.clone(),
+        )));
 
         let (reader, registration) = AbortHandle::new_pair();
         let owner = Arc::new(SessionOwner {
@@ -189,13 +194,14 @@ impl Session {
                 code: crate::error::encode_stream_code(0, false),
                 reason: Vec::new(),
                 _settings: Some(Arc::new(settings)),
+                _accept: Some(accept.clone()),
             })),
         });
 
         let this = Self {
             owner,
             conn,
-            accept: Some(Arc::new(Mutex::new(accept))),
+            accept: Some(accept),
             session_id: Some(session_id),
             header_uni: header_uni.into(),
             header_bi: header_bi.into(),
@@ -470,7 +476,10 @@ impl Session {
         // task already set a remote close error, or close() was already called,
         // this is a no-op. A raw peer close that already arrived is latched first.
         if let Some(err) = self.conn.close_reason() {
-            self.map_error(err);
+            // `map_error` decodes raw codes too, but only raw mapping latches the
+            // result itself. Preserve an observed HTTP/3 peer close before returning.
+            let _ = self.error.set(self.map_error(err));
+            return;
         }
         let err = SessionError::ConnectionError(quinn::ConnectionError::LocallyClosed);
         if self.error.set(err).is_err() {
@@ -623,6 +632,7 @@ impl Session {
                     code: 0u32.into(),
                     reason: Vec::new(),
                     _settings: None,
+                    _accept: None,
                 })),
             }),
             error: Arc::new(CloseReason::raw(conn.clone())),
@@ -789,8 +799,7 @@ pub struct SessionAccept {
     // Shared session error for propagation to accepted streams.
     error: Arc<CloseReason>,
 
-    // We also need to keep a reference to the qpack streams if the endpoint (incorrectly) creates them.
-    // Again, this is just so they don't get closed until we drop the session.
+    // QPACK streams are critical HTTP/3 streams, so retain them through graceful close.
     qpack_encoder: Option<quinn::RecvStream>,
     qpack_decoder: Option<quinn::RecvStream>,
 
@@ -941,7 +950,7 @@ impl SessionAccept {
             }
         }
 
-        // We need to keep a reference to the qpack streams if the endpoint (incorrectly) creates them, so return everything.
+        // Return QPACK streams too so their critical-stream lifetime can be retained.
         Ok((typ, recv))
     }
 
@@ -1663,6 +1672,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_close_preserves_http3_peer_error_before_reader_records_it() {
+        let (session, _connect, peer, _endpoints) = http3_pair().await;
+        let native = session.conn.clone();
+        let reader = Arc::downgrade(&session.error);
+        // Model a reader that has not recorded closure: cancellation prevents it
+        // from winning the first-reason race after the peer closes the connection.
+        session
+            .owner
+            .close
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .reader
+            .as_ref()
+            .unwrap()
+            .abort();
+        peer.close(crate::error::encode_stream_code(99, false), b"peer");
+        native.closed().await;
+        assert!(session.error.get().is_none());
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(1, b"local", Some(runtime.clone()));
+        assert!(runtime.tasks.lock().unwrap().is_empty());
+        assert!(
+            matches!(session.close_reason(), Some(SessionError::WebTransportError(WebTransportError::Closed(99, reason))) if reason == "peer")
+        );
+        drop(session);
+        reader_released(reader).await;
+    }
+
+    #[tokio::test]
     async fn reader_preserves_observed_peer_error() {
         let (client, peer, _endpoints) = pair().await;
         let (mut send, recv) = client.open_bi().await.unwrap();
@@ -1737,6 +1777,56 @@ mod tests {
         native.closed().await;
         reader_released(reader).await;
         reader_released(settings).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_close_retains_peer_qpack_streams() {
+        let (session, connect, peer, _endpoints) = http3_pair().await;
+        let mut encoder = peer.open_uni().await.unwrap();
+        let mut decoder = peer.open_uni().await.unwrap();
+        encoder.write_all(&[0x02]).await.unwrap();
+        decoder.write_all(&[0x03]).await.unwrap();
+        let accept = session.accept.as_ref().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            kio::wait(|waiter| {
+                let mut accept = accept.lock().unwrap();
+                assert!(accept.poll_accept_uni(waiter).is_pending());
+                if accept.qpack_encoder.is_some() && accept.qpack_decoder.is_some() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let accept = Arc::downgrade(accept);
+        let runtime = Arc::new(CapturedRuntime::default());
+        session.close_on(42, b"first", Some(runtime.clone()));
+        let task = runtime.take();
+        drop(session);
+        assert!(
+            accept.strong_count() > 0,
+            "final drop released the critical QPACK streams"
+        );
+        let receive = async {
+            let capsule = Session::read_capsules(connect.recv).await.unwrap();
+            let encoder_stopped = encoder.stopped();
+            let decoder_stopped = decoder.stopped();
+            futures::pin_mut!(encoder_stopped, decoder_stopped);
+            assert!(futures::poll!(encoder_stopped).is_pending());
+            assert!(futures::poll!(decoder_stopped).is_pending());
+            peer.close(0u32.into(), b"ack");
+            capsule
+        };
+        let (_, capsule) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(task, receive)
+        })
+        .await
+        .unwrap();
+        assert_eq!(capsule, (42, "first".into()));
+        assert_eq!(accept.strong_count(), 0);
     }
 
     // The capsule is larger than the peer's CONNECT receive credit and the peer never reads it.
@@ -2038,6 +2128,7 @@ mod tests {
                 code: crate::error::encode_stream_code(0, false),
                 reason: b"bye".to_vec(),
                 _settings: None,
+                _accept: None,
             },
             send,
             capsule,

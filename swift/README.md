@@ -12,6 +12,10 @@ For now, consume the package locally by downloading the `web-transport-ffi-${VER
 .package(path: "/path/to/web-transport-ffi-${VERSION}-swift"),
 ```
 
+## Session lifetime
+
+Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
+
 ## Local development
 
 `swift/scripts/check.sh` builds `web-transport-ffi` for the host, regenerates the UniFFI Swift bindings, and (on macOS) assembles a single-slice `WebTransportFFI.xcframework` so `swift test` can run. Requires macOS with `xcodebuild` and `swift` on `$PATH`. Skips cleanly on non-macOS hosts.
