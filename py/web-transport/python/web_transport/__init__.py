@@ -441,9 +441,26 @@ class SessionRequest:
             raise  # unreachable
         return Session(sess)
 
-    async def reject(self, status_code: int = 404) -> None:
+    async def reject(
+        self,
+        status_code: int = 404,
+        *,
+        headers: list[tuple[str, bytes]] | None = None,
+        protocol: str | None = None,
+    ) -> None:
+        """Reject with repeated headers and an optional protocol offered by the peer.
+
+        Waits for delivery or peer termination; cancel for an application deadline.
+        """
         try:
-            await self._inner.reject(status_code)
+            await self._inner.reject(
+                status_code,
+                [
+                    _uniffi.HttpHeader(name=name, value=value)
+                    for name, value in headers or ()
+                ],
+                protocol,
+            )
         except _UniffiError as e:
             reraise(e)
 

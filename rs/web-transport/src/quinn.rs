@@ -179,6 +179,11 @@ impl Session {
         self.inner.request().map(|request| &request.url)
     }
 
+    /// Return the HTTP/3 CONNECT response and its headers, or `None` for raw QUIC.
+    pub fn response(&self) -> Option<&quinn::proto::ConnectResponse> {
+        self.inner.response()
+    }
+
     /// Return the application protocol used to create the session.
     ///
     /// For a WebTransport session this is the negotiated subprotocol; for a raw QUIC
@@ -350,5 +355,41 @@ impl From<quinn::ReadError> for Error {
             quinn::ReadError::SessionError(e) => Error::Session(e),
             e => Error::Read(e),
         }
+    }
+}
+
+impl Error {
+    /// Return the peer's CONNECT rejection response, including repeated headers (native only).
+    pub fn response(&self) -> Option<&quinn::proto::ConnectResponse> {
+        match self {
+            Self::Client(quinn::ClientError::HttpError(quinn::ConnectError::ErrorStatus(
+                response,
+            ))) => Some(response),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn rejection_response_survives_router_error() {
+        let response = quinn::proto::ConnectResponse::new(quinn::http::StatusCode::FORBIDDEN)
+            .with_header(
+                quinn::http::header::SET_COOKIE,
+                quinn::http::HeaderValue::from_static("a=1"),
+            )
+            .with_header(
+                quinn::http::header::SET_COOKIE,
+                quinn::http::HeaderValue::from_static("b=2"),
+            );
+        let error = Error::from(quinn::ClientError::HttpError(
+            quinn::ConnectError::ErrorStatus(Box::new(response)),
+        ));
+        let response = error.response().unwrap();
+        assert_eq!(response.status, quinn::http::StatusCode::FORBIDDEN);
+        assert_eq!(response.headers.get_all("set-cookie").iter().count(), 2);
     }
 }

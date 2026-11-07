@@ -11,7 +11,7 @@ use thiserror::Error;
 // RFC 9114 section 4.2.2: each decoded field costs name + value + 32 bytes.
 pub(crate) const MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
 
-// Errors that can occur during the connect request.
+/// An error parsing or encoding a CONNECT request or response.
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum ConnectError {
@@ -33,8 +33,9 @@ pub enum ConnectError {
     #[error("invalid status")]
     InvalidStatus,
 
-    #[error("expected 200, got: {0:?}")]
-    WrongStatus(Option<http::StatusCode>),
+    /// The response has no status pseudo-header.
+    #[error("missing status")]
+    MissingStatus,
 
     #[error("expected connect, got: {0:?}")]
     WrongMethod(Option<http::method::Method>),
@@ -60,8 +61,13 @@ pub enum ConnectError {
     #[error("frame too large")]
     FrameTooLarge,
 
-    #[error("non-200 status: {0:?}")]
-    ErrorStatus(http::StatusCode),
+    /// A generic header conflicts with a field managed by the CONNECT encoder.
+    #[error("reserved CONNECT header: {0}")]
+    ReservedHeader(http::HeaderName),
+
+    /// A pseudo-header is duplicated, unknown, or follows an ordinary field.
+    #[error("invalid pseudo-header")]
+    InvalidPseudoHeader,
 
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
@@ -114,7 +120,10 @@ pub struct ConnectRequest {
     /// The subprotocols requested (if any).
     pub protocols: Vec<String>,
 
-    /// The raw HTTP/3 headers from the request.
+    /// Ordinary HTTP/3 request headers, including repeated values.
+    ///
+    /// Set `protocols` instead of inserting the reserved `wt-available-protocols`
+    /// field; encoding a generic entry for that name returns [`ConnectError::ReservedHeader`].
     pub headers: http::HeaderMap,
 }
 
@@ -155,6 +164,27 @@ impl ConnectRequest {
     fn decode_headers<B: Buf>(data: &mut B) -> Result<Self, ConnectError> {
         let headers = qpack::Headers::decode(data)?;
 
+        let mut pseudo = std::collections::HashSet::new();
+        let mut ordinary = false;
+        for (name, _) in &headers.fields {
+            if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err(ConnectError::InvalidHttpHeaderName);
+            }
+            if name.starts_with(':') {
+                if ordinary
+                    || !matches!(
+                        name.as_str(),
+                        ":scheme" | ":authority" | ":path" | ":method" | ":protocol"
+                    )
+                    || !pseudo.insert(name)
+                {
+                    return Err(ConnectError::InvalidPseudoHeader);
+                }
+            } else {
+                ordinary = true;
+            }
+        }
+
         let scheme = match headers.get(":scheme") {
             Some("https") => "https",
             Some(scheme) => Err(ConnectError::WrongScheme(Some(scheme.to_string())))?,
@@ -181,12 +211,16 @@ impl ConnectRequest {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
+        // Structured lists combine all field lines before parsing (RFC 8941 §4.2).
         let protocols = headers
-            .get(protocol_negotiation::AVAILABLE_NAME)
-            .map(protocol_negotiation::decode_list)
-            .transpose()
-            .map_err(|_| ConnectError::InvalidProtocol)?
-            .unwrap_or_default();
+            .fields
+            .iter()
+            .filter(|(name, _)| name == protocol_negotiation::AVAILABLE_NAME)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let protocols = protocol_negotiation::decode_list(&protocols)
+            .map_err(|_| ConnectError::InvalidProtocol)?;
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
 
@@ -223,30 +257,28 @@ impl ConnectRequest {
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
         for (item_header_name, item_header_value) in self.headers.iter() {
-            // Skip protocol negotiation headers; they are derived from `self.protocols`.
             if item_header_name == protocol_negotiation::AVAILABLE_NAME {
-                continue;
+                return Err(ConnectError::ReservedHeader(item_header_name.clone()));
             }
-            // http::HeaderValue can contain arbitrary bytes (not just UTF-8).
-            // The to_str() method fails when the header value contains invalid UTF-8 bytes
+            // QPACK's string encoder requires visible ASCII (with internal tabs).
             let item_header_value_str = item_header_value
                 .to_str()
                 .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
-            headers.set(item_header_name.as_str(), item_header_value_str);
+            headers.append(item_header_name.as_str(), item_header_value_str);
         }
-        headers.set(":method", "CONNECT");
-        headers.set(":scheme", self.url.scheme());
-        headers.set(":authority", self.url.authority());
+        headers.append(":method", "CONNECT");
+        headers.append(":scheme", self.url.scheme());
+        headers.append(":authority", self.url.authority());
         let path_and_query = match self.url.query() {
             Some(query) => format!("{}?{}", self.url.path(), query),
             None => self.url.path().to_string(),
         };
-        headers.set(":path", &path_and_query);
-        headers.set(":protocol", "webtransport");
+        headers.append(":path", &path_and_query);
+        headers.append(":protocol", "webtransport");
 
         if !self.protocols.is_empty() {
             let encoded = protocol_negotiation::encode_list(&self.protocols)?;
-            headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
+            headers.append(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
         encode_headers_frame(&headers, buf)
@@ -335,81 +367,148 @@ impl fmt::Debug for ConnectRequest {
 }
 
 /// A CONNECT response to accept or reject a WebTransport session.
+///
+/// Header values are redacted in [`Debug`](fmt::Debug), as for [`ConnectRequest`].
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectResponse {
     /// The status code of the response.
-    pub status: http::status::StatusCode,
+    pub status: http::StatusCode,
 
-    /// The subprotocol selected by the server, if any
+    /// The subprotocol selected by the server, if any.
     pub protocol: Option<String>,
+
+    /// Ordinary HTTP/3 response headers, including repeated values.
+    ///
+    /// `wt-protocol` and `sec-webtransport-http3-draft` are managed by the encoder
+    /// and must not be inserted here; pseudo-headers cannot be represented by a
+    /// [`http::HeaderName`]. Values unsupported by the QPACK encoder return
+    /// [`ConnectError::InvalidHttpHeaderValue`].
+    pub headers: http::HeaderMap,
 }
 
 impl ConnectResponse {
-    pub const OK: Self = Self {
-        status: http::StatusCode::OK,
-        protocol: None,
-    };
-
+    /// Create a response with the given status and no application headers.
     pub fn new(status: http::StatusCode) -> Self {
         Self {
             status,
             protocol: None,
+            headers: http::HeaderMap::new(),
         }
     }
 
+    /// Select the subprotocol negotiated with the client.
     pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.protocol = Some(protocol.into());
         self
     }
 
+    /// Append an ordinary response header without replacing earlier values.
+    pub fn with_header(mut self, name: http::HeaderName, value: http::HeaderValue) -> Self {
+        self.headers.append(name, value);
+        self
+    }
+
+    /// Extend the response headers, replacing values for names present in the map.
+    pub fn with_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.headers.extend(headers);
+        self
+    }
+
+    /// Decode one HEADERS frame, preserving both successful and rejection responses.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ConnectError> {
         let mut data = decode_headers_frame(buf)?;
-        Self::decode_headers(&mut data)
+        let response = Self::decode_headers(&mut data);
+        data.advance(data.remaining());
+        response
     }
 
     fn decode_headers<B: Buf>(data: &mut B) -> Result<Self, ConnectError> {
-        let headers = qpack::Headers::decode(data)?;
+        let fields = qpack::Headers::decode(data)?;
+        let mut status = None;
+        let mut protocol = None;
+        let mut headers = http::HeaderMap::new();
+        let mut ordinary = false;
+        let mut draft = false;
 
-        let status = match headers
-            .get(":status")
-            .map(|status| {
-                http::StatusCode::from_str(status).map_err(|_| ConnectError::InvalidStatus)
-            })
-            .transpose()?
-        {
-            Some(status) if status.is_success() => status,
-            o => return Err(ConnectError::WrongStatus(o)),
-        };
+        for (name, value) in fields.fields {
+            if name.starts_with(':') {
+                if ordinary || name != ":status" || status.is_some() {
+                    return Err(ConnectError::InvalidPseudoHeader);
+                }
+                status = Some(
+                    http::StatusCode::from_str(&value).map_err(|_| ConnectError::InvalidStatus)?,
+                );
+                continue;
+            }
+            ordinary = true;
+            // HeaderName would normalize uppercase names instead of rejecting them.
+            if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err(ConnectError::InvalidHttpHeaderName);
+            }
+            let name = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ConnectError::InvalidHttpHeaderName)?;
+            let value = http::HeaderValue::from_str(&value)
+                .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
+            validate_response_header(&name, &value)?;
+            if name == protocol_negotiation::SELECTED_NAME {
+                if protocol.is_some() {
+                    return Err(ConnectError::InvalidProtocol);
+                }
+                protocol = Some(
+                    protocol_negotiation::decode_item(
+                        value.to_str().map_err(|_| ConnectError::InvalidProtocol)?,
+                    )
+                    .map_err(|_| ConnectError::InvalidProtocol)?,
+                );
+            } else if name == LEGACY_DRAFT_HEADER {
+                if draft {
+                    return Err(ConnectError::InvalidHttpHeaderValue);
+                }
+                draft = true;
+            } else {
+                headers.append(name, value);
+            }
+        }
 
-        let protocol = headers
-            .get(protocol_negotiation::SELECTED_NAME)
-            .map(protocol_negotiation::decode_item)
-            .transpose()
-            .map_err(|_| ConnectError::InvalidProtocol)?;
-
-        Ok(Self { status, protocol })
+        Ok(Self {
+            status: status.ok_or(ConnectError::MissingStatus)?,
+            protocol,
+            headers,
+        })
     }
 
-    /// Read a CONNECT response from a stream, consuming only the exact bytes of the frame.
+    /// Read one response, consuming only its frame bytes, including on rejection.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
         let buf = read_headers_frame(stream).await?;
         Self::decode_headers(&mut buf.as_slice())
     }
 
+    /// Encode the response, rejecting reserved generic fields before writing any bytes.
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
         let mut headers = qpack::Headers::default();
-        headers.set(":status", self.status.as_str());
-        headers.set("sec-webtransport-http3-draft", "draft02");
+        headers.append(":status", self.status.as_str());
+        headers.append(LEGACY_DRAFT_HEADER, "draft02");
 
         if let Some(protocol) = self.protocol.as_ref() {
             let encoded = protocol_negotiation::encode_item(protocol)?;
-            headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
+            headers.append(protocol_negotiation::SELECTED_NAME, &encoded);
+        }
+        for (name, value) in &self.headers {
+            if name == protocol_negotiation::SELECTED_NAME || name == LEGACY_DRAFT_HEADER {
+                return Err(ConnectError::ReservedHeader(name.clone()));
+            }
+            validate_response_header(name, value)?;
+            let value = value
+                .to_str()
+                .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
+            headers.append(name.as_str(), value);
         }
 
         encode_headers_frame(&headers, buf)
     }
 
+    /// Write the response after validating its complete field section.
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
         let mut buf = BytesMut::new();
         self.encode(&mut buf)?;
@@ -418,18 +517,47 @@ impl ConnectResponse {
     }
 }
 
+const LEGACY_DRAFT_HEADER: &str = "sec-webtransport-http3-draft";
+
+fn validate_response_header(
+    name: &http::HeaderName,
+    value: &http::HeaderValue,
+) -> Result<(), ConnectError> {
+    value
+        .to_str()
+        .map_err(|_| ConnectError::InvalidHttpHeaderValue)?;
+    // HTTP/3 forbids connection-specific fields; TE is only defined in requests.
+    if matches!(
+        name.as_str(),
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te"
+    ) {
+        return Err(ConnectError::InvalidHttpHeaderName);
+    }
+    if matches!(value.as_bytes(), [b' ' | b'\t', ..] | [.., b' ' | b'\t']) {
+        return Err(ConnectError::InvalidHttpHeaderValue);
+    }
+    Ok(())
+}
+
+impl fmt::Debug for ConnectResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectResponse")
+            .field("status", &self.status)
+            .field("protocol", &self.protocol)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
+    }
+}
+
 impl Default for ConnectResponse {
     fn default() -> Self {
-        Self::OK
+        Self::new(http::StatusCode::OK)
     }
 }
 
 impl From<http::StatusCode> for ConnectResponse {
     fn from(status: http::StatusCode) -> Self {
-        Self {
-            status,
-            protocol: None,
-        }
+        Self::new(status)
     }
 }
 
@@ -591,7 +719,7 @@ mod tests {
 
     /// Build a framed CONNECT response on the wire.
     fn encode_response() -> Vec<u8> {
-        let resp = ConnectResponse::OK;
+        let resp = ConnectResponse::default();
         let mut buf = Vec::new();
         resp.encode(&mut buf).unwrap();
         buf
@@ -633,6 +761,414 @@ mod tests {
                 .to_string(),
             "field section too large"
         );
+    }
+
+    #[test]
+    fn rejection_is_a_decoded_response() {
+        let mut wire = Vec::new();
+        ConnectResponse::new(http::StatusCode::FORBIDDEN)
+            .encode(&mut wire)
+            .unwrap();
+        assert_eq!(
+            ConnectResponse::decode(&mut wire.as_slice())
+                .unwrap()
+                .status,
+            http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn qpack_preserves_repeated_field_lines() {
+        let mut section = vec![0, 0];
+        append_literal(&mut section, b"set-cookie", b"a=1");
+        append_literal(&mut section, b"set-cookie", b"b=2");
+        let headers = qpack::Headers::decode(&mut section.as_slice()).unwrap();
+        assert_eq!(
+            headers
+                .fields
+                .iter()
+                .filter(|(name, _)| name.as_str() == "set-cookie")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn request_rejects_duplicate_unknown_and_late_pseudo_headers() {
+        for extra in [
+            ":scheme",
+            ":authority",
+            ":path",
+            ":method",
+            ":protocol",
+            ":status",
+        ] {
+            let mut fields = qpack::Headers::default();
+            for (name, value) in [
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", "/"),
+                (":method", "CONNECT"),
+                (":protocol", "webtransport"),
+            ] {
+                fields.append(name, value);
+            }
+            fields.append(extra, "invalid");
+            let mut wire = Vec::new();
+            encode_headers_frame(&fields, &mut wire).unwrap();
+            assert!(matches!(
+                ConnectRequest::decode(&mut wire.as_slice()),
+                Err(ConnectError::InvalidPseudoHeader)
+            ));
+        }
+        let mut section = vec![0, 0];
+        append_literal(&mut section, b"x-first", b"value");
+        append_literal(&mut section, b":scheme", b"https");
+        let wire = reframe(&section);
+        assert!(matches!(
+            ConnectRequest::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidPseudoHeader)
+        ));
+    }
+
+    #[test]
+    fn request_combines_repeated_protocol_lists_and_validates_each_line() {
+        for last in ["\"b\", \"c\"", "unquoted", ""] {
+            let mut fields = qpack::Headers::default();
+            for (name, value) in [
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", "/"),
+                (":method", "CONNECT"),
+                (":protocol", "webtransport"),
+                ("wt-available-protocols", "\"a\""),
+                ("wt-available-protocols", last),
+            ] {
+                fields.append(name, value);
+            }
+            let mut wire = Vec::new();
+            encode_headers_frame(&fields, &mut wire).unwrap();
+            let result = ConnectRequest::decode(&mut wire.as_slice());
+            if last != "\"b\", \"c\"" {
+                assert!(matches!(result, Err(ConnectError::InvalidProtocol)));
+            } else {
+                let request = result.unwrap();
+                assert_eq!(request.protocols, ["a", "b", "c"]);
+                assert!(!request.headers.contains_key("wt-available-protocols"));
+            }
+        }
+    }
+
+    #[test]
+    fn request_rejects_uppercase_reserved_names() {
+        let mut section = vec![0, 0];
+        append_literal(&mut section, b"WT-Available-Protocols", b"\"moq\"");
+        let wire = reframe(&section);
+        assert!(matches!(
+            ConnectRequest::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidHttpHeaderName)
+        ));
+    }
+
+    #[test]
+    fn duplicate_draft_is_malformed_peer_input() {
+        let mut fields = qpack::Headers::default();
+        fields.append(":status", "403");
+        fields.append(LEGACY_DRAFT_HEADER, "draft02");
+        fields.append(LEGACY_DRAFT_HEADER, "draft02");
+        let mut wire = Vec::new();
+        encode_headers_frame(&fields, &mut wire).unwrap();
+        assert!(matches!(
+            ConnectResponse::decode(&mut wire.as_slice()),
+            Err(ConnectError::InvalidHttpHeaderValue)
+        ));
+    }
+
+    fn assert_response_headers(response: &ConnectResponse) {
+        assert_eq!(response.protocol.as_deref(), Some("moq"));
+        assert!(!response.headers.contains_key("wt-protocol"));
+        assert!(!response.headers.contains_key(LEGACY_DRAFT_HEADER));
+        assert_eq!(
+            response
+                .headers
+                .get_all("set-cookie")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a=1", "b=2"]
+        );
+        assert_eq!(response.headers["x-diagnostic"], "retry elsewhere");
+    }
+
+    #[tokio::test]
+    async fn response_headers_roundtrip_and_exact_consumption() {
+        for status in [
+            http::StatusCode::OK,
+            http::StatusCode::FORBIDDEN,
+            http::StatusCode::TEMPORARY_REDIRECT,
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.append(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_static("a=1"),
+            );
+            headers.append(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_static("b=2"),
+            );
+            let response = ConnectResponse::new(status)
+                .with_protocol("moq")
+                .with_headers(headers)
+                .with_header(
+                    http::HeaderName::from_static("x-diagnostic"),
+                    http::HeaderValue::from_static("retry elsewhere"),
+                );
+            let mut wire = Vec::new();
+            response.write(&mut wire).await.unwrap();
+            wire.extend_from_slice(b"trailing");
+            let mut buf = wire.as_slice();
+            let response = ConnectResponse::decode(&mut buf).unwrap();
+            assert_eq!(response.status, status);
+            assert_response_headers(&response);
+            assert_eq!(buf, b"trailing");
+            let mut cursor = Cursor::new(wire);
+            let response = ConnectResponse::read(&mut cursor).await.unwrap();
+            assert_eq!(response.status, status);
+            assert_response_headers(&response);
+            let mut tail = Vec::new();
+            cursor.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, b"trailing");
+            let mut wire = Vec::new();
+            response.encode(&mut wire).unwrap();
+            assert_response_headers(&ConnectResponse::decode(&mut wire.as_slice()).unwrap());
+        }
+    }
+
+    #[test]
+    fn request_preserves_repeated_ordinary_fields() {
+        let request = ConnectRequest::new(Url::parse("https://example.com/").unwrap())
+            .with_header(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("text/plain"),
+            )
+            .with_header(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("text/html"),
+            );
+        let mut wire = Vec::new();
+        request.encode(&mut wire).unwrap();
+        let request = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(
+            request
+                .headers
+                .get_all("accept")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["text/plain", "text/html"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_generic_fields_write_nothing() {
+        for name in ["wt-protocol", LEGACY_DRAFT_HEADER] {
+            let response = ConnectResponse::default().with_header(
+                http::HeaderName::from_static(name),
+                http::HeaderValue::from_static("override"),
+            );
+            let mut wire = Vec::new();
+            assert!(matches!(
+                response.encode(&mut wire),
+                Err(ConnectError::ReservedHeader(_))
+            ));
+            assert!(matches!(
+                response.write(&mut wire).await,
+                Err(ConnectError::ReservedHeader(_))
+            ));
+            assert!(wire.is_empty());
+        }
+        let request = ConnectRequest::new(Url::parse("https://example.com/").unwrap()).with_header(
+            http::HeaderName::from_static("wt-available-protocols"),
+            http::HeaderValue::from_static("override"),
+        );
+        let mut wire = Vec::new();
+        assert!(matches!(
+            request.encode(&mut wire),
+            Err(ConnectError::ReservedHeader(_))
+        ));
+        assert!(matches!(
+            request.write(&mut wire).await,
+            Err(ConnectError::ReservedHeader(_))
+        ));
+        assert!(wire.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_rejects_malformed_field_lines() {
+        let cases: &[&[(&[u8], &[u8])]] = &[
+            &[(b"x", b"no status")],
+            &[(b":status", b"bad")],
+            &[(b":status", b"200"), (b":status", b"403")],
+            &[(b":path", b"/"), (b":status", b"200")],
+            &[(b"x", b"first"), (b":status", b"200")],
+            &[(b":status", b"403"), (b"wt-protocol", b"unquoted")],
+            &[
+                (b":status", b"200"),
+                (b"wt-protocol", b"\"a\""),
+                (b"wt-protocol", b"\"b\""),
+            ],
+            &[(b":status", b"200"), (b"wt-protocol", b"\"a\", \"b\"")],
+            &[(b":status", b"403"), (b"X-Invalid", b"value")],
+            &[(b":status", b"200"), (b"bad name", b"value")],
+            &[(b":status", b"403"), (b"x", b"bad\r\nvalue")],
+            &[(b":status", b"403"), (b"x", b"\x00")],
+            &[(b":status", b"200"), (b"x", b" leading")],
+            &[(b":status", b"200"), (b"x", b"trailing\t")],
+            &[(b":status", b"200"), (b"x", b"\xff")],
+            &[(b":status", b"403"), (b"x-reason", "café".as_bytes())],
+            &[
+                (b":status", b"200"),
+                (b"sec-webtransport-http3-draft", b"draft02"),
+                (b"sec-webtransport-http3-draft", b"draft02"),
+            ],
+        ];
+        for fields in cases {
+            let mut section = vec![0, 0];
+            for (name, value) in *fields {
+                append_literal(&mut section, name, value);
+            }
+            let mut wire = reframe(&section);
+            wire.extend_from_slice(b"trailing");
+            let mut buf = wire.as_slice();
+            assert!(
+                ConnectResponse::decode(&mut buf).is_err(),
+                "accepted {fields:?}"
+            );
+            assert_eq!(buf, b"trailing");
+            let mut cursor = Cursor::new(wire);
+            assert!(
+                ConnectResponse::read(&mut cursor).await.is_err(),
+                "accepted {fields:?}"
+            );
+            let mut tail = Vec::new();
+            cursor.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, b"trailing");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_qpack_consumes_only_its_frame() {
+        // A dynamic reference is unsupported, with unread bytes left in the section.
+        let mut wire = reframe(&[0, 0, 0x80, 0xc0 | 25]);
+        wire.extend_from_slice(b"trailing");
+        let mut buf = wire.as_slice();
+        assert!(matches!(
+            ConnectResponse::decode(&mut buf),
+            Err(ConnectError::QpackError(_))
+        ));
+        assert_eq!(buf, b"trailing");
+        let mut cursor = Cursor::new(wire);
+        assert!(matches!(
+            ConnectResponse::read(&mut cursor).await,
+            Err(ConnectError::QpackError(_))
+        ));
+        let mut tail = Vec::new();
+        cursor.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"trailing");
+    }
+
+    #[test]
+    fn response_rejects_connection_specific_fields() {
+        for name in [
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "te",
+        ] {
+            let response = ConnectResponse::default().with_header(
+                http::HeaderName::from_static(name),
+                http::HeaderValue::from_static("value"),
+            );
+            let mut wire = Vec::new();
+            assert!(matches!(
+                response.encode(&mut wire),
+                Err(ConnectError::InvalidHttpHeaderName)
+            ));
+            assert!(wire.is_empty());
+            let mut section = vec![0, 0];
+            append_literal(&mut section, b":status", b"403");
+            append_literal(&mut section, name.as_bytes(), b"value");
+            assert!(matches!(
+                ConnectResponse::decode(&mut reframe(&section).as_slice()),
+                Err(ConnectError::InvalidHttpHeaderName)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_generic_values_validate_before_writing() {
+        for value in [
+            http::HeaderValue::from_bytes(b"\xff").unwrap(),
+            http::HeaderValue::from_static(" leading"),
+            http::HeaderValue::from_static("trailing "),
+        ] {
+            let response =
+                ConnectResponse::default().with_header(http::HeaderName::from_static("x"), value);
+            let mut wire = Vec::new();
+            assert!(matches!(
+                response.encode(&mut wire),
+                Err(ConnectError::InvalidHttpHeaderValue)
+            ));
+            assert!(matches!(
+                response.write(&mut wire).await,
+                Err(ConnectError::InvalidHttpHeaderValue)
+            ));
+            assert!(wire.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_response_headers_obey_exact_size_limit() {
+        // Charge every field line, including both occurrences of x-pad.
+        let overhead = (32 + ":status".len() + 3)
+            + (32 + LEGACY_DRAFT_HEADER.len() + "draft02".len())
+            + 2 * (32 + "x-pad".len());
+        let fill = MAX_FIELD_SECTION_SIZE as usize - overhead - 1;
+        for status in [http::StatusCode::OK, http::StatusCode::FORBIDDEN] {
+            let response = |len| {
+                ConnectResponse::new(status)
+                    .with_header(
+                        http::HeaderName::from_static("x-pad"),
+                        http::HeaderValue::from_static("a"),
+                    )
+                    .with_header(
+                        http::HeaderName::from_static("x-pad"),
+                        http::HeaderValue::from_str(&"b".repeat(len)).unwrap(),
+                    )
+            };
+            let mut wire = Vec::new();
+            response(fill).encode(&mut wire).unwrap();
+            let decoded = ConnectResponse::decode(&mut wire.as_slice()).unwrap();
+            assert_eq!(decoded.headers.get_all("x-pad").iter().count(), 2);
+            let mut wire = Vec::new();
+            assert_section_too_large(response(fill + 1).encode(&mut wire));
+            assert_section_too_large(response(fill + 1).write(&mut wire).await);
+            assert!(wire.is_empty());
+        }
+    }
+
+    #[test]
+    fn response_debug_redacts_rejection_secrets() {
+        let response = ConnectResponse::new(http::StatusCode::FORBIDDEN).with_header(
+            http::header::SET_COOKIE,
+            http::HeaderValue::from_static("SECRET"),
+        );
+        let debug = format!("{response:?}");
+        assert!(debug.contains("403"));
+        assert!(debug.contains("set-cookie"));
+        assert!(!debug.contains("SECRET"));
     }
 
     #[test]
@@ -690,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn response_encode_refuses_field_section_over_limit() {
         let response =
-            ConnectResponse::OK.with_protocol("a".repeat(MAX_FIELD_SECTION_SIZE as usize));
+            ConnectResponse::default().with_protocol("a".repeat(MAX_FIELD_SECTION_SIZE as usize));
         let mut wire = Vec::new();
         assert_section_too_large(response.encode(&mut wire));
         assert_section_too_large(response.write(&mut wire).await);

@@ -113,3 +113,93 @@ async fn connect_ipv4_literal_url() -> Result<()> {
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn connect_response_and_rejection_preserve_headers() -> Result<()> {
+    use http::{header::SET_COOKIE, HeaderValue, StatusCode};
+    use web_transport_quiche::{h3, proto::ConnectResponse, ClientError};
+
+    for status in [
+        StatusCode::OK,
+        StatusCode::FORBIDDEN,
+        StatusCode::NO_CONTENT,
+    ] {
+        let (chain, key) = make_self_signed()?;
+        let mut server = ServerBuilder::default()
+            .with_bind((Ipv4Addr::LOCALHOST, 0))?
+            .with_single_cert(chain, key)?;
+        let addr = *server.local_addrs().first().context("no server address")?;
+        let url = Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))?;
+        let serving = async {
+            let request = server.accept().await.context("no request")?;
+            let response = ConnectResponse::new(status)
+                .with_header(SET_COOKIE, HeaderValue::from_static("a=1"))
+                .with_header(SET_COOKIE, HeaderValue::from_static("b=2"))
+                .with_header(
+                    http::HeaderName::from_static("x-padding"),
+                    HeaderValue::from_str(&"x".repeat(
+                        16 * 1024
+                            - (32 + 7 + 3)
+                            - (32 + "sec-webtransport-http3-draft".len() + 7)
+                            - 2 * (32 + "set-cookie".len() + 3)
+                            - (32 + "x-padding".len()),
+                    ))
+                    .unwrap(),
+                );
+            if status == StatusCode::OK {
+                Ok(Some(request.respond(response).await?))
+            } else {
+                request.reject(response).await?;
+                anyhow::Ok(None)
+            }
+        };
+        let connecting = async {
+            client()
+                .with_bind((Ipv4Addr::LOCALHOST, 0))?
+                .connect(url)
+                .await?
+                .established()
+                .await
+                .map_err(anyhow::Error::from)
+        };
+        let (served, connected) = tokio::join!(serving, connecting);
+        let served = served?;
+        let response = if status == StatusCode::OK {
+            let session = connected?;
+            assert_eq!(
+                served
+                    .as_ref()
+                    .unwrap()
+                    .response()
+                    .unwrap()
+                    .headers
+                    .get_all(SET_COOKIE)
+                    .iter()
+                    .count(),
+                2
+            );
+            let response = session.response().context("no response")?.clone();
+            session.close(0, "done");
+            response
+        } else {
+            let error = connected.err().context("rejection established a session")?;
+            let Some(ClientError::Connect(h3::ConnectError::Status(response))) =
+                error.downcast_ref::<ClientError>()
+            else {
+                anyhow::bail!("rejection lost response: {error:?}")
+            };
+            response.as_ref().clone()
+        };
+        assert_eq!(response.status, status);
+        assert_eq!(
+            response
+                .headers
+                .get_all(SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a=1", "b=2"]
+        );
+    }
+    Ok(())
+}

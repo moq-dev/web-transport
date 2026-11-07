@@ -132,7 +132,7 @@ async fn run_server(session: Session) -> anyhow::Result<()> {
     );
 
     // Respond with 200 OK.
-    let response = ConnectResponse::OK.with_protocol(H3QX_ALPN);
+    let response = ConnectResponse::default().with_protocol(H3QX_ALPN);
 
     let mut buf = BytesMut::new();
     response.encode(&mut buf)?;
