@@ -154,7 +154,7 @@ pub(crate) fn decode_stream_code(code: quinn::VarInt, raw: bool) -> Option<u32> 
     }
 }
 
-/// An error that can occur when reading/writing the WebTransport stream header.
+/// An error in a WebTransport stream header or session capsule.
 #[derive(Clone, Error, Debug)]
 pub enum WebTransportError {
     #[error("closed: code={0} reason={1}")]
