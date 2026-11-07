@@ -15,15 +15,13 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+## Platform API and traits
 
-## Why no trait?
+This crate exposes concrete types selected at compile time for the target platform.
+The backend crates also implement [web-transport-trait](../web-transport-trait)'s
+async and poll-based session and stream traits. Its `MaybeSend` and `MaybeSync`
+bounds require `Send` and `Sync` on native targets and relax those requirements on
+WASM, allowing the browser backend to implement the same traits.
 
-See [web-transport-trait](https://docs.rs/web-transport-trait). 
-
-The biggest problem with async traits in Rust is `Send`.
-WASM is `!Send` and as far as I can tell, it's not possible to implement a trait that both can support.
-`web-transport-trait` requires `Send` which rules out WASM.
-
-This crate skirts the issue by switching the underlying implementation based on the platform.
-The compiler can then automatically apply `Send` bounds instead of explicitly requiring them.
-Unfortunate, I know.
+Use the backend types directly when your code needs these trait implementations;
+the wrapper types exported by this crate do not implement them.

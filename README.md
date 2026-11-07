@@ -25,16 +25,26 @@ They are basically UDP packets, except they are encrypted and congestion control
 
 # Crates
 
-This project is broken up into quite a few different crates:
+The Rust workspace contains these crates under [`rs/`](rs/):
 
--   [web-transport](web-transport) provides a generic interface, delegating to [web-transport-quinn](web-transport-quinn) or [web-transport-wasm](web-transport-wasm) depending on the platform.
--   [web-transport-quinn](web-transport-quinn) mirrors the [Quinn API](https://docs.rs/quinn/latest/quinn/index.html), abstracting away the HTTP/3 setup.
--   [web-transport-noq](web-transport-noq) mirrors the [Noq API](https://docs.rs/noq/latest/noq/index.html), a Quinn fork with the same surface area.
--   [web-transport-wasm](web-transport-wasm) wraps the [browser API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API)
--   [web-transport-ffi](rs/web-transport-ffi) exposes the WebTransport client/server through [UniFFI](https://mozilla.github.io/uniffi-rs/) for Python, Kotlin, and Swift.
-- [qmux](qmux) implements QMux (draft-ietf-quic-qmux) over TCP/TLS/WebSocket, with backwards compatibility for the legacy WebTransport-over-WebSocket wire format.
-- [web-transport-trait](web-transport-trait) defines an async trait, currently implemented by [web-transport-quinn](web-transport-quinn) and [qmux](qmux).
--   [web-transport-proto](web-transport-proto) a bare minimum implementation of HTTP/3 just to establish the WebTransport session.
+- [web-transport](rs/web-transport) provides a platform-selected API backed by Quinn on native targets and the browser API on WASM.
+- [web-transport-trait](rs/web-transport-trait) defines async and poll-based interfaces for sessions and streams on native and WASM targets.
+- [web-transport-proto](rs/web-transport-proto) implements the HTTP/3 setup for WebTransport and shared protocol primitives.
+- [web-transport-quinn](rs/web-transport-quinn) wraps Quinn with WebTransport session setup.
+- [web-transport-noq](rs/web-transport-noq) wraps Noq, a Quinn fork, with WebTransport session setup.
+- [web-transport-quiche](rs/web-transport-quiche) wraps Quiche through tokio-quiche with WebTransport session setup.
+- [web-transport-iroh](rs/web-transport-iroh) runs WebTransport over iroh connections.
+- [web-transport-wasm](rs/web-transport-wasm) wraps the browser WebTransport API.
+- [qmux](rs/qmux) implements QMux over TCP, TLS, Unix domain sockets, and WebSockets, including the legacy WebTransport-over-WebSocket wire format.
+- [web-transport-node](rs/web-transport-node) exposes the Quinn backend through NAPI-RS for the Node.js package.
+- [web-transport-ffi](rs/web-transport-ffi) exposes the Quinn backend through UniFFI for Python, Kotlin, and Swift.
+
+## JavaScript workspace
+
+- [@moq/qmux](js/qmux) implements QMux over WebSockets.
+- [@moq/web-socket-stream](js/web-socket-stream) provides a WebSocketStream ponyfill and polyfill.
+- [@moq/web-transport](js/web-transport) provides a Node.js WebTransport client and server through the native Node bridge.
+- [web-demo](js/web-demo) is the browser demo.
 
 ## Language bindings
 
@@ -42,9 +52,9 @@ Built from `rs/web-transport-ffi` via UniFFI; all three release workflows fire f
 
 | Language | Package                                                                      | Source       |
 |----------|------------------------------------------------------------------------------|--------------|
-| Python   | [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) (PyPI)      | `py/web-transport` |
-| Kotlin   | `dev.moq:web-transport` (Maven Central)                                      | `kt/`        |
-| Swift    | `WebTransportFFI.xcframework.zip` (attached to GitHub Releases)              | `swift/`     |
+| Python   | [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) (PyPI)      | [py/web-transport](py/web-transport) |
+| Kotlin   | `dev.moq:web-transport` (Maven Central)                                      | [kt/](kt/)   |
+| Swift    | `WebTransportFFI.xcframework.zip` (attached to GitHub Releases)              | [swift/](swift/) |
 
 ## Quests
 
