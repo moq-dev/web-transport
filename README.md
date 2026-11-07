@@ -27,7 +27,7 @@ They are basically UDP packets, except they are encrypted and congestion control
 
 The Rust workspace contains these crates under [`rs/`](rs/):
 
-- [web-transport](rs/web-transport) provides a platform-selected API backed by Quinn on native targets and the browser API on WASM.
+- [web-transport](rs/web-transport) provides a platform-selected API backed by Quinn or the browser WebTransport API.
 - [web-transport-trait](rs/web-transport-trait) defines async and poll-based interfaces for sessions and streams on native and WASM targets.
 - [web-transport-proto](rs/web-transport-proto) implements the HTTP/3 setup for WebTransport and shared protocol primitives.
 - [web-transport-quinn](rs/web-transport-quinn) wraps Quinn with WebTransport session setup.

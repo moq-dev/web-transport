@@ -53,8 +53,9 @@ across independent streams, destination capacities, and fragment sizes.
 
 ## Send and Sync
 
-`MaybeSend` and `MaybeSync` require `Send` and `Sync` on native targets and impose
-no such bounds on WASM. The async traits use these conditional bounds on sessions,
+`MaybeSend` and `MaybeSync` require `Send` and `Sync` when `target_family` is not
+`wasm` and impose no such bounds on the `wasm` target family, including browser
+and WASI targets. The async traits use these conditional bounds on sessions,
 streams, and futures so the same interface supports native runtimes and browser
 types. The shared `Error` trait also uses `MaybeSend` and `MaybeSync`, including
 for errors returned by the poll traits.
