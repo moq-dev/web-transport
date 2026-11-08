@@ -71,6 +71,12 @@ server use the [default `cubic` controller][cc-default]. Pass `Settings` to eith
 | `cubic` (default), `reno` | Latest accepted delivery-rate sample. A sample marked app-limited may raise the rate but cannot lower it. There is no windowed maximum or expiry of the retained estimate. |
 | `bbr`, `bbr2`, `bbr2_gcongestion` | All select BBR2. Its maximum-bandwidth filter rejects lower app-limited samples; the reported estimate is also capped by BBR2's congestion-derived `bandwidth_lo` when present. |
 
+The client builder's `with_settings` replaces its defaults, and
+`Settings::default()` leaves `verify_peer` false. When starting a client from
+`Settings::default()`, set `verify_peer = true` or configure
+`with_root_certificates` or `with_server_certificate_hashes`; otherwise the
+client skips certificate verification.
+
 Quiche's [controller selector][cc-selector] accepts those five names and rejects
 others. The [CUBIC/Reno sampler][legacy-rate] already checks the app-limited flag
 before replacing its stored rate, so this value is not an unfiltered raw sample.
