@@ -20,8 +20,7 @@ Found while fixing [#470](https://github.com/moq-dev/web-transport/pull/470):
   STOP_SENDING, and fixed it there.
 
 Decided 2026-10-28 (maintainer): one quest for both, since they share the
-session and stream teardown path, separate from
-[Node Server.close()](/quest/a0/node-server-close.md).
+session and stream teardown path.
 
 Add loopback regressions that fail without the fix: a failed connect and an
 abnormal end each reject `closed` with the right `source` and code; dropping
