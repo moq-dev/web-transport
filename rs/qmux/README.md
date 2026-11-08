@@ -55,6 +55,13 @@ builder or the handshake. The default grants a peer 100 concurrent streams in
 each direction; raise `max_streams_bidi` and `max_streams_uni` if your
 application holds more streams open at once.
 
+`Config::handshake_timeout` bounds the wait for peer transport parameters after
+the transport connects, including WebSocket sessions. A silent peer closes the
+session with `Error::HandshakeTimeout`; WebSocket builders return before this
+exchange, so observe the error through session operations or `Session::closed`.
+The default is 10 seconds, zero disables the deadline, and the legacy
+`webtransport` format exchanges no parameters and is exempt.
+
 To run QMux over something the built-in modules don't cover, wrap any
 `AsyncRead + AsyncWrite` byte stream in `transport::Stream`, or implement
 `transport::Transport` yourself, then pass it to `Session::connect` /
@@ -67,14 +74,6 @@ sequence number, as permitted by QMux §4.3. A peer that stops reading cannot
 grow a response queue by sending more pings; inbound stream processing continues
 while the writer is blocked. Pending responses are discarded during teardown,
 and a close frame ends the writer's output.
-
-## Send-rate estimate
-
-On Linux, TCP and WebSocket sessions with `TcpStats` estimate available send
-bandwidth from a 10-second maximum of kernel delivery-rate samples. An
-application-limited sample can raise the estimate but cannot lower it, even after
-the window expires. Only a usable sample retires old measurements; a zero rate
-keeps the last estimate. macOS does not expose a delivery-rate estimate.
 
 ## License
 
