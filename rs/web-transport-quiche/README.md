@@ -39,7 +39,10 @@ Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they m
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
 # Usage
-To use web-transport-quiche, figure it out yourself lul.
+The default client resolves the remote before binding an ephemeral socket of
+the same address family. IPv6 sockets are IPv6-only; IPv4-mapped IPv6 remotes
+use IPv4. Explicit `with_bind` and `with_socket` inputs retain their address
+handling.
 
 ## Session lifetime
 

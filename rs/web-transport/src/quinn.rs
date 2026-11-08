@@ -7,7 +7,7 @@ pub use web_transport_quinn as quinn;
 pub use web_transport_quinn::CongestionControl;
 
 /// Create a [Client] that can be used to dial multiple [Session]s.
-/// Build a client before cloning it to share its endpoint and configuration.
+/// Build a client before cloning it to share its endpoints and configuration.
 #[derive(Default)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,

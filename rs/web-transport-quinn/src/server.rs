@@ -253,7 +253,7 @@ impl core::ops::Deref for Request {
 }
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client::tests::{assert_transport, custom_transport};
     use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -269,7 +269,7 @@ mod tests {
     /// `ServerBuilder::new` goes through [crypto::default_provider], which panics when
     /// both backends are compiled in and no process-wide default is installed. Pick one
     /// here rather than mutating global state from a test.
-    fn builder() -> ServerBuilder {
+    pub(crate) fn builder() -> ServerBuilder {
         #[cfg(feature = "aws-lc-rs")]
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
