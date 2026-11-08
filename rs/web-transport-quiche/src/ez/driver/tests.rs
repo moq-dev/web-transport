@@ -229,3 +229,118 @@ fn accepting_a_live_send_half_registers_it() {
     );
     assert_eq!(&response, b"response");
 }
+
+#[test]
+fn notification_racing_with_send_retirement_is_harmless() {
+    use super::super::SendStream;
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() <= tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Both local terminal paths can retire a stream between notify's two locks.
+    for reset in [false, true] {
+        let mut pair = Pair::new();
+        let mut driver = driver(false);
+        let waiter = Waiter::noop();
+        assert!(driver.poll(&waiter, &mut pair.client).is_pending());
+
+        let Poll::Ready(Ok((_, retired_id, retired_state))) = driver.state.lock().open_uni(&waiter)
+        else {
+            panic!("stream was not opened");
+        };
+        let Poll::Ready(Ok((_, live_id, live_state))) = driver.state.lock().open_uni(&waiter)
+        else {
+            panic!("stream was not opened");
+        };
+        let mut retired = SendStream::new(retired_id, retired_state.clone(), driver.state.clone());
+        let mut live = SendStream::new(live_id, live_state, driver.state.clone());
+        retired.set_priority(1);
+        live.set_priority(0);
+        assert!(matches!(
+            driver.poll(&waiter, &mut pair.client),
+            Poll::Ready(Ok(()))
+        ));
+        driver.write(&mut pair.client).unwrap();
+        assert_eq!(driver.state.lock().urgency_of(live_id), Some(1));
+
+        if reset {
+            retired.reset(42);
+        } else {
+            retired.finish().unwrap();
+        }
+
+        // Split notify at its lock boundary: it sees an open state, then the
+        // driver flushes the queued FIN/reset before the pending ID is enqueued.
+        assert!(!retired_state.lock().is_closed());
+        assert!(matches!(
+            driver.poll(&waiter, &mut pair.client),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(retired_state.lock().is_closed());
+        assert!(!driver.send.contains_key(&retired_id));
+        let wake = driver.state.lock().send(retired_id).unwrap();
+        wake.wake();
+        {
+            let mut state = driver.state.lock();
+            assert!(state.send(retired_id).is_none());
+            assert_eq!(state.send.len(), 1, "notifications must coalesce");
+        }
+        assert!(matches!(
+            live.poll_write(&waiter, b"live"),
+            Poll::Ready(Ok(4))
+        ));
+        assert_eq!(driver.state.lock().send.len(), 2);
+
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Warnings(warnings.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(matches!(
+                driver.poll(&waiter, &mut pair.client),
+                Poll::Ready(Ok(()))
+            ));
+        });
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            0,
+            "stale send notification warned"
+        );
+        assert!(driver.state.lock().send.is_empty());
+        assert!(!driver.send.contains_key(&retired_id));
+        assert_eq!(driver.state.lock().priority_of(retired_id), None);
+        assert_eq!(driver.state.lock().priority_of(live_id), Some(0));
+        assert_eq!(driver.state.lock().urgency_of(live_id), Some(0));
+        assert!(driver.state.lock().priority.take().is_empty());
+        assert!(!driver.state.lock().is_closed());
+
+        pair.pump();
+        let mut received = [0; 4];
+        assert_eq!(
+            pair.server
+                .stream_recv(live_id.into(), &mut received)
+                .unwrap(),
+            (4, false)
+        );
+        assert_eq!(&received, b"live");
+
+        // A retained handle does not keep notifying, and the driver can sleep
+        // again after draining the single stale ID alongside the live work.
+        assert!(matches!(
+            retired.poll_write(&waiter, b"late"),
+            Poll::Ready(Err(_))
+        ));
+        assert!(driver.state.lock().send.is_empty());
+        assert!(driver.poll(&waiter, &mut pair.client).is_pending());
+    }
+}
