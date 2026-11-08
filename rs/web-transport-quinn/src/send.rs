@@ -20,7 +20,6 @@ use crate::{
 /// WebTransport uses u32 error codes and they're mapped in a reserved HTTP/3 error space.
 #[derive(Debug)]
 pub struct SendStream {
-    bytes_written: u64,
     stream: quinn::SendStream,
     error: Arc<CloseReason>,
 
@@ -35,18 +34,10 @@ impl SendStream {
     pub(crate) fn new(stream: quinn::SendStream, error: Arc<CloseReason>, raw: bool) -> Self {
         Self {
             stream,
-            bytes_written: 0,
             error,
             raw,
             closed: Default::default(),
         }
-    }
-
-    /// Collect application payload statistics for this stream.
-    pub async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, WriteError> {
-        let mut stats = web_transport_trait::SendStreamStats::default();
-        stats.bytes_written = Some(self.bytes_written);
-        Ok(stats)
     }
 
     /// Decode the peer's stop code, and replace connection-level errors with the stored
@@ -110,49 +101,39 @@ impl SendStream {
 
     /// Write some data to the stream, returning the size written. See [`quinn::SendStream::write`].
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, WriteError> {
-        let size = self
-            .stream
-            .write(buf)
-            .await
-            .map_err(|e| self.map_error(e))?;
-        self.bytes_written += size as u64;
-        Ok(size)
+        self.stream.write(buf).await.map_err(|e| self.map_error(e))
     }
 
     /// Write all of the data to the stream. See [`quinn::SendStream::write_all`].
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
-        let mut buf = buf;
-        while !buf.is_empty() {
-            let size = self.write(buf).await?;
-            buf = &buf[size..];
-        }
-        Ok(())
+        self.stream
+            .write_all(buf)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write chunks of data to the stream. See [`quinn::SendStream::write_chunks`].
     pub async fn write_chunks(&mut self, bufs: &mut [Bytes]) -> Result<quinn::Written, WriteError> {
-        let written = self
-            .stream
+        self.stream
             .write_chunks(bufs)
             .await
-            .map_err(|e| self.map_error(e))?;
-        self.bytes_written += written.bytes as u64;
-        Ok(written)
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write a chunk of data to the stream. See [`quinn::SendStream::write_chunk`].
     pub async fn write_chunk(&mut self, buf: Bytes) -> Result<(), WriteError> {
-        self.write_all_chunks(&mut [buf]).await
+        self.stream
+            .write_chunk(buf)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Write all of the chunks of data to the stream. See [`quinn::SendStream::write_all_chunks`].
     pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), WriteError> {
-        let mut bufs = bufs;
-        while !bufs.is_empty() {
-            let written = self.write_chunks(bufs).await?;
-            bufs = &mut bufs[written.chunks..];
-        }
-        Ok(())
+        self.stream
+            .write_all_chunks(bufs)
+            .await
+            .map_err(|e| self.map_error(e))
     }
 
     /// Mark the stream as finished, such that no more data can be written. See [`quinn::SendStream::finish`].
@@ -190,11 +171,7 @@ impl tokio::io::AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         // We have to use this syntax because quinn added its own poll_write method.
-        let result = tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf);
-        if let Poll::Ready(Ok(size)) = &result {
-            self.bytes_written += *size as u64;
-        }
-        result
+        tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.stream), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
@@ -208,10 +185,6 @@ impl tokio::io::AsyncWrite for SendStream {
 
 impl web_transport_trait::SendStream for SendStream {
     type Error = WriteError;
-
-    async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, Self::Error> {
-        self.stats().await
-    }
 
     fn set_priority(&mut self, order: i32) {
         Self::set_priority(self, order).ok();
@@ -261,7 +234,6 @@ impl web_transport_trait::poll::SendStream for SendStream {
             buf
         ))
         .map_err(|e| self.map_error(e))?;
-        self.bytes_written += size as u64;
         Poll::Ready(Ok(size))
     }
 

@@ -15,7 +15,6 @@ const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x44454356);
 
 /// A stream that can be used to receive bytes.
 pub struct RecvStream {
-    bytes_read: u64,
     inner: ez::RecvStream,
 
     // For the poll traits, which are handed a `Context` rather than a waiter. One cell
@@ -28,57 +27,35 @@ impl RecvStream {
     pub(super) fn new(inner: ez::RecvStream) -> Self {
         Self {
             inner,
-            bytes_read: 0,
             parked_read: Parked::default(),
             parked_closed: Parked::default(),
         }
-    }
-
-    /// Collect application payload statistics for this stream.
-    pub async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, StreamError> {
-        let mut stats = web_transport_trait::RecvStreamStats::default();
-        stats.bytes_read = Some(self.bytes_read);
-        Ok(stats)
     }
 
     /// Read some data into the buffer and return the amount read.
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, StreamError> {
-        let size = self.inner.read(buf).await?;
-        self.bytes_read += size.unwrap_or(0) as u64;
-        Ok(size)
+        self.inner.read(buf).await.map_err(Into::into)
     }
 
     /// Read a chunk of data from the stream.
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, StreamError> {
-        let chunk = self.inner.read_chunk(max).await?;
-        self.bytes_read += chunk.as_ref().map_or(0, Bytes::len) as u64;
-        Ok(chunk)
+        self.inner.read_chunk(max).await.map_err(Into::into)
     }
 
     /// Read data into a mutable buffer and return the amount read.
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>, StreamError> {
-        // Request only the allocated space: a pending read is also `ez`'s prefetch
-        // budget, and a growable buffer's `remaining_mut` would disable backpressure.
-        let chunk = match self.read_chunk(buf.chunk_mut().len()).await? {
-            Some(chunk) if !chunk.is_empty() => chunk,
-            _ => return Ok(None),
-        };
-        let size = chunk.len();
-        buf.put(chunk);
-        Ok(Some(size))
+        self.inner.read_buf(buf).await.map_err(Into::into)
     }
 
     /// Read until the end of the stream or the limit is hit.
     pub async fn read_all(&mut self, max: usize) -> Result<Bytes, StreamError> {
-        let mut buf = bytes::BytesMut::new().limit(max);
-        while buf.has_remaining_mut() && self.read_buf(&mut buf).await?.is_some() {}
-        Ok(buf.into_inner().freeze())
+        self.inner.read_all(max).await.map_err(Into::into)
     }
 
     /// Tell the other end to stop sending data with the given error code.
@@ -109,20 +86,13 @@ impl AsyncRead for RecvStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let before = buf.filled().len();
         let pinned = pin!(&mut self.inner);
-        let result = pinned.poll_read(cx, buf);
-        self.bytes_read += (buf.filled().len() - before) as u64;
-        result
+        pinned.poll_read(cx, buf)
     }
 }
 
 impl web_transport_trait::RecvStream for RecvStream {
     type Error = StreamError;
-
-    async fn stats(&mut self) -> Result<web_transport_trait::RecvStreamStats, Self::Error> {
-        self.stats().await
-    }
 
     async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
         self.read(dst).await
@@ -150,11 +120,9 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         cx: &mut Context<'_>,
         dst: &mut [u8],
     ) -> Poll<Result<Option<usize>, Self::Error>> {
-        let size = std::task::ready!(self
-            .parked_read
-            .poll(cx, |waiter| self.inner.poll_read(waiter, dst)))?;
-        self.bytes_read += size.unwrap_or(0) as u64;
-        Poll::Ready(Ok(size))
+        self.parked_read
+            .poll(cx, |waiter| self.inner.poll_read(waiter, dst))
+            .map_err(Into::into)
     }
 
     fn poll_read_chunk(
@@ -163,11 +131,9 @@ impl web_transport_trait::poll::RecvStream for RecvStream {
         max: usize,
     ) -> Poll<Result<Option<Bytes>, Self::Error>> {
         // ez already owns the bytes, so this hands them over instead of copying.
-        let size = std::task::ready!(self
-            .parked_read
-            .poll(cx, |waiter| self.inner.poll_read_chunk(waiter, max)))?;
-        self.bytes_read += size.as_ref().map_or(0, |chunk| chunk.len()) as u64;
-        Poll::Ready(Ok(size))
+        self.parked_read
+            .poll(cx, |waiter| self.inner.poll_read_chunk(waiter, max))
+            .map_err(Into::into)
     }
 
     fn stop(&mut self, code: u32) {

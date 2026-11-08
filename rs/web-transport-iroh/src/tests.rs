@@ -70,12 +70,7 @@ async fn h3_smoke() -> n0_error::Result<()> {
             assert_eq!(session.request().map(|r| &r.url), Some(&url));
 
             let mut stream = session.open_uni().await.unwrap();
-            assert_eq!(stream.stats().await.unwrap().bytes_written, Some(0));
             stream.write_all(b"hi").await.unwrap();
-            let stats = stream.stats().await.unwrap();
-            assert_eq!(stats.bytes_written, Some(2));
-            assert_eq!(stats.bytes_sent, None);
-            assert_eq!(stats.bytes_acknowledged, None);
             stream.finish().unwrap();
             let reason = session.closed().await;
             assert!(
@@ -101,9 +96,7 @@ async fn h3_smoke() -> n0_error::Result<()> {
             assert_eq!(session.request().map(|r| &r.url), Some(&url));
             assert_eq!(session.conn().remote_id(), client_id);
             let mut stream = session.accept_uni().await.unwrap();
-            assert_eq!(stream.stats().await.unwrap().bytes_read, Some(0));
             let buf = stream.read_to_end(2).await.unwrap();
-            assert_eq!(stream.stats().await.unwrap().bytes_read, Some(2));
             assert_eq!(buf, b"hi");
             session.close(23, b"bye");
             server.close().await;
@@ -648,31 +641,5 @@ async fn h3_local_close_reason() -> n0_error::Result<()> {
         .expect("server task timed out")
         .unwrap();
     client.close().await;
-    Ok(())
-}
-
-#[path = "../../web-transport-trait/tests/support/stream_stats.rs"]
-mod stream_stats;
-#[path = "../../web-transport-trait/tests/support/tokio_stream_stats.rs"]
-mod tokio_stream_stats;
-
-#[tokio::test]
-async fn stream_payload_statistics() -> n0_error::Result<()> {
-    let client = Client::new(Endpoint::bind(presets::Minimal).await?);
-    let server = Endpoint::builder(presets::Minimal)
-        .alpns(vec![ALPN_H3.as_bytes().to_vec()])
-        .bind()
-        .await?;
-    let url: Url = format!("https://{}/", server.id()).parse().unwrap();
-    let (outgoing, incoming) = tokio::join!(client.connect_h3(server.addr(), url), async {
-        let conn = server.accept().await.unwrap().await.unwrap();
-        H3Request::accept(conn).await?.ok().await
-    },);
-    let (outgoing, incoming) = (outgoing?, incoming?);
-    stream_stats::payload_stats(&outgoing, &incoming).await;
-    tokio_stream_stats::payload_stats(&outgoing, &incoming).await;
-    outgoing.close(0, b"done");
-    client.close().await;
-    server.close().await;
     Ok(())
 }

@@ -176,15 +176,3 @@ fn read_buf_reports_end_of_stream() {
     let mut buf = BytesMut::with_capacity(8);
     assert_eq!(block_on(recv.read_buf(&mut buf)).unwrap(), None);
 }
-
-#[test]
-fn stream_statistics_default_to_unavailable() {
-    assert_eq!(
-        block_on(DripSend::default().stats()).unwrap(),
-        web_transport_trait::SendStreamStats::default()
-    );
-    assert_eq!(
-        block_on(DripRecv::new(b"").stats()).unwrap(),
-        web_transport_trait::RecvStreamStats::default()
-    );
-}

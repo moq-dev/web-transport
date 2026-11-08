@@ -15,6 +15,3 @@ mod quic;
 mod quic;
 
 pub use quic::*;
-
-/// Payload progress snapshots shared by the native and browser streams.
-pub use web_transport_trait::{RecvStreamStats, SendStreamStats};

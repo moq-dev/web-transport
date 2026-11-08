@@ -1,21 +1,18 @@
-//! Drive a real quiche session through the poll surface.
+//! Drive a real quiche session entirely through the poll surface.
 //!
-//! The round trips call no `async` method on the transport — every operation goes
+//! Nothing here calls an `async` method on the transport — every operation goes
 //! through `web_transport_trait::poll`, stepped with `poll_fn`. Unlike quinn, quiche
 //! reaches this with no retained futures at all: `ez` exposes a `poll_*` for every
-//! step, so opening a stream is a plain state machine over them. The waker tests also
-//! cover the inherent `async` methods, which must not share the poll bridge's
-//! retained waiter.
+//! step, so opening a stream is a plain state machine over them.
 
 use std::{
-    future::{poll_fn, Future},
+    future::poll_fn,
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     task::{Context, Poll, Wake, Waker},
-    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -84,12 +81,6 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
     let mut send = poll_fn(|cx| client.poll_open_uni(cx)).await?;
     poll_fn(|cx| send.poll_write(cx, b"hello")).await?;
     send.finish()?;
-    assert_eq!(
-        web_transport_trait::SendStream::stats(&mut send)
-            .await?
-            .bytes_written,
-        Some(5)
-    );
 
     let mut recv = poll_fn(|cx| server.poll_accept_uni(cx)).await?;
 
@@ -98,12 +89,6 @@ async fn a_uni_stream_round_trips_through_the_poll_surface() -> Result<()> {
         .await?
         .context("stream ended early")?;
     assert_eq!(&dst[..size], b"hello");
-    assert_eq!(
-        web_transport_trait::RecvStream::stats(&mut recv)
-            .await?
-            .bytes_read,
-        Some(5)
-    );
 
     Ok(())
 }
@@ -221,178 +206,5 @@ async fn a_finished_poll_releases_the_poller() -> Result<()> {
         "the finished read is still holding the poller's waker"
     );
 
-    Ok(())
-}
-
-#[path = "../../web-transport-trait/tests/support/stream_stats.rs"]
-mod stream_stats;
-
-#[tokio::test]
-async fn stream_payload_statistics() -> Result<()> {
-    let (client, server) = pair().await?;
-    stream_stats::payload_stats(&client, &server).await;
-    Ok(())
-}
-
-#[path = "../../web-transport-trait/tests/support/tokio_stream_stats.rs"]
-mod tokio_stream_stats;
-
-#[tokio::test]
-async fn tokio_stream_payload_statistics() -> Result<()> {
-    let (client, server) = pair().await?;
-    tokio_stream_stats::payload_stats(&client, &server).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn empty_inherent_read_buffer_preserves_completion_and_statistics() -> Result<()> {
-    let (client, server) = pair().await?;
-    let mut send = client.open_uni().await?;
-    send.write_all(b"payload").await?;
-    send.finish()?;
-    let mut recv = server.accept_uni().await?;
-    let mut empty: &mut [u8] = &mut [];
-    assert_eq!(recv.read_buf(&mut empty).await?, None);
-    assert_eq!(recv.stats().await?.bytes_read, Some(0));
-    assert_eq!(recv.read_all(7).await?.as_ref(), b"payload");
-    assert_eq!(recv.stats().await?.bytes_read, Some(7));
-    Ok(())
-}
-
-/// Wait until nothing but the test holds `flag`, failing if something keeps a clone.
-async fn released(flag: &Arc<FlagWaker>, what: &str) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(flag) > 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .with_context(|| format!("the stream still holds the waker of {what}"))
-}
-
-/// Dropping a pending `async` read releases its waiter with the future.
-///
-/// The `async` methods own their waiter, unlike the poll bridge, which has to retain one
-/// between polls. A cancelled read on a stream the caller keeps must not leave its
-/// registration and task waker behind once the stream's own wakeup slot is drained.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_async_read_releases_the_poller() -> Result<()> {
-    let (client, server) = pair().await?;
-
-    // An opening byte, so the stream reaches the peer and can be accepted.
-    let mut send = client.open_uni().await?;
-    send.write_all(b"h").await?;
-    let mut recv = server.accept_uni().await?;
-    assert_eq!(recv.read(&mut [0u8; 1]).await?, Some(1));
-
-    let flag = Arc::new(FlagWaker::default());
-    let waker = Waker::from(flag.clone());
-    let mut dst = [0u8; 16];
-    {
-        let mut read = std::pin::pin!(recv.read(&mut dst));
-        assert!(read
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending());
-    }
-    drop(waker);
-
-    // An arrival wakes and empties the stream's wakeup slot; after that, only a
-    // retained waiter could still hold the cancelled caller.
-    send.write_all(b"more").await?;
-    released(&flag, "the cancelled read").await?;
-
-    assert_eq!(recv.read_all(4).await?.as_ref(), b"more");
-    assert_eq!(recv.stats().await?.bytes_read, Some(5));
-
-    Ok(())
-}
-
-/// Dropping a pending `async` write releases its waiter with the future.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancelled_async_write_releases_the_poller() -> Result<()> {
-    let (client, server) = pair().await?;
-
-    let mut send = client.open_uni().await?;
-    let flag = Arc::new(FlagWaker::default());
-    let waker = Waker::from(flag.clone());
-
-    // Fill the peer's flow control window until a write parks, then cancel that write.
-    let chunk = vec![0u8; 64 * 1024];
-    let mut written = 0u64;
-    loop {
-        let mut write = std::pin::pin!(send.write(&chunk));
-        match write.as_mut().poll(&mut Context::from_waker(&waker)) {
-            Poll::Ready(size) => written += size? as u64,
-            Poll::Pending => break,
-        }
-    }
-    drop(waker);
-
-    // Reading on the peer grants more credit, which wakes and empties the stream's
-    // wakeup slot; after that, only a retained waiter could still hold the caller.
-    let reader = tokio::spawn(async move {
-        let mut recv = server.accept_uni().await?;
-        let mut total = 0u64;
-        let mut buf = vec![0u8; 64 * 1024];
-        while let Some(size) = recv.read(&mut buf).await? {
-            total += size as u64;
-        }
-        anyhow::Ok(total)
-    });
-    released(&flag, "the cancelled write").await?;
-
-    send.write_all(b"done").await?;
-    send.finish()?;
-    assert_eq!(reader.await??, written + 4);
-    assert_eq!(send.stats().await?.bytes_written, Some(written + 4));
-
-    Ok(())
-}
-
-/// A growable `read_buf` destination must not lift receive backpressure.
-///
-/// A pending read's size is also how much `ez` drains from quiche ahead of the
-/// application. Requesting a `BytesMut`'s theoretical growth limit would keep draining
-/// after the read returns, so the peer could send without bound to a slow reader.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_growable_read_buf_keeps_backpressure() -> Result<()> {
-    // Far beyond quiche's default 1 MB stream window, so only backpressure stops it.
-    const TOTAL: usize = 32 << 20;
-    const BOUND: u64 = 4 << 20;
-
-    let (client, server) = pair().await?;
-
-    let mut send = client.open_uni().await?;
-    send.write_all(b"h").await?;
-    let mut recv = server.accept_uni().await?;
-    assert_eq!(recv.read(&mut [0u8; 1]).await?, Some(1));
-
-    // The read parks before data is drained, so its size becomes the prefetch budget.
-    let reader = tokio::spawn(async move {
-        let mut buf = bytes::BytesMut::new();
-        recv.read_buf(&mut buf).await?;
-        anyhow::Ok(recv)
-    });
-
-    // Backpressure shows up as a write that never finishes; the timeout only bounds how
-    // long the test watches for it, so a slow machine can only make this pass, not flake.
-    let data = vec![0u8; TOTAL];
-    let finished = tokio::time::timeout(Duration::from_secs(2), send.write_all(&data)).await;
-    assert!(
-        finished.is_err(),
-        "a reader that consumed one chunk let the peer finish {finished:?}"
-    );
-    let written = send
-        .stats()
-        .await?
-        .bytes_written
-        .context("missing bytes_written")?;
-    assert!(
-        written <= BOUND,
-        "the peer accepted {written} bytes from a reader that consumed one chunk"
-    );
-
-    drop(reader.await??);
     Ok(())
 }

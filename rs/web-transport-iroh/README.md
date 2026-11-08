@@ -31,10 +31,3 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [WebTransport]: https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.html
 [`web-transport-quinn`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-quinn
 [`web-transport-trait`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-trait
-
-## Stream statistics
-
-The async stream `stats()` methods report application payload accepted and read,
-excluding protocol headers, including partial progress in cancelled helpers.
-Sent, acknowledged and contiguous received progress remain unavailable. See the
-[metric definitions and example](../web-transport-trait/README.md#stream-statistics).

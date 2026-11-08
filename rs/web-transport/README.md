@@ -20,12 +20,6 @@ The native `ClientBuilder::with_transport_config` accepts Quinn's owned `Transpo
 The native `ClientBuilder` does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings.
 
 
-## Stream statistics
-
-Both platform stream types expose `stats().await`, returning `SendStreamStats`
-or `RecvStreamStats` with optional payload measurements. See the
-[metric definitions, backend support and example](../web-transport-trait/README.md#stream-statistics).
-
 ## Why no trait?
 
 See [web-transport-trait](https://docs.rs/web-transport-trait). 

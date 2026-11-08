@@ -74,12 +74,3 @@ the environment. Both override `.cargo/config.toml` rather than adding to it, so
 other.
 
 Building without the flag fails with a `compile_error!` pointing back here.
-
-## Stream statistics
-
-`send.stats().await` and `recv.stats().await` report application payload accepted
-and returned by this adapter. Delivery metrics come from feature-detected browser
-`getStats()` support; absent methods or fields remain unavailable. Collection
-errors propagate. Rust buffering does not inflate `bytes_read`, and feeding a
-browser writer does not establish `bytes_sent` or `bytes_acknowledged`. See the
-[metric definitions and example](../web-transport-trait/README.md#stream-statistics).

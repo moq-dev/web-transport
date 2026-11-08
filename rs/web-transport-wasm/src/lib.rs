@@ -54,8 +54,6 @@ mod recv;
 mod send;
 #[cfg(web_sys_unstable_apis)]
 mod session;
-#[cfg(web_sys_unstable_apis)]
-mod stats;
 #[cfg(all(web_sys_unstable_apis, target_family = "wasm"))]
 mod traits;
 

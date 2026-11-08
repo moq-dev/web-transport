@@ -19,7 +19,6 @@ const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
 /// This wrapper is mainly needed for error codes.
 /// WebTransport uses u32 error codes and they're mapped in a reserved HTTP/3 error space.
 pub struct SendStream {
-    bytes_written: u64,
     inner: ez::SendStream,
 
     // For the poll traits, which are handed a `Context` rather than a waiter. One cell
@@ -32,49 +31,29 @@ impl SendStream {
     pub(super) fn new(inner: ez::SendStream) -> Self {
         Self {
             inner,
-            bytes_written: 0,
             parked_write: Parked::default(),
             parked_closed: Parked::default(),
         }
     }
 
-    /// Collect application payload statistics for this stream.
-    pub async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, StreamError> {
-        let mut stats = web_transport_trait::SendStreamStats::default();
-        stats.bytes_written = Some(self.bytes_written);
-        Ok(stats)
-    }
-
     /// Write some data to the stream, returning the size written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
-        let size = self.inner.write(buf).await?;
-        self.bytes_written += size as u64;
-        Ok(size)
+        self.inner.write(buf).await.map_err(Into::into)
     }
 
     /// Write data from a buffer to the stream, returning the size written.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, StreamError> {
-        let size = self.inner.write_buf(buf).await?;
-        self.bytes_written += size as u64;
-        Ok(size)
+        self.inner.write_buf(buf).await.map_err(Into::into)
     }
 
     /// Write all of the data to the stream.
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), StreamError> {
-        let mut buf = buf;
-        while !buf.is_empty() {
-            let size = self.write(buf).await?;
-            buf = &buf[size..];
-        }
-        Ok(())
+        self.inner.write_all(buf).await.map_err(Into::into)
     }
 
     /// Write all data from a buffer to the stream.
     pub async fn write_buf_all<B: Buf>(&mut self, buf: &mut B) -> Result<(), StreamError> {
-        while buf.has_remaining() {
-            self.write_buf(buf).await?;
-        }
-        Ok(())
+        self.inner.write_buf_all(buf).await.map_err(Into::into)
     }
 
     /// Mark the stream as finished, such that no more data can be written.
@@ -125,9 +104,7 @@ impl AsyncWrite for SendStream {
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
         let inner = std::pin::pin!(&mut self.inner);
-        let size = std::task::ready!(inner.poll_write(cx, buf))?;
-        self.bytes_written += size as u64;
-        Poll::Ready(Ok(size))
+        inner.poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
@@ -146,10 +123,6 @@ impl AsyncWrite for SendStream {
 
 impl web_transport_trait::SendStream for SendStream {
     type Error = StreamError;
-
-    async fn stats(&mut self) -> Result<web_transport_trait::SendStreamStats, Self::Error> {
-        self.stats().await
-    }
 
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         self.write(buf).await
@@ -176,11 +149,9 @@ impl web_transport_trait::poll::SendStream for SendStream {
     type Error = StreamError;
 
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>> {
-        let size = std::task::ready!(self
-            .parked_write
-            .poll(cx, |waiter| self.inner.poll_write(waiter, buf)))?;
-        self.bytes_written += size as u64;
-        Poll::Ready(Ok(size))
+        self.parked_write
+            .poll(cx, |waiter| self.inner.poll_write(waiter, buf))
+            .map_err(Into::into)
     }
 
     fn poll_write_buf<B: Buf>(
@@ -190,11 +161,9 @@ impl web_transport_trait::poll::SendStream for SendStream {
     ) -> Poll<Result<usize, Self::Error>> {
         // ez advances `buf` by exactly what it accepted, so this keeps the
         // partial-write contract while skipping the default's extra copy.
-        let size = std::task::ready!(self
-            .parked_write
-            .poll(cx, |waiter| self.inner.poll_write_buf(waiter, buf)))?;
-        self.bytes_written += size as u64;
-        Poll::Ready(Ok(size))
+        self.parked_write
+            .poll(cx, |waiter| self.inner.poll_write_buf(waiter, buf))
+            .map_err(Into::into)
     }
 
     fn set_priority(&mut self, order: i32) {
