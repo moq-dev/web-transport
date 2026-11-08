@@ -5668,6 +5668,32 @@ mod credit_update_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn initial_max_streams_above_2_60_fails_connect() {
+        for version in VERSIONS {
+            for bidi in [true, false] {
+                let mut params = small_params(version);
+                if bidi {
+                    params.initial_max_streams_bidi = (1 << 60) + 1;
+                } else {
+                    params.initial_max_streams_uni = (1 << 60) + 1;
+                }
+                let (tx, rx) = mpsc::unbounded_channel();
+                tx.send(Frame::TransportParameters(params).encode(version).unwrap())
+                    .unwrap();
+                let transport = ScriptedTransport {
+                    incoming: rx,
+                    outgoing: Arc::new(Mutex::new(Vec::new())),
+                    written: Arc::new(Notify::new()),
+                };
+                assert!(matches!(
+                    Session::connect(transport, Config::new(version)).await,
+                    Err(Error::TransportParameter)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn max_streams_above_2_60_is_a_frame_encoding_error() {
         for frame in [
             Frame::MaxStreamsBidi((1 << 60) + 1),

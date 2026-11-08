@@ -52,11 +52,9 @@ pub enum Error {
     #[error("protocol violation")]
     ProtocolViolation,
 
-    /// A transport parameter carried an illegal value — QMux's
-    /// TRANSPORT_PARAMETER_ERROR. Record-framed drafts raise this when a peer
-    /// advertises a `max_record_size` below the default minimum. WebSocket
-    /// builders also return this locally when their effective record limit is
-    /// below that minimum.
+    /// The peer sent an invalid transport parameter (TRANSPORT_PARAMETER_ERROR).
+    /// WebSocket builders also return this locally when their effective record
+    /// limit is below the default minimum `max_record_size`.
     #[error("transport parameter error")]
     TransportParameter,
 

@@ -563,6 +563,23 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	for (const param of ["initialMaxStreamsBidi", "initialMaxStreamsUni"] as const) {
+		test(`${param} above 2^60 closes the session before granting stream credit`, async () => {
+			const { session, peer } = connect();
+			await session.ready;
+			const opening = settleTo<unknown>(
+				param === "initialMaxStreamsBidi"
+					? session.createBidirectionalStream()
+					: session.createUnidirectionalStream(),
+			);
+			peer.send({ type: "transport_parameters", params: peerParams({ [param]: (1n << 60n) + 1n }) });
+
+			expect(await opening).toMatchObject({ message: "initial_max_streams transport parameter exceeds 2^60" });
+			await expectSessionFailure(session);
+			await waitFor(() => sentCloseCode(peer) === 1002);
+		});
+	}
+
 	test("MAX_STREAMS above 2^60 is a connection error", async () => {
 		const { session, peer } = connect();
 		await session.ready;
