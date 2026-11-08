@@ -63,7 +63,9 @@ impl RecvStream {
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Result<Option<usize>, StreamError> {
-        let chunk = match self.read_chunk(buf.remaining_mut()).await? {
+        // Request only the allocated space: a pending read is also `ez`'s prefetch
+        // budget, and a growable buffer's `remaining_mut` would disable backpressure.
+        let chunk = match self.read_chunk(buf.chunk_mut().len()).await? {
             Some(chunk) if !chunk.is_empty() => chunk,
             _ => return Ok(None),
         };

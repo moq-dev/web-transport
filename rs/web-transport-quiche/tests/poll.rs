@@ -349,3 +349,50 @@ async fn a_cancelled_async_write_releases_the_poller() -> Result<()> {
 
     Ok(())
 }
+
+/// A growable `read_buf` destination must not lift receive backpressure.
+///
+/// A pending read's size is also how much `ez` drains from quiche ahead of the
+/// application. Requesting a `BytesMut`'s theoretical growth limit would keep draining
+/// after the read returns, so the peer could send without bound to a slow reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_growable_read_buf_keeps_backpressure() -> Result<()> {
+    // Far beyond quiche's default 1 MB stream window, so only backpressure stops it.
+    const TOTAL: usize = 32 << 20;
+    const BOUND: u64 = 4 << 20;
+
+    let (client, server) = pair().await?;
+
+    let mut send = client.open_uni().await?;
+    send.write_all(b"h").await?;
+    let mut recv = server.accept_uni().await?;
+    assert_eq!(recv.read(&mut [0u8; 1]).await?, Some(1));
+
+    // The read parks before data is drained, so its size becomes the prefetch budget.
+    let reader = tokio::spawn(async move {
+        let mut buf = bytes::BytesMut::new();
+        recv.read_buf(&mut buf).await?;
+        anyhow::Ok(recv)
+    });
+
+    // Backpressure shows up as a write that never finishes; the timeout only bounds how
+    // long the test watches for it, so a slow machine can only make this pass, not flake.
+    let data = vec![0u8; TOTAL];
+    let finished = tokio::time::timeout(Duration::from_secs(2), send.write_all(&data)).await;
+    assert!(
+        finished.is_err(),
+        "a reader that consumed one chunk let the peer finish {finished:?}"
+    );
+    let written = send
+        .stats()
+        .await?
+        .bytes_written
+        .context("missing bytes_written")?;
+    assert!(
+        written <= BOUND,
+        "the peer accepted {written} bytes from a reader that consumed one chunk"
+    );
+
+    drop(reader.await??);
+    Ok(())
+}
