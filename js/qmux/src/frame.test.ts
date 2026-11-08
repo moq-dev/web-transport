@@ -181,6 +181,25 @@ describe("MAX_STREAMS bounds", () => {
 	}
 });
 
+describe("initial_max_streams transport parameter bounds", () => {
+	for (const param of ["initialMaxStreamsBidi", "initialMaxStreamsUni"] as const) {
+		test(`${param} accepts 2^60 and rejects anything larger`, () => {
+			const frame: Frame.TransportParameters = {
+				type: "transport_parameters",
+				params: { ...Frame.DEFAULT_TRANSPORT_PARAMS, [param]: 1n << 60n },
+			};
+			const ok = Frame.encode(frame, "qmux-01");
+			expect(Frame.decodeRecord(ok)).toEqual([frame]);
+			expect(Frame.decode(ok, "qmux-00")).toEqual(frame);
+
+			frame.params[param] += 1n;
+			const over = Frame.encode(frame, "qmux-01");
+			expect(() => Frame.decodeRecord(over)).toThrow("initial_max_streams transport parameter exceeds 2^60");
+			expect(() => Frame.decode(over, "qmux-00")).toThrow("initial_max_streams transport parameter exceeds 2^60");
+		});
+	}
+});
+
 describe("QMux02 (draft-02)", () => {
 	test("qmux-02 shares the qmux-01 record wire format", () => {
 		const id = new Stream.Id(VarInt.from(4n));

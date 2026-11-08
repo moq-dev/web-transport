@@ -1,7 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use web_transport_proto::VarInt;
 
-use super::varint_size;
+use super::{frame::MAX_STREAM_COUNT, varint_size};
 use crate::Error;
 
 /// Transport parameters exchanged during QMux connection setup.
@@ -240,6 +240,12 @@ impl TransportParams {
             }
         }
 
+        if params.initial_max_streams_bidi > MAX_STREAM_COUNT
+            || params.initial_max_streams_uni > MAX_STREAM_COUNT
+        {
+            return Err(Error::TransportParameter);
+        }
+
         Ok(params)
     }
 }
@@ -281,6 +287,34 @@ fn decode_varint_param(data: &mut Bytes) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_max_streams_bounds() {
+        for bidi in [true, false] {
+            for value in [1 << 60, (1 << 60) + 1] {
+                let mut params = TransportParams::default();
+                if bidi {
+                    params.initial_max_streams_bidi = value;
+                } else {
+                    params.initial_max_streams_uni = value;
+                }
+                let decoded = TransportParams::decode(params.encode().unwrap());
+                if value == 1 << 60 {
+                    let decoded = decoded.unwrap();
+                    assert_eq!(
+                        decoded.initial_max_streams_bidi,
+                        params.initial_max_streams_bidi
+                    );
+                    assert_eq!(
+                        decoded.initial_max_streams_uni,
+                        params.initial_max_streams_uni
+                    );
+                } else {
+                    assert!(matches!(decoded, Err(Error::TransportParameter)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn protocols_round_trip() {

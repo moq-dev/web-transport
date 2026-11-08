@@ -33,8 +33,6 @@ fn client_config_for(cert_hash: Vec<u8>) -> ClientConfig {
 
 #[tokio::test]
 async fn echo_datagram() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let (chain, key) = self_signed_cert();
     let cert_hash = sha256(&chain[0]);
 
@@ -106,7 +104,6 @@ fn sha256(cert_der: &[u8]) -> Vec<u8> {
 async fn cancelled_session_calls_release_the_final_owner() {
     use std::{future::Future, task::Poll};
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     for operation in 0..4 {
         let (chain, key) = self_signed_cert();
         let cert_hash = sha256(&chain[0]);
@@ -163,25 +160,50 @@ async fn cancelled_session_calls_release_the_final_owner() {
 async fn cancelled_stream_opens_release_the_final_owner() {
     use std::{future::Future, sync::Arc, task::Poll};
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    use web_transport_quinn::crypto;
+
     let (chain, key) = self_signed_cert();
     let cert = rustls::pki_types::CertificateDer::from(chain[0].clone());
     let key = rustls::pki_types::PrivateKeyDer::try_from(key).unwrap();
-    let mut config = quinn::ServerConfig::with_single_cert(vec![cert.clone()], key).unwrap();
+    let provider = crypto::default_provider().unwrap();
+    let endpoint = |server_config| {
+        quinn::Endpoint::new(
+            crypto::endpoint_config().unwrap(),
+            server_config,
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .unwrap()
+    };
+
+    let tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .unwrap();
+    let mut config =
+        crypto::server_config(Arc::new(crypto::QuicServerConfig::try_from(tls).unwrap())).unwrap();
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(None);
     transport.max_concurrent_bidi_streams(0u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
     config.transport_config(Arc::new(transport));
-    let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server = endpoint(Some(config));
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert).unwrap();
-    let mut config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut config =
+        quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls).unwrap()));
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(None);
     config.transport_config(Arc::new(transport));
-    let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut client = endpoint(None);
     client.set_default_client_config(config);
 
     for bidirectional in [false, true] {
@@ -210,5 +232,85 @@ async fn cancelled_stream_opens_release_the_final_owner() {
         tokio::time::timeout(TIMEOUT, peer.closed())
             .await
             .expect("cancelled stream open retained the final Session owner");
+    }
+}
+
+async fn dual_family_sessions(
+    client: &Client,
+) -> (Vec<ServerSession>, Vec<std::sync::Arc<Server>>) {
+    let (chain, key) = self_signed_cert();
+    let mut sessions = Vec::new();
+    let mut servers = Vec::new();
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let server = Server::new(ServerConfig {
+            certificate_chain: chain.clone(),
+            private_key: key.clone(),
+            bind: bind.into(),
+            congestion_control: CongestionControl::Default,
+            max_idle_timeout_secs: Some(10.0),
+            keep_alive_interval_secs: None,
+        })
+        .unwrap();
+        let addr = server.local_addr();
+        let remote = std::net::SocketAddr::new(addr.host.parse().unwrap(), addr.port);
+        let (session, peer) = tokio::join!(client.connect(format!("https://{remote}/")), async {
+            server.accept().await.unwrap().accept().await.unwrap()
+        },);
+        sessions.push((session.unwrap(), peer));
+        servers.push(server);
+    }
+    (sessions, servers)
+}
+
+type ServerSession = (
+    std::sync::Arc<crate::session::Session>,
+    std::sync::Arc<crate::session::Session>,
+);
+
+#[tokio::test]
+async fn client_close_and_drop_cover_both_families() {
+    tokio::time::timeout(TIMEOUT, async {
+        for explicit_close in [true, false] {
+            let client = Client::new(ClientConfig {
+                no_cert_verification: true,
+                ..Default::default()
+            })
+            .unwrap();
+            let (sessions, servers) = dual_family_sessions(&client).await;
+            if explicit_close {
+                client.close(42, "all sockets".into()).unwrap();
+                assert!(client
+                    .connect("https://127.0.0.1:443/".into())
+                    .await
+                    .is_err());
+                assert!(client.connect("https://[::1]:443/".into()).await.is_err());
+                client.wait_closed().await;
+            }
+            drop(client);
+            for (session, peer) in &sessions {
+                assert!(session.receive_datagram().await.is_err());
+                assert!(peer.receive_datagram().await.is_err());
+            }
+            for server in servers {
+                server.close(0, String::new()).unwrap();
+                server.wait_closed().await;
+            }
+        }
+    })
+    .await
+    .expect("client shutdown timed out");
+}
+
+#[tokio::test]
+async fn closing_unused_client_prevents_first_bind() {
+    let client = Client::new(ClientConfig::default()).unwrap();
+    client.close(0, String::new()).unwrap();
+    client.wait_closed().await;
+    for url in [
+        "https://127.0.0.1:443/",
+        "https://[::1]:443/",
+        "https://[::ffff:127.0.0.1]:443/",
+    ] {
+        assert!(client.connect(url.into()).await.is_err());
     }
 }

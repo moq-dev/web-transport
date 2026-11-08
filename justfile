@@ -36,15 +36,9 @@ check:
 	cargo fmt --all --check
 
 	# requires: cargo install cargo-hack
-	# web-transport-ffi excluded from the feature powerset because aws-lc-rs and
-	# ring are mutually exclusive at link time (one rustls provider must win).
-	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-ffi
+	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
-
-	# web-transport-ffi: explicit check under each TLS provider.
-	cargo check -p web-transport-ffi
-	cargo check -p web-transport-ffi --no-default-features --features ring
 
 	# requires: cargo install cargo-shear
 	cargo shear
@@ -120,6 +114,14 @@ build-ffi:
 build-ffi-target target:
 	./rs/web-transport-ffi/build.sh --target {{target}} --output rs/web-transport-ffi/dist
 
+# Build and exercise generated Swift bindings against the native macOS host library.
+test-swift:
+	./swift/scripts/check.sh
+
+# Build and exercise the Linux Kotlin/JVM JAR, including its packaged native library.
+test-kotlin:
+	./kt/scripts/check.sh
+
 # Delete build artifacts and caches to reclaim disk space. web-transport keeps
 # a single root justfile (unlike moq's per-language modules), so the per-language
 # cleanups are inlined here. Sweeps the shared caches, then recurses into any
@@ -150,7 +152,7 @@ clean:
 		kt/web-transport/src/jvmMain/resources \
 		kt/web-transport/src/androidMain/jniLibs
 
-	# Swift: SPM build dir + generated bindings/xcframework.
+	# Swift: SPM caches and optional developer-generated bindings/XCFramework.
 	rm -rf swift/.build swift/.swiftpm swift/Package.resolved \
 		swift/Sources/WebTransportFFI/Generated.swift swift/WebTransportFFI.xcframework
 

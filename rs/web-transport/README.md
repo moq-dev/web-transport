@@ -15,6 +15,10 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+The native `ClientBuilder::with_transport_config` accepts Quinn's owned `TransportConfig`, available through `web_transport::quinn::quinn::TransportConfig`. Explicit congestion control overrides only its controller, regardless of setter order; see the [Quinn configuration documentation](../web-transport-quinn/README.md#transport-configuration) for defaults and examples.
+
+The native `ClientBuilder` does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings.
+
 
 ## Native session lifetime
 
@@ -31,3 +35,14 @@ WASM is `!Send` and as far as I can tell, it's not possible to implement a trait
 This crate skirts the issue by switching the underlying implementation based on the platform.
 The compiler can then automatically apply `Send` bounds instead of explicitly requiring them.
 Unfortunate, I know.
+
+## Native crypto
+
+The native Quinn backend uses rind through rind-rustls, with an installed process-wide
+rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
+Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
+returns an error if the CPU lacks a required feature. This also applies with another
+TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+
+WASM uses the browser's TLS and does not depend on rind. Advanced native callers use
+[`web_transport_quinn::crypto`](../web-transport-quinn/README.md#crypto-and-migration).
