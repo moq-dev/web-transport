@@ -84,6 +84,15 @@ available. `closed()` reports the terminal reason without waiting for asynchrono
 transport cleanup and descriptor release to finish. A caller
 that retains its own `SharedSocketStats` copy keeps that handle alive.
 
+## Stream control validation
+
+MAX_STREAM_DATA and STOP_SENDING close the session when they name a receive-only
+stream or a locally initiated stream that has not been allocated. Late controls
+for previously opened and closed streams are ignored. These checks follow
+[RFC 9000 §19.5](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.5) and
+[§19.10](https://www.rfc-editor.org/rfc/rfc9000.html#section-19.10); detected
+violations use the existing CONNECTION_CLOSE code 1002.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
