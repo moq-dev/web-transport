@@ -68,6 +68,13 @@ legacy `webtransport` negotiates no size bound. A `None` WebSocket limit is
 unbounded. For `ws::Upgraded`, the caller must keep `max_record_size` within the
 externally configured frame and message limits, which QMux cannot inspect.
 
+`Config::handshake_timeout` bounds the wait for peer transport parameters after
+the transport connects, including WebSocket sessions. A silent peer closes the
+session with `Error::HandshakeTimeout`; WebSocket builders return before this
+exchange, so observe the error through session operations or `Session::closed`.
+The default is 10 seconds, zero disables the deadline, and the legacy
+`webtransport` format exchanges no parameters and is exempt.
+
 To run QMux over something the built-in modules don't cover, wrap any
 `AsyncRead + AsyncWrite` byte stream in `transport::Stream`, or implement
 `transport::Transport` yourself, then pass it to `Session::connect` /

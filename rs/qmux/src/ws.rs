@@ -104,9 +104,8 @@ where
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
     /// frame and message limits, since each record is one message. QMux cannot
     /// inspect these limits on an externally upgraded WebSocket.
@@ -243,9 +242,8 @@ impl Client {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. The advertised
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). The advertised
     /// [`max_record_size`](Config::max_record_size) on record-framed drafts
     /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
     /// and 64 MiB by default), since each record is one message. Establishment
@@ -416,9 +414,8 @@ impl Server {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. The advertised
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). The advertised
     /// [`max_record_size`](Config::max_record_size) on record-framed drafts
     /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
     /// and 64 MiB by default), since each record is one message. Establishment
@@ -823,6 +820,257 @@ mod record_size_tests {
                     peer.close(0, "done");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use std::{future::Future, task::Context};
+    use tokio::time::{advance, timeout};
+    use tokio_tungstenite::{tungstenite::client::IntoClientRequest, WebSocketStream};
+    use web_transport_trait::Session as _;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    trait Peer:
+        Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+        + Sink<tungstenite::Message, Error = tungstenite::Error>
+        + Unpin
+    {
+    }
+
+    impl<T> Peer for WebSocketStream<T> where T: AsyncRead + AsyncWrite + Unpin {}
+
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        Client,
+        Server,
+        UpgradedClient,
+        UpgradedServer,
+    }
+
+    const BUILDERS: &[Builder] = &[
+        Builder::Client,
+        Builder::Server,
+        Builder::UpgradedClient,
+        Builder::UpgradedServer,
+    ];
+
+    fn config() -> Config {
+        Config {
+            handshake_timeout: DEADLINE,
+            max_idle_timeout: 0,
+            rtt_interval: Duration::ZERO,
+            ..Config::default()
+        }
+    }
+
+    async fn start(builder: Builder, version: Version, config: Config) -> (Session, Box<dyn Peer>) {
+        use tungstenite::{http::header::SEC_WEBSOCKET_PROTOCOL, protocol::Role};
+
+        if let Builder::Client = builder {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    move |request: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        let protocol = if version.is_qmux() {
+                            request.headers()[SEC_WEBSOCKET_PROTOCOL].clone()
+                        } else {
+                            version.alpn().parse().unwrap()
+                        };
+                        response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+                        Ok(response)
+                    };
+                tokio_tungstenite::accept_hdr_async(socket, callback)
+                    .await
+                    .unwrap()
+            };
+            let client = Client::new().with_session_config(config);
+            let client = if version.is_qmux() {
+                client.with_protocol("test", &[version]).require_protocol()
+            } else {
+                client
+            };
+            let (session, peer) = tokio::join!(client.connect(&url), server);
+            return (session.unwrap(), Box::new(peer));
+        }
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        if let Builder::Server = builder {
+            let server = Server::new().with_session_config(config);
+            let mut request = "ws://localhost".into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, version.alpn().parse().unwrap());
+            let (session, peer) = tokio::join!(
+                server.accept(a),
+                tokio_tungstenite::client_async(request, b)
+            );
+            return (session.unwrap(), Box::new(peer.unwrap().0));
+        }
+
+        let is_server = matches!(builder, Builder::UpgradedServer);
+        let (role, peer_role) = if is_server {
+            (Role::Server, Role::Client)
+        } else {
+            (Role::Client, Role::Server)
+        };
+        let socket = WebSocketStream::from_raw_socket(a, role, None).await;
+        let peer = WebSocketStream::from_raw_socket(b, peer_role, None).await;
+        let upgraded = Upgraded::new(socket)
+            .with_alpn(version.alpn())
+            .with_session_config(config);
+        let session = if is_server {
+            upgraded.accept()
+        } else {
+            upgraded.connect()
+        };
+        (session, Box::new(peer))
+    }
+
+    fn assert_open(session: &Session) {
+        let mut closed = std::pin::pin!(session.closed());
+        assert!(closed
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending());
+    }
+
+    async fn network_io<F: Future>(builder: Builder, io: F) -> F::Output {
+        // Real socket delivery must not race paused time's automatic advance.
+        let real_time = matches!(builder, Builder::Client);
+        if real_time {
+            tokio::time::resume();
+        }
+        let output = io.await;
+        if real_time {
+            tokio::time::pause();
+        }
+        output
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_hits_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, _peer) = start(builder, version, config()).await;
+                advance(DEADLINE - Duration::from_millis(1)).await;
+                assert_open(&session);
+                let error = timeout(Duration::from_secs(1), session.closed())
+                    .await
+                    .unwrap_or_else(|_| panic!("{builder:?} {version:?}: handshake stayed open"));
+                assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+                assert!(matches!(
+                    session.open_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
+                assert!(matches!(
+                    session.accept_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_handshake_deadline_and_legacy_stay_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL {
+                let mut config = config();
+                if version.is_qmux() {
+                    config.handshake_timeout = Duration::ZERO;
+                }
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_handshake_deadline_stays_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let mut config = config();
+                config.handshake_timeout = Duration::MAX;
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_sends_connection_close() {
+        for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+            let (session, mut peer) = start(Builder::UpgradedClient, version, config()).await;
+            // Drain our parameters so the writer is idle when the deadline fires.
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                tungstenite::Message::Binary(_)
+            ));
+            let error = timeout(DEADLINE * 2, session.closed()).await.unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout));
+            let message = timeout(DEADLINE, peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let tungstenite::Message::Binary(data) = message else {
+                panic!("expected a QMux CONNECTION_CLOSE, got {message:?}");
+            };
+            let Some(crate::Frame::ConnectionClose(close)) =
+                crate::Frame::decode(data, version).unwrap()
+            else {
+                panic!("expected a QMux CONNECTION_CLOSE");
+            };
+            assert_eq!(close.code.into_inner(), 0);
+            assert_eq!(close.reason, Error::HandshakeTimeout.to_string());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiving_parameters_cancels_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, mut peer) = start(builder, version, config()).await;
+                advance(DEADLINE / 2).await;
+                let mut peer_config = config();
+                peer_config.version = version;
+                let params = crate::Frame::TransportParameters(peer_config.to_transport_params())
+                    .encode(version)
+                    .unwrap();
+                let _stream = network_io(builder, async {
+                    peer.send(tungstenite::Message::Binary(params))
+                        .await
+                        .unwrap();
+                    // Opening acknowledges that the parameters were applied.
+                    session.open_uni().await.unwrap()
+                })
+                .await;
+                advance(DEADLINE * 2).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_before_parameters_preserves_error() {
+        for &builder in BUILDERS {
+            let (session, peer) = start(builder, Version::QMux02, config()).await;
+            let error = network_io(builder, async {
+                drop(peer);
+                timeout(DEADLINE / 2, session.closed()).await.unwrap()
+            })
+            .await;
+            assert!(!matches!(error, Error::HandshakeTimeout), "{error:?}");
         }
     }
 }
