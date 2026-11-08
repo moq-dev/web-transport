@@ -24,3 +24,7 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
+
+[[bench]]
+name = "buffering"
+harness = false
