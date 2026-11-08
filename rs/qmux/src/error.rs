@@ -54,7 +54,9 @@ pub enum Error {
 
     /// A transport parameter carried an illegal value — QMux's
     /// TRANSPORT_PARAMETER_ERROR. Record-framed drafts raise this when a peer
-    /// advertises a `max_record_size` below the default minimum.
+    /// advertises a `max_record_size` below the default minimum. WebSocket
+    /// builders also return this locally when their effective record limit is
+    /// below that minimum.
     #[error("transport parameter error")]
     TransportParameter,
 
@@ -114,10 +116,11 @@ impl Error {
     /// The wire error code to send on a CONNECTION_CLOSE (0x1c) when *we* tear the
     /// session down because of this error, or `None` when the peer should not (or
     /// cannot) be told: a graceful close, a close the peer already sent us, an idle
-    /// timeout (silent, like QUIC), or a dead transport. Every protocol/transport
-    /// violation we detect maps to 1002, matching the JS QMux polyfill.
+    /// timeout (silent, like QUIC), or a dead transport. Handshake expiry uses 0;
+    /// protocol/transport violations map to 1002, matching the JS QMux polyfill.
     pub(crate) fn transport_close(&self) -> Option<u32> {
         match self {
+            Error::HandshakeTimeout => Some(0),
             Error::ProtocolViolation
             | Error::FrameEncoding
             | Error::TransportParameter

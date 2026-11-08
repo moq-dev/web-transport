@@ -54,20 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let config: web_transport_quinn::crypto::QuicClientConfig = config.try_into()?;
     let config = quinn::ClientConfig::new(Arc::new(config));
 
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV6,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_only_v6(false)?;
-    socket.bind(&"[::]:0".parse::<std::net::SocketAddr>()?.into())?;
-    let client = quinn::Endpoint::new(
-        web_transport_quinn::crypto::endpoint_config()?,
-        None,
-        socket.into(),
-        quinn::default_runtime().context("no async runtime")?,
-    )?;
-    let client = web_transport_quinn::Client::new(client, config);
+    let client = web_transport_quinn::Client::from(config);
 
     // Connect to the given URL.
     tracing::info!(host = ?args.url.host_str(), path = args.url.path(), "connecting");

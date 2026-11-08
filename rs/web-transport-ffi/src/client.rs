@@ -51,7 +51,6 @@ impl Default for ClientConfig {
 #[derive(uniffi::Object)]
 pub struct Client {
     inner: web_transport_quinn::Client,
-    endpoint: quinn::Endpoint,
 }
 
 #[uniffi::export]
@@ -139,20 +138,8 @@ impl Client {
         client_config.transport_config(transport.into());
 
         let _guard = RUNTIME.enter();
-        let endpoint_config = web_transport_quinn::crypto::endpoint_config()
-            .map_err(|e| WebTransportError::invalid(e.to_string()))?;
-        let socket = client_socket("[::]:0".parse().unwrap())
-            .or_else(|_| client_socket("0.0.0.0:0".parse().unwrap()))
-            .map_err(|e| WebTransportError::Io(format!("failed to bind: {e}")))?;
-        let endpoint =
-            quinn::Endpoint::new(endpoint_config, None, socket, Arc::new(quinn::TokioRuntime))
-                .map_err(|e| WebTransportError::Io(format!("failed to create endpoint: {e}")))?;
-
-        let client = web_transport_quinn::Client::new(endpoint.clone(), client_config);
-
         Ok(Arc::new(Self {
-            inner: client,
-            endpoint,
+            inner: web_transport_quinn::Client::from(client_config),
         }))
     }
 
@@ -179,15 +166,15 @@ impl Client {
         let var_code = quinn::VarInt::from_u64(code)
             .map_err(|_| WebTransportError::invalid("code must be < 2^62"))?;
         let _guard = RUNTIME.enter();
-        self.endpoint.close(var_code, reason.as_bytes());
+        self.inner.close(var_code, reason.as_bytes());
         Ok(())
     }
 
-    /// Wait until all connections have shut down cleanly.
+    /// Wait for bound endpoints to drain; close first to prevent new connections.
     pub async fn wait_closed(&self) {
-        let endpoint = self.endpoint.clone();
+        let client = self.inner.clone();
         let handle = RUNTIME.spawn(async move {
-            endpoint.wait_idle().await;
+            client.wait_idle().await;
         });
         let _ = handle.await;
     }
@@ -196,23 +183,8 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let _guard = RUNTIME.enter();
-        self.endpoint.close(quinn::VarInt::from_u32(0), b"");
+        self.inner.close(quinn::VarInt::from_u32(0), b"");
     }
-}
-
-// Match Quinn's client sockets rather than platform-specific IPv6-only defaults.
-fn client_socket(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(addr),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    if addr.is_ipv6() {
-        // IPv6-only operation is still valid, as in Quinn's convenience constructor.
-        let _ = socket.set_only_v6(false);
-    }
-    socket.bind(&addr.into())?;
-    Ok(socket.into())
 }
 
 // ---------------------------------------------------------------------------

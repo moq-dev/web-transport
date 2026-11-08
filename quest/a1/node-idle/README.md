@@ -10,5 +10,4 @@ The native configuration and Node option quests are independently reviewable. Th
 
 ## Required
 
-- [Native transport configuration](/quest/a1/node-idle/native-transport-config.md) - typed reusable builder input
 - [Node options](/quest/a1/node-idle/options.md) - explicit millisecond options and runtime behavior

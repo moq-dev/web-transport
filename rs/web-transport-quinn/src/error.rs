@@ -7,8 +7,8 @@ use crate::{ConnectError, SettingsError};
 /// An error returned when connecting to a WebTransport endpoint.
 #[derive(Error, Debug, Clone)]
 pub enum ClientError {
-    /// Creating or binding the endpoint failed.
-    #[error("I/O error: {0}")]
+    /// Creating or binding a client endpoint failed.
+    #[error("failed to bind client endpoint: {0}")]
     IoError(Arc<std::io::Error>),
 
     /// A CPU feature required by rind is unavailable.

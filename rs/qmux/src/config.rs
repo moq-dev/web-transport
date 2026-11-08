@@ -75,12 +75,12 @@ pub struct Config {
     /// 16382 bytes.
     pub max_datagram_frame_size: u64,
 
-    /// How long [`Session::connect`](crate::Session::connect) /
-    /// [`accept`](crate::Session::accept) waits for the peer's transport
-    /// parameters before giving up. Bounds the handshake so a peer that completes
-    /// the transport connection but never sends its parameters can't hang
-    /// establishment forever. Default: 10s; a zero duration disables the timeout
-    /// (wait indefinitely).
+    /// How long a session waits for the peer's transport parameters before
+    /// closing with [`Error::HandshakeTimeout`](crate::Error::HandshakeTimeout).
+    /// Starts when the session is created, after the transport handshake,
+    /// including for WebSocket sessions that return before parameters arrive.
+    /// The legacy `webtransport` format exchanges no parameters and is exempt.
+    /// Default: 10s; a zero duration disables the timeout (wait indefinitely).
     pub handshake_timeout: Duration,
 
     /// How often to send a `QX_PING` request purely to measure round-trip time,

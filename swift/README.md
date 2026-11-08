@@ -14,7 +14,37 @@ For now, consume the package locally by downloading the `web-transport-ffi-${VER
 
 ## Local development
 
-`swift/scripts/check.sh` builds `web-transport-ffi` for the host, regenerates the UniFFI Swift bindings, and (on macOS) assembles a single-slice `WebTransportFFI.xcframework` so `swift test` can run. Requires macOS with `xcodebuild` and `swift` on `$PATH`. Skips cleanly on non-macOS hosts.
+On macOS, from the repository root:
+
+```sh
+just test-swift
+# Or, without Just:
+./swift/scripts/check.sh
+```
+
+Requires the Swift 5.9+ toolchain, Rust/Cargo, Python 3, OpenSSL and Apple's
+`install_name_tool` and `codesign` on `$PATH`. Unsupported hosts and missing tools are errors.
+With the Nix development shell available, use `nix develop --command just test-swift`;
+the Apple tools must still be installed on the host.
+
+The command builds the native host library in release mode, generates bindings
+from it, and stages an isolated Swift package under `.tmp/`. The package compiles
+the generated Swift API and the wrapper, links that run's dynamic library, and
+checks its loaded path at runtime. Tests open a loopback client/server session,
+exchange bidirectional and unidirectional streams and datagrams, check FIN/EOF
+and structured errors, and explicitly close sessions and endpoints. Test-only
+credentials are generated for each run; verification is disabled only for the
+loopback client.
+
+Staged packages and credentials are removed on success, failure or runtime
+cancellation after stopping the test process group. Test output remains in
+`.tmp/swift-test-results/`, with xUnit results for completed runs. Runtime execution
+fails after 120 seconds if a native call hangs, allowing five seconds for graceful
+termination before forcing exit. Interrupted runs may have partial logs and no XML;
+unbuffered phase messages identify the last lifecycle operation. The command leaves `Package.swift` and
+developer-generated bindings untouched. The independent `Swift runtime` PR job
+runs this command on macOS for every PR, including shared Rust and build changes.
+It does not publish or test the release XCFramework platform matrix or iOS simulators.
 
 To compute the XCFramework checksum yourself for a local `Package.swift` edit:
 
@@ -29,8 +59,9 @@ swift/
   Package.swift                       Manifest (URL+checksum rewritten by package.sh at release time)
   Sources/
     WebTransport/                     Ergonomic shim re-exporting WebTransportFFI
-    WebTransportFFI/                  UniFFI-generated swift (populated by check.sh/package.sh, gitignored)
-  Tests/WebTransportTests/            Smoke tests
+    WebTransportFFI/                  UniFFI-generated Swift (populated in release packages, gitignored)
+  Tests/WebTransportTests/            Package tests (included in release archives)
+  Tests/HostTests/                    macOS host runtime tests (check.sh only)
   scripts/                            check.sh, package.sh
 ```
 

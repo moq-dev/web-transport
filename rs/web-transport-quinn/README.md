@@ -28,9 +28,24 @@ Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they m
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
 # Usage
-Use `ClientBuilder` and `ServerBuilder` for WebTransport defaults. Advanced callers
-can build a `quinn::Endpoint` and pass it to `Client::new` or `Server::new`; set the
-TLS ALPN to `web_transport_quinn::ALPN` (`h3`).
+
+Use `ClientBuilder::new().with_system_roots()?` to build a reusable client,
+then call `client.connect(url).await?` to establish a session. Clones share the
+client's endpoints. The first connection to each address family binds an
+IPv4 `0.0.0.0:0` or IPv6-only `[::]:0` socket. IPv4-mapped IPv6 destinations
+use IPv4. Socket setup failures are returned by `connect`, so building a client
+does not require IPv6 support or a running async runtime. Both sockets use the
+runtime present at construction, or at the first connection if constructed
+outside a runtime. Keep that runtime alive while using the client.
+
+For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
+lazy sockets. Set its ALPN to `web_transport_quinn::ALPN` (`h3`).
+`Client::new(endpoint, config)` instead keeps the caller's endpoint and address
+handling, and `Server::new(endpoint)` accepts a caller's server endpoint.
+
+`client.close(code, reason)` closes all bound endpoints and prevents new
+connections through any clone. Await `client.wait_idle()` after closing to
+wait for every bound endpoint to drain.
 
 ## Crypto and migration
 
@@ -54,26 +69,23 @@ Import rustls directly instead of through the feature-gated `quinn::rustls` re-e
 Use `crypto::server_config(Arc::new(crypto))?` instead of
 `quinn::ServerConfig::with_crypto`, and `quinn::Endpoint::new` with
 `crypto::endpoint_config()?` instead of `Endpoint::client` or `Endpoint::server`.
-Those Quinn convenience methods require its ring or aws-lc-rs feature. For an IPv6
-client socket, disable `IPV6_V6ONLY` before binding to retain Quinn's dual-stack
-behavior; the advanced client example shows the socket2 setup.
+Those Quinn convenience methods require its ring or aws-lc-rs feature.
 
 ```rust,no_run
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use std::{net::UdpSocket, sync::Arc};
+use std::sync::Arc;
 use web_transport_quinn::{crypto, quinn};
+
+let mut roots = rustls::RootCertStore::empty();
+roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
 
 let mut tls = rustls::ClientConfig::builder_with_provider(crypto::default_provider()?)
     .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_root_certificates(roots)
     .with_no_client_auth();
 tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
 let config = quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls)?));
-let endpoint = quinn::Endpoint::new(
-    crypto::endpoint_config()?, None, UdpSocket::bind("0.0.0.0:0")?,
-    quinn::default_runtime().ok_or("no async runtime")?,
-)?;
-let client = web_transport_quinn::Client::new(endpoint, config);
+let client = web_transport_quinn::Client::from(config);
 # Ok(())
 # }
 ```
@@ -91,6 +103,31 @@ Each WebTransport session runs a background task that reads capsules from the CO
 Both are spawned on the runtime that [quinn::default_runtime](https://docs.rs/quinn/latest/quinn/fn.default_runtime.html) detects, the same way `quinn::Endpoint::client` and `quinn::Endpoint::server` pick theirs.
 Tokio works out of the box. To run on async-std or smol instead, enable quinn's `runtime-async-std` or `runtime-smol` feature in your own `Cargo.toml`.
 Resolving a hostname in `Client::connect` still uses tokio, so outside a tokio runtime connect to an IP address or resolve the name yourself.
+
+## Transport configuration
+
+`ClientBuilder::with_transport_config` and `ServerBuilder::with_transport_config` take an owned `quinn::TransportConfig`. When omitted, the builders use Quinn's defaults: a 30-second maximum idle timeout, no keepalive, and CUBIC congestion control. The transport configuration applies to every client certificate-verification path and to server connections.
+
+```rust,no_run
+use std::time::Duration;
+use web_transport_quinn::{quinn, ClientBuilder, CongestionControl};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut transport = quinn::TransportConfig::default();
+transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
+let client = ClientBuilder::new()
+    .with_transport_config(transport)
+    .with_congestion_control(CongestionControl::LowLatency)
+    .with_system_roots()?;
+# Ok(())
+# }
+```
+
+An explicit `LowLatency` or `Throughput` congestion choice overrides only the configuration's congestion controller, regardless of builder call order. `Default` removes that override and preserves the supplied controller. Calling `with_transport_config` again replaces the supplied configuration; other settings survive the congestion override.
+
+Quinn's `TransportConfig` is not cloneable, so `ClientBuilder` owns it and does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` to share its endpoints and settings across connections.
 
 ## API
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
