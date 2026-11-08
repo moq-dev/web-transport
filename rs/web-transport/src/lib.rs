@@ -5,24 +5,6 @@
 //!  - web: [web-transport-wasm](https://docs.rs/web-transport-wasm/latest)
 //!
 //! WASM lacks server support, so for native you first establish a [web_transport_quinn::Session] and then use [Session::from()] to cast to this generic interface.
-//!
-//! # Crypto providers
-//!
-//! On native targets, the `aws-lc-rs` feature (enabled by default) and `ring`
-//! forward to `web-transport-quinn`. To use ring without aws-lc-rs, disable
-//! default features and enable only `ring`.
-//!
-//! An installed process-wide rustls crypto provider takes precedence. Cargo
-//! unifies backend features across dependencies, so another dependency can enable
-//! an additional provider. With both backend providers enabled, install one with
-//! `CryptoProvider::install_default()` before constructing a `ClientBuilder`;
-//! otherwise construction panics.
-//! With neither feature enabled, the native `ClientBuilder` is unavailable.
-//! `Session` and `Server` conversions remain available for callers that configure
-//! `web-transport-quinn` themselves, for example through its `Client::new`.
-//!
-//! These features have no effect on WASM, where the browser handles TLS and
-//! `ClientBuilder` is always available.
 
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 #[path = "quinn.rs"]

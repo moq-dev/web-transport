@@ -60,8 +60,6 @@ check:
 # Run any CI tests
 test:
 	cargo test --workspace --all-targets --all-features
-	cargo test -p web-transport --no-default-features --features aws-lc-rs --test crypto
-	cargo test -p web-transport --no-default-features --features ring --test crypto
 	cargo test --target wasm32-unknown-unknown -p web-transport --all-targets --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport-wasm --all-targets --all-features
 
