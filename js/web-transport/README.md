@@ -56,7 +56,7 @@ Install `Session` as the global `WebTransport` for libraries that expect the bro
 ```ts
 import { install } from "@moq/web-transport";
 
-install(); // globalThis.WebTransport = Session (no-op if already defined)
+install(); // globalThis.WebTransport = Session, plus WebTransportError (no-op if already defined)
 ```
 
 ## Server
@@ -72,6 +72,9 @@ const key = fs.readFileSync("key.pem");
 
 const server = Server.bind("[::]:4443", cert, key);
 
+// Stop accepting new connections when shutting down.
+process.once("SIGINT", () => server.close());
+
 while (true) {
 	const request = await server.accept();
 	if (!request) break;
@@ -84,10 +87,11 @@ while (true) {
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
 }
-
-// Stop accepting new connections
-server.close();
 ```
+
+`server.close()` is synchronous and safe to call repeatedly. Pending and future
+`accept()` calls resolve to `null`; sessions already accepted remain open until
+they are closed separately.
 
 ## W3C WebTransport API
 
@@ -135,6 +139,16 @@ const reader = session.datagrams.readable.getReader();
 const { value: datagram } = await reader.read();
 ```
 
+### Stream errors
+
+A peer's RESET_STREAM errors the reader, and its STOP_SENDING errors the writer, with a `WebTransportError` whose `source` is `"stream"` and whose `streamErrorCode` is the peer's code. A session failure errors its streams with `source: "session"`. Pass a `WebTransportError` to `abort()` or `cancel()` to send a code of your own:
+
+```ts
+import { WebTransportError } from "@moq/web-transport";
+
+await writer.abort(new WebTransportError("cancelled", { streamErrorCode: 7 }));
+```
+
 ### Closing
 
 ```ts
@@ -145,10 +159,6 @@ session.close({ closeCode: 0, reason: "done" });
 const info = await session.closed;
 console.log(info.closeCode, info.reason);
 ```
-
-## License
-
-MIT OR Apache-2.0
 
 ## Runtime tests
 
@@ -178,3 +188,7 @@ wrapper. Packing or publishing runs `build:js` through `prepack`, so the package
 exports JavaScript and declarations from `dist/` without requiring a TypeScript
 loader in Node. Platform-specific native packages and their release layout are
 unchanged.
+
+## License
+
+MIT OR Apache-2.0

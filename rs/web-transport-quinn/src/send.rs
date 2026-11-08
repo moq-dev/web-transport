@@ -1,5 +1,6 @@
 use crate::error::CloseReason;
 use std::{
+    future::Future,
     io,
     pin::Pin,
     sync::Arc,
@@ -75,14 +76,24 @@ impl SendStream {
     ///
     /// Unlike Quinn, this returns None if the code is not a valid WebTransport error code.
     /// Also unlike Quinn, this returns a SessionError, not a StoppedError, because 0-RTT is not supported.
-    pub async fn stopped(&self) -> Result<Option<u32>, SessionError> {
-        match self.stream.stopped().await {
-            Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
-            Ok(None) => Ok(None),
-            Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                Err(self.error.map(conn_err.into()))
+    ///
+    /// Like Quinn, the future does not borrow the stream, so it can be awaited while writing.
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<u32>, SessionError>> + Send + Sync + 'static {
+        let stopped = self.stream.stopped();
+        let error = self.error.clone();
+        let raw = self.raw;
+
+        async move {
+            match stopped.await {
+                Ok(Some(code)) => Ok(decode_stream_code(code, raw)),
+                Ok(None) => Ok(None),
+                Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
+                    Err(error.map(conn_err.into()))
+                }
+                Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
             }
-            Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
     }
 

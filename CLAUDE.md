@@ -84,4 +84,4 @@ nearest package README (or a nested `AGENTS.md` only when agents need instructio
 that do not belong in user documentation), then link to it here if it affects
 repository-wide work.
 
-Quests: when work mentions a quest, run `quest guide` and follow it.
+Quests: before starting work, run `quest guide` and follow it.

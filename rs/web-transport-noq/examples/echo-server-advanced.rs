@@ -100,7 +100,8 @@ async fn run_conn(conn: noq::Incoming) -> anyhow::Result<()> {
 
     // Perform the WebTransport handshake.
     let request = web_transport_noq::Request::accept(conn).await?;
-    tracing::info!(url = %request.url, "received WebTransport request");
+    // The Debug output redacts credentials, such as the query and header values.
+    tracing::info!(request = ?*request, "received WebTransport request");
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;

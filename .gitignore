@@ -14,3 +14,10 @@ __pycache__/
 *.pyd
 *.egg-info/
 .venv/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Agent scratch
+/.tmp/

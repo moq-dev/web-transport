@@ -5,7 +5,7 @@ authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
 
-version = "0.6.4"
+version = "0.6.6"
 edition = "2021"
 
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
@@ -48,6 +48,11 @@ tokio = { version = "1.27", features = ["full", "test-util"] }
 url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
+
+[[bench]]
+name = "credit"
+harness = false
+required-features = ["tcp"]
 
 [[example]]
 name = "h3qx"

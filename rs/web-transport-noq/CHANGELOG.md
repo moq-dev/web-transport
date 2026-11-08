@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.5](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.4...web-transport-noq-v0.4.5) - 2026-11-03
+
+### Fixed
+
+- *(proto)* redact credentials from ConnectRequest's Debug output ([#475](https://github.com/moq-dev/web-transport/pull/475))
+
+## [0.4.4](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.3...web-transport-noq-v0.4.4) - 2026-10-22
+
+### Other
+
+- Close Noq connections when graceful close is cancelled ([#453](https://github.com/moq-dev/web-transport/pull/453))
+- Close Noq transports on final Session drop ([#446](https://github.com/moq-dev/web-transport/pull/446))
+
 ## [0.4.3](https://github.com/moq-dev/web-transport/compare/web-transport-noq-v0.4.2...web-transport-noq-v0.4.3) - 2026-10-20
 
 ### Other

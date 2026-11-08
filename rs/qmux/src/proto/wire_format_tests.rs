@@ -560,6 +560,28 @@ fn qmux00_max_streams_uni() {
 }
 
 #[test]
+fn max_streams_above_2_60_rejected() {
+    // 2^60 is an 8-byte varint: 0xd0 followed by seven zero bytes. One more is a
+    // FRAME_ENCODING_ERROR (RFC 9000 §19.11), in bare frames and in records.
+    for (frame_type, frame) in [
+        (0x12, Frame::MaxStreamsBidi(1 << 60)),
+        (0x13, Frame::MaxStreamsUni(1 << 60)),
+    ] {
+        let limit = [frame_type, 0xd0, 0, 0, 0, 0, 0, 0, 0];
+        assert_round_trip(Version::QMux00, &limit, &frame);
+        let decoded = Frame::decode_record(Bytes::copy_from_slice(&limit)).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_frames_eq(&decoded[0], &frame, Version::QMux01);
+
+        let over = [frame_type, 0xd0, 0, 0, 0, 0, 0, 0, 1];
+        let err = Frame::decode(Bytes::copy_from_slice(&over), Version::QMux00).unwrap_err();
+        assert!(matches!(err, Error::FrameEncoding), "got {err:?}");
+        let err = Frame::decode_record(Bytes::copy_from_slice(&over)).unwrap_err();
+        assert!(matches!(err, Error::FrameEncoding), "got {err:?}");
+    }
+}
+
+#[test]
 fn qmux00_data_blocked() {
     // 0x14 + limit(=1024).
     let bytes = [0x14, 0x44, 0x00];

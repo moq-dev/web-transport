@@ -9,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use js_sys::{Function, Promise, Reflect, Uint8Array};
 use url::Url;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     ReadableStream, ReadableStreamDefaultReader, WebTransport, WebTransportBidirectionalStream,
@@ -22,6 +22,26 @@ use crate::{
     js::{promise, read_value, Op},
     Error, RecvStream, SendStream,
 };
+
+// The web-sys stream-open methods do not catch synchronous browser exceptions.
+// A closed transport can throw before returning its promise.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = WebTransport, js_name = WebTransport)]
+    type StreamTransport;
+
+    #[wasm_bindgen(method, structural, catch, js_name = createUnidirectionalStream)]
+    fn create_unidirectional_stream(
+        this: &StreamTransport,
+        options: &WebTransportSendStreamOptions,
+    ) -> Result<Promise, JsValue>;
+
+    #[wasm_bindgen(method, structural, catch, js_name = createBidirectionalStream)]
+    fn create_bidirectional_stream(
+        this: &StreamTransport,
+        options: &WebTransportSendStreamOptions,
+    ) -> Result<Promise, JsValue>;
+}
 
 /// A session represents a connection between a client and a server.
 ///
@@ -307,7 +327,10 @@ impl Session {
     pub fn poll_open_uni(&self, cx: &mut Context<'_>) -> Poll<Result<SendStream, Error>> {
         let inner = &self.shared.inner;
         let stream = ready!(self.open_uni.poll(cx, || {
-            promise(inner.create_unidirectional_stream_with_options(&stream_options()))
+            inner
+                .unchecked_ref::<StreamTransport>()
+                .create_unidirectional_stream(&stream_options())
+                .unwrap_or_else(|error| Promise::reject(&error))
         }))?;
 
         Poll::Ready(SendStream::new(stream.unchecked_into()))
@@ -321,7 +344,10 @@ impl Session {
     ) -> Poll<Result<(SendStream, RecvStream), Error>> {
         let inner = &self.shared.inner;
         let stream = ready!(self.open_bi.poll(cx, || {
-            promise(inner.create_bidirectional_stream_with_options(&stream_options()))
+            inner
+                .unchecked_ref::<StreamTransport>()
+                .create_bidirectional_stream(&stream_options())
+                .unwrap_or_else(|error| Promise::reject(&error))
         }))?;
 
         Poll::Ready(bi_streams(stream.unchecked_into()))

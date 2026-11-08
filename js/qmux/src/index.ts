@@ -2,7 +2,7 @@ import type { Version } from "./session.ts";
 import Session from "./session.ts";
 
 export { SessionError, StreamError } from "./error.ts";
-export type { AcceptOptions, Config, SessionOptions, Version } from "./session.ts";
+export type { AcceptOptions, Config, SendStreamOptions, SessionOptions, Version } from "./session.ts";
 export { selectSubprotocol } from "./session.ts";
 
 /** Options forwarded to every `Session` constructed by [[install]]. */

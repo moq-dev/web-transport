@@ -154,7 +154,12 @@ impl ClientBuilder {
             Some(url::Host::Domain(host)) => host.to_string(),
             Some(url::Host::Ipv4(ip)) => ip.to_string(),
             Some(url::Host::Ipv6(ip)) => ip.to_string(),
-            None => return Err(ClientError::InvalidUrl(request.url.to_string())),
+            // Keep only the scheme: a hostless URL's path can carry data, such as
+            // `data:text/plain,SECRET`.
+            None => {
+                let scheme = request.url.scheme();
+                return Err(ClientError::InvalidUrl(format!("{scheme} URL has no host")));
+            }
         };
 
         Ok((host, request.url.port().unwrap_or(443)))
@@ -175,5 +180,18 @@ impl Connecting {
     pub async fn established(self) -> Result<Connection, ClientError> {
         let conn = self.connecting.established().await?;
         Connection::connect(conn, self.request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostless_url_error_omits_url_content() {
+        let request =
+            ConnectRequest::new(url::Url::parse("data:text/plain,SECRET?q=SECRET").unwrap());
+        let err = ClientBuilder::target(&request).unwrap_err();
+        assert_eq!(err.to_string(), "invalid URL: data URL has no host");
     }
 }

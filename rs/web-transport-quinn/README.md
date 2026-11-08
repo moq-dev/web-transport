@@ -51,6 +51,37 @@ See the [examples](examples) or [moq-native](https://github.com/moq-dev/moq-rs/b
     send.write(b"hello").await?;
 ```
 
+## Async runtimes
+Each WebTransport session runs a background task that reads capsules from the CONNECT stream, and `Session::close` runs the graceful close in another.
+Both are spawned on the runtime that [quinn::default_runtime](https://docs.rs/quinn/latest/quinn/fn.default_runtime.html) detects, the same way `quinn::Endpoint::client` and `quinn::Endpoint::server` pick theirs.
+Tokio works out of the box. To run on async-std or smol instead, enable quinn's `runtime-async-std` or `runtime-smol` feature in your own `Cargo.toml`.
+Resolving a hostname in `Client::connect` still uses tokio, so outside a tokio runtime connect to an IP address or resolve the name yourself.
+
+## Transport configuration
+
+`ClientBuilder::with_transport_config` and `ServerBuilder::with_transport_config` take an owned `quinn::TransportConfig`. When omitted, the builders use Quinn's defaults: a 30-second maximum idle timeout, no keepalive, and CUBIC congestion control. The transport configuration applies to every client certificate-verification path and to server connections.
+
+```rust,no_run
+use std::time::Duration;
+use web_transport_quinn::{quinn, ClientBuilder, CongestionControl};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut transport = quinn::TransportConfig::default();
+transport.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
+transport.keep_alive_interval(Some(Duration::from_secs(10)));
+
+let client = ClientBuilder::new()
+    .with_transport_config(transport)
+    .with_congestion_control(CongestionControl::LowLatency)
+    .with_system_roots()?;
+# Ok(())
+# }
+```
+
+An explicit `LowLatency` or `Throughput` congestion choice overrides only the configuration's congestion controller, regardless of builder call order. `Default` removes that override and preserves the supplied controller. Calling `with_transport_config` again replaces the supplied configuration; other settings survive the congestion override.
+
+Quinn's `TransportConfig` is not cloneable, so `ClientBuilder` owns it and does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` to share its endpoint and settings across connections.
+
 ## API
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
 

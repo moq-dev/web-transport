@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let client = web_transport_quinn::Client::new(client, config);
 
     // Connect to the given URL.
-    tracing::info!(url = %args.url, "connecting");
+    tracing::info!(host = ?args.url.host_str(), path = args.url.path(), "connecting");
     let session = client.connect(args.url).await?;
 
     tracing::info!("connected");

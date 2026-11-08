@@ -22,6 +22,8 @@ const STREAMS_BLOCKED_BIDI: VarInt = VarInt::from_u32(0x16);
 const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 const CONNECTION_CLOSE: VarInt = VarInt::from_u32(0x1c);
+// RFC 9000 §19.11: a stream count above 2^60 can't be encoded as a stream ID.
+const MAX_STREAM_COUNT: u64 = 1 << 60;
 // DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
 // the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
 // QMux01, where each rides its own record, so the record boundary would already
@@ -202,6 +204,16 @@ pub enum Frame {
     Datagram(Datagram),
 }
 
+/// Decode a MAX_STREAMS count, rejecting one above [`MAX_STREAM_COUNT`] as a
+/// FRAME_ENCODING_ERROR.
+fn decode_max_streams<B: Buf>(data: &mut B) -> Result<u64, Error> {
+    let max = VarInt::decode(data)?.into_inner();
+    if max > MAX_STREAM_COUNT {
+        return Err(Error::FrameEncoding);
+    }
+    Ok(max)
+}
+
 impl Frame {
     /// Encode the frame into bytes using the given wire format version.
     ///
@@ -372,12 +384,12 @@ impl Frame {
             }
             // MAX_STREAMS (bidi)
             0x12 => {
-                let max = VarInt::decode(data)?.into_inner();
+                let max = decode_max_streams(data)?;
                 Ok(Some(Frame::MaxStreamsBidi(max)))
             }
             // MAX_STREAMS (uni)
             0x13 => {
-                let max = VarInt::decode(data)?.into_inner();
+                let max = decode_max_streams(data)?;
                 Ok(Some(Frame::MaxStreamsUni(max)))
             }
             // DATA_BLOCKED
@@ -769,12 +781,12 @@ impl Frame {
             }
             // MAX_STREAMS (bidi)
             0x12 => {
-                let max = VarInt::decode(&mut data)?.into_inner();
+                let max = decode_max_streams(&mut data)?;
                 Ok(Some(Frame::MaxStreamsBidi(max)))
             }
             // MAX_STREAMS (uni)
             0x13 => {
-                let max = VarInt::decode(&mut data)?.into_inner();
+                let max = decode_max_streams(&mut data)?;
                 Ok(Some(Frame::MaxStreamsUni(max)))
             }
             // DATA_BLOCKED

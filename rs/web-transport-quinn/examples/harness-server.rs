@@ -12,6 +12,9 @@
 //! just harness
 //! ```
 //!
+//! Unidirectional payloads are echoed as datagrams, so the harness can verify
+//! opening and finishing a uni stream after abandoned opens.
+//!
 //! Commands, one per bidirectional stream, as a UTF-8 line:
 //!
 //! - `echo <text>` — write `<text>` back and finish.
@@ -106,6 +109,21 @@ async fn run_session(session: Session) -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     if let Err(err) = read_command(session, send, recv).await {
                         tracing::warn!(?err, "command failed");
+                    }
+                });
+            },
+            res = session.accept_uni() => {
+                let mut recv = res?;
+                let session = session.clone();
+                tokio::spawn(async move {
+                    match recv.read_to_end(4096).await {
+                        Ok(payload) => {
+                            if let Err(err) = session.send_datagram(payload.into()) {
+                                tracing::debug!(?err, "uni echo ended");
+                            }
+                        }
+                        // Abandoned opens deliberately reset before sending a payload.
+                        Err(err) => tracing::debug!(?err, "uni stream abandoned"),
                     }
                 });
             },

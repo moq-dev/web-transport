@@ -77,6 +77,7 @@ impl PingResponse {
 /// it without message passing, the way a QUIC endpoint shares connection state.
 #[derive(Default)]
 struct Streams {
+    closed: bool,
     send: HashMap<StreamId, SendState>,
     recv: HashMap<StreamId, RecvState>,
     // One count per initiator and direction; a bidi stream occupies one slot
@@ -134,6 +135,39 @@ impl Streams {
             *self.count(*id) -= 1;
         }
         Some(state)
+    }
+
+    fn open(&mut self, id: StreamId, send: SendState, recv: Option<RecvState>) -> bool {
+        // A local open can claim stream credit before teardown, then acquire
+        // this lock afterwards. Never restore channel senders once closed.
+        if self.closed {
+            return false;
+        }
+        if let Some(credit) = &send.stream_credit {
+            let max = match id.dir() {
+                StreamDir::Uni => self.peer_initial_max_stream_data_uni,
+                StreamDir::Bi => self.peer_initial_max_stream_data_bidi_remote,
+            };
+            credit.increase_max(max);
+        }
+        self.insert_send(id, send);
+        if let Some(recv) = recv {
+            self.insert_recv(id, recv);
+        }
+        true
+    }
+
+    fn close(&mut self) {
+        self.closed = true;
+        for (_, send) in self.send.drain() {
+            if let Some(credit) = send.stream_credit {
+                credit.close();
+            }
+        }
+        // Session handles retain this table after the backend exits. Drop its
+        // senders so receivers drain queued data and then observe closure.
+        self.recv.clear();
+        self.open = Default::default();
     }
 }
 
@@ -444,6 +478,14 @@ fn note_closed(closed: &watch::Sender<Option<Error>>, err: Error) {
             false
         }
     });
+}
+
+/// The MAX_STREAMS frame constructor for streams in `dir`.
+fn max_streams_frame(dir: StreamDir) -> fn(u64) -> Frame {
+    match dir {
+        StreamDir::Bi => Frame::MaxStreamsBidi,
+        StreamDir::Uni => Frame::MaxStreamsUni,
+    }
 }
 
 /// Writer-side task state: owns the transport send half and is the sole producer
@@ -1739,9 +1781,8 @@ impl<R: Reader> SessionState<R> {
                 // The gap consumes connection flow control, but no bytes in it can
                 // ever occupy receive memory. Make it immediately eligible to
                 // replenish the connection window.
-                if let Some(new_max) = self.conn_recv_credit.consume(gap) {
-                    self.control.send(Frame::MaxData(new_max)).ok();
-                }
+                self.conn_recv_credit
+                    .consume(gap, &self.control, Frame::MaxData);
 
                 match live {
                     // Deliver the reset. The id was recorded in `recv_open` at
@@ -1762,13 +1803,7 @@ impl<R: Reader> SessionState<R> {
                             StreamDir::Bi => &self.recv_bi_credit,
                             StreamDir::Uni => &self.recv_uni_credit,
                         };
-                        if let Some(new_max) = credit.consume(1) {
-                            let frame = match reset_id.dir() {
-                                StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                                StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                            };
-                            self.control.send(frame).ok();
-                        }
+                        credit.consume(1, &self.control, max_streams_frame(reset_id.dir()));
                     }
                 }
             }
@@ -1803,22 +1838,28 @@ impl<R: Reader> SessionState<R> {
                     },
                 );
             }
-            // Flow control frames
+            // Flow control frames. A limit that doesn't increase is stale and is
+            // ignored (RFC 9000 §19.9–§19.11); `increase_max` handles that.
             Frame::MaxData(max) => {
-                self.conn_send_credit.increase_max(max)?;
+                self.conn_send_credit.increase_max(max);
             }
             Frame::MaxStreamData { id, max } => {
+                // RFC 9000 §19.10: MAX_STREAM_DATA for a receive-only stream is a
+                // STREAM_STATE_ERROR.
+                if !id.can_send(self.is_server) {
+                    return Err(Error::InvalidStreamId);
+                }
                 if let Some(send) = self.streams.lock().unwrap().send.get(&id) {
                     if let Some(credit) = &send.stream_credit {
-                        credit.increase_max(max)?;
+                        credit.increase_max(max);
                     }
                 }
             }
             Frame::MaxStreamsBidi(max) => {
-                self.open_bi_credit.increase_max(max)?;
+                self.open_bi_credit.increase_max(max);
             }
             Frame::MaxStreamsUni(max) => {
-                self.open_uni_credit.increase_max(max)?;
+                self.open_uni_credit.increase_max(max);
             }
             // Informational frames — peer is telling us they're blocked.
             // We don't need to act on these since we auto-tune windows.
@@ -1915,17 +1956,13 @@ impl<R: Reader> SessionState<R> {
         }
 
         // Set connection-level send credit from peer's initial_max_data
-        self.conn_send_credit
-            .increase_max(params.initial_max_data)
-            .ok();
+        self.conn_send_credit.increase_max(params.initial_max_data);
 
         // Set stream count limits from peer's params
         self.open_bi_credit
-            .increase_max(params.initial_max_streams_bidi)
-            .ok();
+            .increase_max(params.initial_max_streams_bidi);
         self.open_uni_credit
-            .increase_max(params.initial_max_streams_uni)
-            .ok();
+            .increase_max(params.initial_max_streams_uni);
 
         // Publish the peer's initial per-stream send limits and credit the streams
         // we've already opened — both under one lock, so a stream being opened
@@ -1951,7 +1988,7 @@ impl<R: Reader> SessionState<R> {
                         }
                         StreamDir::Uni => params.initial_max_stream_data_uni,
                     };
-                    credit.increase_max(initial).ok();
+                    credit.increase_max(initial);
                 }
             }
         }
@@ -2070,32 +2107,12 @@ impl Session {
             return Ok(());
         }
 
-        let wait = async { established.wait_for(|&done| done).await.is_ok() };
-        let timeout = self.config.handshake_timeout;
-        // A zero timeout disables the bound (wait indefinitely).
-        let outcome = if timeout.is_zero() {
-            Some(wait.await)
+        if established.wait_for(|&done| done).await.is_ok() {
+            Ok(())
         } else {
-            tokio::time::timeout(timeout, wait).await.ok()
-        };
-
-        match outcome {
-            // Established.
-            Some(true) => Ok(()),
-            // The backend task ended before establishing — surface the close reason.
-            Some(false) => Err(self.close_reason().await),
-            // Timed out waiting for the peer's parameters: abort the half-open
-            // handshake, notifying the peer, and fail rather than hang.
-            // If the session closed first, report that reason instead.
-            None => {
-                // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
-                // rather than seeing a graceful close.
-                let frame = ConnectionClose {
-                    code: VarInt::from(0u32),
-                    reason: "handshake timeout".to_string(),
-                };
-                Err(self.close_with(frame.into(), Error::HandshakeTimeout))
-            }
+            // The backend enforces the handshake deadline and records its error
+            // before dropping the establishment sender.
+            Err(self.close_reason().await)
         }
     }
 
@@ -2286,8 +2303,33 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
+        let handshake_deadline = if version.is_qmux() && !config.handshake_timeout.is_zero() {
+            // A deadline beyond the clock's range cannot expire.
+            base.checked_add(config.handshake_timeout)
+        } else {
+            None
+        };
+        let mut established = established_rx.clone();
         tokio::spawn(async move {
-            let err = backend.run().await.err().unwrap_or(Error::Closed);
+            let handshake = async {
+                if let Some(deadline) = handshake_deadline {
+                    if tokio::time::timeout_at(deadline, established.wait_for(|&done| done))
+                        .await
+                        .is_err()
+                    {
+                        return Error::HandshakeTimeout;
+                    }
+                }
+                std::future::pending().await
+            };
+            // The deadline starts at construction and remains pollable even if
+            // the reader is parked on application backpressure. Already-readable
+            // peer input wins over an expired deadline.
+            let err = tokio::select! {
+                biased;
+                result = backend.run() => result.err().unwrap_or(Error::Closed),
+                err = handshake => err,
+            };
             // If we tore down because of a protocol/transport violation *we*
             // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
             // session rejects too, rather than seeing a bare drop. Enqueue on the
@@ -2314,12 +2356,8 @@ impl Session {
             backend.conn_send_credit.close();
             backend.conn_recv_credit.close();
             backend.outbound.close();
-            for send in backend.streams.lock().unwrap().send.values() {
-                if let Some(credit) = &send.stream_credit {
-                    credit.close();
-                }
-            }
-            // Recorded last, so a `closed()` waiter sees every credit closed.
+            backend.streams.lock().unwrap().close();
+            // Recorded last, so a `closed()` waiter sees credits and streams closed.
             // The reader often fails (EOF, WebSocket Close) right after an
             // APPLICATION_CLOSE, so keep the reason recorded first.
             note_closed(&backend.closed, err);
@@ -2458,14 +2496,9 @@ impl generic::Session for Session {
         // from the peer's params if they've already arrived (otherwise it's still
         // zero here and `recv_transport_parameters` will credit it later) — see the
         // note on `Streams::peer_initial_max_stream_data_uni`.
-        {
-            let mut streams = self.streams.lock().unwrap();
-            if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_uni)
-                    .ok();
-            }
-            streams.insert_send(id, send_backend);
+        let registered = self.streams.lock().unwrap().open(id, send_backend, None);
+        if !registered {
+            return Err(self.close_reason().await);
         }
 
         Ok(send_frontend)
@@ -2542,15 +2575,13 @@ impl generic::Session for Session {
 
         // Register both backends before returning the frontends (see `open_uni`).
         // A bidi stream we initiate sends under the peer's `bidi_remote` limit.
-        {
-            let mut streams = self.streams.lock().unwrap();
-            if let Some(credit) = &send_backend.stream_credit {
-                credit
-                    .increase_max(streams.peer_initial_max_stream_data_bidi_remote)
-                    .ok();
-            }
-            streams.insert_send(id, send_backend);
-            streams.insert_recv(id, recv_backend);
+        let registered = self
+            .streams
+            .lock()
+            .unwrap()
+            .open(id, send_backend, Some(recv_backend));
+        if !registered {
+            return Err(self.close_reason().await);
         }
 
         Ok((send_frontend, recv_frontend))
@@ -3009,20 +3040,14 @@ impl RecvStream {
             return;
         }
 
-        // Per-stream window update
-        if let Some(new_max) = self.recv_credit.consume(len) {
-            let frame = Frame::MaxStreamData {
-                id: self.id,
-                max: new_max,
-            };
-            self.outbound_priority.send(frame).ok();
-        }
-
-        // Connection-level window update
-        if let Some(new_max) = self.conn_recv_credit.consume(len) {
-            let frame = Frame::MaxData(new_max);
-            self.outbound_priority.send(frame).ok();
-        }
+        let id = self.id;
+        self.recv_credit
+            .consume(len, &self.outbound_priority, |max| Frame::MaxStreamData {
+                id,
+                max,
+            });
+        self.conn_recv_credit
+            .consume(len, &self.outbound_priority, Frame::MaxData);
     }
 }
 
@@ -3034,13 +3059,7 @@ impl Drop for RecvStream {
 
         // Replenish stream count when this recv half is done
         if let Some(credit) = &self.recv_streams_credit {
-            if let Some(new_max) = credit.consume(1) {
-                let frame = match self.id.dir() {
-                    StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                    StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                };
-                self.outbound_priority.send(frame).ok();
-            }
+            credit.consume(1, &self.outbound_priority, max_streams_frame(self.id.dir()));
         }
     }
 }
@@ -3595,12 +3614,12 @@ mod recv_open_tests {
 
     use bytes::Bytes;
     use tokio::sync::mpsc;
-    use web_transport_trait::{RecvStream as _, Session as _};
+    use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
     use web_transport_proto::VarInt;
 
     use super::{Reader, Session, Transport, Writer};
-    use crate::proto::{Frame, ResetStream, Stream};
+    use crate::proto::{ApplicationClose, Frame, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
     /// A transport whose inbound frames are scripted through a channel; outbound
@@ -3660,6 +3679,48 @@ mod recv_open_tests {
 
     fn scripted_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
         scripted_session_with_config(Config::new(Version::QMux01))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_handshake_frames_win_after_delayed_poll() {
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            for peer_closed in [false, true] {
+                let mut config = Config::new(version);
+                config.handshake_timeout = Duration::from_secs(1);
+                config.max_idle_timeout = 0;
+                config.rtt_interval = Duration::ZERO;
+                let params = config.to_transport_params();
+                let (session, incoming) = scripted_session_with_config(config);
+                incoming
+                    .send(Frame::TransportParameters(params).encode(version).unwrap())
+                    .unwrap();
+                if peer_closed {
+                    let frame = Frame::ConnectionClose(crate::proto::ConnectionClose {
+                        code: VarInt::from_u32(42),
+                        reason: "peer closed".into(),
+                    });
+                    incoming.send(frame.encode(version).unwrap()).unwrap();
+                }
+                // No spawned session task is polled until the clock has passed
+                // its deadline, with the peer's frame already readable.
+                tokio::time::advance(Duration::from_secs(2)).await;
+                if peer_closed {
+                    let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(error, Error::ConnectionReset { code, .. } if code.into_inner() == 42)
+                    );
+                } else {
+                    session.established().await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), session.closed())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
 
     /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and
@@ -3897,6 +3958,153 @@ mod recv_open_tests {
 
         // Reads resume at offset 2, in order, with nothing dropped.
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"lloworld!");
+    }
+
+    fn poll_once<F: std::future::Future>(future: F) -> std::task::Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    #[test]
+    fn terminal_stream_table_rejects_late_registration() {
+        let mut streams = super::Streams::default();
+        let (send, mut signal) = mpsc::unbounded_channel();
+        let (data, mut received) = mpsc::unbounded_channel();
+        let (reset, mut resets) = mpsc::unbounded_channel();
+        let send = super::SendState {
+            inbound_signal: send,
+            sent_offset: 0,
+            stream_credit: None,
+        };
+        let recv = super::RecvState {
+            inbound_data: data,
+            inbound_reset: reset,
+            recv_credit: super::Credit::new(0),
+            recv_offset: 0,
+        };
+        streams.close();
+        assert!(!streams.open(StreamId::new(0, StreamDir::Bi, false), send, Some(recv)));
+        assert!(matches!(
+            signal.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            received.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            resets.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(streams.send.is_empty());
+        assert!(streams.recv.is_empty());
+    }
+
+    fn application_close() -> Bytes {
+        Frame::ApplicationClose(ApplicationClose {
+            code: VarInt::from_u32(42),
+            reason: "done".into(),
+        })
+        .encode(Version::QMux01)
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_session_drains_unfinished_receive_stream() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        assert_eq!(recv.read_chunk(2).await.unwrap().unwrap(), b"he".as_slice());
+        tx.send(uni_stream_at(0, 5, b"world", false)).unwrap();
+        tx.send(application_close()).unwrap();
+
+        session.closed().await;
+        // The accepted-stream queue closes after reader teardown, even while
+        // this Session handle keeps the shared per-stream table alive.
+        assert!(session.accept_uni().await.is_err());
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"llo".as_slice()
+        );
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"world".as_slice()
+        );
+        assert!(matches!(
+            poll_once(recv.read_chunk(64)),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_session_receive_closed_preserves_buffered_data() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"hello", false)).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        assert_eq!(recv.read_chunk(2).await.unwrap().unwrap(), b"he".as_slice());
+        tx.send(uni_stream_at(0, 5, b"world", false)).unwrap();
+        tx.send(application_close()).unwrap();
+        session.closed().await;
+        assert!(session.accept_uni().await.is_err());
+
+        assert!(matches!(
+            poll_once(recv.closed()),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"llo".as_slice()
+        );
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"world".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_session_preserves_received_fin() {
+        let (session, tx) = scripted_session();
+        tx.send(uni_stream(0, b"finished", true)).unwrap();
+        tx.send(application_close()).unwrap();
+        let mut recv = session.accept_uni().await.unwrap();
+        session.closed().await;
+        assert!(session.accept_uni().await.is_err());
+        assert_eq!(recv.read_all().await.unwrap(), b"finished".as_slice());
+        assert!(recv.closed().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_session_closes_unfinished_bidirectional_stream() {
+        let (session, tx) = scripted_session();
+        tx.send(
+            Frame::Stream(Stream {
+                id: StreamId::new(0, StreamDir::Bi, true),
+                offset: 0,
+                data: Bytes::from_static(b"hello"),
+                fin: false,
+            })
+            .encode(Version::QMux01)
+            .unwrap(),
+        )
+        .unwrap();
+        let (mut send, mut recv) = session.accept_bi().await.unwrap();
+        assert_eq!(
+            recv.read_chunk(64).await.unwrap().unwrap(),
+            b"hello".as_slice()
+        );
+        session.close(42, "done");
+        assert!(session.accept_bi().await.is_err());
+
+        assert!(matches!(
+            poll_once(send.closed()),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
+        assert!(matches!(
+            poll_once(recv.read_chunk(64)),
+            std::task::Poll::Ready(Err(Error::Closed))
+        ));
     }
 
     /// Streams raced against a dropped `RecvStream`: dropping it queues
@@ -4846,6 +5054,60 @@ mod teardown_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn handshake_timeout_releases_wedged_writer_with_retained_session() {
+        use web_transport_trait::Session as _;
+
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+            let mut config = Config::new(version);
+            config.handshake_timeout = Duration::from_secs(1);
+            let session = Session::new(
+                WedgedTransport {
+                    entered_send: entered_tx,
+                    dropped: dropped_tx,
+                },
+                false,
+                config,
+            );
+            entered_rx.recv().await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), session.closed())
+                .await
+                .unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_entrypoints_report_shared_handshake_timeout() {
+        for is_server in [false, true] {
+            let (entered_send, _entered_rx) = mpsc::unbounded_channel();
+            let (dropped, _dropped_rx) = mpsc::unbounded_channel();
+            let transport = WedgedTransport {
+                entered_send,
+                dropped,
+            };
+            let mut config = Config::new(Version::QMux02);
+            config.handshake_timeout = Duration::from_secs(1);
+            let establish = async {
+                if is_server {
+                    Session::accept(transport, config).await
+                } else {
+                    Session::connect(transport, config).await
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), establish)
+                .await
+                .expect("establishment stayed pending");
+            assert!(matches!(result, Err(Error::HandshakeTimeout)));
+        }
+    }
+
     /// A writer parked inside `send()` on a wedged transport must still observe
     /// teardown when the last `Session` clone drops, cancelling the in-flight
     /// write instead of staying alive until the transport eventually errors.
@@ -5086,6 +5348,220 @@ mod ping_backpressure_tests {
             );
             drop(recv);
             drop(session);
+        }
+    }
+}
+
+#[cfg(test)]
+mod credit_update_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+    use web_transport_trait::{SendStream as _, Session as _};
+
+    use super::{Reader, Session, Transport, Writer};
+    use crate::proto::{Frame, TransportParams};
+    use crate::{Config, Error, StreamDir, StreamId, Version};
+
+    const VERSIONS: [Version; 3] = [Version::QMux00, Version::QMux01, Version::QMux02];
+
+    /// A transport whose inbound frames are scripted and whose outbound records
+    /// are kept for inspection.
+    struct ScriptedTransport {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedWriter {
+        outgoing: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    struct ScriptedReader {
+        incoming: mpsc::UnboundedReceiver<Bytes>,
+    }
+
+    impl Transport for ScriptedTransport {
+        type Writer = ScriptedWriter;
+        type Reader = ScriptedReader;
+
+        fn split(self) -> (ScriptedWriter, ScriptedReader) {
+            (
+                ScriptedWriter {
+                    outgoing: self.outgoing,
+                },
+                ScriptedReader {
+                    incoming: self.incoming,
+                },
+            )
+        }
+    }
+
+    impl Writer for ScriptedWriter {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            self.outgoing.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    impl Reader for ScriptedReader {
+        async fn recv(&mut self) -> Result<Bytes, Error> {
+            match self.incoming.recv().await {
+                Some(bytes) => Ok(bytes),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct Peer {
+        version: Version,
+        inbound: mpsc::UnboundedSender<Bytes>,
+        outbound: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    impl Peer {
+        fn send(&self, frame: Frame) {
+            self.inbound
+                .send(frame.encode(self.version).unwrap())
+                .unwrap();
+        }
+
+        /// Payload bytes the session has written on stream `id`.
+        fn sent_on(&self, id: StreamId) -> usize {
+            self.outbound
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|record| match self.version {
+                    Version::QMux00 => Frame::decode(record.clone(), self.version)
+                        .unwrap()
+                        .into_iter()
+                        .collect(),
+                    _ => Frame::decode_record(record.clone()).unwrap(),
+                })
+                .map(|frame| match frame {
+                    Frame::Stream(stream) if stream.id == id => stream.data.len(),
+                    _ => 0,
+                })
+                .sum()
+        }
+    }
+
+    /// A client session opposite a scripted server that has announced `params`.
+    fn scripted_session(version: Version, params: TransportParams) -> (Session, Peer) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new(
+            ScriptedTransport {
+                incoming: rx,
+                outgoing: outbound.clone(),
+            },
+            false,
+            Config::new(version),
+        );
+        let peer = Peer {
+            version,
+            inbound: tx,
+            outbound,
+        };
+        peer.send(Frame::TransportParameters(params));
+        (session, peer)
+    }
+
+    fn small_params(version: Version) -> TransportParams {
+        let mut params = Config::new(version).to_transport_params();
+        params.initial_max_streams_bidi = 1;
+        params.initial_max_streams_uni = 1;
+        params.initial_max_data = 4;
+        params.initial_max_stream_data_uni = 4;
+        params
+    }
+
+    /// Lower and equal limits after a higher one arrive as a peer's reordered
+    /// updates would. They are ignored: the session stays open and keeps the
+    /// highest credit for stream counts, connection data and stream data.
+    #[tokio::test(start_paused = true)]
+    async fn stale_limits_are_ignored() {
+        for version in VERSIONS {
+            let (session, peer) = scripted_session(version, small_params(version));
+            let mut send = session.open_uni().await.unwrap();
+            let id = StreamId::new(0, StreamDir::Uni, false);
+
+            for frame in [
+                Frame::MaxStreamsUni(3),
+                Frame::MaxStreamsUni(2),
+                Frame::MaxStreamsUni(3),
+                Frame::MaxStreamsBidi(2),
+                Frame::MaxStreamsBidi(1),
+                Frame::MaxData(8),
+                Frame::MaxData(6),
+                Frame::MaxData(8),
+                Frame::MaxStreamData { id, max: 8 },
+                Frame::MaxStreamData { id, max: 6 },
+            ] {
+                peer.send(frame);
+            }
+
+            // Paused time only advances once every task is idle, so this fires
+            // only if an open or write stalls on credit or the session closed.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                session.open_uni().await.unwrap();
+                session.open_uni().await.unwrap();
+                session.open_bi().await.unwrap();
+                session.open_bi().await.unwrap();
+                let mut written = 0;
+                while written < 8 {
+                    written += send.write(&[0; 8][written..]).await.unwrap();
+                }
+                while peer.sent_on(id) < 8 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{version:?}: stale limit reduced credit"));
+            assert_eq!(peer.sent_on(id), 8, "{version:?}");
+
+            let closed = tokio::time::timeout(Duration::from_millis(1), session.closed()).await;
+            assert!(closed.is_err(), "{version:?}: session closed: {closed:?}");
+        }
+    }
+
+    async fn closed_with(frame: Frame) -> Vec<Error> {
+        let mut errors = Vec::new();
+        for version in VERSIONS {
+            let (session, peer) = scripted_session(version, small_params(version));
+            peer.send(frame.clone());
+            let err = tokio::time::timeout(Duration::from_secs(10), session.closed())
+                .await
+                .unwrap_or_else(|_| panic!("{version:?}: {frame:?} was accepted"));
+            errors.push(err);
+        }
+        errors
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_streams_above_2_60_is_a_frame_encoding_error() {
+        for frame in [
+            Frame::MaxStreamsBidi((1 << 60) + 1),
+            Frame::MaxStreamsUni((1 << 60) + 1),
+        ] {
+            for err in closed_with(frame).await {
+                assert!(matches!(err, Error::FrameEncoding), "got {err:?}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn max_stream_data_on_receive_only_stream_is_rejected() {
+        // A server-initiated uni stream is receive-only for this client.
+        let id = StreamId::new(0, StreamDir::Uni, true);
+        for err in closed_with(Frame::MaxStreamData { id, max: 10 }).await {
+            assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
         }
     }
 }

@@ -2,14 +2,9 @@
 
 //! A browser harness for the poll state machine.
 //!
-//! `cargo check` proves this crate compiles for `wasm32`; nothing in CI runs it,
-//! because the browser API it wraps only exists in a browser. So the paths that are
-//! easiest to get wrong — an accept whose handle went away, a closed-watch racing
-//! buffered bytes, a peer reset code — had no coverage at all. This runs them
-//! against a real browser and a real QUIC peer.
-//!
-//! Pair it with `harness-server` from `web-transport-quinn`, which is driven by the
-//! commands sent here. See `just harness`.
+//! `just test-browser` runs this against Chromium and the real QUIC peer from
+//! `web-transport-quinn`. The peer is driven by the commands sent here; use
+//! `just harness` for interactive inspection.
 //!
 //! Each check returns a row rather than panicking, so one failure does not hide the
 //! rest.
@@ -56,6 +51,26 @@ export function openDatagramTransport() {
     };
 }
 
+export function failingStreamTransport(reject) {
+    const failure = new DOMException('transport is closed', 'InvalidStateError');
+    let calls = 0;
+    const create = options => {
+        if (options.waitUntilAvailable !== true) throw new Error('missing stream credit option');
+        calls++;
+        if (reject) return Promise.reject(failure);
+        throw failure;
+    };
+    return {
+        transport: {
+            protocol: '',
+            createUnidirectionalStream: create,
+            createBidirectionalStream: create,
+        },
+        failure,
+        calls: () => calls,
+    };
+}
+
 export async function flushMicrotasks() {
     for (let i = 0; i < 8; i++) await Promise.resolve();
 }
@@ -65,6 +80,8 @@ extern "C" {
     fn closing_datagram_transport() -> Object;
     #[wasm_bindgen(js_name = openDatagramTransport)]
     fn open_datagram_transport() -> Object;
+    #[wasm_bindgen(js_name = failingStreamTransport)]
+    fn failing_stream_transport(reject: bool) -> Object;
     #[wasm_bindgen(js_name = flushMicrotasks)]
     async fn flush_microtasks();
 }
@@ -114,6 +131,17 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     };
     results.push(&outcome);
 
+    for (name, reject) in [
+        ("synchronous stream-open errors return to Rust", false),
+        ("rejected stream-open promises return to Rust", true),
+    ] {
+        let outcome = match stream_open_errors(reject).await {
+            Ok(detail) => row(name, true, &detail),
+            Err(err) => row(name, false, &format!("{err}")),
+        };
+        results.push(&outcome);
+    }
+
     // Each check gets its own session, so one that closes or wedges the connection
     // cannot decide the outcome of the next.
     macro_rules! check {
@@ -132,8 +160,12 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("echo round trip", echo_round_trip);
     check!("no subprotocol reports None", no_subprotocol_is_none);
     check!(
-        "dropped pending opens release stream credit",
+        "dropped pending bi opens release stream credit",
         dropped_pending_opens_release_credit
+    );
+    check!(
+        "dropped pending uni opens release stream credit",
+        dropped_pending_uni_opens_release_credit
     );
     check!("accept_uni delivers every stream", accept_all);
     check!("a dropped clone does not swallow a stream", orphaned_accept);
@@ -166,6 +198,34 @@ pub async fn run(url: String, hash: String) -> Result<Array, JsValue> {
     check!("session close code and reason survive", session_close);
 
     Ok(results)
+}
+
+/// A browser can throw before returning an open promise, or reject it later.
+/// Both directions must preserve the same error and leave the operation reusable.
+async fn stream_open_errors(reject: bool) -> Result<String, Error> {
+    let fixture = failing_stream_transport(reject);
+    let transport = Reflect::get(&fixture, &"transport".into())?.unchecked_into();
+    let failure = Reflect::get(&fixture, &"failure".into())?;
+    let session = Session::new(transport, "https://controlled.invalid".parse().unwrap());
+
+    for _ in 0..2 {
+        let uni = session.open_uni().await.err();
+        let bi = session.open_bi().await.err();
+        for result in [uni, bi] {
+            match result {
+                Some(Error::Unknown(error)) if Object::is(&error, &failure) => {}
+                other => return expect(false, format!("stream open lost its error: {other:?}")),
+            }
+        }
+    }
+
+    let calls = Reflect::get(&fixture, &"calls".into())?
+        .unchecked_into::<js_sys::Function>()
+        .call0(&fixture)?;
+    expect(
+        calls.as_f64() == Some(4.0),
+        format!("both stream directions preserved their errors across {calls:?} calls"),
+    )
 }
 
 async fn connect(url: &url::Url, hash: &[u8]) -> Result<Session, Error> {
@@ -244,6 +304,34 @@ async fn dropped_pending_opens_release_credit(session: Session) -> Result<String
     .map_err(|_| stalled("an abandoned open retained the peer's stream credit"))??;
 
     expect(got == "credit returned", format!("echoed {got:?}"))
+}
+
+/// Exercise the separate unidirectional open path past the peer's stream limit.
+async fn dropped_pending_uni_opens_release_credit(session: Session) -> Result<String, Error> {
+    for _ in 0..110 {
+        let doomed = session.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        match doomed.poll_open_uni(&mut cx) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(mut send)) => send.reset(0),
+            Poll::Ready(Err(err)) => return Err(err),
+        }
+    }
+
+    sleep(250).await;
+    let got = timeout(
+        async {
+            let mut send = session.open_uni().await?;
+            send.write(b"uni credit returned").await?;
+            send.finish()?;
+            session.recv_datagram().await
+        },
+        3_000,
+    )
+    .await
+    .map_err(|_| stalled("an abandoned uni open retained the peer's stream credit"))??;
+
+    expect(got == b"uni credit returned"[..], format!("echoed {got:?}"))
 }
 
 /// Every stream the peer opens is delivered, in order.

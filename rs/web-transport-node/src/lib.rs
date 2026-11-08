@@ -3,7 +3,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 // Teardown safety: every `#[napi] async fn` below runs on napi-rs's global tokio
 // runtime. On `process.exit()` napi tears that runtime down with
@@ -33,6 +33,43 @@ fn session_error_to_close_info(err: &web_transport_quinn::SessionError) -> NapiC
             close_code: 0,
             reason: other.to_string(),
         },
+    }
+}
+
+/// The origin of a stream failure, matching W3C `WebTransportErrorSource`.
+#[napi(string_enum = "lowercase")]
+pub enum NapiErrorSource {
+    /// The peer reset or stopped this stream.
+    Stream,
+    /// The whole session failed.
+    Session,
+}
+
+/// A stream failure carrying the fields of W3C `WebTransportError`.
+#[napi(object)]
+pub struct NapiStreamError {
+    pub source: NapiErrorSource,
+    /// The peer's RESET_STREAM or STOP_SENDING code, or null for a session failure or a code
+    /// outside the WebTransport range.
+    pub stream_error_code: Option<u32>,
+    pub message: String,
+}
+
+impl NapiStreamError {
+    fn stream(code: Option<u32>, message: String) -> Self {
+        Self {
+            source: NapiErrorSource::Stream,
+            stream_error_code: code,
+            message,
+        }
+    }
+
+    fn session(err: &web_transport_quinn::SessionError) -> Self {
+        Self {
+            source: NapiErrorSource::Session,
+            stream_error_code: None,
+            message: err.to_string(),
+        }
     }
 }
 
@@ -119,7 +156,34 @@ pub struct NapiConnectOptions {
 /// A WebTransport server that accepts incoming sessions.
 #[napi]
 pub struct NapiServer {
-    inner: Arc<Mutex<Option<web_transport_quinn::Server>>>,
+    inner: Arc<ServerState>,
+}
+
+struct ServerState {
+    server: Mutex<Option<web_transport_quinn::Server>>,
+    closed: watch::Sender<bool>,
+}
+
+impl ServerState {
+    async fn finish_accept(
+        &self,
+        mut guard: tokio::sync::MutexGuard<'_, Option<web_transport_quinn::Server>>,
+        request: Option<web_transport_quinn::Request>,
+    ) -> Option<web_transport_quinn::Request> {
+        if request.is_none() {
+            guard.take();
+            return None;
+        }
+        // Unlock before checking shutdown, so close either takes the server itself or is
+        // observed here even when it raced with an accept that already produced a request.
+        drop(guard);
+        if *self.closed.borrow() {
+            self.server.lock().await.take();
+            None
+        } else {
+            request
+        }
+    }
 }
 
 #[napi]
@@ -145,7 +209,10 @@ impl NapiServer {
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
             Ok(Self {
-                inner: Arc::new(Mutex::new(Some(server))),
+                inner: Arc::new(ServerState {
+                    server: Mutex::new(Some(server)),
+                    closed: watch::channel(false).0,
+                }),
             })
         })
     }
@@ -155,28 +222,140 @@ impl NapiServer {
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
         // Own the shared state for the duration of the future (see module note).
         let inner = self.inner.clone();
-        let mut guard = inner.lock().await;
+        let mut closed = inner.closed.subscribe();
+        let mut guard = inner.server.lock().await;
         let server = match guard.as_mut() {
             Some(server) => server,
             None => return Ok(None),
         };
-        match server.accept().await {
-            Some(request) => Ok(Some(NapiRequest {
+        let request = tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => None,
+            request = server.accept() => request,
+        };
+        Ok(inner
+            .finish_accept(guard, request)
+            .await
+            .map(|request| NapiRequest {
                 inner: Arc::new(Mutex::new(Some(request))),
-            })),
-            None => {
-                guard.take();
-                Ok(None)
-            }
-        }
+            }))
     }
 
     /// Close the server, stopping it from accepting new connections.
     #[napi]
     pub fn close(&self) {
         within_runtime_if_available(|| {
-            self.inner.blocking_lock().take();
+            // A pending accept owns the lock. Wake it to drop the server; otherwise drop it now.
+            self.inner.closed.send_replace(true);
+            if let Ok(mut server) = self.inner.server.try_lock() {
+                server.take();
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn bind() -> NapiServer {
+        // Workspace all-features tests enable both TLS backends; choose one for this process.
+        static PROVIDER: std::sync::Once = std::sync::Once::new();
+        PROVIDER.call_once(|| {
+            web_transport_quinn::quinn::rustls::crypto::aws_lc_rs::default_provider()
+                .install_default()
+                .expect("install test TLS provider");
+        });
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = web_transport_quinn::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(
+                vec![cert.cert.der().clone()],
+                web_transport_quinn::quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                    cert.signing_key.serialize_der(),
+                )
+                .into(),
+            )
+            .unwrap();
+        NapiServer {
+            inner: Arc::new(ServerState {
+                server: Mutex::new(Some(server)),
+                closed: watch::channel(false).0,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending_and_queued_accepts() {
+        let server = bind();
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(server.accept());
+        let mut queued = std::pin::pin!(server.accept());
+
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        // Prove that accept is suspended in native code holding the server, without a sleep.
+        assert!(server.inner.server.try_lock().is_err());
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        wake.0.store(false, Ordering::SeqCst);
+
+        server.close();
+        server.close();
+        assert!(wake.0.load(Ordering::SeqCst));
+        let (pending, queued) = tokio::join!(pending, queued);
+        assert!(pending.unwrap().is_none());
+        assert!(queued.unwrap().is_none());
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drops_an_idle_server() {
+        let server = bind();
+        server.close();
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drops_server_when_a_request_is_already_ready() {
+        let server = bind();
+        let mut guard = server.inner.server.lock().await;
+        let backend = guard.as_mut().unwrap();
+        let url: url::Url = format!("https://{}", backend.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()
+            .unwrap();
+        let connecting = tokio::spawn(async move { client.connect(url).await });
+        let request = backend.accept().await.unwrap();
+
+        // Reproduce close losing try_lock after accept has already selected a ready request.
+        server.close();
+        assert!(server.inner.server.try_lock().is_err());
+        assert!(server
+            .inner
+            .finish_accept(guard, Some(request))
+            .await
+            .is_none());
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(connecting.await.unwrap().is_err());
     }
 }
 
@@ -423,16 +602,41 @@ pub struct NapiSendStream {
 
 #[napi]
 impl NapiSendStream {
-    /// Write data to the stream.
+    /// Write data to the stream, returning the error if the peer stopped it or the session failed.
     #[napi]
-    pub async fn write(&self, data: Buffer) -> Result<()> {
+    pub async fn write(&self, data: Buffer) -> Result<Option<NapiStreamError>> {
+        use web_transport_quinn::WriteError;
+
         // Own the shared stream for the duration of the future (see module note).
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        stream
-            .write_all(&data)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))
+        let err = match stream.write_all(&data).await {
+            Ok(()) => return Ok(None),
+            Err(err @ WriteError::Stopped(code)) => {
+                NapiStreamError::stream(Some(code), err.to_string())
+            }
+            Err(err @ WriteError::InvalidStopped(_)) => {
+                NapiStreamError::stream(None, err.to_string())
+            }
+            Err(WriteError::SessionError(err)) => NapiStreamError::session(&err),
+            Err(err @ WriteError::ClosedStream) => return Err(Error::from_reason(err.to_string())),
+        };
+        Ok(Some(err))
+    }
+
+    /// Watch for the stream to close. Call before any write, since it takes the stream lock.
+    ///
+    /// The watch is its own object because a pending call keeps its receiver alive: awaiting
+    /// on this stream would keep an abandoned one from dropping and sending its implicit FIN.
+    #[napi]
+    pub fn closed(&self) -> Result<NapiSendClosed> {
+        let stream = self
+            .inner
+            .try_lock()
+            .map_err(|_| Error::from_reason("send stream busy"))?;
+        Ok(NapiSendClosed {
+            stopped: Arc::new(Mutex::new(Some(Box::pin(stream.stopped())))),
+        })
     }
 
     /// Signal that no more data will be written.
@@ -466,6 +670,44 @@ impl NapiSendStream {
     }
 }
 
+type Stopped = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<Option<u32>, web_transport_quinn::SessionError>,
+            > + Send,
+    >,
+>;
+
+/// A watch on a send stream, holding only the connection rather than the stream.
+#[napi]
+pub struct NapiSendClosed {
+    stopped: Arc<Mutex<Option<Stopped>>>,
+}
+
+#[napi]
+impl NapiSendClosed {
+    /// Wait until the peer has read the whole stream (null), stopped it, or the session failed.
+    /// Can only be called once.
+    #[napi]
+    pub async fn wait(&self) -> Result<Option<NapiStreamError>> {
+        // Own the shared state for the duration of the future (see module note).
+        let stopped = self.stopped.clone();
+        let stopped = stopped
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| Error::from_reason("already waited"))?;
+        Ok(match stopped.await {
+            Ok(None) => None,
+            Ok(Some(code)) => Some(NapiStreamError::stream(
+                Some(code),
+                format!("STOP_SENDING: {code}"),
+            )),
+            Err(err) => Some(NapiStreamError::session(&err)),
+        })
+    }
+}
+
 /// A receive stream for reading data.
 #[napi]
 pub struct NapiRecvStream {
@@ -474,21 +716,29 @@ pub struct NapiRecvStream {
 
 #[napi]
 impl NapiRecvStream {
-    /// Read up to `max_size` bytes from the stream. Returns null on FIN.
+    /// Read up to `max_size` bytes from the stream. Returns null on FIN, or the error if the
+    /// peer reset the stream or the session failed.
     #[napi]
-    pub async fn read(&self, max_size: u32) -> Result<Option<Buffer>> {
+    pub async fn read(&self, max_size: u32) -> Result<Option<Either<Buffer, NapiStreamError>>> {
+        use web_transport_quinn::ReadError;
+
         // Own the shared stream for the duration of the future (see module note).
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        let Some(chunk) = stream
-            .read_chunk(max_size as usize, true)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?
-        else {
-            return Ok(None);
+        let err = match stream.read_chunk(max_size as usize, true).await {
+            Ok(chunk) => {
+                return Ok(chunk.map(|chunk| Either::A(Buffer::from(chunk.bytes.to_vec()))))
+            }
+            Err(err @ ReadError::Reset(code)) => {
+                NapiStreamError::stream(Some(code), err.to_string())
+            }
+            Err(err @ ReadError::InvalidReset(_)) => NapiStreamError::stream(None, err.to_string()),
+            Err(ReadError::SessionError(err)) => NapiStreamError::session(&err),
+            Err(err @ (ReadError::ClosedStream | ReadError::IllegalOrderedRead)) => {
+                return Err(Error::from_reason(err.to_string()))
+            }
         };
-
-        Ok(Some(Buffer::from(chunk.bytes.to_vec())))
+        Ok(Some(Either::B(err)))
     }
 
     /// Tell the peer to stop sending with the given error code.

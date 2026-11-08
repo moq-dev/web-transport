@@ -31,6 +31,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.5...web-transport-quinn-v0.13.6) - 2026-11-03
+
+### Fixed
+
+- *(proto)* redact credentials from ConnectRequest's Debug output ([#475](https://github.com/moq-dev/web-transport/pull/475))
+- *(web-transport)* report stream errors as WebTransportError in the Node polyfill ([#470](https://github.com/moq-dev/web-transport/pull/470))
+
+## [0.13.5](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.4...web-transport-quinn-v0.13.5) - 2026-10-24
+
+### Other
+
+- Spawn web-transport-quinn's tasks on the detected quinn runtime ([#441](https://github.com/moq-dev/web-transport/pull/441))
+
+## [0.13.4](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.3...web-transport-quinn-v0.13.4) - 2026-10-22
+
+### Other
+
+- Run WASM browser regressions in Chromium CI ([#454](https://github.com/moq-dev/web-transport/pull/454))
+
 ## [0.13.3](https://github.com/moq-dev/web-transport/compare/web-transport-quinn-v0.13.2...web-transport-quinn-v0.13.3) - 2026-10-20
 
 ### Other

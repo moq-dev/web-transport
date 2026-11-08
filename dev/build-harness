@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+if [ ! -f dev/localhost.crt ] || [ ! -f dev/localhost.key ] || [ ! -f dev/localhost.hex ]; then
+    ./dev/setup
+fi
+
+target=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+out="$target/harness"
+want=$(cargo metadata --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="wasm-bindgen"))')
+got=$(wasm-bindgen --version | awk '{print $2}')
+
+cargo build --example harness -p web-transport-wasm --target wasm32-unknown-unknown
+# Adjacent crate/CLI versions can share a schema. Let bindgen check compatibility.
+if ! wasm-bindgen --target web --out-dir "$out" "$target/wasm32-unknown-unknown/debug/examples/harness.wasm"; then
+    echo "wasm-bindgen CLI is $got but the build uses $want." >&2
+    echo "Install the matching CLI outside the Nix shell: cargo binstall -y --force wasm-bindgen-cli@$want" >&2
+    exit 1
+fi
+cp rs/web-transport-wasm/examples/harness.html "$out/index.html"
+cp dev/localhost.hex "$out/localhost.hex"
+cargo build --example harness-server -p web-transport-quinn

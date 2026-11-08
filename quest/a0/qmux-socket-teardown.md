@@ -13,3 +13,7 @@ Approved behavior: socket-derived metrics become unavailable after teardown; oth
 ## Closes
 
 - [#383](https://github.com/moq-dev/web-transport/issues/383) - the implementation completes this report
+
+## Related
+
+- [QMux send-rate filter](/quest/a1/qmux-rate-filter.md) - adds state to the same `TcpStats`

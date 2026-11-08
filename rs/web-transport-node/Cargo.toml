@@ -4,7 +4,7 @@ description = "WebTransport NAPI-RS bindings for Node.js"
 authors = ["Luke Curley"]
 repository = "https://github.com/moq-dev/web-transport"
 license = "MIT OR Apache-2.0"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2021"
 
 [lib]
@@ -16,9 +16,12 @@ http = "1"
 napi = { version = "3.10.0", features = ["async", "napi8"] }
 napi-derive = "3"
 rustls-pemfile = "2"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["macros", "sync"] }
 url = "2"
 web-transport-quinn = { path = "../web-transport-quinn", version = "0.13" }
 
 [build-dependencies]
 napi-build = "2"
+
+[dev-dependencies]
+rcgen = "0.14"

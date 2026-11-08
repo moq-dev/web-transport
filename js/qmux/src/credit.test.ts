@@ -67,3 +67,26 @@ describe("Credit.close reason propagation", () => {
 		expect(await settle(credit.claim(1n))).toBe(first);
 	});
 });
+
+describe("Credit.increaseMax ignores stale limits", () => {
+	test("a lower or equal limit neither reduces credit nor wakes a waiter", async () => {
+		const credit = new Credit(2n);
+		expect(credit.tryClaim(2n)).toBe(2n);
+
+		let woke = false;
+		const pending = credit.claim(1n).then((v) => {
+			woke = true;
+			return v;
+		});
+
+		credit.increaseMax(1n);
+		credit.increaseMax(2n);
+		await Promise.resolve();
+		expect(credit.max).toBe(2n);
+		expect(woke).toBe(false);
+
+		credit.increaseMax(3n);
+		expect(await pending).toBe(1n);
+		expect(credit.max).toBe(3n);
+	});
+});

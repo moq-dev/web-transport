@@ -166,6 +166,21 @@ describe("QMux01 record framing", () => {
 	});
 });
 
+describe("MAX_STREAMS bounds", () => {
+	for (const type of ["max_streams_bidi", "max_streams_uni"] as const) {
+		test(`${type} accepts 2^60 and rejects anything larger`, () => {
+			const limit = 1n << 60n;
+			const ok = Frame.encode({ type, max: limit }, "qmux-01");
+			expect(Frame.decodeRecord(ok)).toEqual([{ type, max: limit }]);
+			expect(Frame.decode(ok, "qmux-00")).toEqual({ type, max: limit });
+
+			const over = Frame.encode({ type, max: limit + 1n }, "qmux-01");
+			expect(() => Frame.decodeRecord(over)).toThrow("MAX_STREAMS exceeds 2^60");
+			expect(() => Frame.decode(over, "qmux-00")).toThrow("MAX_STREAMS exceeds 2^60");
+		});
+	}
+});
+
 describe("QMux02 (draft-02)", () => {
 	test("qmux-02 shares the qmux-01 record wire format", () => {
 		const id = new Stream.Id(VarInt.from(4n));

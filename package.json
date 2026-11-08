@@ -10,10 +10,12 @@
 	],
 	"scripts": {
 		"check": "biome check",
-		"fix": "biome check --fix"
+		"fix": "biome check --fix",
+		"test:browser": "playwright test --config rs/web-transport-wasm/browser/playwright.config.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.15",
+		"@playwright/test": "1.64.1",
 		"publint": "^0.3.25"
 	}
 }

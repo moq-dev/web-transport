@@ -82,7 +82,8 @@ async fn run_conn(
     request: web_transport_noq::Request,
     protocol: Option<String>,
 ) -> anyhow::Result<()> {
-    tracing::info!(url = %request.url, "received WebTransport request");
+    // The Debug output redacts credentials, such as the query and header values.
+    tracing::info!(request = ?*request, "received WebTransport request");
 
     // Negotiate protocol if both client and server support it.
     let negotiated = protocol.filter(|p| request.protocols.contains(p));

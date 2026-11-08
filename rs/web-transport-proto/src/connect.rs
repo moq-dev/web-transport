@@ -1,12 +1,15 @@
-use std::{str::FromStr, sync::Arc};
+use std::{fmt, str::FromStr, sync::Arc};
 
 use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use url::Url;
+use url::{Position, Url};
 
 use super::{qpack, Frame, VarInt, MAX_FRAME_SIZE};
 
 use thiserror::Error;
+
+// RFC 9114 section 4.2.2: each decoded field costs name + value + 32 bytes.
+pub(crate) const MAX_FIELD_SECTION_SIZE: u64 = 16 * 1024;
 
 // Errors that can occur during the connect request.
 #[derive(Error, Debug, Clone)]
@@ -68,6 +71,19 @@ pub enum ConnectError {
 
     #[error("invalid http header name")]
     InvalidHttpHeaderName,
+
+    /// The encoded HEADERS frame or its decoded field section exceeds the CONNECT limit.
+    #[error("field section too large")]
+    FieldSectionTooLarge,
+}
+
+impl From<qpack::FieldSectionError> for ConnectError {
+    fn from(err: qpack::FieldSectionError) -> Self {
+        match err {
+            qpack::FieldSectionError::Decode(err) => Self::QpackError(err),
+            qpack::FieldSectionError::TooLarge => Self::FieldSectionTooLarge,
+        }
+    }
 }
 
 impl From<std::io::Error> for ConnectError {
@@ -83,8 +99,14 @@ impl From<sfv::Error> for ConnectError {
 }
 
 /// A CONNECT request to initiate a WebTransport session.
+///
+/// The [`Debug`](fmt::Debug) output is safe to log. It keeps the URL's scheme,
+/// host, port, and path, the protocols, and the header names, but redacts the
+/// URL's userinfo, query, and fragment. Header values are redacted too, except
+/// `origin` and `user-agent` when not marked
+/// [sensitive](http::HeaderValue::set_sensitive).
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectRequest {
     /// The URL to connect to.
     pub url: Url,
@@ -126,11 +148,7 @@ impl ConnectRequest {
     }
 
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ConnectError> {
-        let (typ, mut data) = Frame::read(buf).map_err(|_| ConnectError::UnexpectedEnd)?;
-        if typ != Frame::HEADERS {
-            return Err(ConnectError::UnexpectedFrame(typ));
-        }
-
+        let mut data = decode_headers_frame(buf)?;
         Self::decode_headers(&mut data)
     }
 
@@ -203,6 +221,11 @@ impl ConnectRequest {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
+        self.frame()?.encode(buf);
+        Ok(())
+    }
+
+    fn frame(&self) -> Result<HeadersFrame, ConnectError> {
         let mut headers = qpack::Headers::default();
         for (item_header_name, item_header_value) in self.headers.iter() {
             // Skip protocol negotiation headers; they are derived from `self.protocols`.
@@ -231,23 +254,11 @@ impl ConnectRequest {
             headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
-        // Use a temporary buffer so we can compute the size.
-        let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
-        let size = VarInt::from_u32(tmp.len() as u32);
-
-        Frame::HEADERS.encode(buf);
-        size.encode(buf);
-        buf.put_slice(&tmp);
-
-        Ok(())
+        HeadersFrame::new(headers)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::new();
-        self.encode(&mut buf)?;
-        stream.write_all_buf(&mut buf).await?;
-        Ok(())
+        self.frame()?.write(stream).await
     }
 }
 
@@ -258,6 +269,70 @@ impl From<Url> for ConnectRequest {
             protocols: Vec::new(),
             headers: http::HeaderMap::new(),
         }
+    }
+}
+
+/// Header values shown by [`ConnectRequest`]'s `Debug` output.
+///
+/// This is an allowlist so that credentials in unknown or custom headers
+/// (`authorization`, `cookie`, `x-api-key`, ...) are redacted by default.
+const DEBUG_VISIBLE_HEADERS: [http::HeaderName; 2] =
+    [http::header::ORIGIN, http::header::USER_AGENT];
+
+/// Replaces a redacted value in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// Formats a URL with its userinfo, query, and fragment redacted.
+struct RedactedUrl<'a>(&'a Url);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        let mut redacted = String::from(&url[..Position::BeforeUsername]);
+        if !url.username().is_empty() || url.password().is_some() {
+            redacted.push_str("[redacted]@");
+        }
+        redacted.push_str(&url[Position::BeforeHost..Position::AfterPath]);
+        if url.query().is_some() {
+            redacted.push_str("?[redacted]");
+        }
+        if url.fragment().is_some() {
+            redacted.push_str("#[redacted]");
+        }
+        fmt::Debug::fmt(&redacted, f)
+    }
+}
+
+/// Formats headers with every value outside [`DEBUG_VISIBLE_HEADERS`] redacted.
+struct RedactedHeaders<'a>(&'a http::HeaderMap);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for (name, value) in self.0 {
+            if DEBUG_VISIBLE_HEADERS.contains(name) && !value.is_sensitive() {
+                map.entry(name, value);
+            } else {
+                map.entry(name, &Redacted);
+            }
+        }
+        map.finish()
+    }
+}
+
+impl fmt::Debug for ConnectRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectRequest")
+            .field("url", &RedactedUrl(&self.url))
+            .field("protocols", &self.protocols)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .finish()
     }
 }
 
@@ -291,11 +366,7 @@ impl ConnectResponse {
     }
 
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, ConnectError> {
-        let (typ, mut data) = Frame::read(buf).map_err(|_| ConnectError::UnexpectedEnd)?;
-        if typ != Frame::HEADERS {
-            return Err(ConnectError::UnexpectedFrame(typ));
-        }
-
+        let mut data = decode_headers_frame(buf)?;
         Self::decode_headers(&mut data)
     }
 
@@ -329,6 +400,11 @@ impl ConnectResponse {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
+        self.frame()?.encode(buf);
+        Ok(())
+    }
+
+    fn frame(&self) -> Result<HeadersFrame, ConnectError> {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
@@ -338,23 +414,11 @@ impl ConnectResponse {
             headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
         }
 
-        // Use a temporary buffer so we can compute the size.
-        let mut tmp = Vec::new();
-        headers.encode(&mut tmp);
-        let size = VarInt::from_u32(tmp.len() as u32);
-
-        Frame::HEADERS.encode(buf);
-        size.encode(buf);
-        buf.put_slice(&tmp);
-
-        Ok(())
+        HeadersFrame::new(headers)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::new();
-        self.encode(&mut buf)?;
-        stream.write_all_buf(&mut buf).await?;
-        Ok(())
+        self.frame()?.write(stream).await
     }
 }
 
@@ -373,6 +437,59 @@ impl From<http::StatusCode> for ConnectResponse {
     }
 }
 
+fn check_frame_size(typ: Frame, size: u64) -> Result<(), ConnectError> {
+    if typ == Frame::HEADERS && size > MAX_FIELD_SECTION_SIZE {
+        return Err(ConnectError::FieldSectionTooLarge);
+    }
+    if size > MAX_FRAME_SIZE {
+        return Err(ConnectError::FrameTooLarge);
+    }
+    Ok(())
+}
+
+// A validated field section and its wire length, shared by sync and async encoding.
+struct HeadersFrame {
+    headers: qpack::Headers,
+    size: VarInt,
+}
+
+impl HeadersFrame {
+    fn new(headers: qpack::Headers) -> Result<Self, ConnectError> {
+        let size = VarInt::from_u32(headers.encoded_size()? as u32);
+        Ok(Self { headers, size })
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Frame::HEADERS.encode(buf);
+        self.size.encode(buf);
+        self.headers.encode(buf);
+    }
+
+    async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
+        let capacity = Frame::HEADERS.0.size() + self.size.size() + self.size.into_inner() as usize;
+        let mut buf = BytesMut::with_capacity(capacity);
+        self.encode(&mut buf);
+        stream.write_all_buf(&mut buf).await?;
+        Ok(())
+    }
+}
+
+fn decode_headers_frame<B: Buf>(buf: &mut B) -> Result<bytes::buf::Take<&mut B>, ConnectError> {
+    let (typ, data) = Frame::read_bounded(buf, MAX_FIELD_SECTION_SIZE, MAX_FRAME_SIZE).map_err(
+        |err| match err {
+            crate::frame::FrameReadError::UnexpectedEnd => ConnectError::UnexpectedEnd,
+            crate::frame::FrameReadError::TooLarge(Frame::HEADERS) => {
+                ConnectError::FieldSectionTooLarge
+            }
+            crate::frame::FrameReadError::TooLarge(_) => ConnectError::FrameTooLarge,
+        },
+    )?;
+    if typ != Frame::HEADERS {
+        return Err(ConnectError::UnexpectedFrame(typ));
+    }
+    Ok(data)
+}
+
 /// Read the next HEADERS frame from the stream, skipping any GREASE frames.
 ///
 /// Returns the raw payload bytes of the HEADERS frame.
@@ -388,9 +505,7 @@ async fn read_headers_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<
             .map_err(|_| ConnectError::UnexpectedEnd)?;
 
         let size = size.into_inner();
-        if size > MAX_FRAME_SIZE {
-            return Err(ConnectError::FrameTooLarge);
-        }
+        check_frame_size(typ, size)?;
 
         let mut payload = stream.take(size);
 
@@ -506,6 +621,230 @@ mod tests {
         buf
     }
 
+    fn reframe(payload: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(payload.len() as u32).encode(&mut wire);
+        wire.extend_from_slice(payload);
+        wire
+    }
+
+    fn payload(mut wire: &[u8]) -> Vec<u8> {
+        let (_, mut data) = Frame::read(&mut wire).unwrap();
+        data.copy_to_bytes(data.remaining()).to_vec()
+    }
+
+    fn append_literal(payload: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+        qpack::encode_prefix(payload, 3, 0b00100, name.len());
+        payload.extend_from_slice(name);
+        qpack::encode_prefix(payload, 7, 0, value.len());
+        payload.extend_from_slice(value);
+    }
+
+    fn assert_section_too_large<T: std::fmt::Debug>(result: Result<T, ConnectError>) {
+        assert_eq!(
+            result
+                .expect_err("oversized section was accepted")
+                .to_string(),
+            "field section too large"
+        );
+    }
+
+    #[test]
+    fn connect_rejects_literal_field_accordion() {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        for base in [encode_request("https://example.com/"), encode_response()] {
+            let mut headers = payload(&base);
+            for i in 0..4_000 {
+                append_literal(&mut headers, &[alphabet[i / 64], alphabet[i % 64]], b"");
+            }
+            assert!(headers.len() < 16 * 1024);
+            let wire = reframe(&headers);
+            assert_section_too_large(ConnectRequest::decode(&mut wire.as_slice()));
+            assert_section_too_large(ConnectResponse::decode(&mut wire.as_slice()));
+        }
+    }
+
+    #[test]
+    fn response_charges_repeated_static_fields() {
+        let mut headers = payload(&encode_response());
+        // The indexed `:status: 200` line is one byte but costs 42 decoded bytes.
+        let status = headers[2];
+        assert_eq!(status, 0b1100_0000 | 25);
+        headers.resize(headers.len() + 500, status);
+        assert!(headers.len() < MAX_FIELD_SECTION_SIZE as usize);
+        assert_section_too_large(ConnectResponse::decode(&mut reframe(&headers).as_slice()));
+    }
+
+    #[tokio::test]
+    async fn request_encode_refuses_field_section_over_limit() {
+        // The pseudo-headers for https://example.com/ cost 234 bytes; `x-pad` costs 37 plus its value.
+        let fill = MAX_FIELD_SECTION_SIZE as usize - 234 - 37;
+        let request = |len: usize| {
+            ConnectRequest::new(Url::parse("https://example.com/").unwrap()).with_header(
+                http::HeaderName::from_static("x-pad"),
+                http::HeaderValue::from_str(&"a".repeat(len)).unwrap(),
+            )
+        };
+
+        let mut wire = Vec::new();
+        request(fill).encode(&mut wire).unwrap();
+        let decoded = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.headers["x-pad"].len(), fill);
+
+        let mut wire = Vec::new();
+        assert_section_too_large(request(fill + 1).encode(&mut wire));
+        assert_section_too_large(request(fill + 1).write(&mut wire).await);
+        assert!(
+            wire.is_empty(),
+            "a refused request wrote {} bytes",
+            wire.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn response_encode_refuses_field_section_over_limit() {
+        let response =
+            ConnectResponse::OK.with_protocol("a".repeat(MAX_FIELD_SECTION_SIZE as usize));
+        let mut wire = Vec::new();
+        assert_section_too_large(response.encode(&mut wire));
+        assert_section_too_large(response.write(&mut wire).await);
+        assert!(
+            wire.is_empty(),
+            "a refused response wrote {} bytes",
+            wire.len()
+        );
+    }
+
+    // RFC 7541 Appendix B gives 'a' the five-bit code 00011.
+    fn huffman_a(count: usize) -> Vec<u8> {
+        let bits = count * 5;
+        let mut encoded = vec![0; bits.div_ceil(8)];
+        for i in 0..count {
+            for bit in [3, 4] {
+                let position = i * 5 + bit;
+                encoded[position / 8] |= 1 << (7 - position % 8);
+            }
+        }
+        for position in bits..encoded.len() * 8 {
+            encoded[position / 8] |= 1 << (7 - position % 8);
+        }
+        encoded
+    }
+
+    #[test]
+    fn connect_rejects_huffman_expansion() {
+        for base in [encode_request("https://example.com/"), encode_response()] {
+            let mut headers = payload(&base);
+            qpack::encode_prefix(&mut headers, 3, 0b00100, 1);
+            headers.push(b'x');
+            let encoded = huffman_a(17_000);
+            qpack::encode_prefix(&mut headers, 7, 1, encoded.len());
+            headers.extend_from_slice(&encoded);
+            assert!(headers.len() < 16 * 1024);
+            let wire = reframe(&headers);
+            assert_section_too_large(ConnectRequest::decode(&mut wire.as_slice()));
+            assert_section_too_large(ConnectResponse::decode(&mut wire.as_slice()));
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_declared_size_before_payload_arrives() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::from_u32(16 * 1024 + 1).encode(&mut wire);
+        assert_section_too_large(ConnectRequest::decode(&mut wire.as_slice()));
+        assert_section_too_large(ConnectResponse::decode(&mut wire.as_slice()));
+        assert_section_too_large(ConnectRequest::read(&mut Cursor::new(wire.clone())).await);
+        assert_section_too_large(ConnectResponse::read(&mut Cursor::new(wire)).await);
+    }
+
+    #[test]
+    fn response_charges_duplicate_literal_names() {
+        let mut headers = payload(&encode_response());
+        for _ in 0..500 {
+            append_literal(&mut headers, b"x", b"");
+        }
+        assert_section_too_large(ConnectResponse::decode(&mut reframe(&headers).as_slice()));
+    }
+
+    #[test]
+    fn connect_rejects_huffman_name_expansion() {
+        let mut headers = payload(&encode_request("https://example.com/"));
+        let name = huffman_a(17_000);
+        qpack::encode_prefix(&mut headers, 3, 0b00101, name.len());
+        headers.extend_from_slice(&name);
+        qpack::encode_prefix(&mut headers, 7, 0, 0);
+        assert!(headers.len() < MAX_FIELD_SECTION_SIZE as usize);
+        let wire = reframe(&headers);
+        assert_section_too_large(ConnectRequest::decode(&mut wire.as_slice()));
+        assert_section_too_large(ConnectResponse::decode(&mut wire.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn grease_keeps_its_frame_budget_and_skips_iteratively() {
+        let mut grease = encode_grease_frame(&vec![0; 20 * 1024]);
+        for _ in 0..10_000 {
+            grease.extend_from_slice(&encode_grease_frame(b""));
+        }
+        for base in [encode_request("https://example.com/"), encode_response()] {
+            let mut wire = grease.clone();
+            wire.extend_from_slice(&base);
+            if base == encode_response() {
+                assert_eq!(
+                    ConnectResponse::decode(&mut wire.as_slice())
+                        .unwrap()
+                        .status,
+                    http::StatusCode::OK
+                );
+                assert_eq!(
+                    ConnectResponse::read(&mut Cursor::new(wire))
+                        .await
+                        .unwrap()
+                        .status,
+                    http::StatusCode::OK
+                );
+            } else {
+                assert_eq!(
+                    ConnectRequest::decode(&mut wire.as_slice())
+                        .unwrap()
+                        .url
+                        .as_str(),
+                    "https://example.com/"
+                );
+                assert_eq!(
+                    ConnectRequest::read(&mut Cursor::new(wire))
+                        .await
+                        .unwrap()
+                        .url
+                        .as_str(),
+                    "https://example.com/"
+                );
+            }
+        }
+        let wire = encode_grease_frame(&vec![0; MAX_FRAME_SIZE as usize + 1]);
+        assert!(matches!(
+            ConnectRequest::decode(&mut wire.as_slice()),
+            Err(ConnectError::FrameTooLarge)
+        ));
+        assert!(matches!(
+            ConnectResponse::read(&mut Cursor::new(wire)).await,
+            Err(ConnectError::FrameTooLarge)
+        ));
+    }
+
+    #[test]
+    fn declared_size_is_checked_without_pointer_width_truncation() {
+        let mut wire = Vec::new();
+        Frame::HEADERS.encode(&mut wire);
+        VarInt::try_from((1_u64 << 32) + 2)
+            .unwrap()
+            .encode(&mut wire);
+        wire.extend_from_slice(&[0, 0]);
+        assert_section_too_large(ConnectRequest::decode(&mut wire.as_slice()));
+        assert_section_too_large(ConnectResponse::decode(&mut wire.as_slice()));
+    }
+
     // ---- ConnectRequest::read tests ----
 
     #[tokio::test]
@@ -549,14 +888,14 @@ mod tests {
         // Craft a frame header claiming a huge payload.
         let mut wire = Vec::new();
         Frame::HEADERS.encode(&mut wire);
-        // 128 KiB > MAX_FRAME_SIZE (64 KiB)
+        // Refuse the HEADERS length before reading any payload.
         VarInt::from_u32(128 * 1024).encode(&mut wire);
 
         let mut cursor = Cursor::new(wire);
         let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::FrameTooLarge),
-            "expected FrameTooLarge, got {err:?}"
+            matches!(err, ConnectError::FieldSectionTooLarge),
+            "expected FieldSectionTooLarge, got {err:?}"
         );
     }
 
@@ -625,8 +964,8 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectResponse::read(&mut cursor).await.unwrap_err();
         assert!(
-            matches!(err, ConnectError::FrameTooLarge),
-            "expected FrameTooLarge, got {err:?}"
+            matches!(err, ConnectError::FieldSectionTooLarge),
+            "expected FieldSectionTooLarge, got {err:?}"
         );
     }
 
@@ -689,5 +1028,113 @@ mod tests {
         let mut cursor = Cursor::new(wire);
         let err = ConnectRequest::read(&mut cursor).await.unwrap_err();
         assert!(matches!(err, ConnectError::UnexpectedEnd));
+    }
+
+    #[test]
+    fn request_debug_keeps_url_without_credentials() {
+        let req = ConnectRequest::new(Url::parse("https://example.com:4443/moq/room").unwrap())
+            .with_protocol("moq-lite-03");
+        assert_eq!(
+            format!("{req:?}"),
+            r#"ConnectRequest { url: "https://example.com:4443/moq/room", protocols: ["moq-lite-03"], headers: {} }"#
+        );
+    }
+
+    #[test]
+    fn request_debug_redacts_url_credentials() {
+        let url = "https://alice:hunter2@example.com/moq?jwt=SECRET&x=1#access_token=SECRET";
+        let req = ConnectRequest::new(Url::parse(url).unwrap());
+        let debug = format!("{req:?}");
+        assert!(
+            debug.contains(r#"url: "https://[redacted]@example.com/moq?[redacted]#[redacted]""#),
+            "{debug}"
+        );
+        for secret in ["alice", "hunter2", "SECRET", "x=1"] {
+            assert!(!debug.contains(secret), "{secret} leaked: {debug}");
+        }
+
+        let req = ConnectRequest::new(Url::parse("https://alice@example.com/").unwrap());
+        assert!(format!("{req:?}").contains(r#""https://[redacted]@example.com/""#));
+    }
+
+    #[test]
+    fn request_debug_redacts_header_values() {
+        use http::{header, HeaderName, HeaderValue};
+
+        let mut sensitive_agent = HeaderValue::from_static("agent-SECRET");
+        sensitive_agent.set_sensitive(true);
+
+        let req = ConnectRequest::new(Url::parse("https://example.com/").unwrap())
+            .with_header(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer SECRET"),
+            )
+            .with_header(
+                header::PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic SECRET"),
+            )
+            .with_header(header::COOKIE, HeaderValue::from_static("session=SECRET"))
+            .with_header(
+                header::SET_COOKIE,
+                HeaderValue::from_static("session=SECRET"),
+            )
+            .with_header(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_static("SECRET"),
+            )
+            .with_header(
+                header::ORIGIN,
+                HeaderValue::from_static("https://app.example"),
+            )
+            .with_header(header::USER_AGENT, sensitive_agent);
+        let debug = format!("{req:?}");
+
+        assert!(!debug.contains("SECRET"), "{debug}");
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "x-api-key",
+        ] {
+            assert!(
+                debug.contains(&format!(r#""{name}": [redacted]"#)),
+                "{name}: {debug}"
+            );
+        }
+        assert!(
+            debug.contains(r#""origin": "https://app.example""#),
+            "{debug}"
+        );
+        assert!(debug.contains(r#""user-agent": [redacted]"#), "{debug}");
+    }
+
+    #[test]
+    fn decoded_request_debug_redacts_credentials() {
+        let req = ConnectRequest::new(Url::parse("https://example.com/moq?jwt=SECRET").unwrap())
+            .with_header(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_static("Bearer SECRET"),
+            )
+            .with_header(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static("moq-test"),
+            );
+        let mut wire = Vec::new();
+        req.encode(&mut wire).unwrap();
+
+        let decoded = ConnectRequest::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.url.query(), Some("jwt=SECRET"));
+
+        // Decoded header order is unspecified, so check each entry separately.
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        for expected in [
+            r#"url: "https://example.com/moq?[redacted]""#,
+            r#""authorization": [redacted]"#,
+            r#""user-agent": "moq-test""#,
+        ] {
+            assert!(debug.contains(expected), "{expected}: {debug}");
+        }
     }
 }

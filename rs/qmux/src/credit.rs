@@ -4,7 +4,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use crate::Error;
+use tokio::sync::mpsc;
+
+use crate::{Error, Frame};
 
 #[derive(Debug, Clone, Copy)]
 struct CreditState {
@@ -20,7 +22,7 @@ struct CreditState {
 ///
 /// Works for both send and recv flow control:
 /// - **Send**: `try_claim`/`claim` to reserve credit, `release` for rollback, `increase_max` on peer's MAX_DATA.
-/// - **Recv**: `receive` to validate incoming data, `consume` to track app consumption and trigger window updates.
+/// - **Recv**: `receive` to validate incoming data, `consume` to track app consumption and queue window updates.
 ///
 /// Clone is cheap (internally `Arc`'d).
 ///
@@ -176,23 +178,18 @@ impl Credit {
         wake_all(wakers);
     }
 
-    /// Increase the max. Returns error if new_max < current max.
-    pub fn increase_max(&self, new_max: u64) -> Result<(), Error> {
-        let (ok, wakers) = self.inner.lock().unwrap().update(|state| {
-            if new_max < state.max {
-                return (false, false);
+    /// Raise the max to `new_max`. A non-increasing value is ignored, as RFC 9000
+    /// §19.9–§19.11 require for MAX_DATA, MAX_STREAM_DATA and MAX_STREAMS: an
+    /// update can arrive after a larger one, so it is stale rather than invalid.
+    pub fn increase_max(&self, new_max: u64) {
+        let ((), wakers) = self.inner.lock().unwrap().update(|state| {
+            let changed = new_max > state.max;
+            if changed {
+                state.max = new_max;
             }
-            let changed = new_max != state.max;
-            state.max = new_max;
-            (true, changed)
+            ((), changed)
         });
         wake_all(wakers);
-
-        if ok {
-            Ok(())
-        } else {
-            Err(Error::FlowControlError)
-        }
     }
 
     // --- Recv-side methods ---
@@ -218,10 +215,21 @@ impl Credit {
         true
     }
 
-    /// Report that `len` bytes have been consumed by the application.
-    /// Returns `Some(new_max)` if a window update should be sent.
-    pub fn consume(&self, len: u64) -> Option<u64> {
-        let (update, wakers) = self.inner.lock().unwrap().update(|state| {
+    /// Report that `len` units have been consumed by the application, queueing
+    /// `frame(new_max)` on `control` when a window update is due.
+    ///
+    /// The update is queued before the lock is released, so concurrent consumers
+    /// of one credit queue their limits in increasing order. Computing it under the
+    /// lock and sending afterwards would let a smaller limit overtake a larger one.
+    /// The unbounded send never blocks or reenters this credit.
+    pub(crate) fn consume(
+        &self,
+        len: u64,
+        control: &mpsc::UnboundedSender<Frame>,
+        frame: impl FnOnce(u64) -> Frame,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let ((), wakers) = inner.update(|state| {
             state.released += len;
 
             // Send a window update when: used + 2*released > max
@@ -230,12 +238,127 @@ impl Credit {
                 let new_max = state.max + state.released;
                 state.max = new_max;
                 state.released = 0;
-                (Some(new_max), true)
+                control.send(frame(new_max)).ok();
+                ((), true)
             } else {
-                (None, false)
+                ((), false)
             }
         });
+        drop(inner);
         wake_all(wakers);
-        update
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc as std_mpsc, Arc, TryLockError,
+        },
+        task::{Context, Poll, Wake, Waker},
+        thread,
+    };
+
+    use tokio::sync::mpsc;
+
+    use super::Credit;
+    use crate::Frame;
+
+    #[derive(Default)]
+    struct CountingWaker(AtomicUsize);
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Frame>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            match frame {
+                Frame::MaxData(max) => out.push(max),
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// Two consumers race to replenish one credit. The first is paused while it
+    /// queues its update, which must happen under the credit lock: otherwise the
+    /// second could compute and queue a larger limit ahead of it.
+    #[test]
+    fn concurrent_updates_are_queued_in_increasing_order() {
+        let credit = Credit::new(4);
+        assert!(credit.receive(4));
+        let (control, mut rx) = mpsc::unbounded_channel();
+
+        let (inside_tx, inside_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        let first = thread::spawn({
+            let credit = credit.clone();
+            let control = control.clone();
+            move || {
+                credit.consume(2, &control, |max| {
+                    inside_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Frame::MaxData(max)
+                });
+            }
+        });
+        inside_rx.recv().unwrap();
+
+        // The first update is computed but not yet queued. Holding the lock here
+        // is what keeps any other consumer from computing a later limit first.
+        assert!(
+            matches!(credit.inner.try_lock(), Err(TryLockError::WouldBlock)),
+            "the update is queued after the credit lock is released"
+        );
+
+        let second = thread::spawn({
+            let credit = credit.clone();
+            let control = control.clone();
+            move || credit.consume(2, &control, Frame::MaxData)
+        });
+        release_tx.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        assert_eq!(drain(&mut rx), [6, 8]);
+    }
+
+    /// A consumer that doesn't cross the replenish threshold queues nothing.
+    #[test]
+    fn consume_below_threshold_queues_nothing() {
+        let credit = Credit::new(10);
+        assert!(credit.receive(2));
+        let (control, mut rx) = mpsc::unbounded_channel();
+        credit.consume(2, &control, Frame::MaxData);
+        assert!(drain(&mut rx).is_empty());
+        credit.consume(4, &control, Frame::MaxData);
+        assert_eq!(drain(&mut rx), [16]);
+    }
+
+    /// A lower or equal limit keeps the current credit and leaves waiters parked;
+    /// a higher one releases them.
+    #[test]
+    fn non_increasing_limits_are_ignored_without_waking() {
+        let credit = Credit::new(2);
+        assert_eq!(credit.try_claim(2), 2);
+
+        let counter = Arc::new(CountingWaker::default());
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(credit.poll_claim(&mut cx, 1).is_pending());
+
+        credit.increase_max(1);
+        credit.increase_max(2);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(credit.try_claim(1), 0);
+
+        credit.increase_max(3);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(credit.poll_claim(&mut cx, 1), Poll::Ready(Ok(1))));
     }
 }
