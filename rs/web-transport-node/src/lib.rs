@@ -407,7 +407,7 @@ impl NapiRequest {
     }
 }
 
-/// An established WebTransport session.
+/// An established WebTransport session; call close explicitly because pending async methods own handles.
 #[napi]
 pub struct NapiSession {
     inner: web_transport_quinn::Session,

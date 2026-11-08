@@ -115,8 +115,9 @@ impl Server {
 
 /// A WebTransport Session, able to accept/create streams and send/recv datagrams.
 ///
-/// The session can be cloned to create multiple handles, which is which no method is &mut.
-/// The session will be closed with on drop.
+/// Clones share the connection. Dropping the final Session handle closes it immediately,
+/// even if streams remain. An explicit [`Self::close`] already in progress retains its
+/// bounded graceful close.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     inner: quinn::Session,
@@ -175,7 +176,7 @@ impl Session {
         Ok(self.inner.read_datagram().await?)
     }
 
-    /// Close the connection immediately with a code and reason.
+    /// Close with a code and reason, attempting graceful capsule delivery within a bounded timeout.
     pub fn close(&self, code: u32, reason: &str) {
         self.inner.close(code, reason.as_bytes())
     }

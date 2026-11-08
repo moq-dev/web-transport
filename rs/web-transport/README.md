@@ -20,6 +20,10 @@ The native `ClientBuilder::with_transport_config` accepts Quinn's owned `Transpo
 The native `ClientBuilder` does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings.
 
 
+## Native session lifetime
+
+Dropping the final `Session` clone closes the Quinn connection, even if streams or native handles remain. Keep a Session clone while using its streams. An explicit `Session::close` already in progress finishes its bounded graceful close after the final handle drops. Keep the runtime alive and await `Session::closed` to allow capsule delivery; a timeout or cancellation can prevent delivery.
+
 ## Why no trait?
 
 See [web-transport-trait](https://docs.rs/web-transport-trait). 

@@ -14,6 +14,12 @@ dependencies {
 }
 ```
 
+## Session lifetime
+
+Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
+
+A local binding alone does not guarantee JVM reachability through the end of its lexical scope. Keep a Session use after the last stream operation, for example `try { /* stream work */ } finally { session.close(code = 0U, reason = "") }` when that scope owns the connection. If another owner controls closure, use [`Reference.reachabilityFence(session)`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/ref/Reference.html#reachabilityFence(java.lang.Object)) in `finally` on JVMs that provide that API.
+
 ## Build
 
 ```sh
