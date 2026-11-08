@@ -67,7 +67,7 @@ try {
   status.textContent = `ran against ${url}`;
   summary.textContent = `${window.harness.passed} passed, ${window.harness.failed} failed`;
 } catch (err) {
-  status.textContent = "harness failed to run: " + err;
+  status.textContent = `harness failed to run: ${err}`;
   window.harness.failed = 1;
 } finally {
   window.harness.done = true;
