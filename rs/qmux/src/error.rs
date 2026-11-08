@@ -88,11 +88,6 @@ pub enum Error {
     #[error("invalid server name")]
     InvalidServerName,
 
-    /// A CPU feature required by the default WSS crypto provider is unavailable.
-    #[cfg(feature = "wss")]
-    #[error("unsupported CPU: {0}")]
-    UnsupportedCpu(String),
-
     /// The server rejected the handshake with a non-success HTTP status.
     ///
     /// Surfaced from the WebSocket upgrade response so callers can distinguish
@@ -119,10 +114,11 @@ impl Error {
     /// The wire error code to send on a CONNECTION_CLOSE (0x1c) when *we* tear the
     /// session down because of this error, or `None` when the peer should not (or
     /// cannot) be told: a graceful close, a close the peer already sent us, an idle
-    /// timeout (silent, like QUIC), or a dead transport. Every protocol/transport
-    /// violation we detect maps to 1002, matching the JS QMux polyfill.
+    /// timeout (silent, like QUIC), or a dead transport. Handshake expiry uses 0;
+    /// protocol/transport violations map to 1002, matching the JS QMux polyfill.
     pub(crate) fn transport_close(&self) -> Option<u32> {
         match self {
+            Error::HandshakeTimeout => Some(0),
             Error::ProtocolViolation
             | Error::FrameEncoding
             | Error::TransportParameter

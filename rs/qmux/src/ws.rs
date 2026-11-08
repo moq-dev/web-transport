@@ -21,27 +21,6 @@ pub use tokio_tungstenite;
 /// [`Error::WebSocket`] wraps a `tungstenite::Error`.
 pub use tokio_tungstenite::tungstenite;
 
-#[cfg(feature = "wss")]
-fn default_provider() -> Result<std::sync::Arc<rustls::crypto::CryptoProvider>, Error> {
-    if let Some(provider) = rustls::crypto::CryptoProvider::get_default() {
-        return Ok(provider.clone());
-    }
-    #[cfg(test)]
-    if REFUSE_CPU.get() {
-        return Err(Error::UnsupportedCpu(
-            "simulated missing CPU feature".into(),
-        ));
-    }
-    rind_rustls::default_provider()
-        .map(std::sync::Arc::new)
-        .map_err(|err| Error::UnsupportedCpu(err.to_string()))
-}
-
-#[cfg(all(test, feature = "wss"))]
-thread_local! {
-    static REFUSE_CPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Keep-alive configuration for WebSocket transports.
 ///
 /// WebSocket has no built-in idle timeout: when the peer's host crashes
@@ -125,9 +104,8 @@ where
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
     /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
@@ -256,9 +234,8 @@ impl Client {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
     /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
@@ -267,52 +244,10 @@ impl Client {
     }
 
     /// Set the TLS connector for secure WebSocket connections.
-    ///
-    /// The connector and its TLS config are used unchanged. Without one, WSS
-    /// uses native roots and the installed rustls provider, otherwise rind.
     #[cfg(feature = "wss")]
     pub fn with_connector(mut self, connector: tokio_tungstenite::Connector) -> Self {
         self.connector = Some(connector);
         self
-    }
-
-    #[cfg(feature = "wss")]
-    fn connector(
-        &self,
-        uri: &tungstenite::http::Uri,
-    ) -> Result<Option<tokio_tungstenite::Connector>, Error> {
-        if self.connector.is_some() || uri.scheme_str() != Some("wss") {
-            return Ok(self.connector.clone());
-        }
-
-        use std::{io, sync::Arc};
-        let provider = default_provider()?;
-        let loaded = rustls_native_certs::load_native_certs();
-        if !loaded.errors.is_empty() {
-            tracing::warn!(errors = ?loaded.errors, "native root CA certificate loading errors");
-        }
-        let mut roots = rustls::RootCertStore::empty();
-        // OS stores can contain unusable entries; retain every valid trust anchor.
-        let (_, ignored) = roots.add_parsable_certificates(loaded.certs);
-        if ignored != 0 {
-            tracing::warn!(ignored, "ignored malformed native root CA certificates");
-        }
-        if roots.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no native root CA certificates found (errors: {:?})",
-                    loaded.errors
-                ),
-            )
-            .into());
-        }
-        let config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(config))))
     }
 
     /// Connect to a WebSocket server, negotiating an advertised `(alpn, version)`.
@@ -339,10 +274,14 @@ impl Client {
 
         #[cfg(feature = "wss")]
         let (ws_stream, response) = {
-            let connector = self.connector(request.uri())?;
-            tokio_tungstenite::connect_async_tls_with_config(request, self.config, false, connector)
-                .await
-                .map_err(Error::from)?
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                self.config,
+                false,
+                self.connector.clone(),
+            )
+            .await
+            .map_err(Error::from)?
         };
 
         #[cfg(not(feature = "wss"))]
@@ -445,9 +384,8 @@ impl Server {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
     /// frame limit (16 MiB by default), since each record is one message.
     pub fn with_session_config(mut self, config: Config) -> Self {
@@ -547,83 +485,253 @@ impl Server {
     }
 }
 
-#[cfg(all(test, feature = "wss"))]
-mod crypto_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
-    use std::sync::Arc;
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use std::{future::Future, task::Context};
+    use tokio::time::{advance, timeout};
+    use tokio_tungstenite::{tungstenite::client::IntoClientRequest, WebSocketStream};
     use web_transport_trait::Session as _;
 
-    #[tokio::test]
-    async fn installed_provider_and_cpu_refusal() {
-        const CHILD: &str = "QMUX_PROVIDER_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "ws::crypto_tests::installed_provider_and_cpu_refusal",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            return;
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    trait Peer:
+        Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+        + Sink<tungstenite::Message, Error = tungstenite::Error>
+        + Unpin
+    {
+    }
+
+    impl<T> Peer for WebSocketStream<T> where T: AsyncRead + AsyncWrite + Unpin {}
+
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        Client,
+        Server,
+        UpgradedClient,
+        UpgradedServer,
+    }
+
+    const BUILDERS: &[Builder] = &[
+        Builder::Client,
+        Builder::Server,
+        Builder::UpgradedClient,
+        Builder::UpgradedServer,
+    ];
+
+    fn config() -> Config {
+        Config {
+            handshake_timeout: DEADLINE,
+            max_idle_timeout: 0,
+            rtt_interval: Duration::ZERO,
+            ..Config::default()
         }
-        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
-        let provider = default_provider().unwrap();
-        let config = Arc::new(
-            rustls::ClientConfig::builder_with_provider(provider.clone())
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(rustls::RootCertStore::empty())
-                .with_no_client_auth(),
-        );
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                REFUSE_CPU.set(false);
+    }
+
+    async fn start(builder: Builder, version: Version, config: Config) -> (Session, Box<dyn Peer>) {
+        use tungstenite::{http::header::SEC_WEBSOCKET_PROTOCOL, protocol::Role};
+
+        if let Builder::Client = builder {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    move |request: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        let protocol = if version.is_qmux() {
+                            request.headers()[SEC_WEBSOCKET_PROTOCOL].clone()
+                        } else {
+                            version.alpn().parse().unwrap()
+                        };
+                        response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+                        Ok(response)
+                    };
+                tokio_tungstenite::accept_hdr_async(socket, callback)
+                    .await
+                    .unwrap()
+            };
+            let client = Client::new().with_session_config(config);
+            let client = if version.is_qmux() {
+                client.with_protocol("test", &[version]).require_protocol()
+            } else {
+                client
+            };
+            let (session, peer) = tokio::join!(client.connect(&url), server);
+            return (session.unwrap(), Box::new(peer));
+        }
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        if let Builder::Server = builder {
+            let server = Server::new().with_session_config(config);
+            let mut request = "ws://localhost".into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, version.alpn().parse().unwrap());
+            let (session, peer) = tokio::join!(
+                server.accept(a),
+                tokio_tungstenite::client_async(request, b)
+            );
+            return (session.unwrap(), Box::new(peer.unwrap().0));
+        }
+
+        let is_server = matches!(builder, Builder::UpgradedServer);
+        let (role, peer_role) = if is_server {
+            (Role::Server, Role::Client)
+        } else {
+            (Role::Client, Role::Server)
+        };
+        let socket = WebSocketStream::from_raw_socket(a, role, None).await;
+        let peer = WebSocketStream::from_raw_socket(b, peer_role, None).await;
+        let upgraded = Upgraded::new(socket)
+            .with_alpn(version.alpn())
+            .with_session_config(config);
+        let session = if is_server {
+            upgraded.accept()
+        } else {
+            upgraded.connect()
+        };
+        (session, Box::new(peer))
+    }
+
+    fn assert_open(session: &Session) {
+        let mut closed = std::pin::pin!(session.closed());
+        assert!(closed
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending());
+    }
+
+    async fn network_io<F: Future>(builder: Builder, io: F) -> F::Output {
+        // Real socket delivery must not race paused time's automatic advance.
+        let real_time = matches!(builder, Builder::Client);
+        if real_time {
+            tokio::time::resume();
+        }
+        let output = io.await;
+        if real_time {
+            tokio::time::pause();
+        }
+        output
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_hits_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, _peer) = start(builder, version, config()).await;
+                advance(DEADLINE - Duration::from_millis(1)).await;
+                assert_open(&session);
+                let error = timeout(Duration::from_secs(1), session.closed())
+                    .await
+                    .unwrap_or_else(|_| panic!("{builder:?} {version:?}: handshake stayed open"));
+                assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+                assert!(matches!(
+                    session.open_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
+                assert!(matches!(
+                    session.accept_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
             }
         }
-        let _reset = Reset;
-        REFUSE_CPU.set(true);
-        assert!(matches!(
-            Client::new().connect("wss://localhost:1/").await,
-            Err(Error::UnsupportedCpu(_))
-        ));
-        let uri = "wss://localhost/".parse().unwrap();
-        let client =
-            Client::new().with_connector(tokio_tungstenite::Connector::Rustls(config.clone()));
-        let Some(tokio_tungstenite::Connector::Rustls(preserved)) = client.connector(&uri).unwrap()
-        else {
-            panic!("caller connector was replaced");
-        };
-        assert!(Arc::ptr_eq(&preserved, &config));
-        let client = Client::new().with_connector(tokio_tungstenite::Connector::Plain);
-        assert!(matches!(
-            client.connector(&uri).unwrap(),
-            Some(tokio_tungstenite::Connector::Plain)
-        ));
+    }
 
-        // Plain WS must still connect without consulting the refused fallback.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accept = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            Server::new().accept(socket).await.unwrap()
-        });
-        let session = Client::new()
-            .connect(&format!("ws://{addr}/"))
-            .await
-            .unwrap();
-        let server = accept.await.unwrap();
-        session.close(0, "done");
-        server.close(0, "done");
+    #[tokio::test(start_paused = true)]
+    async fn disabled_handshake_deadline_and_legacy_stay_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL {
+                let mut config = config();
+                if version.is_qmux() {
+                    config.handshake_timeout = Duration::ZERO;
+                }
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
 
-        (*provider).clone().install_default().unwrap();
-        let installed = rustls::crypto::CryptoProvider::get_default().unwrap();
-        assert!(Arc::ptr_eq(&default_provider().unwrap(), installed));
-        assert!(
-            REFUSE_CPU.get(),
-            "installed provider bypasses the rind CPU check"
-        );
+    #[tokio::test(start_paused = true)]
+    async fn oversized_handshake_deadline_stays_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let mut config = config();
+                config.handshake_timeout = Duration::MAX;
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_sends_connection_close() {
+        for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+            let (session, mut peer) = start(Builder::UpgradedClient, version, config()).await;
+            // Drain our parameters so the writer is idle when the deadline fires.
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                tungstenite::Message::Binary(_)
+            ));
+            let error = timeout(DEADLINE * 2, session.closed()).await.unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout));
+            let message = timeout(DEADLINE, peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let tungstenite::Message::Binary(data) = message else {
+                panic!("expected a QMux CONNECTION_CLOSE, got {message:?}");
+            };
+            let Some(crate::Frame::ConnectionClose(close)) =
+                crate::Frame::decode(data, version).unwrap()
+            else {
+                panic!("expected a QMux CONNECTION_CLOSE");
+            };
+            assert_eq!(close.code.into_inner(), 0);
+            assert_eq!(close.reason, Error::HandshakeTimeout.to_string());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiving_parameters_cancels_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, mut peer) = start(builder, version, config()).await;
+                advance(DEADLINE / 2).await;
+                let mut peer_config = config();
+                peer_config.version = version;
+                let params = crate::Frame::TransportParameters(peer_config.to_transport_params())
+                    .encode(version)
+                    .unwrap();
+                let _stream = network_io(builder, async {
+                    peer.send(tungstenite::Message::Binary(params))
+                        .await
+                        .unwrap();
+                    // Opening acknowledges that the parameters were applied.
+                    session.open_uni().await.unwrap()
+                })
+                .await;
+                advance(DEADLINE * 2).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_before_parameters_preserves_error() {
+        for &builder in BUILDERS {
+            let (session, peer) = start(builder, Version::QMux02, config()).await;
+            let error = network_io(builder, async {
+                drop(peer);
+                timeout(DEADLINE / 2, session.closed()).await.unwrap()
+            })
+            .await;
+            assert!(!matches!(error, Error::HandshakeTimeout), "{error:?}");
+        }
     }
 }
