@@ -26,5 +26,5 @@ web-transport-wasm = { version = "0.8.8", path = "../web-transport-wasm" }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 anyhow = "1"
 rcgen = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }

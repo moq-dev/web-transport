@@ -82,7 +82,7 @@ export declare class NapiServer {
 	close(): void;
 }
 
-/** An established WebTransport session. */
+/** An established WebTransport session; call close explicitly because pending async methods own handles. */
 export declare class NapiSession {
 	/** The subprotocol selected by the server during WT-Available-Protocols negotiation. */
 	get protocol(): string | null;

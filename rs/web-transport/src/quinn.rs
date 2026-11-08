@@ -7,7 +7,8 @@ pub use web_transport_quinn as quinn;
 pub use web_transport_quinn::CongestionControl;
 
 /// Create a [Client] that can be used to dial multiple [Session]s.
-#[derive(Default, Clone)]
+/// Build a client before cloning it to share its endpoints and configuration.
+#[derive(Default)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,
     protocols: Vec<String>,
@@ -16,6 +17,17 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// Explicit congestion control overrides only its controller, regardless of
+    /// the order this method and [`Self::with_congestion_control`] are called.
+    pub fn with_transport_config(self, transport: quinn::quinn::TransportConfig) -> Self {
+        Self {
+            inner: self.inner.with_transport_config(transport),
+            ..self
+        }
     }
 
     /// Allow a lower latency congestion controller.
@@ -61,14 +73,14 @@ impl ClientBuilder {
 /// Used to dial multiple [Session]s.
 ///
 /// On native targets, convert a configured [`quinn::Client`] with [`Client::from`]
-/// to preserve its endpoint, TLS and transport configuration.
+/// to preserve its endpoints, TLS and transport configuration.
 #[derive(Clone, Debug)]
 pub struct Client {
     inner: quinn::Client,
     protocols: Vec<String>,
 }
 
-/// Wrap a configured native client without changing its endpoint or configuration.
+/// Wrap a configured native client without changing its endpoints or configuration.
 impl From<quinn::Client> for Client {
     fn from(inner: quinn::Client) -> Self {
         Self {
@@ -133,8 +145,9 @@ impl Server {
 
 /// A WebTransport Session, able to accept/create streams and send/recv datagrams.
 ///
-/// The session can be cloned to create multiple handles, which is which no method is &mut.
-/// The session will be closed with on drop.
+/// Clones share the connection. Dropping the final Session handle closes it immediately,
+/// even if streams remain. An explicit [`Self::close`] already in progress retains its
+/// bounded graceful close.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     inner: quinn::Session,
@@ -193,7 +206,7 @@ impl Session {
         Ok(self.inner.read_datagram().await?)
     }
 
-    /// Close the connection immediately with a code and reason.
+    /// Close with a code and reason, attempting graceful capsule delivery within a bounded timeout.
     pub fn close(&self, code: u32, reason: &str) {
         self.inner.close(code, reason.as_bytes())
     }

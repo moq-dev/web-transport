@@ -72,6 +72,9 @@ const key = fs.readFileSync("key.pem");
 
 const server = Server.bind("[::]:4443", cert, key);
 
+// Stop accepting new connections when shutting down.
+process.once("SIGINT", () => server.close());
+
 while (true) {
 	const request = await server.accept();
 	if (!request) break;
@@ -84,10 +87,11 @@ while (true) {
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
 }
-
-// Stop accepting new connections
-server.close();
 ```
+
+`server.close()` is synchronous and safe to call repeatedly. Pending and future
+`accept()` calls resolve to `null`; sessions already accepted remain open until
+they are closed separately.
 
 ## W3C WebTransport API
 
@@ -147,6 +151,8 @@ await writer.abort(new WebTransportError("cancelled", { streamErrorCode: 7 }));
 
 ### Closing
 
+Always call `session.close()` when finished and await `session.closed`. The Node wrapper retains native Session handles while its close promise and incoming stream operations are pending. Garbage collecting the JavaScript Session does not close those handles, so it does not provide the Rust Session's final-handle cleanup contract.
+
 ```ts
 // Close gracefully
 session.close({ closeCode: 0, reason: "done" });
@@ -156,6 +162,43 @@ const info = await session.closed;
 console.log(info.closeCode, info.reason);
 ```
 
+## Runtime tests
+
+From the repository root, install the Bun tooling and run:
+
+```bash
+nix develop --command bun install --frozen-lockfile
+nix develop --command bun run --cwd js/web-transport test:runtime
+```
+
+This builds the native release artifact, runs the package prepack build to emit
+JavaScript and declarations, packs the package, and extracts it into
+a temporary `node_modules` directory. The tests import the packaged entry point
+under the Nix shell's Node runtime and exercise a local client/server connection,
+uni/bi streams, datagrams, close information, and blocked readers waking on close.
+One process must exit naturally after cleanup; another exits with native operations
+still pending to exercise runtime teardown. A 30-second process deadline catches
+leaked handles and reports the last completed phase. Temporary files and timed-out
+process groups are removed; no registry publishing is needed. OpenSSL generates a
+short-lived test certificate.
+
+The independent Node runtime PR workflow runs this command on Linux for all pull
+requests, including changes to shared Rust code and build/workflow files.
+
+`bun run --cwd js/web-transport build` builds the native module and its JavaScript
+wrapper. Packing or publishing runs `build:js` through `prepack`, so the package
+exports JavaScript and declarations from `dist/` without requiring a TypeScript
+loader in Node. Platform-specific native packages and their release layout are
+unchanged.
+
 ## License
 
 MIT OR Apache-2.0
+
+## Native crypto
+
+The native Quinn backend uses rind through rind-rustls, with an installed process-wide
+rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
+Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
+returns an error if the CPU lacks a required feature. This also applies with another
+TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.

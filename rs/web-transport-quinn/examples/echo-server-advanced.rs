@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Standard Quinn setup
     let mut config = rustls::ServerConfig::builder_with_provider(
-        web_transport_quinn::crypto::default_provider(),
+        web_transport_quinn::crypto::default_provider()?,
     )
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
@@ -72,12 +72,17 @@ async fn main() -> anyhow::Result<()> {
     config.max_early_data_size = u32::MAX;
     config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()]; // this one is important
 
-    let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+    let config: web_transport_quinn::crypto::QuicServerConfig = config.try_into()?;
+    let config = web_transport_quinn::crypto::server_config(Arc::new(config))?;
 
     tracing::info!(addr = %args.addr, "listening");
 
-    let server = quinn::Endpoint::server(config, args.addr)?;
+    let server = quinn::Endpoint::new(
+        web_transport_quinn::crypto::endpoint_config()?,
+        Some(config),
+        std::net::UdpSocket::bind(args.addr)?,
+        quinn::default_runtime().context("no async runtime")?,
+    )?;
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {

@@ -18,7 +18,7 @@ WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 ## Configured native clients
 
 On native targets, `Client::from(web_transport::quinn::Client)` wraps a configured
-client, preserving its endpoint, TLS settings and transport configuration. This
+client, preserving its endpoints, TLS settings and transport configuration. This
 matches the existing native `Server` and `Session` conversions. The converted
 client initially offers no application subprotocols; use its native-only
 `with_protocols` method to replace the offers. An empty iterator clears them.
@@ -49,9 +49,11 @@ async fn connect(url: url::Url) -> Result<web_transport::Session, web_transport:
 }
 ```
 
-Configure a native `quinn::Client` with its builder, or use `quinn::Client::new`
-with your own Quinn endpoint and configuration. Custom TLS configurations must
-offer `web_transport::quinn::ALPN` (`h3`). Offered application subprotocols are
+Configure a native `quinn::Client` with its builder, use `quinn::Client::from` with
+a `quinn::ClientConfig` to bind default per-family endpoints on first use, or use
+`quinn::Client::new` with your own Quinn endpoint. Build custom TLS with the
+`web_transport::quinn::crypto` adapters; it must offer `web_transport::quinn::ALPN`
+(`h3`). Offered application subprotocols are
 separate from ALPN; read the negotiated selection with `Session::protocol`.
 
 Browsers always authenticate the server. `ClientBuilder::with_system_roots`
@@ -61,6 +63,15 @@ lifetime and key type; see
 [serverCertificateHashes](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/WebTransport#servercertificatehashes).
 Browsers provide no certificate-verification bypass.
 
+## Native transport configuration
+
+The native `ClientBuilder::with_transport_config` accepts Quinn's owned `TransportConfig`, available through `web_transport::quinn::quinn::TransportConfig`. Explicit congestion control overrides only its controller, regardless of setter order; see the [Quinn configuration documentation](../web-transport-quinn/README.md#transport-configuration) for defaults and examples.
+
+The native `ClientBuilder` does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` when sharing its endpoint and settings.
+
+## Native session lifetime
+
+Dropping the final `Session` clone closes the Quinn connection, even if streams or native handles remain. Keep a Session clone while using its streams. An explicit `Session::close` already in progress finishes its bounded graceful close after the final handle drops. Keep the runtime alive and await `Session::closed` to allow capsule delivery; a timeout or cancellation can prevent delivery.
 
 ## Why no trait?
 
@@ -73,3 +84,14 @@ WASM is `!Send` and as far as I can tell, it's not possible to implement a trait
 This crate skirts the issue by switching the underlying implementation based on the platform.
 The compiler can then automatically apply `Send` bounds instead of explicitly requiring them.
 Unfortunate, I know.
+
+## Native crypto
+
+The native Quinn backend uses rind through rind-rustls, with an installed process-wide
+rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
+Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
+returns an error if the CPU lacks a required feature. This also applies with another
+TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+
+WASM uses the browser's TLS and does not depend on rind. Advanced native callers use
+[`web_transport_quinn::crypto`](../web-transport-quinn/README.md#crypto-and-migration).
