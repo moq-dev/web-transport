@@ -1,4 +1,4 @@
-# Runtime coverage for language bindings
+# [S] Runtime coverage for language bindings
 
 ## Goal
 
@@ -7,7 +7,3 @@ Python, Node, Kotlin/JVM and Swift packages have independently maintained PR run
 ## Plan
 
 The children own their language jobs. This epic owns the final coverage map and shared-source trigger audit, checking that Rust/FFI changes trigger every affected job and local testing instructions point to real commands. Do not expand to mobile emulators or a cross-product platform matrix.
-
-## Required
-
-- [Swift runtime CI](/quest/a1/bindings/swift.md) - exercise the built package on macOS
