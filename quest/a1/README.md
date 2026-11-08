@@ -11,7 +11,6 @@ The Required list is ordered by priority. Independent children may proceed concu
 ## Required
 
 - [Dual-stack bind](/quest/a1/dual-stack-bind.md) - native clients bind by the server's address family
-- [Router crypto features](/quest/a1/router-crypto-features.md) - interim aws-lc-rs/ring features on `web-transport`
 - [Rust crates on rind](/quest/a1/rind/README.md) - no C crypto outside Quiche
 - [Binding runtime coverage](/quest/a1/bindings/README.md) - independent language jobs
 - [Node idle configuration](/quest/a1/node-idle/README.md) - typed native input and Node options
