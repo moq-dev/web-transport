@@ -4,10 +4,6 @@
 //! There is no HTTP/3 exchange on this path, so there is neither a request URL nor
 //! a response. The session reports the negotiated ALPN as its protocol instead.
 
-// A crypto provider is needed to establish the connection, matching the gate on
-// the crate's own builders.
-#![cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -35,24 +31,10 @@ fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     Ok((cert_der, key_der))
 }
 
-/// The provider is passed explicitly rather than relying on the process-level
-/// default, which rustls cannot determine when both backend features are enabled
-/// (as `--all-features` does).
-fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    #[cfg(feature = "aws-lc-rs")]
-    {
-        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-    }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    {
-        Arc::new(rustls::crypto::ring::default_provider())
-    }
-}
-
 /// Bind a server endpoint and a client endpoint, both offering only `RAW_ALPN`.
 fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
     let (cert, key) = self_signed()?;
-    let provider = crypto_provider();
+    let provider = web_transport_quinn::crypto::default_provider()?;
 
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -61,12 +43,17 @@ fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
     server_crypto.alpn_protocols = vec![RAW_ALPN.as_bytes().to_vec()];
     server_crypto.max_early_data_size = u32::MAX;
 
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
-    ));
+    let server_config = web_transport_quinn::crypto::server_config(Arc::new(
+        web_transport_quinn::crypto::QuicServerConfig::try_from(server_crypto)?,
+    ))?;
 
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = quinn::Endpoint::server(server_config, bind)?;
+    let server = quinn::Endpoint::new(
+        web_transport_quinn::crypto::endpoint_config()?,
+        Some(server_config),
+        std::net::UdpSocket::bind(bind)?,
+        quinn::default_runtime().context("no async runtime")?,
+    )?;
     let server_addr = server.local_addr()?;
 
     let mut roots = rustls::RootCertStore::empty();
@@ -82,10 +69,15 @@ fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
     client_crypto.enable_early_data = true;
 
     let client_config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
+        web_transport_quinn::crypto::QuicClientConfig::try_from(client_crypto)?,
     ));
 
-    let mut client = quinn::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into())?;
+    let mut client = quinn::Endpoint::new(
+        web_transport_quinn::crypto::endpoint_config()?,
+        None,
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?,
+        quinn::default_runtime().context("no async runtime")?,
+    )?;
     client.set_default_client_config(client_config);
 
     Ok((server, client, server_addr))
@@ -111,7 +103,7 @@ fn negotiated_alpn(conn: &quinn::Connection) -> Result<String> {
     let data = conn
         .handshake_data()
         .context("no handshake data")?
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .downcast::<web_transport_quinn::crypto::HandshakeData>()
         .ok()
         .context("unexpected handshake data")?;
 

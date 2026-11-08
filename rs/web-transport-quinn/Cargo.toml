@@ -15,9 +15,6 @@ categories = ["network-programming", "web-programming"]
 all-features = true
 
 [features]
-default = ["aws-lc-rs"]
-aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
-ring = ["quinn/rustls-ring", "rustls/ring"]
 # Unlocks `quinn::TransportConfig::qlog_stream` and `quinn::QlogConfig`, which this
 # crate re-exports but cannot enable on a caller's behalf.
 qlog = ["quinn/qlog"]
@@ -34,11 +31,16 @@ quinn = { version = "0.11", default-features = false, features = [
     "bloom",
 ] }
 
+quinn-proto = { version = "0.11.19", default-features = false }
+rind = "0.2.1"
+rind-rustls = "0.23"
+
 rustls = { version = "0.23", default-features = false, features = [
     "logging",
     "std",
 ] }
 rustls-native-certs = "0.8"
+socket2 = "0.6"
 thiserror = "2"
 
 tokio = { version = "1", default-features = false, features = [
@@ -53,8 +55,9 @@ web-transport-trait = { workspace = true }
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs"] }
 rcgen = "0.14"
 rustls-pemfile = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

@@ -60,6 +60,15 @@ async fn spawn_server(bind: SocketAddr) -> Result<(SocketAddr, tokio::task::Join
     Ok((addr, handle))
 }
 
+async fn stop_server(server: tokio::task::JoinHandle<()>) -> Result<()> {
+    server.abort();
+    match server.await {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_cancelled() => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn client() -> ClientBuilder {
     // The certificate is self-signed and the subject here is address handling,
     // which verify.rs already covers from the other side.
@@ -79,7 +88,6 @@ async fn connect_ipv6_literal_url() -> Result<()> {
     let url = Url::parse(&format!("https://[::1]:{}/", addr.port()))?;
 
     let session = client()
-        .with_bind((Ipv6Addr::LOCALHOST, 0))?
         .connect(url)
         .await
         .context("an IPv6 literal URL should resolve to the address it names")?
@@ -88,7 +96,7 @@ async fn connect_ipv6_literal_url() -> Result<()> {
 
     session.close(0, "bye");
     session.closed().await;
-    server.abort();
+    stop_server(server).await?;
     Ok(())
 }
 
@@ -101,16 +109,38 @@ async fn connect_ipv4_literal_url() -> Result<()> {
     let (addr, server) = spawn_server((Ipv4Addr::LOCALHOST, 0).into()).await?;
     let url = Url::parse(&format!("https://127.0.0.1:{}/", addr.port()))?;
 
-    let session = client()
-        .with_bind((Ipv4Addr::LOCALHOST, 0))?
-        .connect(url)
-        .await?
-        .established()
-        .await?;
+    let session = client().connect(url).await?.established().await?;
 
     session.close(0, "bye");
     session.closed().await;
-    server.abort();
+    stop_server(server).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_ipv4_mapped_literal_url() -> Result<()> {
+    let (addr, server) = spawn_server((Ipv4Addr::LOCALHOST, 0).into()).await?;
+    let url = Url::parse(&format!("https://[::ffff:127.0.0.1]:{}/", addr.port()))?;
+    let session = client().connect(url).await?.established().await?;
+    session.close(0, "bye");
+    session.closed().await;
+    stop_server(server).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_hostname_uses_resolved_family() -> Result<()> {
+    use std::net::ToSocketAddrs;
+    let bind = ("localhost", 0)
+        .to_socket_addrs()?
+        .next()
+        .context("localhost did not resolve")?;
+    let (addr, server) = spawn_server(bind).await?;
+    let url = Url::parse(&format!("https://localhost:{}/", addr.port()))?;
+    let session = client().connect(url).await?.established().await?;
+    session.close(0, "bye");
+    session.closed().await;
+    stop_server(server).await?;
     Ok(())
 }
 

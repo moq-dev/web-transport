@@ -264,7 +264,11 @@ class RecvStream:
 
 
 class Session:
-    """An established WebTransport session."""
+    """An established WebTransport session.
+
+    Keep the Session alive while using its streams: stream objects do not retain
+    it, and releasing the final Session reference closes the connection.
+    """
 
     def __init__(self, inner: _uniffi.Session) -> None:
         self._inner = inner

@@ -83,14 +83,24 @@ impl Server {
         }
         let transport_config = Arc::new(transport);
 
-        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        let quic = web_transport_quinn::crypto::QuicServerConfig::try_from(tls)
             .map_err(|e| WebTransportError::invalid(format!("QUIC config: {e}")))?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+        let mut server_config = web_transport_quinn::crypto::server_config(Arc::new(quic))
+            .map_err(|e| WebTransportError::invalid(e.to_string()))?;
         server_config.transport_config(transport_config.clone());
 
         let _guard = RUNTIME.enter();
-        let endpoint = quinn::Endpoint::server(server_config, addr)
+        let endpoint_config = web_transport_quinn::crypto::endpoint_config()
+            .map_err(|e| WebTransportError::invalid(e.to_string()))?;
+        let socket = std::net::UdpSocket::bind(addr)
             .map_err(|e| WebTransportError::Io(format!("failed to bind: {e}")))?;
+        let endpoint = quinn::Endpoint::new(
+            endpoint_config,
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| WebTransportError::Io(format!("failed to bind: {e}")))?;
 
         let local_addr = endpoint
             .local_addr()
@@ -153,9 +163,10 @@ impl Server {
         private_key: Vec<u8>,
     ) -> Result<(), WebTransportError> {
         let tls = build_server_tls(certificate_chain, private_key)?;
-        let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        let quic = web_transport_quinn::crypto::QuicServerConfig::try_from(tls)
             .map_err(|e| WebTransportError::invalid(format!("QUIC config: {e}")))?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+        let mut server_config = web_transport_quinn::crypto::server_config(Arc::new(quic))
+            .map_err(|e| WebTransportError::invalid(e.to_string()))?;
         server_config.transport_config(self.transport_config.clone());
         self.endpoint.set_server_config(Some(server_config));
         Ok(())

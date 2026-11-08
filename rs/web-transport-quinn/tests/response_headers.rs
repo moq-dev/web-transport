@@ -1,5 +1,4 @@
 //! CONNECT response metadata survives both session creation and rejection.
-#![cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 
 use std::net::Ipv4Addr;
 
@@ -43,10 +42,6 @@ fn assert_headers(response: &ConnectResponse) {
 
 #[tokio::test]
 async fn response_and_rejection_preserve_headers() -> Result<()> {
-    #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
-    let _ =
-        web_transport_quinn::quinn::rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     for status in [
         StatusCode::OK,
         StatusCode::FORBIDDEN,

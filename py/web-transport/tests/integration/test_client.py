@@ -447,10 +447,13 @@ async def test_client_close_code_propagates_to_server(self_signed_cert, cert_has
     ) as server:
         _, port = server.local_addr
 
+        accepted = asyncio.Event()
+
         async def server_task():
             request = await server.accept()
             assert request is not None
             session = await request.accept()
+            accepted.set()
             # Endpoint-level close (QUIC CONNECTION_CLOSE) is inherently
             # racy — the CLOSE frame may not arrive before the connection
             # drops, so the server may see SessionClosedLocally.
@@ -459,6 +462,7 @@ async def test_client_close_code_propagates_to_server(self_signed_cert, cert_has
                 pytest.fail("Expected an exception from accept_bi()")
             except web_transport.SessionClosedByPeer as e:
                 assert e.source == "application"
+                assert e.reason == "client shutdown"
             except web_transport.SessionClosedLocally:
                 pass
 
@@ -467,11 +471,13 @@ async def test_client_close_code_propagates_to_server(self_signed_cert, cert_has
                 server_certificate_hashes=[cert_hash],
             )
             await client.__aenter__()
-            await client.connect(f"https://[::1]:{port}")
-            await asyncio.sleep(0.1)
+            session = await client.connect(f"https://[::1]:{port}")
+            await accepted.wait()
+            assert session.close_reason is None
             # Close the client endpoint (not the session)
             client.close(42, "client shutdown")
             await client.wait_closed()
+            await session.wait_closed()
 
         await asyncio.gather(
             asyncio.create_task(server_task()),

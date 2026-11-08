@@ -1,17 +1,15 @@
 #!/usr/bin/env just --justfile
 #
-# Language-specific recipes for the Swift package under swift/. Invoked
-# from the repo root as `just swift <recipe>` via the `mod swift` import.
+# Swift recipes, invoked as `just --justfile swift/justfile <recipe>` from the root.
 
 set working-directory := '.'
 
 default:
 	just check
 
-# Build web-transport-ffi for the host, regenerate uniffi bindings, run swift test.
-# Skips cleanly on non-macOS hosts.
+# Exercise generated bindings in an isolated macOS host package; missing tools fail.
 check:
-	bash scripts/check.sh
+	just --justfile ../justfile test-swift
 
 # Assemble the XCFramework + Package.swift from per-target web-transport-ffi
 # binaries + bindings. Used by .github/workflows/release-swift.yml; see

@@ -1,9 +1,16 @@
+import WebTransport
 import XCTest
-@testable import WebTransport
 
 final class WebTransportTests: XCTestCase {
-    func testPlaceholder() throws {
-        // Real tests run against the XCFramework; this just ensures
-        // the test target compiles.
+    func testInvalidClientConfig() throws {
+        XCTAssertThrowsError(try Client(config: ClientConfig(
+            serverCertificateHashes: [],
+            noCertVerification: true,
+            congestionControl: .default
+        ))) { error in
+            guard let bindingError = error as? WebTransportError, case .InvalidArgument = bindingError else {
+                return XCTFail("Expected InvalidArgument, got \(error)")
+            }
+        }
     }
 }

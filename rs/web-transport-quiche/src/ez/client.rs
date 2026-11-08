@@ -160,12 +160,6 @@ impl ClientBuilder {
     ///
     /// This takes ownership because the underlying quiche implementation doesn't support reusing the same socket.
     pub async fn connect(mut self, host: &str, port: u16) -> io::Result<Connecting> {
-        if self.socket.is_none() {
-            self = self.with_bind("[::]:0")?;
-        }
-
-        let socket = self.socket.take().unwrap();
-
         let mut remotes = match tokio::net::lookup_host((host, port)).await {
             Ok(remotes) => remotes,
             Err(err) => {
@@ -187,6 +181,7 @@ impl ClientBuilder {
             }
         };
 
+        let (socket, remote) = self.socket(remote)?;
         socket.connect(remote).await?;
 
         // Enable the offloads the kernel supports before the socket is wrapped;
@@ -255,6 +250,40 @@ impl ClientBuilder {
             driver,
         })
     }
+
+    fn socket(
+        &mut self,
+        remote: std::net::SocketAddr,
+    ) -> io::Result<(tokio::net::UdpSocket, std::net::SocketAddr)> {
+        if let Some(socket) = self.socket.take() {
+            return Ok((socket, remote));
+        }
+
+        let remote = match remote {
+            std::net::SocketAddr::V6(addr) => addr
+                .ip()
+                .to_ipv4_mapped()
+                .map(|ip| std::net::SocketAddr::from((ip, addr.port())))
+                .unwrap_or(remote),
+            _ => remote,
+        };
+        let bind: std::net::SocketAddr = if remote.is_ipv4() {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(bind),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        if bind.is_ipv6() {
+            socket.set_only_v6(true)?;
+        }
+        socket.set_nonblocking(true)?;
+        socket.bind(&bind.into())?;
+        Ok((tokio::net::UdpSocket::from_std(socket.into())?, remote))
+    }
 }
 
 /// A QUIC connection that is still completing the TLS handshake.
@@ -275,5 +304,48 @@ impl Connecting {
         kio::wait(|waiter| self.driver.lock().poll_handshake(waiter)).await?;
 
         Ok(self.connection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn default_socket_matches_each_remote_family() {
+        for remote in ["127.0.0.1:443", "[::1]:443", "[::ffff:127.0.0.1]:443"] {
+            let remote: SocketAddr = remote.parse().unwrap();
+            let (socket, target) = ClientBuilder::new().socket(remote).unwrap();
+            let local = socket.local_addr().unwrap();
+            assert_eq!(local.is_ipv4(), target.is_ipv4());
+            assert!(local.ip().is_unspecified());
+            assert_ne!(local.port(), 0);
+            if target.is_ipv6() {
+                assert!(socket2::SockRef::from(&socket).only_v6().unwrap());
+            } else {
+                assert_eq!(target, "127.0.0.1:443".parse().unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_and_bind_are_preserved() {
+        let remote = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (socket, target) = ClientBuilder::new()
+            .with_socket(socket)
+            .unwrap()
+            .socket(remote)
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap(), addr);
+        assert_eq!(target, remote);
+
+        let mut builder = ClientBuilder::new().with_bind("[::1]:0").unwrap();
+        let addr = builder.socket.as_ref().unwrap().local_addr().unwrap();
+        let (socket, target) = builder.socket(remote).unwrap();
+        assert_eq!(socket.local_addr().unwrap(), addr);
+        assert_eq!(target, remote);
     }
 }

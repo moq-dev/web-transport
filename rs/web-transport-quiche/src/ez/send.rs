@@ -313,9 +313,8 @@ impl SendStream {
 
     /// Tell the driver this stream has work to flush.
     ///
-    /// Skipped once the state is closed: the driver retires a stream as soon as it
-    /// observes that, so a notification afterwards names a stream it no longer
-    /// tracks and is reported as a spurious wakeup.
+    /// Skipped once the state is closed to avoid unnecessary driver wakeups.
+    /// Retirement can race with the enqueue below; the driver ignores stale IDs.
     fn notify(&self) {
         // Take the two locks in sequence, never both at once.
         let closed = self.state.lock().is_closed();
