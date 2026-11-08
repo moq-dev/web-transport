@@ -36,7 +36,3 @@ Decision prompts (✅ chosen):
 - [Quinn on rind](/quest/a1/rind/quinn.md) - provider-neutral QUIC crypto adapter; Quinn, FFI, Node and router on rind
 - [Noq on rind](/quest/a1/rind/noq.md) - Noq's rustls without ring, with rind keys
 - [iroh on rind](/quest/a1/rind/iroh.md) - iroh endpoint built with rind's provider
-
-## Related
-
-- [Router crypto features](/quest/a1/router-crypto-features.md) - interim features that the Quinn child removes
