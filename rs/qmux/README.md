@@ -88,6 +88,15 @@ grow a response queue by sending more pings; inbound stream processing continues
 while the writer is blocked. Pending responses are discarded during teardown,
 and a close frame ends the writer's output.
 
+## Socket statistics
+
+Sessions release their socket statistics handle during teardown, even if the
+application retains a `Session` clone. Once closure is signalled, `stats()` calls
+omit socket-derived metrics; QMux's own RTT estimate and stream counters remain
+available. `closed()` reports the terminal reason without waiting for asynchronous
+transport cleanup and descriptor release to finish. A caller
+that retains its own `SharedSocketStats` copy keeps that handle alive.
+
 ## Stream control validation
 
 MAX_STREAM_DATA and STOP_SENDING close the session when they name a receive-only
