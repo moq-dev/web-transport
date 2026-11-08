@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Standard Noq setup
     let mut config =
-        rustls::ServerConfig::builder_with_provider(web_transport_noq::crypto::default_provider())
+        rustls::ServerConfig::builder_with_provider(web_transport_noq::crypto::default_provider()?)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
@@ -71,12 +71,20 @@ async fn main() -> anyhow::Result<()> {
     config.max_early_data_size = u32::MAX;
     config.alpn_protocols = vec![web_transport_noq::ALPN.as_bytes().to_vec()]; // this one is important
 
-    let config: noq::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let config = noq::ServerConfig::with_crypto(Arc::new(config));
+    let config = noq::crypto::rustls::QuicServerConfig::with_initial(
+        Arc::new(config),
+        web_transport_noq::crypto::initial_suite()?,
+    )?;
+    let config = web_transport_noq::crypto::server_config(Arc::new(config))?;
 
     tracing::info!(addr = %args.addr, "listening");
 
-    let server = noq::Endpoint::server(config, args.addr)?;
+    let server = noq::Endpoint::new(
+        web_transport_noq::crypto::endpoint_config()?,
+        Some(config),
+        std::net::UdpSocket::bind(args.addr)?,
+        Arc::new(noq::TokioRuntime),
+    )?;
 
     // Accept new connections.
     while let Some(conn) = server.accept().await {

@@ -2,14 +2,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::proto::ConnectRequest;
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use noq::crypto::rustls::QuicClientConfig;
 use rustls::{client::danger::ServerCertVerifier, pki_types::CertificateDer};
 use tokio::net::lookup_host;
 use url::Host;
 
 use crate::crypto;
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::ALPN;
 use crate::{ClientError, Session};
 
@@ -25,18 +23,16 @@ pub enum CongestionControl {
     LowLatency,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
 #[derive(Clone)]
 pub struct ClientBuilder {
-    provider: crypto::Provider,
+    provider: Result<crypto::Provider, crypto::UnsupportedCpu>,
     congestion_controller:
         Option<Arc<dyn noq::congestion::ControllerFactory + Send + Sync + 'static>>,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ClientBuilder {
     /// Create a Client builder, which can be used to establish multiple [Session]s.
     pub fn new() -> Self {
@@ -79,7 +75,7 @@ impl ClientBuilder {
         }
 
         let crypto = self
-            .builder()
+            .builder()?
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -91,12 +87,12 @@ impl ClientBuilder {
         self,
         certs: Vec<CertificateDer>,
     ) -> Result<Client, ClientError> {
-        let hashes = certs.iter().map({
-            let provider = self.provider.clone();
-            move |cert| crypto::sha256(&provider, cert).as_ref().to_vec()
-        });
+        let provider = self.provider.clone()?;
+        let hashes = certs
+            .iter()
+            .map(|cert| crypto::sha256(&provider, cert).map(|hash| hash.as_ref().to_vec()));
 
-        self.with_server_certificate_hashes(hashes.collect())
+        self.with_server_certificate_hashes(hashes.collect::<Result<_, _>>()?)
     }
 
     /// Supply sha256 hashes for accepted certificates instead of using root CAs.
@@ -106,13 +102,13 @@ impl ClientBuilder {
     ) -> Result<Client, ClientError> {
         // Use a custom fingerprint verifier.
         let fingerprints = Arc::new(ServerFingerprints {
-            provider: self.provider.clone(),
+            provider: self.provider.clone()?,
             fingerprints: hashes,
         });
 
         // Configure the crypto client.
         let crypto = self
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(fingerprints.clone())
             .with_no_client_auth();
@@ -129,16 +125,22 @@ impl ClientBuilder {
         DangerousClientBuilder { inner: self }
     }
 
-    fn builder(&self) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
-        rustls::ClientConfig::builder_with_provider(self.provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+    fn builder(
+        &self,
+    ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ClientError>
+    {
+        Ok(
+            rustls::ClientConfig::builder_with_provider(self.provider.clone()?)
+                .with_protocol_versions(&[&rustls::version::TLS13])?,
+        )
     }
 
     fn build(self, mut crypto: rustls::ClientConfig) -> Result<Client, ClientError> {
         crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-        let client_config = QuicClientConfig::try_from(crypto).unwrap();
+        let client_config =
+            QuicClientConfig::with_initial(Arc::new(crypto), crypto::initial_suite()?)
+                .expect("rind initial suite is AES-128-GCM-SHA256");
         let mut client_config = noq::ClientConfig::new(Arc::new(client_config));
 
         let mut transport = noq::TransportConfig::default();
@@ -148,7 +150,8 @@ impl ClientBuilder {
 
         client_config.transport_config(transport.into());
 
-        let client = noq::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+        let client = crate::endpoint(crypto::endpoint_config()?, None, "[::]:0".parse().unwrap())
+            .map_err(|e| ClientError::IoError(Arc::new(e)))?;
         Ok(Client {
             endpoint: client,
             config: client_config,
@@ -156,14 +159,12 @@ impl ClientBuilder {
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Builder for dangerous TLS configuration options.
 ///
 /// This builder provides access to potentially insecure TLS configurations.
@@ -173,7 +174,6 @@ pub struct DangerousClientBuilder {
     inner: ClientBuilder,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl DangerousClientBuilder {
     /// Disable certificate verification entirely.
     ///
@@ -183,11 +183,11 @@ impl DangerousClientBuilder {
     /// This method is safe in the Rust sense (no memory unsafety), but dangerous in the
     /// security sense, hence the explicit `dangerous()` builder requirement.
     pub fn with_no_certificate_verification(self) -> Result<Client, ClientError> {
-        let noop = NoCertificateVerification(self.inner.provider.clone());
+        let noop = NoCertificateVerification(self.inner.provider.clone()?);
 
         let crypto = self
             .inner
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(noop))
             .with_no_client_auth();
@@ -257,14 +257,13 @@ impl Client {
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+/// Panics if endpoint setup fails, including on a CPU rind does not support.
 impl Default for Client {
     fn default() -> Self {
         ClientBuilder::new().with_system_roots().unwrap()
     }
 }
 
-#[cfg_attr(not(any(feature = "aws-lc-rs", feature = "ring")), allow(dead_code))]
 #[derive(Debug)]
 struct ServerFingerprints {
     provider: crypto::Provider,
@@ -280,7 +279,7 @@ impl ServerCertVerifier for ServerFingerprints {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let cert_hash = crypto::sha256(&self.provider, end_entity);
+        let cert_hash = crypto::sha256(&self.provider, end_entity)?;
         if self
             .fingerprints
             .iter()
