@@ -507,6 +507,7 @@ impl web_transport_trait::Stats for ez::ConnectionStats {
         self.rtt
     }
 
+    /// Returns [`ez::ConnectionStats::send_rate`], with its controller-specific limits.
     fn estimated_send_rate(&self) -> Option<u64> {
         self.send_rate
     }

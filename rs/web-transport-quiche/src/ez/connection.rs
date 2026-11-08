@@ -38,8 +38,18 @@ pub struct ConnectionStats {
     pub packets_lost: u64,
     /// Smoothed round-trip time for the active path, if one is established.
     pub rtt: Option<Duration>,
-    /// Estimated send rate in bits per second (from the congestion controller),
-    /// if a path is established.
+    /// Estimated available send bandwidth in bits per second, if a path exists.
+    ///
+    /// Uses Quiche 0.30's [`PathStats::delivery_rate`](quiche::PathStats::delivery_rate).
+    /// BBR2 reports its filtered bandwidth estimate, capped by its congestion
+    /// bound. CUBIC (the default) and Reno report the most recent accepted rate
+    /// sample: a lower app-limited sample cannot replace the previous rate,
+    /// but there is no windowed maximum or expiry for stale estimates.
+    ///
+    /// This is not a guarantee of link capacity or application throughput.
+    /// Estimates can remain stale while the sender is app-limited. `Some(0)`
+    /// is possible before a usable sample; `None` means no path statistics have
+    /// been sampled yet.
     pub send_rate: Option<u64>,
 }
 
@@ -57,7 +67,7 @@ impl ConnectionStats {
             packets_received: stats.recv as u64,
             packets_lost: stats.lost as u64,
             rtt: path.as_ref().map(|p| p.rtt),
-            // quiche reports the delivery rate in bytes/sec; the trait wants bits/sec.
+            // Quiche reports bytes/sec; the trait wants bits/sec.
             send_rate: path.as_ref().map(|p| p.delivery_rate.saturating_mul(8)),
         }
     }
