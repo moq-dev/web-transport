@@ -10,7 +10,6 @@ The Required list is ordered by priority. Independent children may proceed concu
 
 ## Required
 
-- [Native metric availability](/quest/a2/native-stats-upstream.md) - advance external accessor prerequisites
 - [QMux draft readiness](/quest/a2/qmux-draft-readiness.md) - establish strict-validation compatibility boundary
 - [Quiche send-rate audit](/quest/a2/quiche-delivery-rate.md) - app-limited samples under legacy controllers
 - [Quinn provider-neutral rustls release](/quest/a2/quinn-provider-release.md) - waiting on quinn-rs/quinn#2341
