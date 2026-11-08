@@ -221,6 +221,11 @@ impl ConnectRequest {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
+        self.frame()?.encode(buf);
+        Ok(())
+    }
+
+    fn frame(&self) -> Result<HeadersFrame, ConnectError> {
         let mut headers = qpack::Headers::default();
         for (item_header_name, item_header_value) in self.headers.iter() {
             // Skip protocol negotiation headers; they are derived from `self.protocols`.
@@ -249,14 +254,11 @@ impl ConnectRequest {
             headers.set(protocol_negotiation::AVAILABLE_NAME, &encoded);
         }
 
-        encode_headers_frame(&headers, buf)
+        HeadersFrame::new(headers)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::new();
-        self.encode(&mut buf)?;
-        stream.write_all_buf(&mut buf).await?;
-        Ok(())
+        self.frame()?.write(stream).await
     }
 }
 
@@ -398,6 +400,11 @@ impl ConnectResponse {
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), ConnectError> {
+        self.frame()?.encode(buf);
+        Ok(())
+    }
+
+    fn frame(&self) -> Result<HeadersFrame, ConnectError> {
         let mut headers = qpack::Headers::default();
         headers.set(":status", self.status.as_str());
         headers.set("sec-webtransport-http3-draft", "draft02");
@@ -407,14 +414,11 @@ impl ConnectResponse {
             headers.set(protocol_negotiation::SELECTED_NAME, &encoded);
         }
 
-        encode_headers_frame(&headers, buf)
+        HeadersFrame::new(headers)
     }
 
     pub async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
-        let mut buf = BytesMut::new();
-        self.encode(&mut buf)?;
-        stream.write_all_buf(&mut buf).await?;
-        Ok(())
+        self.frame()?.write(stream).await
     }
 }
 
@@ -443,20 +447,31 @@ fn check_frame_size(typ: Frame, size: u64) -> Result<(), ConnectError> {
     Ok(())
 }
 
-fn encode_headers_frame<B: BufMut>(
-    headers: &qpack::Headers,
-    buf: &mut B,
-) -> Result<(), ConnectError> {
-    // Use a temporary buffer so we can compute the size and write nothing on error.
-    let mut tmp = Vec::new();
-    headers.encode(&mut tmp)?;
-    let size = VarInt::from_u32(tmp.len() as u32);
+// A validated field section and its wire length, shared by sync and async encoding.
+struct HeadersFrame {
+    headers: qpack::Headers,
+    size: VarInt,
+}
 
-    Frame::HEADERS.encode(buf);
-    size.encode(buf);
-    buf.put_slice(&tmp);
+impl HeadersFrame {
+    fn new(headers: qpack::Headers) -> Result<Self, ConnectError> {
+        let size = VarInt::from_u32(headers.encoded_size()? as u32);
+        Ok(Self { headers, size })
+    }
 
-    Ok(())
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        Frame::HEADERS.encode(buf);
+        self.size.encode(buf);
+        self.headers.encode(buf);
+    }
+
+    async fn write<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<(), ConnectError> {
+        let capacity = Frame::HEADERS.0.size() + self.size.size() + self.size.into_inner() as usize;
+        let mut buf = BytesMut::with_capacity(capacity);
+        self.encode(&mut buf);
+        stream.write_all_buf(&mut buf).await?;
+        Ok(())
+    }
 }
 
 fn decode_headers_frame<B: Buf>(buf: &mut B) -> Result<bytes::buf::Take<&mut B>, ConnectError> {
