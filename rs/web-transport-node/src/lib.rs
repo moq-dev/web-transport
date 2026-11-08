@@ -272,23 +272,13 @@ mod server_tests {
     }
 
     fn bind() -> NapiServer {
-        // Workspace all-features tests enable both TLS backends; choose one for this process.
-        static PROVIDER: std::sync::Once = std::sync::Once::new();
-        PROVIDER.call_once(|| {
-            web_transport_quinn::quinn::rustls::crypto::aws_lc_rs::default_provider()
-                .install_default()
-                .expect("install test TLS provider");
-        });
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls_pemfile::private_key(&mut cert.signing_key.serialize_pem().as_bytes())
+            .unwrap()
+            .unwrap();
         let server = web_transport_quinn::ServerBuilder::new()
             .with_addr("127.0.0.1:0".parse().unwrap())
-            .with_certificate(
-                vec![cert.cert.der().clone()],
-                web_transport_quinn::quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(
-                    cert.signing_key.serialize_der(),
-                )
-                .into(),
-            )
+            .with_certificate(vec![cert.cert.der().clone()], key)
             .unwrap();
         NapiServer {
             inner: Arc::new(ServerState {

@@ -33,8 +33,6 @@ fn client_config_for(cert_hash: Vec<u8>) -> ClientConfig {
 
 #[tokio::test]
 async fn echo_datagram() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let (chain, key) = self_signed_cert();
     let cert_hash = sha256(&chain[0]);
 

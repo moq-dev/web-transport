@@ -4,17 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub(crate) fn builder() -> ClientBuilder {
-    // Avoid a process-wide provider when both features are enabled.
-    #[cfg(feature = "aws-lc-rs")]
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-    ClientBuilder {
-        provider,
-        transport: quinn::TransportConfig::default(),
-        congestion_controller: None,
-    }
+    ClientBuilder::new()
 }
 
 fn client() -> Client {
@@ -236,7 +226,13 @@ fn missing_runtime_is_a_connect_error_and_allows_later_connections() {
 
 #[tokio::test]
 async fn caller_endpoint_keeps_its_address_and_remote_handling() {
-    let endpoint = backend::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let endpoint = backend::Endpoint::new(
+        crypto::endpoint_config().unwrap(),
+        None,
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        backend::default_runtime().unwrap(),
+    )
+    .unwrap();
     let addr = endpoint.local_addr().unwrap();
     let client = Client::new(endpoint, client().config);
     let error = client

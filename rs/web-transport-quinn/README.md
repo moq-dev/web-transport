@@ -39,14 +39,64 @@ runtime present at construction, or at the first connection if constructed
 outside a runtime. Keep that runtime alive while using the client.
 
 For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
-lazy sockets. Set its ALPN to `h3`. `Client::new(endpoint, config)` instead keeps
-the caller's endpoint and address handling.
+lazy sockets. Set its ALPN to `web_transport_quinn::ALPN` (`h3`).
+`Client::new(endpoint, config)` instead keeps the caller's endpoint and address
+handling, and `Server::new(endpoint)` accepts a caller's server endpoint.
 
 `client.close(code, reason)` closes all bound endpoints and prevents new
 connections through any clone. Await `client.wait_idle()` after closing to
 wait for every bound endpoint to drain.
 
-See the [examples](examples) for certificate setup and server construction.
+## Crypto and migration
+
+TLS uses the process-wide rustls provider if one is installed, otherwise
+[rind-rustls](https://github.com/moq-dev/rind/tree/main/rind-rustls). Retry integrity,
+stateless resets and handshake tokens always use rind. The normal and build
+dependency graph contains no ring or aws-lc-rs; aws-lc-rs is a development dependency
+for interop tests. The `ring` and `aws-lc-rs` crate features have been removed.
+
+rind supports x86_64, aarch64 and 32-bit ARM. A CPU missing a required feature is
+rejected by the builders' finishing methods with `ClientError::UnsupportedCpu` or
+`ServerError::UnsupportedCpu`. `new()` stays infallible. This check also applies
+when the process installed another TLS provider, because endpoint keys use rind.
+`Client::default()` unwraps system-root setup and panics on an unsupported CPU;
+use `ClientBuilder::new().with_system_roots()` to handle the error.
+
+For manually configured endpoints, replace `quinn::crypto::rustls::QuicClientConfig`,
+`QuicServerConfig` and `HandshakeData` with the same names under
+`web_transport_quinn::crypto`. `crypto::default_provider()` and `crypto::sha256()` now return a `Result`.
+Import rustls directly instead of through the feature-gated `quinn::rustls` re-export.
+Use `crypto::server_config(Arc::new(crypto))?` instead of
+`quinn::ServerConfig::with_crypto`, and `quinn::Endpoint::new` with
+`crypto::endpoint_config()?` instead of `Endpoint::client` or `Endpoint::server`.
+Those Quinn convenience methods require its ring or aws-lc-rs feature.
+
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::sync::Arc;
+use web_transport_quinn::{crypto, quinn};
+
+let mut roots = rustls::RootCertStore::empty();
+roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+
+let mut tls = rustls::ClientConfig::builder_with_provider(crypto::default_provider()?)
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+let config = quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls)?));
+let client = web_transport_quinn::Client::from(config);
+# Ok(())
+# }
+```
+
+The adapter accepts any rustls provider exposing the QUIC AES-128-GCM-SHA256
+initial suite. Configure TLS 1.3, and set server `max_early_data_size` to zero or
+`u32::MAX`. `crypto::ResetKey` and `crypto::TokenKey` accept persistent secrets
+when endpoints need keys that survive restarts. `HandshakeData` is a distinct
+Rust type from Quinn's, so raw-session ALPN discovery requires this adapter.
+
+See the [advanced examples](examples) for custom TLS and WebTransport setup.
 
 ## Async runtimes
 Each WebTransport session runs a background task that reads capsules from the CONNECT stream, and `Session::close` runs the graceful close in another.

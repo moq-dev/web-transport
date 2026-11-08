@@ -36,15 +36,9 @@ check:
 	cargo fmt --all --check
 
 	# requires: cargo install cargo-hack
-	# web-transport-ffi excluded from the feature powerset because aws-lc-rs and
-	# ring are mutually exclusive at link time (one rustls provider must win).
-	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-ffi
+	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
-
-	# web-transport-ffi: explicit check under each TLS provider.
-	cargo check -p web-transport-ffi
-	cargo check -p web-transport-ffi --no-default-features --features ring
 
 	# requires: cargo install cargo-shear
 	cargo shear

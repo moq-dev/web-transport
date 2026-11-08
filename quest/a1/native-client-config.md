@@ -13,7 +13,3 @@ Do not add a pretend browser certificate-verification bypass, a browser panic or
 ## Closes
 
 - [#135](https://github.com/moq-dev/web-transport/issues/135) - the implementation completes this report
-
-## Related
-
-- [Quinn on rind](/quest/a1/rind/quinn.md) - replaces the crypto these builders configure

@@ -1,8 +1,4 @@
 //! WebTransport client wrapped for UniFFI.
-//!
-//! Mirrors `rs/web-transport-python/src/client.rs` with PyO3 replaced by
-//! `#[uniffi::export]` and the `ring` crypto provider replaced by either
-//! `aws-lc-rs` (default) or `ring` (feature-gated).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +64,7 @@ impl Client {
             ));
         }
 
-        let provider = Arc::new(default_crypto_provider());
+        let provider = default_crypto_provider()?;
 
         let tls_builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -136,7 +132,7 @@ impl Client {
             }
         }
 
-        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        let quic_config = web_transport_quinn::crypto::QuicClientConfig::try_from(tls_config)
             .map_err(|e| WebTransportError::invalid(format!("QUIC config: {e}")))?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
         client_config.transport_config(transport.into());
@@ -192,22 +188,12 @@ impl Drop for Client {
 }
 
 // ---------------------------------------------------------------------------
-// Crypto provider selection (matches feature gates in Cargo.toml).
+// Crypto provider selection and CPU support.
 // ---------------------------------------------------------------------------
 
-fn default_crypto_provider() -> rustls::crypto::CryptoProvider {
-    #[cfg(feature = "aws-lc-rs")]
-    {
-        rustls::crypto::aws_lc_rs::default_provider()
-    }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    {
-        rustls::crypto::ring::default_provider()
-    }
-    #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
-    {
-        compile_error!("web-transport-ffi requires one of: aws-lc-rs, ring");
-    }
+fn default_crypto_provider() -> Result<Arc<rustls::crypto::CryptoProvider>, WebTransportError> {
+    web_transport_quinn::crypto::default_provider()
+        .map_err(|e| WebTransportError::invalid(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +215,7 @@ impl ServerCertVerifier for ServerFingerprints {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let cert_hash = sha256(&self.provider, end_entity)?;
+        let cert_hash = web_transport_quinn::crypto::sha256(&self.provider, end_entity)?;
         if self.fingerprints.iter().any(|fp| fp == cert_hash.as_ref()) {
             return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
@@ -321,25 +307,6 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-fn sha256(
-    provider: &Arc<rustls::crypto::CryptoProvider>,
-    cert: &CertificateDer<'_>,
-) -> Result<rustls::crypto::hash::Output, rustls::Error> {
-    let hash_provider = provider
-        .cipher_suites
-        .iter()
-        .find_map(|suite| {
-            let hp = suite.tls13()?.common.hash_provider;
-            if hp.algorithm() == rustls::crypto::hash::HashAlgorithm::SHA256 {
-                Some(hp)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| rustls::Error::General("crypto provider missing SHA-256".into()))?;
-    Ok(hash_provider.hash(cert))
-}
-
 // ---------------------------------------------------------------------------
 // Helper used by server.rs for TLS configuration.
 // ---------------------------------------------------------------------------
@@ -355,8 +322,8 @@ pub(crate) fn build_server_tls(
     let key = rustls::pki_types::PrivateKeyDer::try_from(private_key)
         .map_err(|e| WebTransportError::invalid(format!("invalid private key: {e}")))?;
 
-    let provider = default_crypto_provider();
-    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+    let provider = default_crypto_provider()?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| WebTransportError::invalid(format!("TLS config: {e}")))?
         .with_no_client_auth()

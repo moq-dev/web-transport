@@ -1,4 +1,3 @@
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -7,37 +6,31 @@ use futures::{
     stream::FuturesUnordered,
     StreamExt,
 };
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::client::{controller_factory, transport_config, ControllerFactory};
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
     Connecting, ServerError, Session, Settings,
 };
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Server] using sane defaults.
 ///
 /// This is optional; advanced users may use [Server::new] directly.
 pub struct ServerBuilder {
-    provider: crypto::Provider,
+    provider: Result<crypto::Provider, crypto::UnsupportedCpu>,
     addr: std::net::SocketAddr,
     transport: quinn::TransportConfig,
     congestion_controller: Option<ControllerFactory>,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ServerBuilder {
     /// Create a server builder with sane defaults.
     pub fn new() -> Self {
@@ -82,8 +75,15 @@ impl ServerBuilder {
         let addr = self.addr;
         let config = self.config(chain, key)?;
 
-        let server =
-            quinn::Endpoint::server(config, addr).map_err(|e| ServerError::IoError(e.into()))?;
+        let server = quinn::Endpoint::new(
+            crypto::endpoint_config()?,
+            Some(config),
+            std::net::UdpSocket::bind(addr).map_err(|e| ServerError::IoError(e.into()))?,
+            quinn::default_runtime().ok_or_else(|| {
+                ServerError::IoError(std::io::Error::other("no async runtime found").into())
+            })?,
+        )
+        .map_err(|e| ServerError::IoError(e.into()))?;
 
         Ok(Server::new(server))
     }
@@ -94,15 +94,15 @@ impl ServerBuilder {
         key: PrivateKeyDer<'static>,
     ) -> Result<quinn::ServerConfig, ServerError> {
         // Standard Quinn setup
-        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone()?)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // this one is important
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let config: crate::crypto::QuicServerConfig = config.try_into()?;
+        let mut config = crypto::server_config(Arc::new(config))?;
         config.transport_config(transport_config(
             self.transport,
             self.congestion_controller.as_ref(),
@@ -252,7 +252,7 @@ impl core::ops::Deref for Request {
     }
 }
 
-#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::client::tests::{assert_transport, custom_transport};
@@ -266,21 +266,8 @@ pub(crate) mod tests {
         (chain, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
     }
 
-    /// `ServerBuilder::new` goes through [crypto::default_provider], which panics when
-    /// both backends are compiled in and no process-wide default is installed. Pick one
-    /// here rather than mutating global state from a test.
     pub(crate) fn builder() -> ServerBuilder {
-        #[cfg(feature = "aws-lc-rs")]
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-        ServerBuilder {
-            provider,
-            addr: "[::]:0".parse().unwrap(),
-            transport: quinn::TransportConfig::default(),
-            congestion_controller: None,
-        }
+        ServerBuilder::new().with_addr("[::]:0".parse().unwrap())
     }
 
     /// quinn installs its own default transport config, so the builder's has to be
