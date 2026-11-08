@@ -2,7 +2,7 @@
 
 ## Goal
 
-Every Rust crate here except Quiche and QMux takes its TLS crypto only from [rind](https://github.com/moq-dev/rind) through `rind-rustls`, so no build compiles C crypto. On every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. The crates' `aws-lc-rs` and `ring` features are removed.
+Every Rust crate here except Quiche and QMux takes its TLS crypto only from [rind](https://github.com/moq-dev/rind) through `rind-rustls`, so their builds compile no C crypto. For those crates on every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. Their `aws-lc-rs` and `ring` features are removed.
 
 Non-goals: web-transport-quiche, which is BoringSSL (rind doesn't apply); qmux, which is being retired in favour of [moq-dev/moq's qmux](https://github.com/moq-dev/moq/blob/main/rs/qmux/MIGRATE.md), already on rind; and WASM, which uses the browser's TLS.
 
@@ -19,7 +19,7 @@ Decided with the maintainer on 2026-11-06 (planning interview, following moq's [
 The epic's own work, once every child has merged:
 
 - A CI guard that no release target's normal or build graph holds aws-lc-sys, ring, or `cc` through a crypto crate. Quiche's and QMux's graphs are exempt.
-- Remove leftover aws-lc-rs and ring from the workspace, except dev-dependencies that only tests use.
+- Remove leftover aws-lc-rs and ring from the workspace, except QMux's and dev-dependencies that only tests use.
 
 Decision prompts (✅ chosen):
 
