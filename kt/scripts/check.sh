@@ -1,65 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local smoke check for the Kotlin wrapper.
-#
-# Builds web-transport-ffi for the host target, drops the cdylib into the JNA-resource
-# layout of the :web-transport KMP module, regenerates the bindings, and runs
-# `:web-transport:jvmTest`. Intended for `just kt check`.
-#
-# Skipped cleanly on hosts without `java` or `cargo`.
-
+# Build and test the host JVM JAR with its packaged JNA native resource.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_DIR="$(cd "$KT_DIR/.." && pwd)"
 
-if ! command -v java >/dev/null 2>&1; then
-    echo "kt check: no JDK on PATH, skipping" >&2
-    exit 0
+# Match the Gradle wrapper's JDK selection, including Nix shells that reset PATH.
+if [[ -n "${JAVA_HOME:-}" ]]; then
+    export PATH="$JAVA_HOME/bin:$PATH"
 fi
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "kt check: no cargo on PATH, skipping" >&2
-    exit 0
-fi
+for tool in java cargo rustc openssl; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "kt check: required tool not on PATH: $tool" >&2; exit 1; }
+done
 
 HOST_TARGET=$(rustc -vV | awk '/^host:/ {print $2}')
-echo "kt check: building web-transport-ffi for $HOST_TARGET..."
-cargo build --release --package web-transport-ffi \
-    --manifest-path "$WORKSPACE_DIR/Cargo.toml"
+case "$HOST_TARGET" in
+    x86_64-unknown-linux-gnu) RESOURCE_PREFIX=linux-x86-64;;
+    aarch64-unknown-linux-gnu) RESOURCE_PREFIX=linux-aarch64;;
+    *) echo "kt check: Linux GNU x86_64 or aarch64 required, got $HOST_TARGET" >&2; exit 1;;
+esac
 
+mkdir -p "$WORKSPACE_DIR/.tmp"
+STAGING=$(mktemp -d "$WORKSPACE_DIR/.tmp/kotlin-smoke.XXXXXX")
+trap 'rm -rf "$STAGING"' EXIT
+
+# An explicit target/profile keeps resource staging independent of Cargo defaults.
+echo "kt check: building web-transport-ffi for $HOST_TARGET..."
+cargo build --release --target "$HOST_TARGET" --package web-transport-ffi \
+    --manifest-path "$WORKSPACE_DIR/Cargo.toml"
 TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps \
     | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
-
-case "$HOST_TARGET" in
-    *-apple-*) CDYLIB="$TARGET_BASE/release/libweb_transport_ffi.dylib"; OS_TAG="darwin";;
-    *-windows-*) CDYLIB="$TARGET_BASE/release/web_transport_ffi.dll"; OS_TAG="win32";;
-    *) CDYLIB="$TARGET_BASE/release/libweb_transport_ffi.so"; OS_TAG="linux";;
-esac
-case "$HOST_TARGET" in
-    aarch64-*) ARCH_TAG="aarch64";;
-    x86_64-*) ARCH_TAG="x86-64";;
-    *) echo "kt check: unsupported host arch in $HOST_TARGET" >&2; exit 1;;
-esac
-
+CDYLIB="$TARGET_BASE/$HOST_TARGET/release/libweb_transport_ffi.so"
 [[ -f "$CDYLIB" ]] || { echo "kt check: cdylib not found at $CDYLIB" >&2; exit 1; }
 
-RES_DIR="$KT_DIR/web-transport/src/jvmMain/resources/${OS_TAG}-${ARCH_TAG}"
-mkdir -p "$RES_DIR"
-cp "$CDYLIB" "$RES_DIR/"
-
-BINDGEN_OUT=$(mktemp -d)
-trap 'rm -rf "$BINDGEN_OUT"' EXIT
-cargo run --release --package web-transport-ffi --bin uniffi-bindgen \
+cargo run --release --target "$HOST_TARGET" --package web-transport-ffi --bin uniffi-bindgen \
     --manifest-path "$WORKSPACE_DIR/Cargo.toml" -- \
-    generate --library "$CDYLIB" --language kotlin --out-dir "$BINDGEN_OUT"
+    generate --library "$CDYLIB" --language kotlin --out-dir "$STAGING/bindings"
 
-mkdir -p "$KT_DIR/web-transport/src/jvmAndAndroidMain/kotlin/uniffi/web_transport"
-cp "$BINDGEN_OUT/uniffi/web_transport/web_transport.kt" "$KT_DIR/web-transport/src/jvmAndAndroidMain/kotlin/uniffi/web_transport/web_transport.kt"
+GENERATED_DIR="$KT_DIR/web-transport/src/jvmAndAndroidMain/kotlin/uniffi"
+RES_DIR="$KT_DIR/web-transport/src/jvmMain/resources"
+# Replace this host's inputs while preserving other staged release libraries.
+rm -rf "$GENERATED_DIR" "$RES_DIR/$RESOURCE_PREFIX"
+mkdir -p "$GENERATED_DIR" "$RES_DIR/$RESOURCE_PREFIX"
+cp -R "$STAGING/bindings/uniffi/"* "$GENERATED_DIR/"
+cp "$CDYLIB" "$RES_DIR/$RESOURCE_PREFIX/"
 
-GRADLE_CMD="${GRADLE_CMD:-$(command -v gradle || true)}"
-if [[ -z "$GRADLE_CMD" ]]; then
-    echo "kt check: gradle not on PATH, skipping" >&2
-    exit 0
-fi
+# Fresh loopback-only credentials, never packaged into the published artifact.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -subj /CN=localhost -days 1 -outform DER -out "$STAGING/cert.der" -keyout "$STAGING/key.pem"
+openssl pkcs8 -topk8 -nocrypt -in "$STAGING/key.pem" -outform DER -out "$STAGING/key.der"
+export WEB_TRANSPORT_TEST_CERT="$STAGING/cert.der"
+export WEB_TRANSPORT_TEST_KEY="$STAGING/key.der"
 
-"$GRADLE_CMD" -p "$KT_DIR" -Pwebtransportffi.version=0.0.0-dev :web-transport:jvmTest
+# Always execute the test, including when Gradle has cached an earlier smoke run.
+"$KT_DIR/gradlew" --no-daemon --console=plain --stacktrace -p "$KT_DIR" \
+    -Pkotlin.compiler.execution.strategy=in-process \
+    -PartifactSmoke=true -Pwebtransportffi.version=0.0.0-dev :web-transport:jvmTest --rerun
