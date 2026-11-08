@@ -12,11 +12,10 @@ Decided with the maintainer on 2026-11-06 (planning interview):
 - A public `web_transport_quinn::crypto` module implements quinn-proto's public crypto traits over `rustls::quic`: the session, `QuicClientConfig`/`QuicServerConfig` equivalents, packet and header keys, the Retry integrity tag (AES-128-GCM), the reset `HmacKey`, and the `HandshakeTokenKey` (HKDF). Retry, HMAC and HKDF come from rind. The session accepts any rustls provider with QUIC suites. Endpoints are built with `Endpoint::new` and an `EndpointConfig` from this module, since `Endpoint::client`/`server` need ring.
 - FFI and callers of `Client::new(endpoint, quinn::ClientConfig)` build their configs from this module. Document the migration from `quinn::crypto::rustls`.
 - Builders default to the installed process provider, else rind. A CPU rind refuses returns a new `UnsupportedCpu` error from the finishing methods. `rind::cpu::check()` runs before any rind primitive is built (the Retry, reset and token keys), even when an installed provider is used. FFI's client constructor, which builds configs from this module, runs the same check first and returns the refusal as a `WebTransportError`. `Client::default()` keeps its `with_system_roots().unwrap()` and documents that it panics on such a CPU.
-- Remove `aws-lc-rs`/`ring` from web-transport-quinn, web-transport-ffi, and the router (the features from [router crypto features](/quest/a1/router-crypto-features.md)). Check that py/kt/swift and Node still build and pass their binding CI.
+- Remove `aws-lc-rs`/`ring` from web-transport-quinn and web-transport-ffi, so the router no longer pulls aws-lc-rs in through its default dependency. Check that py/kt/swift and Node still build and pass their binding CI.
 - Test interop against an unmodified quinn peer on aws-lc-rs: handshake, Retry, stateless reset, key update, 0-RTT rejection, and a CPU-refusal path. Use controlled time where the protocol allows.
 - The adapter is deleted once upstream allows any provider; see [Quinn adapter removal](/quest/a2/quinn-adapter-removal.md).
 
 ## Related
 
 - [Native client composition](/quest/a1/native-client-config.md) - converts a configured Quinn client into the router
-- [Dual-stack bind](/quest/a1/dual-stack-bind.md) - rebuilds the same builders' endpoints

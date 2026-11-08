@@ -1,0 +1,31 @@
+name: Swift runtime
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test native Swift host artifact
+        run: |
+          mkdir -p .tmp/swift-test-results
+          set -o pipefail
+          ./swift/scripts/check.sh 2>&1 | tee .tmp/swift-test-results/check.log
+      - name: Upload runtime test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: swift-host-test-results
+          path: .tmp/swift-test-results/
+          if-no-files-found: ignore

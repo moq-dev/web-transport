@@ -101,3 +101,83 @@ fn sha256(cert_der: &[u8]) -> Vec<u8> {
     hasher.update(cert_der);
     hasher.finalize().to_vec()
 }
+
+async fn dual_family_sessions(
+    client: &Client,
+) -> (Vec<ServerSession>, Vec<std::sync::Arc<Server>>) {
+    let (chain, key) = self_signed_cert();
+    let mut sessions = Vec::new();
+    let mut servers = Vec::new();
+    for bind in ["127.0.0.1:0", "[::1]:0"] {
+        let server = Server::new(ServerConfig {
+            certificate_chain: chain.clone(),
+            private_key: key.clone(),
+            bind: bind.into(),
+            congestion_control: CongestionControl::Default,
+            max_idle_timeout_secs: Some(10.0),
+            keep_alive_interval_secs: None,
+        })
+        .unwrap();
+        let addr = server.local_addr();
+        let remote = std::net::SocketAddr::new(addr.host.parse().unwrap(), addr.port);
+        let (session, peer) = tokio::join!(client.connect(format!("https://{remote}/")), async {
+            server.accept().await.unwrap().accept().await.unwrap()
+        },);
+        sessions.push((session.unwrap(), peer));
+        servers.push(server);
+    }
+    (sessions, servers)
+}
+
+type ServerSession = (
+    std::sync::Arc<crate::session::Session>,
+    std::sync::Arc<crate::session::Session>,
+);
+
+#[tokio::test]
+async fn client_close_and_drop_cover_both_families() {
+    tokio::time::timeout(TIMEOUT, async {
+        for explicit_close in [true, false] {
+            let client = Client::new(ClientConfig {
+                no_cert_verification: true,
+                ..Default::default()
+            })
+            .unwrap();
+            let (sessions, servers) = dual_family_sessions(&client).await;
+            if explicit_close {
+                client.close(42, "all sockets".into()).unwrap();
+                assert!(client
+                    .connect("https://127.0.0.1:443/".into())
+                    .await
+                    .is_err());
+                assert!(client.connect("https://[::1]:443/".into()).await.is_err());
+                client.wait_closed().await;
+            }
+            drop(client);
+            for (session, peer) in &sessions {
+                assert!(session.receive_datagram().await.is_err());
+                assert!(peer.receive_datagram().await.is_err());
+            }
+            for server in servers {
+                server.close(0, String::new()).unwrap();
+                server.wait_closed().await;
+            }
+        }
+    })
+    .await
+    .expect("client shutdown timed out");
+}
+
+#[tokio::test]
+async fn closing_unused_client_prevents_first_bind() {
+    let client = Client::new(ClientConfig::default()).unwrap();
+    client.close(0, String::new()).unwrap();
+    client.wait_closed().await;
+    for url in [
+        "https://127.0.0.1:443/",
+        "https://[::1]:443/",
+        "https://[::ffff:127.0.0.1]:443/",
+    ] {
+        assert!(client.connect(url.into()).await.is_err());
+    }
+}

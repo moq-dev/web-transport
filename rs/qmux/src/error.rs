@@ -53,6 +53,8 @@ pub enum Error {
     ProtocolViolation,
 
     /// The peer sent an invalid transport parameter (TRANSPORT_PARAMETER_ERROR).
+    /// WebSocket builders also return this locally when their effective record
+    /// limit is below the default minimum `max_record_size`.
     #[error("transport parameter error")]
     TransportParameter,
 

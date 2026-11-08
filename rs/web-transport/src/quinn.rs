@@ -7,7 +7,8 @@ pub use web_transport_quinn as quinn;
 pub use web_transport_quinn::CongestionControl;
 
 /// Create a [Client] that can be used to dial multiple [Session]s.
-#[derive(Default, Clone)]
+/// Build a client before cloning it to share its endpoints and configuration.
+#[derive(Default)]
 pub struct ClientBuilder {
     inner: quinn::ClientBuilder,
     protocols: Vec<String>,
@@ -16,6 +17,17 @@ pub struct ClientBuilder {
 impl ClientBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// Explicit congestion control overrides only its controller, regardless of
+    /// the order this method and [`Self::with_congestion_control`] are called.
+    pub fn with_transport_config(self, transport: quinn::quinn::TransportConfig) -> Self {
+        Self {
+            inner: self.inner.with_transport_config(transport),
+            ..self
+        }
     }
 
     /// Allow a lower latency congestion controller.
