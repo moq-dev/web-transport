@@ -17,7 +17,7 @@ use crate::{ClientError, Session};
 ///
 /// Different algorithms make different tradeoffs between throughput and latency.
 pub enum CongestionControl {
-    /// Use the default congestion control algorithm (typically CUBIC).
+    /// Keep the transport configuration's controller (Quinn defaults to CUBIC).
     Default,
     /// Optimize for throughput (typically CUBIC).
     Throughput,
@@ -44,9 +44,9 @@ pub(crate) fn controller_factory(algorithm: CongestionControl) -> Option<Control
 /// drift on which knobs actually get applied.
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 pub(crate) fn transport_config(
+    mut transport: quinn::TransportConfig,
     congestion_controller: Option<&ControllerFactory>,
 ) -> Arc<quinn::TransportConfig> {
-    let mut transport = quinn::TransportConfig::default();
     if let Some(cc) = congestion_controller {
         transport.congestion_controller_factory(cc.clone());
     }
@@ -58,9 +58,10 @@ pub(crate) fn transport_config(
 /// Construct a WebTransport [Client] using sane defaults.
 ///
 /// This is optional; advanced users may use [Client::new] directly.
-#[derive(Clone)]
+/// Build a client before cloning it to share its endpoints and configuration.
 pub struct ClientBuilder {
     provider: crypto::Provider,
+    transport: quinn::TransportConfig,
     congestion_controller: Option<ControllerFactory>,
 }
 
@@ -70,11 +71,24 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
+            transport: quinn::TransportConfig::default(),
             congestion_controller: None,
         }
     }
 
-    /// Enable the specified congestion controller.
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// An explicit [`Self::with_congestion_control`] choice overrides only its
+    /// congestion controller, regardless of the order these methods are called.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Override the transport configuration's congestion controller.
+    ///
+    /// [`CongestionControl::Default`] preserves the supplied configuration's
+    /// controller, or Quinn's default when no configuration is supplied.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = controller_factory(algorithm);
         self
@@ -160,7 +174,10 @@ impl ClientBuilder {
 
         let client_config = QuicClientConfig::try_from(crypto).unwrap();
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
-        client_config.transport_config(transport_config(self.congestion_controller.as_ref()));
+        client_config.transport_config(transport_config(
+            self.transport,
+            self.congestion_controller.as_ref(),
+        ));
 
         Ok(Client::from(client_config))
     }
@@ -579,4 +596,4 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 }
 
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
-mod tests;
+pub(crate) mod tests;
