@@ -815,10 +815,10 @@ impl Driver {
             if let Some(waker) = waker {
                 waker.wake();
             }
-        } else {
-            tracing::warn!(?stream_id, "wakeup for closed stream");
         }
 
+        // notify checks closure before taking the driver lock, so retirement can
+        // race with enqueueing. A notification for a retired send stream is a no-op.
         Ok(())
     }
 
