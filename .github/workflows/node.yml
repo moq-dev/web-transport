@@ -18,7 +18,7 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 2
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31.11.1
+      - uses: cachix/install-nix-action@v31.11.3
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - run: nix develop --command bun install --frozen-lockfile
