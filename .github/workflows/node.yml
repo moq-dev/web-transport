@@ -1,0 +1,26 @@
+name: Node runtime
+
+permissions:
+  contents: read
+
+# Run independently for every PR, including changes to shared Rust code, build
+# scripts, workspace configuration, or this workflow.
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix develop --command bun install --frozen-lockfile
+      - name: Test the packaged native binding under Node
+        run: nix develop --command bun run --cwd js/web-transport test:runtime

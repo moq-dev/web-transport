@@ -2,7 +2,7 @@ use web_transport_proto::error_from_http3;
 
 use crate::ez;
 
-/// An error returned by [Connection], split based on whether they are underlying QUIC errors or WebTransport errors.
+/// An error returned by [Connection](crate::Connection), split based on whether they are underlying QUIC errors or WebTransport errors.
 #[derive(Clone, thiserror::Error, Debug)]
 pub enum SessionError {
     #[error("remote closed: code={0} reason={1}")]
