@@ -254,7 +254,7 @@ async fn caller_endpoint_keeps_its_address_and_remote_handling() {
 
 fn server(addr: SocketAddr) -> crate::Server {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    crate::ServerBuilder::new()
+    crate::server::tests::builder()
         .with_addr(addr)
         .with_certificate(
             vec![cert.cert.der().clone()],
