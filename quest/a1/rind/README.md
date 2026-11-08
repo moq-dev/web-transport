@@ -2,9 +2,9 @@
 
 ## Goal
 
-Every Rust crate here except Quiche takes its TLS crypto only from [rind](https://github.com/moq-dev/rind) through `rind-rustls`, so no build compiles C crypto. On every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. The crates' `aws-lc-rs` and `ring` features are removed.
+Every Rust crate here except Quiche and QMux takes its TLS crypto only from [rind](https://github.com/moq-dev/rind) through `rind-rustls`, so their builds compile no C crypto. For those crates on every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. Their `aws-lc-rs` and `ring` features are removed.
 
-Non-goals: web-transport-quiche, which is BoringSSL (rind doesn't apply), and WASM, which uses the browser's TLS.
+Non-goals: web-transport-quiche, which is BoringSSL (rind doesn't apply); qmux, which is being retired in favour of [moq-dev/moq's qmux](https://github.com/moq-dev/moq/blob/main/rs/qmux/MIGRATE.md), already on rind; and WASM, which uses the browser's TLS.
 
 ## Plan
 
@@ -18,8 +18,8 @@ Decided with the maintainer on 2026-11-06 (planning interview, following moq's [
 
 The epic's own work, once every child has merged:
 
-- A CI guard that no release target's normal or build graph holds aws-lc-sys, ring, or `cc` through a crypto crate. Quiche's graph is exempt.
-- Remove leftover aws-lc-rs and ring from the workspace, except dev-dependencies that only tests use.
+- A CI guard that no release target's normal or build graph holds aws-lc-sys, ring, or `cc` through a crypto crate. Quiche's and QMux's graphs are exempt.
+- Remove leftover aws-lc-rs and ring from the workspace, except QMux's and dev-dependencies that only tests use.
 
 Decision prompts (✅ chosen):
 
@@ -36,4 +36,3 @@ Decision prompts (✅ chosen):
 - [Quinn on rind](/quest/a1/rind/quinn.md) - provider-neutral QUIC crypto adapter; Quinn, FFI, Node and router on rind
 - [Noq on rind](/quest/a1/rind/noq.md) - Noq's rustls without ring, with rind keys
 - [iroh on rind](/quest/a1/rind/iroh.md) - iroh endpoint built with rind's provider
-- [QMux on rind](/quest/a1/rind/qmux.md) - TLS and WSS paths with no aws-lc-rs

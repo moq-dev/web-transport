@@ -84,6 +84,11 @@ impl Credit {
         }
     }
 
+    /// Return the next index for credit allocated with `claim_index`.
+    pub(crate) fn used(&self) -> u64 {
+        self.inner.lock().unwrap().state.used
+    }
+
     /// Snapshot the two distinct stream-count credits while both locks are held.
     pub(crate) fn available_pair(bidi: &Self, uni: &Self) -> (u64, u64) {
         let bidi = bidi.inner.lock().unwrap();
