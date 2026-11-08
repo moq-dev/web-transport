@@ -17,8 +17,8 @@ pub use tokio_tungstenite;
 /// The `tungstenite` version this crate is built against, matching
 /// [`tokio_tungstenite`].
 ///
-/// [`Client::with_config`] and [`Upgraded`] name `tungstenite` types, and
-/// [`Error::WebSocket`] wraps a `tungstenite::Error`.
+/// [`Client::with_config`], [`Server::with_config`], and [`Upgraded`] name
+/// `tungstenite` types, and [`Error::WebSocket`] wraps a `tungstenite::Error`.
 pub use tokio_tungstenite::tungstenite;
 
 /// Keep-alive configuration for WebSocket transports.
@@ -104,11 +104,11 @@ where
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). Keep
     /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// frame and message limits, since each record is one message. QMux cannot
+    /// inspect these limits on an externally upgraded WebSocket.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -218,6 +218,13 @@ impl Client {
     }
 
     /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    ///
+    /// On record-framed drafts (QMux01+), the advertised record size is clamped
+    /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
+    /// establishment locally, before any QMux parameters are sent.
+    /// For bare-frame versions, callers must allow the peer's frame sizes:
+    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// negotiates no size bound.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
         self
@@ -235,11 +242,13 @@ impl Client {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
-    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). The advertised
+    /// [`max_record_size`](Config::max_record_size) on record-framed drafts
+    /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
+    /// and 64 MiB by default), since each record is one message. Establishment
+    /// fails with [`Error::TransportParameter`] before any QMux parameters are
+    /// sent if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -275,7 +284,7 @@ impl Client {
         );
 
         #[cfg(feature = "wss")]
-        let (ws_stream, response) = {
+        let (mut ws_stream, response) = {
             tokio_tungstenite::connect_async_tls_with_config(
                 request,
                 self.config,
@@ -287,7 +296,7 @@ impl Client {
         };
 
         #[cfg(not(feature = "wss"))]
-        let (ws_stream, response) =
+        let (mut ws_stream, response) =
             tokio_tungstenite::connect_async_with_config(request, self.config, false)
                 .await
                 .map_err(Error::from)?;
@@ -308,7 +317,12 @@ impl Client {
             ));
         }
 
-        let config = self.session.clone().with_negotiated(version, protocol);
+        let config = session_config(
+            self.session.clone().with_negotiated(version, protocol),
+            self.config,
+            &mut ws_stream,
+        )
+        .await?;
         let transport = WsTransport::new(ws_stream, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -333,6 +347,7 @@ impl Client {
 pub struct Server {
     protocols: Vec<(String, Vec<Version>)>,
     require_protocol: bool,
+    config: Option<tungstenite::protocol::WebSocketConfig>,
     keep_alive: Option<KeepAlive>,
     session: Config,
 }
@@ -374,6 +389,19 @@ impl Server {
         self
     }
 
+    /// Set the WebSocket configuration (e.g. max message/frame sizes).
+    ///
+    /// On record-framed drafts (QMux01+), the advertised record size is clamped
+    /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
+    /// establishment locally, before any QMux parameters are sent.
+    /// For bare-frame versions, callers must allow the peer's frame sizes:
+    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// negotiates no size bound.
+    pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     /// Send periodic Pings and close the session if the peer goes silent.
     ///
     /// WebSocket has no built-in idle timeout, so without this a crashed peer
@@ -386,11 +414,13 @@ impl Server {
     /// Use `config` for every session setting except the wire-format version
     /// and application protocol, which the handshake negotiates.
     ///
-    /// [`handshake_timeout`](Config::handshake_timeout) does not apply: the
-    /// WebSocket handshake already settled the protocol, so the session starts
-    /// without awaiting the peer's transport parameters. Keep
-    /// [`max_record_size`](Config::max_record_size) within the WebSocket's
-    /// frame limit (16 MiB by default), since each record is one message.
+    /// The session closes if the peer's transport parameters do not arrive within
+    /// [`handshake_timeout`](Config::handshake_timeout). The advertised
+    /// [`max_record_size`](Config::max_record_size) on record-framed drafts
+    /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
+    /// and 64 MiB by default), since each record is one message. Establishment
+    /// fails with [`Error::TransportParameter`] before any QMux parameters are
+    /// sent if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -469,7 +499,8 @@ impl Server {
                 .unwrap())
         };
 
-        let ws = tokio_tungstenite::accept_hdr_async_with_config(socket, callback, None).await?;
+        let mut ws =
+            tokio_tungstenite::accept_hdr_async_with_config(socket, callback, self.config).await?;
 
         let (version, protocol) = negotiated
             .lock()
@@ -477,7 +508,12 @@ impl Server {
             .take()
             .expect("negotiated must be set after successful handshake");
 
-        let config = self.session.clone().with_negotiated(version, protocol);
+        let config = session_config(
+            self.session.clone().with_negotiated(version, protocol),
+            self.config,
+            &mut ws,
+        )
+        .await?;
         let transport = WsTransport::new(ws, config.version, config.max_record_size);
         let transport = match self.keep_alive {
             Some(ka) => transport.with_keep_alive(ka),
@@ -485,5 +521,556 @@ impl Server {
         };
         // Protocol came from the negotiated subprotocol, so no in-band wait.
         Ok(Session::new(transport, true, config))
+    }
+}
+
+async fn session_config<T: AsyncRead + AsyncWrite + Unpin>(
+    mut session: Config,
+    websocket: Option<tungstenite::protocol::WebSocketConfig>,
+    stream: &mut tokio_tungstenite::WebSocketStream<T>,
+) -> Result<Config, Error> {
+    if !session.version.uses_records() {
+        return Ok(session);
+    }
+    let websocket = websocket.unwrap_or_default();
+    for limit in [websocket.max_frame_size, websocket.max_message_size]
+        .into_iter()
+        .flatten()
+    {
+        session.max_record_size = session.max_record_size.min(limit as u64);
+    }
+    if session.max_record_size < crate::DEFAULT_MAX_RECORD_SIZE {
+        stream
+            .close(Some(tungstenite::protocol::CloseFrame {
+                code: tungstenite::protocol::frame::coding::CloseCode::Error,
+                reason: "QMux record limit below minimum".into(),
+            }))
+            .await?;
+        return Err(Error::TransportParameter);
+    }
+    Ok(session)
+}
+
+#[cfg(test)]
+mod record_size_tests {
+    use super::*;
+    use crate::proto::{Frame, TransportParams, DEFAULT_MAX_RECORD_SIZE};
+    use bytes::Bytes;
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::WebSocketStream;
+    use tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Message};
+    use web_transport_trait::Session as _;
+
+    /// Exercise either builder against a raw peer that can inspect its parameters.
+    async fn session_peer(
+        server: bool,
+        websocket: Option<WebSocketConfig>,
+        config: Config,
+    ) -> (Result<Session, Error>, WebSocketStream<TcpStream>) {
+        let version = config.version;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        if server {
+            let mut builder = Server::new().with_session_config(config);
+            if let Some(websocket) = websocket {
+                builder = builder.with_config(websocket);
+            }
+            let accept = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                builder.accept(socket).await
+            };
+            let connect = async {
+                let socket = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let mut request = url.into_client_request().unwrap();
+                request
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", version.alpn().parse().unwrap());
+                tokio_tungstenite::client_async(request, socket)
+                    .await
+                    .unwrap()
+                    .0
+            };
+            tokio::join!(accept, connect)
+        } else {
+            let mut builder = Client::new().with_session_config(config);
+            if version.is_qmux() {
+                builder = builder.with_protocol("test", &[version]).require_protocol();
+            }
+            if let Some(websocket) = websocket {
+                builder = builder.with_config(websocket);
+            }
+            let accept = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    |_: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        let protocol = if version.is_qmux() {
+                            format!("{}test", version.prefix())
+                        } else {
+                            version.alpn().to_string()
+                        };
+                        response
+                            .headers_mut()
+                            .insert("Sec-WebSocket-Protocol", protocol.parse().unwrap());
+                        Ok(response)
+                    };
+                tokio_tungstenite::accept_hdr_async(socket, callback)
+                    .await
+                    .unwrap()
+            };
+            let (session, peer) = tokio::join!(builder.connect(&url), accept);
+            (session, peer)
+        }
+    }
+
+    async fn advertised(
+        peer: &mut WebSocketStream<TcpStream>,
+        version: Version,
+    ) -> TransportParams {
+        let message = peer.next().await.unwrap().unwrap().into_data();
+        let Some(Frame::TransportParameters(params)) = Frame::decode(message, version).unwrap()
+        else {
+            panic!("expected transport parameters");
+        };
+        params
+    }
+
+    #[tokio::test]
+    async fn builders_advertise_the_effective_record_and_datagram_limits() {
+        let min = DEFAULT_MAX_RECORD_SIZE;
+        let unlimited = WebSocketConfig::default()
+            .max_frame_size(None)
+            .max_message_size(None);
+        let limits =
+            |frame, message| Some(unlimited.max_frame_size(frame).max_message_size(message));
+        let bytes = min as usize;
+        let cases = [
+            // Defaults cap a raised session limit at the 16 MiB frame limit.
+            (None, 32 << 20, 16 << 20),
+            (None, min, min),
+            (Some(unlimited), 32 << 20, 32 << 20),
+            (limits(Some(bytes), None), 2 * min, min),
+            (limits(None, Some(bytes)), 2 * min, min),
+            (limits(Some(2 * bytes), Some(bytes)), 3 * min, min),
+            (limits(Some(bytes), Some(2 * bytes)), 3 * min, min),
+            (limits(Some(3 * bytes), Some(2 * bytes)), min, min),
+        ];
+        for server in [false, true] {
+            for version in [Version::QMux01, Version::QMux02] {
+                for (websocket, requested, expected) in cases {
+                    let mut config = Config::new(version);
+                    config.max_record_size = requested;
+                    config.max_datagram_frame_size = requested;
+                    let (session, mut peer) = session_peer(server, websocket, config).await;
+                    let session = session.unwrap();
+                    let params = advertised(&mut peer, version).await;
+                    assert_eq!(
+                        params.max_record_size, expected,
+                        "server={server}, {websocket:?}"
+                    );
+                    assert_eq!(params.max_datagram_frame_size, expected);
+                    session.close(0, "done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn records_at_the_websocket_limit_are_delivered() {
+        let min = DEFAULT_MAX_RECORD_SIZE as usize;
+        for server in [false, true] {
+            for version in [Version::QMux01, Version::QMux02] {
+                // Exercise both tungstenite bounds, including a fragmented message.
+                for frame_limit in [true, false] {
+                    let websocket = WebSocketConfig::default()
+                        .max_frame_size(frame_limit.then_some(min))
+                        .max_message_size((!frame_limit).then_some(min));
+                    let mut config = Config::new(version);
+                    config.max_record_size = 2 * min as u64;
+                    config.max_datagram_frame_size = 2 * min as u64;
+                    let (session, mut peer) = session_peer(server, Some(websocket), config).await;
+                    let session = session.unwrap();
+                    let params = advertised(&mut peer, version).await;
+                    assert_eq!(params.max_record_size, min as u64);
+                    peer.send(Message::Binary(
+                        Frame::TransportParameters(Config::new(version).to_transport_params())
+                            .encode(version)
+                            .unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                    // A lengthless DATAGRAM fills exactly one advertised record.
+                    let mut record = vec![0x5a; min];
+                    record[0] = 0x30;
+                    if frame_limit {
+                        peer.send(Message::Binary(Bytes::from(record)))
+                            .await
+                            .unwrap();
+                    } else {
+                        use tungstenite::protocol::frame::{
+                            coding::{Data, OpCode},
+                            Frame as WsFrame,
+                        };
+                        peer.send(Message::Frame(WsFrame::message(
+                            record[..min / 2].to_vec(),
+                            OpCode::Data(Data::Binary),
+                            false,
+                        )))
+                        .await
+                        .unwrap();
+                        peer.send(Message::Frame(WsFrame::message(
+                            record[min / 2..].to_vec(),
+                            OpCode::Data(Data::Continue),
+                            true,
+                        )))
+                        .await
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        session.recv_datagram().await.unwrap(),
+                        Bytes::from(vec![0x5a; min - 1])
+                    );
+                    // One byte beyond the effective bound must still be rejected by
+                    // the actual WebSocket config, including on the server.
+                    let mut record = vec![0x5a; min + 1];
+                    record[0] = 0x30;
+                    peer.send(Message::Binary(Bytes::from(record)))
+                        .await
+                        .unwrap();
+                    let error = session.closed().await;
+                    assert!(
+                        matches!(&error, Error::WebSocket(e) if matches!(e.as_ref(), tungstenite::Error::Capacity(_))),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn assert_local_config_close(peer: &mut WebSocketStream<TcpStream>) {
+        let Message::Close(Some(close)) = peer.next().await.unwrap().unwrap() else {
+            panic!("expected a WebSocket Close without QMux parameters");
+        };
+        assert_eq!(
+            close.code,
+            tungstenite::protocol::frame::coding::CloseCode::Error
+        );
+        assert_eq!(close.reason.as_str(), "QMux record limit below minimum");
+    }
+
+    #[tokio::test]
+    async fn invalid_record_limits_fail_without_advertising_parameters() {
+        let min = DEFAULT_MAX_RECORD_SIZE as usize;
+        for server in [false, true] {
+            for version in [Version::QMux01, Version::QMux02] {
+                for limit in [0, min - 1] {
+                    for websocket in [
+                        WebSocketConfig::default().max_frame_size(Some(limit)),
+                        WebSocketConfig::default().max_message_size(Some(limit)),
+                    ] {
+                        let (session, mut peer) =
+                            session_peer(server, Some(websocket), Config::new(version)).await;
+                        assert!(matches!(session, Err(Error::TransportParameter)));
+                        // The WebSocket negotiated a record-framed draft, but no
+                        // invalid QMux transport parameters were put on the wire.
+                        assert_local_config_close(&mut peer).await;
+                    }
+                }
+                let mut config = Config::new(version);
+                config.max_record_size = DEFAULT_MAX_RECORD_SIZE - 1;
+                let (session, mut peer) = session_peer(server, None, config).await;
+                assert!(matches!(session, Err(Error::TransportParameter)));
+                assert_local_config_close(&mut peer).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_frame_versions_do_not_require_record_limits() {
+        use web_transport_trait::{RecvStream as _, SendStream as _};
+        for server in [false, true] {
+            for version in [Version::QMux00, Version::WebTransport] {
+                for limit in [8192, DEFAULT_MAX_RECORD_SIZE as usize, 16383] {
+                    let websocket = WebSocketConfig::default()
+                        .max_frame_size(Some(limit))
+                        .max_message_size(Some(limit));
+                    let mut config = Config::new(version);
+                    config.max_record_size = 1000; // Ignored by bare-frame versions.
+                    let (session, peer) = session_peer(server, Some(websocket), config).await;
+                    let session = session.unwrap();
+                    let peer = Upgraded::new(peer).with_alpn(version.alpn());
+                    let peer = if server {
+                        peer.connect()
+                    } else {
+                        peer.accept()
+                    };
+                    let mut send = peer.open_uni().await.unwrap();
+                    send.write(b"bare frame").await.unwrap();
+                    send.finish().unwrap();
+                    let mut recv = session.accept_uni().await.unwrap();
+                    assert_eq!(
+                        recv.read_all().await.unwrap(),
+                        Bytes::from_static(b"bare frame")
+                    );
+                    session.close(0, "done");
+                    peer.close(0, "done");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{Sink, SinkExt, Stream, StreamExt};
+    use std::{future::Future, task::Context};
+    use tokio::time::{advance, timeout};
+    use tokio_tungstenite::{tungstenite::client::IntoClientRequest, WebSocketStream};
+    use web_transport_trait::Session as _;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    trait Peer:
+        Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+        + Sink<tungstenite::Message, Error = tungstenite::Error>
+        + Unpin
+    {
+    }
+
+    impl<T> Peer for WebSocketStream<T> where T: AsyncRead + AsyncWrite + Unpin {}
+
+    #[derive(Clone, Copy, Debug)]
+    enum Builder {
+        Client,
+        Server,
+        UpgradedClient,
+        UpgradedServer,
+    }
+
+    const BUILDERS: &[Builder] = &[
+        Builder::Client,
+        Builder::Server,
+        Builder::UpgradedClient,
+        Builder::UpgradedServer,
+    ];
+
+    fn config() -> Config {
+        Config {
+            handshake_timeout: DEADLINE,
+            max_idle_timeout: 0,
+            rtt_interval: Duration::ZERO,
+            ..Config::default()
+        }
+    }
+
+    async fn start(builder: Builder, version: Version, config: Config) -> (Session, Box<dyn Peer>) {
+        use tungstenite::{http::header::SEC_WEBSOCKET_PROTOCOL, protocol::Role};
+
+        if let Builder::Client = builder {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                #[allow(clippy::result_large_err)]
+                let callback =
+                    move |request: &tungstenite::handshake::server::Request,
+                     mut response: tungstenite::handshake::server::Response| {
+                        let protocol = if version.is_qmux() {
+                            request.headers()[SEC_WEBSOCKET_PROTOCOL].clone()
+                        } else {
+                            version.alpn().parse().unwrap()
+                        };
+                        response.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+                        Ok(response)
+                    };
+                tokio_tungstenite::accept_hdr_async(socket, callback)
+                    .await
+                    .unwrap()
+            };
+            let client = Client::new().with_session_config(config);
+            let client = if version.is_qmux() {
+                client.with_protocol("test", &[version]).require_protocol()
+            } else {
+                client
+            };
+            let (session, peer) = tokio::join!(client.connect(&url), server);
+            return (session.unwrap(), Box::new(peer));
+        }
+
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        if let Builder::Server = builder {
+            let server = Server::new().with_session_config(config);
+            let mut request = "ws://localhost".into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, version.alpn().parse().unwrap());
+            let (session, peer) = tokio::join!(
+                server.accept(a),
+                tokio_tungstenite::client_async(request, b)
+            );
+            return (session.unwrap(), Box::new(peer.unwrap().0));
+        }
+
+        let is_server = matches!(builder, Builder::UpgradedServer);
+        let (role, peer_role) = if is_server {
+            (Role::Server, Role::Client)
+        } else {
+            (Role::Client, Role::Server)
+        };
+        let socket = WebSocketStream::from_raw_socket(a, role, None).await;
+        let peer = WebSocketStream::from_raw_socket(b, peer_role, None).await;
+        let upgraded = Upgraded::new(socket)
+            .with_alpn(version.alpn())
+            .with_session_config(config);
+        let session = if is_server {
+            upgraded.accept()
+        } else {
+            upgraded.connect()
+        };
+        (session, Box::new(peer))
+    }
+
+    fn assert_open(session: &Session) {
+        let mut closed = std::pin::pin!(session.closed());
+        assert!(closed
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending());
+    }
+
+    async fn network_io<F: Future>(builder: Builder, io: F) -> F::Output {
+        // Real socket delivery must not race paused time's automatic advance.
+        let real_time = matches!(builder, Builder::Client);
+        if real_time {
+            tokio::time::resume();
+        }
+        let output = io.await;
+        if real_time {
+            tokio::time::pause();
+        }
+        output
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_peer_hits_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, _peer) = start(builder, version, config()).await;
+                advance(DEADLINE - Duration::from_millis(1)).await;
+                assert_open(&session);
+                let error = timeout(Duration::from_secs(1), session.closed())
+                    .await
+                    .unwrap_or_else(|_| panic!("{builder:?} {version:?}: handshake stayed open"));
+                assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+                assert!(matches!(
+                    session.open_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
+                assert!(matches!(
+                    session.accept_uni().await,
+                    Err(Error::HandshakeTimeout)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_handshake_deadline_and_legacy_stay_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL {
+                let mut config = config();
+                if version.is_qmux() {
+                    config.handshake_timeout = Duration::ZERO;
+                }
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_handshake_deadline_stays_open() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let mut config = config();
+                config.handshake_timeout = Duration::MAX;
+                let (session, _peer) = start(builder, version, config).await;
+                advance(DEADLINE * 10).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_deadline_sends_connection_close() {
+        for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+            let (session, mut peer) = start(Builder::UpgradedClient, version, config()).await;
+            // Drain our parameters so the writer is idle when the deadline fires.
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap(),
+                tungstenite::Message::Binary(_)
+            ));
+            let error = timeout(DEADLINE * 2, session.closed()).await.unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout));
+            let message = timeout(DEADLINE, peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let tungstenite::Message::Binary(data) = message else {
+                panic!("expected a QMux CONNECTION_CLOSE, got {message:?}");
+            };
+            let Some(crate::Frame::ConnectionClose(close)) =
+                crate::Frame::decode(data, version).unwrap()
+            else {
+                panic!("expected a QMux CONNECTION_CLOSE");
+            };
+            assert_eq!(close.code.into_inner(), 0);
+            assert_eq!(close.reason, Error::HandshakeTimeout.to_string());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receiving_parameters_cancels_handshake_deadline() {
+        for &builder in BUILDERS {
+            for &version in Version::ALL.iter().filter(|v| v.is_qmux()) {
+                let (session, mut peer) = start(builder, version, config()).await;
+                advance(DEADLINE / 2).await;
+                let mut peer_config = config();
+                peer_config.version = version;
+                let params = crate::Frame::TransportParameters(peer_config.to_transport_params())
+                    .encode(version)
+                    .unwrap();
+                let _stream = network_io(builder, async {
+                    peer.send(tungstenite::Message::Binary(params))
+                        .await
+                        .unwrap();
+                    // Opening acknowledges that the parameters were applied.
+                    session.open_uni().await.unwrap()
+                })
+                .await;
+                advance(DEADLINE * 2).await;
+                assert_open(&session);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_before_parameters_preserves_error() {
+        for &builder in BUILDERS {
+            let (session, peer) = start(builder, Version::QMux02, config()).await;
+            let error = network_io(builder, async {
+                drop(peer);
+                timeout(DEADLINE / 2, session.closed()).await.unwrap()
+            })
+            .await;
+            assert!(!matches!(error, Error::HandshakeTimeout), "{error:?}");
+        }
     }
 }

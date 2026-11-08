@@ -1476,6 +1476,25 @@ impl<R: Reader> SessionState<R> {
         }
     }
 
+    // RFC 9000 §19.5/§19.10 forbid send controls for receive-only streams
+    // and local IDs we have not allocated. Retired IDs remain valid.
+    fn validate_send_id(&self, id: StreamId) -> Result<(), Error> {
+        if !id.can_send(self.is_server) {
+            return Err(Error::InvalidStreamId);
+        }
+        if id.server_initiated() == self.is_server {
+            // Read before taking the streams lock, preserving the lock order.
+            let next = match id.dir() {
+                StreamDir::Bi => self.open_bi_credit.used(),
+                StreamDir::Uni => self.open_uni_credit.used(),
+            };
+            if id.index() >= next {
+                return Err(Error::InvalidStreamId);
+            }
+        }
+        Ok(())
+    }
+
     async fn recv_frame(&mut self, frame: Frame) -> Result<(), Error> {
         // Draft-02: QX_TRANSPORT_PARAMETERS MUST be the first frame, and only the
         // first. A non-params frame before params, or a second params frame, is a
@@ -1808,9 +1827,7 @@ impl<R: Reader> SessionState<R> {
                 }
             }
             Frame::StopSending(stop) => {
-                if !stop.id.can_send(self.is_server) {
-                    return Err(Error::InvalidStreamId);
-                }
+                self.validate_send_id(stop.id)?;
 
                 if let Some(send) = self.streams.lock().unwrap().send.get(&stop.id) {
                     send.inbound_signal.send(SendSignal::Stopped(stop)).ok();
@@ -1844,11 +1861,7 @@ impl<R: Reader> SessionState<R> {
                 self.conn_send_credit.increase_max(max);
             }
             Frame::MaxStreamData { id, max } => {
-                // RFC 9000 §19.10: MAX_STREAM_DATA for a receive-only stream is a
-                // STREAM_STATE_ERROR.
-                if !id.can_send(self.is_server) {
-                    return Err(Error::InvalidStreamId);
-                }
+                self.validate_send_id(id)?;
                 if let Some(send) = self.streams.lock().unwrap().send.get(&id) {
                     if let Some(credit) = &send.stream_credit {
                         credit.increase_max(max);
@@ -2107,32 +2120,12 @@ impl Session {
             return Ok(());
         }
 
-        let wait = async { established.wait_for(|&done| done).await.is_ok() };
-        let timeout = self.config.handshake_timeout;
-        // A zero timeout disables the bound (wait indefinitely).
-        let outcome = if timeout.is_zero() {
-            Some(wait.await)
+        if established.wait_for(|&done| done).await.is_ok() {
+            Ok(())
         } else {
-            tokio::time::timeout(timeout, wait).await.ok()
-        };
-
-        match outcome {
-            // Established.
-            Some(true) => Ok(()),
-            // The backend task ended before establishing — surface the close reason.
-            Some(false) => Err(self.close_reason().await),
-            // Timed out waiting for the peer's parameters: abort the half-open
-            // handshake, notifying the peer, and fail rather than hang.
-            // If the session closed first, report that reason instead.
-            None => {
-                // Abnormal: a CONNECTION_CLOSE (0x1c) so the peer's session rejects
-                // rather than seeing a graceful close.
-                let frame = ConnectionClose {
-                    code: VarInt::from(0u32),
-                    reason: "handshake timeout".to_string(),
-                };
-                Err(self.close_with(frame.into(), Error::HandshakeTimeout))
-            }
+            // The backend enforces the handshake deadline and records its error
+            // before dropping the establishment sender.
+            Err(self.close_reason().await)
         }
     }
 
@@ -2323,8 +2316,33 @@ impl Session {
             tokio::spawn(timer.run());
         }
 
+        let handshake_deadline = if version.is_qmux() && !config.handshake_timeout.is_zero() {
+            // A deadline beyond the clock's range cannot expire.
+            base.checked_add(config.handshake_timeout)
+        } else {
+            None
+        };
+        let mut established = established_rx.clone();
         tokio::spawn(async move {
-            let err = backend.run().await.err().unwrap_or(Error::Closed);
+            let handshake = async {
+                if let Some(deadline) = handshake_deadline {
+                    if tokio::time::timeout_at(deadline, established.wait_for(|&done| done))
+                        .await
+                        .is_err()
+                    {
+                        return Error::HandshakeTimeout;
+                    }
+                }
+                std::future::pending().await
+            };
+            // The deadline starts at construction and remains pollable even if
+            // the reader is parked on application backpressure. Already-readable
+            // peer input wins over an expired deadline.
+            let err = tokio::select! {
+                biased;
+                result = backend.run() => result.err().unwrap_or(Error::Closed),
+                err = handshake => err,
+            };
             // If we tore down because of a protocol/transport violation *we*
             // detected, tell the peer with a CONNECTION_CLOSE (0x1c) so their
             // session rejects too, rather than seeing a bare drop. Enqueue on the
@@ -3676,6 +3694,48 @@ mod recv_open_tests {
         scripted_session_with_config(Config::new(Version::QMux01))
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn queued_handshake_frames_win_after_delayed_poll() {
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            for peer_closed in [false, true] {
+                let mut config = Config::new(version);
+                config.handshake_timeout = Duration::from_secs(1);
+                config.max_idle_timeout = 0;
+                config.rtt_interval = Duration::ZERO;
+                let params = config.to_transport_params();
+                let (session, incoming) = scripted_session_with_config(config);
+                incoming
+                    .send(Frame::TransportParameters(params).encode(version).unwrap())
+                    .unwrap();
+                if peer_closed {
+                    let frame = Frame::ConnectionClose(crate::proto::ConnectionClose {
+                        code: VarInt::from_u32(42),
+                        reason: "peer closed".into(),
+                    });
+                    incoming.send(frame.encode(version).unwrap()).unwrap();
+                }
+                // No spawned session task is polled until the clock has passed
+                // its deadline, with the peer's frame already readable.
+                tokio::time::advance(Duration::from_secs(2)).await;
+                if peer_closed {
+                    let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(error, Error::ConnectionReset { code, .. } if code.into_inner() == 42)
+                    );
+                } else {
+                    session.established().await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), session.closed())
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
     /// Encode a STREAM frame on a server-initiated uni stream (peer-initiated and
     /// receivable, since we're the client).
     fn uni_stream(index: u64, data: &'static [u8], fin: bool) -> Bytes {
@@ -5007,6 +5067,60 @@ mod teardown_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn handshake_timeout_releases_wedged_writer_with_retained_session() {
+        use web_transport_trait::Session as _;
+
+        for version in [Version::QMux00, Version::QMux01, Version::QMux02] {
+            let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+            let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+            let mut config = Config::new(version);
+            config.handshake_timeout = Duration::from_secs(1);
+            let session = Session::new(
+                WedgedTransport {
+                    entered_send: entered_tx,
+                    dropped: dropped_tx,
+                },
+                false,
+                config,
+            );
+            entered_rx.recv().await.unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), session.closed())
+                .await
+                .unwrap();
+            assert!(matches!(error, Error::HandshakeTimeout), "{error:?}");
+            tokio::time::timeout(Duration::from_secs(1), dropped_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_entrypoints_report_shared_handshake_timeout() {
+        for is_server in [false, true] {
+            let (entered_send, _entered_rx) = mpsc::unbounded_channel();
+            let (dropped, _dropped_rx) = mpsc::unbounded_channel();
+            let transport = WedgedTransport {
+                entered_send,
+                dropped,
+            };
+            let mut config = Config::new(Version::QMux02);
+            config.handshake_timeout = Duration::from_secs(1);
+            let establish = async {
+                if is_server {
+                    Session::accept(transport, config).await
+                } else {
+                    Session::connect(transport, config).await
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(2), establish)
+                .await
+                .expect("establishment stayed pending");
+            assert!(matches!(result, Err(Error::HandshakeTimeout)));
+        }
+    }
+
     /// A writer parked inside `send()` on a wedged transport must still observe
     /// teardown when the last `Session` clone drops, cancelling the in-flight
     /// write instead of staying alive until the transport eventually errors.
@@ -5257,24 +5371,34 @@ mod credit_update_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
     use web_transport_trait::{SendStream as _, Session as _};
 
     use super::{Reader, Session, Transport, Writer};
-    use crate::proto::{Frame, TransportParams};
+    use crate::proto::{Frame, StopSending, TransportParams};
     use crate::{Config, Error, StreamDir, StreamId, Version};
+    use web_transport_proto::VarInt;
 
     const VERSIONS: [Version; 3] = [Version::QMux00, Version::QMux01, Version::QMux02];
+
+    const CONTROL_VERSIONS: [Version; 4] = [
+        Version::WebTransport,
+        Version::QMux00,
+        Version::QMux01,
+        Version::QMux02,
+    ];
 
     /// A transport whose inbound frames are scripted and whose outbound records
     /// are kept for inspection.
     struct ScriptedTransport {
         incoming: mpsc::UnboundedReceiver<Bytes>,
         outgoing: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     struct ScriptedWriter {
         outgoing: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     struct ScriptedReader {
@@ -5289,6 +5413,7 @@ mod credit_update_tests {
             (
                 ScriptedWriter {
                     outgoing: self.outgoing,
+                    written: self.written,
                 },
                 ScriptedReader {
                     incoming: self.incoming,
@@ -5300,6 +5425,7 @@ mod credit_update_tests {
     impl Writer for ScriptedWriter {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
             self.outgoing.lock().unwrap().push(data);
+            self.written.notify_one();
             Ok(())
         }
 
@@ -5321,6 +5447,7 @@ mod credit_update_tests {
         version: Version,
         inbound: mpsc::UnboundedSender<Bytes>,
         outbound: Arc<Mutex<Vec<Bytes>>>,
+        written: Arc<Notify>,
     }
 
     impl Peer {
@@ -5330,19 +5457,55 @@ mod credit_update_tests {
                 .unwrap();
         }
 
-        /// Payload bytes the session has written on stream `id`.
-        fn sent_on(&self, id: StreamId) -> usize {
+        fn received(&self) -> Vec<Frame> {
             self.outbound
                 .lock()
                 .unwrap()
                 .iter()
-                .flat_map(|record| match self.version {
-                    Version::QMux00 => Frame::decode(record.clone(), self.version)
-                        .unwrap()
-                        .into_iter()
-                        .collect(),
-                    _ => Frame::decode_record(record.clone()).unwrap(),
+                .flat_map(|record| {
+                    if self.version.uses_records() {
+                        Frame::decode_record(record.clone()).unwrap()
+                    } else {
+                        Frame::decode(record.clone(), self.version)
+                            .unwrap()
+                            .into_iter()
+                            .collect()
+                    }
                 })
+                .collect()
+        }
+
+        async fn wait_for(&self, predicate: impl Fn(&Frame) -> bool) -> Frame {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(frame) = self.received().into_iter().find(&predicate) {
+                        return frame;
+                    }
+                    self.written.notified().await;
+                }
+            })
+            .await
+            .expect("expected frame was not written")
+        }
+
+        async fn sync(&self, session: &Session, sequence: u64) {
+            // A peer stream is an input barrier supported by every QMux draft.
+            self.send(Frame::Stream(crate::Stream {
+                id: StreamId::new(sequence, StreamDir::Uni, !session.is_server),
+                offset: 0,
+                data: Bytes::new(),
+                fin: true,
+            }));
+            tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("peer input was not processed")
+                .unwrap();
+        }
+
+        /// Payload bytes the session has written on stream `id`.
+        fn sent_on(&self, id: StreamId) -> usize {
+            self.received()
+                .into_iter()
                 .map(|frame| match frame {
                     Frame::Stream(stream) if stream.id == id => stream.data.len(),
                     _ => 0,
@@ -5351,24 +5514,33 @@ mod credit_update_tests {
         }
     }
 
-    /// A client session opposite a scripted server that has announced `params`.
-    fn scripted_session(version: Version, params: TransportParams) -> (Session, Peer) {
+    /// A session opposite a scripted peer that has announced `params`.
+    fn scripted_session(
+        version: Version,
+        params: TransportParams,
+        is_server: bool,
+    ) -> (Session, Peer) {
         let (tx, rx) = mpsc::unbounded_channel();
         let outbound = Arc::new(Mutex::new(Vec::new()));
+        let written = Arc::new(Notify::new());
         let session = Session::new(
             ScriptedTransport {
                 incoming: rx,
                 outgoing: outbound.clone(),
+                written: written.clone(),
             },
-            false,
+            is_server,
             Config::new(version),
         );
         let peer = Peer {
             version,
             inbound: tx,
             outbound,
+            written,
         };
-        peer.send(Frame::TransportParameters(params));
+        if version.is_qmux() {
+            peer.send(Frame::TransportParameters(params));
+        }
         (session, peer)
     }
 
@@ -5387,7 +5559,7 @@ mod credit_update_tests {
     #[tokio::test(start_paused = true)]
     async fn stale_limits_are_ignored() {
         for version in VERSIONS {
-            let (session, peer) = scripted_session(version, small_params(version));
+            let (session, peer) = scripted_session(version, small_params(version), false);
             let mut send = session.open_uni().await.unwrap();
             let id = StreamId::new(0, StreamDir::Uni, false);
 
@@ -5433,7 +5605,7 @@ mod credit_update_tests {
     async fn closed_with(frame: Frame) -> Vec<Error> {
         let mut errors = Vec::new();
         for version in VERSIONS {
-            let (session, peer) = scripted_session(version, small_params(version));
+            let (session, peer) = scripted_session(version, small_params(version), false);
             peer.send(frame.clone());
             let err = tokio::time::timeout(Duration::from_secs(10), session.closed())
                 .await
@@ -5461,6 +5633,151 @@ mod credit_update_tests {
         let id = StreamId::new(0, StreamDir::Uni, true);
         for err in closed_with(Frame::MaxStreamData { id, max: 10 }).await {
             assert!(matches!(err, Error::InvalidStreamId), "got {err:?}");
+        }
+    }
+    fn send_controls(version: Version, id: StreamId) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        if version.is_qmux() {
+            frames.push(Frame::MaxStreamData { id, max: 10 });
+        }
+        frames.push(Frame::StopSending(StopSending {
+            id,
+            code: VarInt::from_u32(42),
+        }));
+        frames
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_controls_on_unopened_local_streams_are_rejected() {
+        for version in CONTROL_VERSIONS {
+            for is_server in [false, true] {
+                for dir in [StreamDir::Uni, StreamDir::Bi] {
+                    for opened in [0, 2] {
+                        for index in [opened, opened + 10] {
+                            for frame in
+                                send_controls(version, StreamId::new(index, dir, is_server))
+                            {
+                                let params = Config::new(version).to_transport_params();
+                                let (session, peer) = scripted_session(version, params, is_server);
+                                // Advancing the other direction must not open this ID.
+                                for _ in 0..3 {
+                                    match dir {
+                                        StreamDir::Bi => {
+                                            session.open_uni().await.unwrap();
+                                        }
+                                        StreamDir::Uni => {
+                                            session.open_bi().await.unwrap();
+                                        }
+                                    }
+                                }
+                                for _ in 0..opened {
+                                    match dir {
+                                        StreamDir::Uni => {
+                                            session.open_uni().await.unwrap();
+                                        }
+                                        StreamDir::Bi => {
+                                            session.open_bi().await.unwrap();
+                                        }
+                                    }
+                                }
+                                peer.send(frame.clone());
+                                let error =
+                                    tokio::time::timeout(Duration::from_secs(1), session.closed())
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            panic!("{version:?} {frame:?} was accepted")
+                                        });
+                                assert!(matches!(error, Error::InvalidStreamId), "{error:?}");
+                                let close = peer
+                                    .wait_for(|f| matches!(f, Frame::ConnectionClose(_)))
+                                    .await;
+                                let Frame::ConnectionClose(close) = close else {
+                                    unreachable!()
+                                };
+                                assert_eq!(close.code.into_inner(), 1002);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_controls_on_opened_and_retired_local_streams_are_allowed() {
+        for version in CONTROL_VERSIONS {
+            for is_server in [false, true] {
+                for dir in [StreamDir::Uni, StreamDir::Bi] {
+                    let mut params = Config::new(version).to_transport_params();
+                    params.initial_max_stream_data_uni = 0;
+                    params.initial_max_stream_data_bidi_remote = 0;
+                    let (session, peer) = scripted_session(version, params, is_server);
+                    let (mut send, recv) = match dir {
+                        StreamDir::Uni => (session.open_uni().await.unwrap(), None),
+                        StreamDir::Bi => {
+                            let (send, recv) = session.open_bi().await.unwrap();
+                            (send, Some(recv))
+                        }
+                    };
+                    let id = StreamId::new(0, dir, is_server);
+                    if version.is_qmux() {
+                        peer.send(Frame::MaxStreamData { id, max: 10 });
+                    }
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(1), send.write(b"x"))
+                            .await
+                            .expect("MAX_STREAM_DATA did not grant credit")
+                            .unwrap(),
+                        1
+                    );
+                    peer.send(Frame::StopSending(StopSending {
+                        id,
+                        code: VarInt::from_u32(42),
+                    }));
+                    peer.sync(&session, 0).await;
+                    assert!(
+                        matches!(tokio::time::timeout(Duration::from_secs(1), send.closed())
+                            .await.expect("STOP_SENDING was ignored"), Err(Error::StreamStop(code)) if code.into_inner() == 42)
+                    );
+                    drop(send);
+                    drop(recv);
+                    peer.wait_for(|f| matches!(f, Frame::ResetStream(reset) if reset.id == id))
+                        .await;
+                    assert!(!session.streams.lock().unwrap().send.contains_key(&id));
+                    for frame in send_controls(version, id) {
+                        peer.send(frame);
+                    }
+                    peer.sync(&session, 1).await;
+                    assert!(!peer
+                        .received()
+                        .iter()
+                        .any(|f| matches!(f, Frame::ConnectionClose(_))));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_controls_on_peer_initiated_streams_keep_their_behavior() {
+        for version in CONTROL_VERSIONS {
+            for is_server in [false, true] {
+                let id = StreamId::new(0, StreamDir::Uni, !is_server);
+                for frame in send_controls(version, id) {
+                    let params = Config::new(version).to_transport_params();
+                    let (session, peer) = scripted_session(version, params, is_server);
+                    let id = StreamId::new(10, StreamDir::Bi, !is_server);
+                    for frame in send_controls(version, id) {
+                        peer.send(frame);
+                    }
+                    peer.sync(&session, 0).await;
+                    assert!(session.streams.lock().unwrap().send.is_empty());
+                    peer.send(frame);
+                    let error = tokio::time::timeout(Duration::from_secs(1), session.closed())
+                        .await
+                        .expect("receive-only send control was accepted");
+                    assert!(matches!(error, Error::InvalidStreamId), "{error:?}");
+                }
+            }
         }
     }
 }
