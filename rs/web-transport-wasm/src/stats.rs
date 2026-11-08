@@ -16,6 +16,7 @@ impl Collector {
         }
     }
 
+    /// Fetch a fresh `getStats()` dictionary, or `undefined` if the browser lacks it.
     pub(crate) async fn collect(&self) -> Result<JsValue, Error> {
         // Optional statistics must not add a failure mode to opening or accepting
         // a stream. Surface broken collectors only when collection is requested.
@@ -38,6 +39,7 @@ impl Collector {
     }
 }
 
+/// Read one W3C counter: `None` when the dictionary or member is absent, an error when malformed.
 pub(crate) fn metric(stats: &JsValue, name: &str) -> Result<Option<u64>, Error> {
     if stats.is_undefined() {
         return Ok(None);

@@ -45,18 +45,18 @@ impl RecvStream {
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, StreamError> {
-        std::future::poll_fn(|cx| web_transport_trait::poll::RecvStream::poll_read(self, cx, buf))
-            .await
+        let size = self.inner.read(buf).await?;
+        self.bytes_read += size.unwrap_or(0) as u64;
+        Ok(size)
     }
 
     /// Read a chunk of data from the stream.
     ///
     /// Returns `None` if the stream has been finished.
     pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, StreamError> {
-        std::future::poll_fn(|cx| {
-            web_transport_trait::poll::RecvStream::poll_read_chunk(self, cx, max)
-        })
-        .await
+        let chunk = self.inner.read_chunk(max).await?;
+        self.bytes_read += chunk.as_ref().map_or(0, Bytes::len) as u64;
+        Ok(chunk)
     }
 
     /// Read data into a mutable buffer and return the amount read.

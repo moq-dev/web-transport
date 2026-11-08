@@ -47,16 +47,16 @@ impl SendStream {
 
     /// Write some data to the stream, returning the size written.
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize, StreamError> {
-        std::future::poll_fn(|cx| web_transport_trait::poll::SendStream::poll_write(self, cx, buf))
-            .await
+        let size = self.inner.write(buf).await?;
+        self.bytes_written += size as u64;
+        Ok(size)
     }
 
     /// Write data from a buffer to the stream, returning the size written.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, StreamError> {
-        std::future::poll_fn(|cx| {
-            web_transport_trait::poll::SendStream::poll_write_buf(self, cx, buf)
-        })
-        .await
+        let size = self.inner.write_buf(buf).await?;
+        self.bytes_written += size as u64;
+        Ok(size)
     }
 
     /// Write all of the data to the stream.
