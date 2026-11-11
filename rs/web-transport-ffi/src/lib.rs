@@ -3,7 +3,7 @@
 //! Exposes a WebTransport client/server API to Swift, Kotlin, and Python via
 //! UniFFI. The shape mirrors `web-transport-quinn` with `Mutex<Option<T>>`
 //! take-out patterns for `finish()`/`reset()` and a single shared tokio
-//! runtime ([`ffi::RUNTIME`]).
+//! runtime (`ffi::RUNTIME`).
 
 #[cfg(target_os = "android")]
 mod android;

@@ -1,8 +1,8 @@
 //! Provider-neutral Quinn TLS over rustls, with rind for Retry and endpoint keys.
 //!
-//! Use [`QuicClientConfig`] and [`QuicServerConfig`] in place of Quinn's
-//! `crypto::rustls` types, [`endpoint_config`] with `quinn::Endpoint::new`, and
-//! [`server_config`] in place of `quinn::ServerConfig::with_crypto`.
+//! Use [`crate::crypto::QuicClientConfig`] and [`crate::crypto::QuicServerConfig`] in place of Quinn's
+//! `crypto::rustls` types, [`crate::crypto::endpoint_config`] with `quinn::Endpoint::new`, and
+//! [`crate::crypto::server_config`] in place of `quinn::ServerConfig::with_crypto`.
 
 use std::sync::Arc;
 

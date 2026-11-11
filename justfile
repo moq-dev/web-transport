@@ -26,6 +26,10 @@ check:
 	cargo check --workspace --all-targets --all-features
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+	# Rustdoc warnings fail the build. Setting RUSTDOCFLAGS replaces build.rustdocflags
+	# from .cargo/config.toml, so the wasm cfg is repeated here.
+	RUSTDOCFLAGS="--cfg=web_sys_unstable_apis -D warnings" cargo doc --workspace --no-deps --all-features
+
 	# Do the same but explicitly use the WASM target.
 	cargo check --target wasm32-unknown-unknown -p web-transport --all-targets --all-features
 	cargo check --target wasm32-unknown-unknown -p web-transport-wasm --all-targets --all-features
