@@ -4,6 +4,8 @@ WebTransport for Node.js, powered by native QUIC/HTTP3 via NAPI-RS.
 
 Provides a custom client and server API for setup, then exposes the standard [W3C WebTransport API](https://www.w3.org/TR/webtransport/) for streams, datagrams, and session lifecycle.
 
+See the [package and backend selection guide](https://github.com/moq-dev/web-transport/blob/main/PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Installation
 
 ```bash
@@ -60,7 +62,7 @@ const session = new Session("https://example.com:4443/path", {
 });
 ```
 
-QUIC uses the smaller of both peers' idle timeouts, so disabling one endpoint's timeout leaves the peer's in effect. To keep an otherwise idle session open, set `keepAliveInterval` below the effective idle timeout on either endpoint.
+QUIC uses the smaller of both peers' idle timeouts, so disabling one endpoint's timeout leaves the peer's in effect. To keep an otherwise idle session open, set `keepAliveInterval` below the effective idle timeout on either endpoint. An expired idle timeout is a connection failure, so it rejects `session.closed` with a session `WebTransportError`.
 
 ### Polyfill
 
@@ -168,9 +170,28 @@ import { WebTransportError } from "@moq/web-transport";
 await writer.abort(new WebTransportError("cancelled", { streamErrorCode: 7 }));
 ```
 
+### Releasing readers
+
+Call `reader.cancel()` when you stop reading a receive stream. Cancellation is the
+release boundary: it interrupts a pending `read()`, sends STOP_SENDING with the reason's
+`streamErrorCode` (0 otherwise), and releases the native stream.
+
+A pending `read()` keeps its stream alive until data, the stream's end, a session
+close, or cancellation settles it. Garbage collection does not cancel an abandoned
+reader with a pending read, so an abandoned reader keeps its stream open and the
+peer never sees STOP_SENDING. This matches Web Streams, where an awaited `read()`
+or `pipeTo()` must not fail because only its promise remains reachable.
+
 ### Closing
 
 Always call `session.close()` when finished and await `session.closed`. The Node wrapper retains native Session handles while its close promise and incoming stream operations are pending. Garbage collecting the JavaScript Session does not close those handles, so it does not provide the Rust Session's final-handle cleanup contract.
+
+`session.closed` resolves with the application code and reason after a local or peer close,
+including nonzero application codes. An orderly HTTP/3 connection shutdown (H3_NO_ERROR)
+without application details resolves with code 0 and an empty reason. A failed connection or an underlying connection
+failure rejects it with a `WebTransportError` whose `source` is `"session"` and
+`streamErrorCode` is `null`. `session.ready` rejects with the same error if connecting fails.
+Backend teardown without an application `session.close()` also rejects `closed`.
 
 ```ts
 // Close gracefully

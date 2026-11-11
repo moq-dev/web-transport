@@ -12,6 +12,4 @@ The Required list is ordered by priority. Independent children may proceed concu
 
 - [Rust crates on rind](/quest/a1/rind/README.md) - no C crypto outside Quiche
 - [Binding runtime coverage](/quest/a1/bindings/README.md) - independent language jobs
-- [Response headers](/quest/a1/response-headers.md) - preserve success and rejection metadata
 - [Rust platform verifier](/quest/a1/platform-verifier.md) - `with_system_roots()` verifies with the OS trust store
-- [Package selection](/quest/a1/package-selection.md) - verified comparison and selection guide

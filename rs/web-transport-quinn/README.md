@@ -6,6 +6,8 @@
 A wrapper around the Quinn API, abstracting away the annoying HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## WebTransport
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new web API that allows for low-level, bidirectional communication between a client and a server.
 It's [available in the browser](https://caniuse.com/webtransport) as an alternative to HTTP and WebSockets.
@@ -135,9 +137,32 @@ An explicit `LowLatency` or `Throughput` congestion choice overrides only the co
 Quinn's `TransportConfig` is not cloneable, so `ClientBuilder` owns it and does not implement `Clone`. Construct a builder for each configuration, then clone the finished `Client` to share its endpoints and settings across connections.
 
 ## API
+`Session::closed` preserves the first close reason. A clean CONNECT-stream FIN without
+a close capsule reports `WebTransportError::Closed(0, "")`; malformed or interrupted
+capsules report `WebTransportError::CapsuleError` unless the underlying connection has
+already reported its own error. An explicit local close reports `ConnectionError::LocallyClosed`.
+
+`WebTransportError::CapsuleError(String)` adds a diagnostic variant to the public
+enum; exhaustive matches must handle it. Dropping a receive stream sends
+application code 0 in the session's code space, preserving raw QUIC code 0 for raw sessions.
+
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
 
 When possible, `Deref` is used to expose the underlying Quinn API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
 - Stream IDs are not avaialble.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
+
+
+## CONNECT response metadata
+
+`Request::respond` and `Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Session::response()`. A rejected CONNECT
+is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

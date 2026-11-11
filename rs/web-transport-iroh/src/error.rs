@@ -72,12 +72,16 @@ pub(crate) fn decode_stream_code(code: endpoint::VarInt, raw: bool) -> Option<u3
     }
 }
 
-/// An error that can occur when reading/writing the WebTransport stream header.
+/// An error in a WebTransport stream header or session capsule.
 #[stack_error(derive, from_sources)]
 #[derive(Clone)]
 pub enum WebTransportError {
     #[error("closed: code={code} reason={reason}")]
     Closed { code: u32, reason: String },
+
+    /// The session's HTTP/3 capsule stream was malformed or interrupted, with a diagnostic message.
+    #[error("capsule error: {_0}")]
+    CapsuleError(String),
 
     #[error("unknown session")]
     UnknownSession,

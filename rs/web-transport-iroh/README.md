@@ -11,6 +11,21 @@ It implements the [`web-transport-trait`] traits for iroh connections and stream
 
 The crate was originally derived from [`web-transport-quinn`].
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
+## Session closure
+
+A peer close capsule reports `WebTransportError::Closed` with its application code
+and reason. A clean CONNECT FIN without a capsule reports code 0 and an empty reason.
+Malformed capsule data reports `WebTransportError::CapsuleError(String)` and closes
+HTTP/3 with H3_MESSAGE_ERROR (0x10e). An existing connection failure keeps its cause.
+
+`CapsuleError(String)` is a new public enum variant; downstream exhaustive matches
+must handle it when upgrading.
+
+Dropping a receive stream sends application code 0 in the session's code space:
+HTTP/3 maps the code, while raw QUIC sends it unchanged.
+
 ## License
 
 Copyright 2025 N0, INC.
@@ -31,3 +46,17 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [WebTransport]: https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.html
 [`web-transport-quinn`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-quinn
 [`web-transport-trait`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-trait
+
+
+## CONNECT response metadata
+
+`H3Request::respond` and `H3Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Session::response()`. A rejected CONNECT
+is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

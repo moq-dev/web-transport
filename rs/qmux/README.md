@@ -6,6 +6,8 @@ QMux brings QUIC's multiplexed streams and flow control to reliable, ordered byt
 
 The protocol reuses QUIC frame types and semantics while adapting them for stream-based transports, providing multiplexed streams with flow control and optional unreliable datagrams.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 ```toml

@@ -23,6 +23,9 @@ QUIC datagrams are unordered, unreliable, and not flow-controlled.
 Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they might arrive out of order or not at all.
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
+For package and backend choices, including a comparison with wtransport, see the
+[selection guide](PACKAGE-SELECTION.md).
+
 # Crates
 
 The Rust workspace contains these crates under [`rs/`](rs/):

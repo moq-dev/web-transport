@@ -117,8 +117,8 @@ async fn negotiate(
         let request = server.accept().await.context("no request")?;
         assert_eq!(request.protocols, offered);
         let response = match selected {
-            Some(protocol) => ConnectResponse::OK.with_protocol(protocol),
-            None => ConnectResponse::OK,
+            Some(protocol) => ConnectResponse::default().with_protocol(protocol),
+            None => ConnectResponse::default(),
         };
         anyhow::Ok(request.respond(response).await?)
     };

@@ -204,7 +204,7 @@ impl Request {
     }
 
     pub async fn ok(self) -> Result<Session, ServerError> {
-        self.respond(ConnectResponse::OK).await
+        self.respond(ConnectResponse::default()).await
     }
 
     /// Reply to the session with the given response, usually 200 OK.
@@ -219,9 +219,11 @@ impl Request {
         Ok(Session::new(self.conn, self.settings, connect))
     }
 
-    /// Reject the session with the given status code.
-    pub async fn reject(self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.reject(status).await?;
+    /// Reject the session with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination; cancel to impose an application deadline.
+    pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ServerError> {
+        self.connect.reject(response).await?;
         Ok(())
     }
 

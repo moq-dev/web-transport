@@ -4,6 +4,8 @@ Kotlin/Android bindings for [web-transport-ffi](../rs/web-transport-ffi) via [Un
 
 Single Kotlin Multiplatform module that publishes `dev.moq:web-transport` with both JVM and Android variants under one coordinate. Consumers add `dev.moq:web-transport:VERSION` and Gradle metadata resolution picks the right artifact for their target.
 
+See the [package and backend selection guide](../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 ```kotlin
@@ -105,6 +107,19 @@ kt/
 ## Publishing
 
 Publishing to Maven Central is CI-only via `.github/workflows/release-kt.yml`, which runs on every `web-transport-ffi-v*` tag. See the moq-dev org docs for Sonatype credentials.
+
+## Rejection diagnostics
+
+The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
+lowercase names and byte values. Repeated names retain all values. Regenerate
+the bindings and native library together when migrating to this expanded error
+record; update exhaustive matches or constructors for the new fields.
+
+Generated `SessionRequest.reject` accepts defaulted `headers` (`HttpHeader`
+field lines) and `protocol` arguments alongside the status code. Existing calls
+keep their defaults. The selected protocol must have been offered by the peer;
+malformed or reserved generic fields fail before consuming the request.
 
 ## Native crypto
 

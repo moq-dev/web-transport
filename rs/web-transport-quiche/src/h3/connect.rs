@@ -19,8 +19,9 @@ pub enum ConnectError {
     #[error("stream error")]
     Stream(#[from] ez::StreamError),
 
-    #[error("http error status: {0}")]
-    Status(http::StatusCode),
+    #[error("http error status: {}", .0.status)]
+    /// The peer rejected the session; includes its status, protocol and headers.
+    Status(Box<ConnectResponse>),
 }
 
 /// An HTTP/3 CONNECT request/response for establishing a WebTransport session.
@@ -56,7 +57,7 @@ impl Connecting {
     }
 
     pub async fn ok(self) -> Result<Connected, ConnectError> {
-        self.respond(ConnectResponse::OK).await
+        self.respond(ConnectResponse::default()).await
     }
 
     /// Send an HTTP/3 CONNECT response to the client.
@@ -79,9 +80,18 @@ impl Connecting {
         })
     }
 
-    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let mut connect = self.respond(status).await?;
-        connect.send.finish()?;
+    /// Reject the CONNECT request with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination, subject to the QUIC idle timeout.
+    /// Cancel the future to impose an application deadline.
+    pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
+        let mut connect = self.respond(response).await?;
+        // RFC 9114 §4.1.1: a complete response can stop the request with H3_NO_ERROR.
+        connect.recv.stop(0x100);
+        match connect.send.rejected().await {
+            Ok(()) | Err(ez::StreamError::Connection(ez::ConnectionError::Remote(..))) => (),
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
 }
@@ -130,7 +140,7 @@ impl Connected {
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
-            return Err(ConnectError::Status(response.status));
+            return Err(ConnectError::Status(Box::new(response)));
         }
 
         Ok(Self {

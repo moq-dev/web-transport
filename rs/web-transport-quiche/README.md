@@ -6,6 +6,8 @@
 A wrapper around the Quiche, abstracting away the annoying API and HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Limitations
 This library builds on top of [tokio-quiche](https://docs.rs/tokio-quiche/latest/tokio_quiche/); the "official" Tokio runtime for [quiche](https://github.com/cloudflare/quiche).
 
@@ -51,6 +53,11 @@ Raw QUIC sessions use the same final-clone ownership boundary.
 Call `Connection::close` before dropping to choose the close code and reason;
 final drop preserves an explicit close already in progress. Await
 `Connection::closed` when the application needs the driver to complete teardown.
+
+The CONNECT reader decodes capsules inside HTTP/3 DATA frames. A clean FIN
+without a close capsule closes the session with application code 0 and an empty
+reason. Malformed capsules fail with H3_MESSAGE_ERROR, preserving any native
+connection failure already observed.
 
 ## Send-rate statistics
 
@@ -110,3 +117,17 @@ sleep. Certificates are generated in memory; no fixture files are needed.
 For a focused run, use `cargo test -p web-transport-quiche --lib ez::driver::tests`.
 The pair pumps queued packets only; tests that need QUIC timer expiry require a
 separate clock-driving seam.
+
+
+## CONNECT response metadata
+
+`Request::respond` and `Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Connection::response()`. A rejected CONNECT
+is a structured `h3::ConnectError::Status(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

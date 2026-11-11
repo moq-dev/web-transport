@@ -120,8 +120,12 @@ async def page(browser: Browser) -> AsyncIterator[Page]:
     ``WebTransport()`` requires a secure context.  ``http://localhost`` is
     treated as secure in Chromium, so we use ``page.route()`` to intercept
     the navigation and serve a minimal HTML page — no real HTTP server needed.
+
+    A routed page has no loopback address space, so Chromium's Local Network
+    Access checks would block its connections to ``127.0.0.1``; the
+    ``local-network-access`` permission allows them.
     """
-    context = await browser.new_context()
+    context = await browser.new_context(permissions=["local-network-access"])
 
     async def intercept(route: Route) -> None:
         await route.fulfill(
