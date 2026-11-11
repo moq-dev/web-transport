@@ -50,7 +50,23 @@ function wrapSendStream(send: NapiSendStream): WritableStream<Uint8Array> {
 	});
 }
 
-export interface SessionOptions extends WebTransportOptions {
+/** QUIC idle timeout and keep-alive settings, in milliseconds, for a client or server. */
+export interface TransportOptions {
+	/**
+	 * Milliseconds without network activity before the connection closes, or 0 to disable this endpoint's
+	 * timeout. Defaults to 30000. A connection uses the smaller of both peers' timeouts, so the peer's own
+	 * timeout still applies when this one is disabled. Must be a non-negative safe integer.
+	 */
+	idleTimeout?: number;
+	/**
+	 * Milliseconds without sending before a keep-alive packet is sent, which keeps an otherwise idle
+	 * connection open when shorter than the idle timeout. Omitted or 0 sends none. Must be a non-negative
+	 * safe integer.
+	 */
+	keepAliveInterval?: number;
+}
+
+export interface SessionOptions extends WebTransportOptions, TransportOptions {
 	/** Skip all certificate verification. Only use for testing. */
 	serverCertificateDisableVerify?: boolean;
 	/** Subprotocols for WT-Available-Protocols negotiation. */
@@ -105,17 +121,17 @@ export default class Session implements WebTransport {
 				throw new Error("serverCertificateDisableVerify and serverCertificateHashes cannot be used together");
 			}
 
-			let client: InstanceType<typeof NapiClient>;
-			if (options?.serverCertificateDisableVerify) {
-				client = NapiClient.disableVerify();
-			} else if (hashes && hashes.length > 0) {
-				const buffers = hashes
-					.filter((h): h is WebTransportHash & { value: BufferSource } => h.value != null)
-					.map((h) => Buffer.from(h.value as ArrayBuffer));
-				client = NapiClient.withCertificateHashes(buffers);
-			} else {
-				client = NapiClient.withSystemRoots();
-			}
+			const client = NapiClient.withOptions({
+				serverCertificateDisableVerify: options?.serverCertificateDisableVerify,
+				serverCertificateHashes:
+					hashes && hashes.length > 0
+						? hashes
+								.filter((h): h is WebTransportHash & { value: BufferSource } => h.value != null)
+								.map((h) => Buffer.from(h.value as ArrayBuffer))
+						: undefined,
+				idleTimeout: options?.idleTimeout,
+				keepAliveInterval: options?.keepAliveInterval,
+			});
 
 			const connectOptions = options?.protocols ? { protocols: options.protocols } : null;
 
