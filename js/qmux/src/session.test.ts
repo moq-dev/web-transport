@@ -1251,6 +1251,159 @@ describe("Session integration (scripted peer)", () => {
 		session.close();
 	});
 
+	// RFC 9000 §4.5: every byte up to a stream's final size counts against
+	// MAX_DATA, so a cancelled stream must keep crediting what the peer still
+	// sends until FIN or RESET_STREAM, exactly once.
+	describe("cancelled receive streams return connection credit", () => {
+		/** Every MAX_DATA value the session advertised, in order. */
+		const maxDataSent = (peer: FakePeer) => peer.received().flatMap((f) => (f.type === "max_data" ? [f.max] : []));
+		/** Whether the session has told the peer `id` is stopped. */
+		const stopped = (peer: FakePeer, id: Stream.Id) =>
+			peer.waitForFrame((f) => f.type === "stop_sending" && f.id.value.value === id.value.value);
+		const sync = async (peer: FakePeer, sequence: bigint) => {
+			peer.send({ type: "ping_request", sequence });
+			await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === sequence);
+		};
+
+		/** Accept the peer's next uni stream and cancel it without reading. */
+		const acceptAndCancel = async (session: Session) => {
+			const acceptor = session.incomingUnidirectionalStreams.getReader();
+			const { value } = await acceptor.read();
+			acceptor.releaseLock();
+			if (!value) throw new Error("expected an incoming stream");
+			await value.cancel();
+		};
+
+		test("late STREAM data after cancel is credited once", async () => {
+			const { session, peer } = connect({ maxData: 100n, maxStreamDataUni: 100n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+			peer.send({ type: "stream", id, data: new Uint8Array(10), fin: false });
+			await acceptAndCancel(session);
+			await stopped(peer, id);
+
+			// In flight before the peer saw STOP_SENDING. 70 of 100 consumed crosses
+			// the half-window threshold, so MAX_DATA advances to 70 + 100.
+			peer.send({ type: "stream", id, data: new Uint8Array(60), fin: false });
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 70n });
+			// Retired: neither may count again.
+			peer.send({ type: "stream", id, data: new Uint8Array(5), fin: false });
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 70n });
+			await sync(peer, 1n);
+
+			expect(maxDataSent(peer)).toEqual([170n]);
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+
+		test("the RESET_STREAM gap after cancel is credited once", async () => {
+			const { session, peer } = connect({ maxData: 100n, maxStreamDataUni: 100n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+			peer.send({ type: "stream", id, data: new Uint8Array(10), fin: false });
+			await acceptAndCancel(session);
+			await stopped(peer, id);
+
+			// 60 bytes the peer sent but we never saw, still charged to MAX_DATA.
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 70n });
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 70n });
+			await sync(peer, 1n);
+
+			expect(maxDataSent(peer)).toEqual([170n]);
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+
+		test("a cancelled local bidi stream credits late data and the reset gap", async () => {
+			const { session, peer } = connect({ maxData: 100n, maxStreamDataBidiLocal: 100n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const stream = await session.createBidirectionalStream();
+			const id = Stream.Id.create(0n, Stream.Dir.Bi, false);
+			peer.send({ type: "stream", id, data: new Uint8Array(10), fin: false });
+			await stream.readable.cancel();
+			await stopped(peer, id);
+
+			peer.send({ type: "stream", id, data: new Uint8Array(30), fin: false });
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 70n });
+			peer.send({ type: "stream", id, data: new Uint8Array(5), fin: false });
+			await sync(peer, 1n);
+
+			expect(maxDataSent(peer)).toEqual([170n]);
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+
+		test("stream-count credit returns when a cancelled stream retires", async () => {
+			const { session, peer } = connect({ maxStreamsUni: 1n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			const id = Stream.Id.create(0n, Stream.Dir.Uni, true);
+			peer.send({ type: "stream", id, data: new Uint8Array(1), fin: false });
+			await acceptAndCancel(session);
+			await stopped(peer, id);
+
+			// The peer may still send up to the final size, so the retained entry
+			// keeps holding its slot: a peer ignoring STOP_SENDING stays bounded.
+			await sync(peer, 1n);
+			expect(peer.count("max_streams_uni")).toBe(0);
+
+			peer.send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 1n });
+			await peer.waitForFrame((f) => f.type === "max_streams_uni");
+			session.close();
+		});
+
+		test("many cancelled streams leave the session usable", async () => {
+			const window = 300n;
+			const { session, peer } = connect({ maxData: window, maxStreamDataUni: window, maxStreamsUni: 2n });
+			await session.ready;
+			peer.send({ type: "transport_parameters", params: peerParams() });
+
+			// The peer honors our limits: it never sends past MAX_DATA or MAX_STREAMS.
+			let sent = 0n;
+			const dataLimit = () => maxDataSent(peer).reduce((max, next) => (next > max ? next : max), window);
+			const streamLimit = () =>
+				peer
+					.received()
+					.flatMap((f) => (f.type === "max_streams_uni" ? [f.max] : []))
+					.reduce((max, next) => (next > max ? next : max), 2n);
+			const send = async (frame: Frame.Data | Frame.ResetStream, bytes: bigint) => {
+				await peer.waitForFrame(() => dataLimit() >= sent + bytes);
+				sent += bytes;
+				peer.send(frame);
+			};
+
+			// Ten streams, each sending 300 bytes (a full connection window) across
+			// data before the cancel, data after it, and the RESET_STREAM gap.
+			for (let i = 0n; i < 10n; i++) {
+				await peer.waitForFrame(() => streamLimit() > i);
+				const id = Stream.Id.create(i, Stream.Dir.Uni, true);
+				await send({ type: "stream", id, data: new Uint8Array(100), fin: false }, 100n);
+				await acceptAndCancel(session);
+				await stopped(peer, id);
+				await send({ type: "stream", id, data: new Uint8Array(100), fin: false }, 100n);
+				await send({ type: "reset_stream", id, code: VarInt.from(0), finalSize: 300n }, 100n);
+			}
+
+			// A fresh stream still gets through and is readable.
+			await peer.waitForFrame(() => streamLimit() > 10n);
+			const id = Stream.Id.create(10n, Stream.Dir.Uni, true);
+			await send({ type: "stream", id, data: new Uint8Array(Number(window)), fin: true }, window);
+			const acceptor = session.incomingUnidirectionalStreams.getReader();
+			const { value } = await acceptor.read();
+			if (!value) throw new Error("expected an incoming stream");
+			expect((await value.getReader().read()).value?.byteLength).toBe(Number(window));
+			expect(peer.has("connection_close")).toBe(false);
+			session.close();
+		});
+	});
+
 	// Regression: a STREAM frame delivered by the read loop after the session has
 	// closed used to hit the already-closed incoming-stream controllers, and the
 	// throw escaped as an unhandled rejection because #handleStreamFrame was an
