@@ -14,5 +14,5 @@ export function install(): boolean {
 export default Session;
 export { WebTransportError, type WebTransportErrorOptions } from "./error.ts";
 export { Request } from "./request.ts";
-export { Server } from "./server.ts";
-export type { SessionOptions } from "./session.ts";
+export { Server, type ServerOptions } from "./server.ts";
+export type { SessionOptions, TransportOptions } from "./session.ts";
