@@ -117,6 +117,32 @@ impl NapiClient {
         })
     }
 
+    /// Create a client with certificate verification and QUIC transport options.
+    ///
+    /// Without certificate options, server certificates are validated against system root CAs.
+    #[napi(factory)]
+    pub fn with_options(options: NapiClientOptions) -> Result<Self> {
+        napi::bindgen_prelude::within_runtime_if_available(|| {
+            let builder = web_transport_quinn::ClientBuilder::new().with_transport_config(
+                transport_config(options.idle_timeout, options.keep_alive_interval)?,
+            );
+            let disable_verify = options.server_certificate_disable_verify.unwrap_or(false);
+            let client = match (disable_verify, options.server_certificate_hashes) {
+                (true, Some(_)) => {
+                    return Err(Error::from_reason(
+                        "serverCertificateDisableVerify and serverCertificateHashes cannot be used together",
+                    ))
+                }
+                (true, None) => builder.dangerous().with_no_certificate_verification(),
+                (false, Some(hashes)) => builder
+                    .with_server_certificate_hashes(hashes.iter().map(|h| h.to_vec()).collect()),
+                (false, None) => builder.with_system_roots(),
+            }
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+            Ok(Self { inner: client })
+        })
+    }
+
     /// Connect to a WebTransport server at the given URL.
     #[napi]
     pub async fn connect(
@@ -151,6 +177,71 @@ impl NapiClient {
 pub struct NapiConnectOptions {
     /// Subprotocols for WT-Available-Protocols negotiation.
     pub protocols: Option<Vec<String>>,
+}
+
+/// Options for creating a WebTransport client.
+#[napi(object)]
+#[derive(Default)]
+#[non_exhaustive]
+pub struct NapiClientOptions {
+    /// Skip all certificate verification. WARNING: Only use for testing.
+    pub server_certificate_disable_verify: Option<bool>,
+    /// Accept only server certificates with these SHA-256 hashes instead of system root CAs.
+    /// An empty list accepts no certificate.
+    pub server_certificate_hashes: Option<Vec<Buffer>>,
+    /// Milliseconds without network activity before a connection closes, or 0 to disable this
+    /// endpoint's timeout. Omitted keeps the 30000 ms default. A connection uses the smaller of both
+    /// peers' timeouts, so a peer's own timeout still applies when this one is disabled.
+    pub idle_timeout: Option<f64>,
+    /// Milliseconds without sending before a keep-alive packet is sent, which keeps an otherwise
+    /// idle connection open when shorter than the idle timeout. Omitted or 0 sends none.
+    pub keep_alive_interval: Option<f64>,
+}
+
+/// Options for binding a WebTransport server.
+#[napi(object)]
+#[derive(Default)]
+#[non_exhaustive]
+pub struct NapiServerOptions {
+    /// Milliseconds without network activity before a connection closes, or 0 to disable this
+    /// endpoint's timeout. Omitted keeps the 30000 ms default. A connection uses the smaller of both
+    /// peers' timeouts, so a peer's own timeout still applies when this one is disabled.
+    pub idle_timeout: Option<f64>,
+    /// Milliseconds without sending before a keep-alive packet is sent, which keeps an otherwise
+    /// idle connection open when shorter than the idle timeout. Omitted or 0 sends none.
+    pub keep_alive_interval: Option<f64>,
+}
+
+/// Build Quinn's transport configuration, changing only the options that were supplied.
+fn transport_config(
+    idle_timeout: Option<f64>,
+    keep_alive_interval: Option<f64>,
+) -> Result<web_transport_quinn::quinn::TransportConfig> {
+    let mut config = web_transport_quinn::quinn::TransportConfig::default();
+    if let Some(ms) = idle_timeout {
+        let timeout = millis("idleTimeout", ms)?
+            .map(web_transport_quinn::quinn::IdleTimeout::try_from)
+            .transpose()
+            .map_err(|e| Error::from_reason(format!("idleTimeout: {e}")))?;
+        config.max_idle_timeout(timeout);
+    }
+    if let Some(ms) = keep_alive_interval {
+        config.keep_alive_interval(millis("keepAliveInterval", ms)?);
+    }
+    Ok(config)
+}
+
+/// Parse a JavaScript millisecond count, where 0 means disabled.
+fn millis(name: &str, ms: f64) -> Result<Option<std::time::Duration>> {
+    // Number.MAX_SAFE_INTEGER: larger integers are not exactly representable in JavaScript.
+    const MAX: f64 = 9_007_199_254_740_991.0;
+    if !(0.0..=MAX).contains(&ms) || ms.fract() != 0.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{name} must be a non-negative safe integer number of milliseconds, got {ms}"),
+        ));
+    }
+    Ok((ms != 0.0).then(|| std::time::Duration::from_millis(ms as u64)))
 }
 
 /// A WebTransport server that accepts incoming sessions.
@@ -191,7 +282,20 @@ impl NapiServer {
     /// Create a server bound to the given address with the given TLS certificate.
     #[napi(factory)]
     pub fn bind(addr: String, cert_pem: Buffer, key_pem: Buffer) -> Result<Self> {
+        Self::bind_with_options(addr, cert_pem, key_pem, NapiServerOptions::default())
+    }
+
+    /// Create a server like `bind`, with QUIC transport options.
+    #[napi(factory)]
+    pub fn bind_with_options(
+        addr: String,
+        cert_pem: Buffer,
+        key_pem: Buffer,
+        options: NapiServerOptions,
+    ) -> Result<Self> {
         napi::bindgen_prelude::within_runtime_if_available(|| {
+            let transport = transport_config(options.idle_timeout, options.keep_alive_interval)?;
+
             let certs = rustls_pemfile::certs(&mut &cert_pem[..])
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| Error::from_reason(format!("invalid certificate PEM: {e}")))?;
@@ -205,6 +309,7 @@ impl NapiServer {
 
             let server = web_transport_quinn::ServerBuilder::new()
                 .with_addr(addr)
+                .with_transport_config(transport)
                 .with_certificate(certs, key)
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
@@ -251,6 +356,120 @@ impl NapiServer {
                 server.take();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+    use std::time::Duration;
+    use web_transport_quinn::quinn::{IdleTimeout, TransportConfig};
+
+    // Quinn exposes no getters, so compare the complete configurations.
+    fn assert_config(actual: Result<TransportConfig>, expected: &TransportConfig) {
+        assert_eq!(format!("{:?}", actual.unwrap()), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn omitted_options_keep_quinn_defaults() {
+        let expected = TransportConfig::default();
+        assert_config(transport_config(None, None), &expected);
+        // The default this binding documents.
+        let mut thirty = TransportConfig::default();
+        thirty.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+        thirty.keep_alive_interval(None);
+        assert_eq!(format!("{expected:?}"), format!("{thirty:?}"));
+    }
+
+    #[test]
+    fn options_set_idle_timeout_and_keep_alive() {
+        let mut expected = TransportConfig::default();
+        expected
+            .max_idle_timeout(Some(
+                IdleTimeout::try_from(Duration::from_millis(1500)).unwrap(),
+            ))
+            .keep_alive_interval(Some(Duration::from_millis(250)));
+        assert_config(transport_config(Some(1500.0), Some(250.0)), &expected);
+    }
+
+    #[test]
+    fn zero_disables() {
+        let mut expected = TransportConfig::default();
+        expected.max_idle_timeout(None).keep_alive_interval(None);
+        assert_config(transport_config(Some(0.0), Some(0.0)), &expected);
+        assert_config(transport_config(Some(-0.0), None), &expected);
+    }
+
+    #[test]
+    fn largest_safe_integer_is_accepted() {
+        let max = 9_007_199_254_740_991.0;
+        let mut expected = TransportConfig::default();
+        expected
+            .max_idle_timeout(Some(
+                IdleTimeout::try_from(Duration::from_millis(max as u64)).unwrap(),
+            ))
+            .keep_alive_interval(Some(Duration::from_millis(max as u64)));
+        assert_config(transport_config(Some(max), Some(max)), &expected);
+    }
+
+    #[test]
+    fn invalid_milliseconds_are_rejected() {
+        for ms in [
+            -1.0,
+            0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+        ] {
+            let err = transport_config(Some(ms), None).unwrap_err();
+            assert_eq!(err.status, Status::InvalidArg);
+            assert!(err.reason.starts_with("idleTimeout "), "{}", err.reason);
+            let err = transport_config(None, Some(ms)).unwrap_err();
+            assert!(
+                err.reason.starts_with("keepAliveInterval "),
+                "{}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn client_rejects_conflicting_verification() {
+        // A present hash list pins, even when empty, so it cannot fall back to system roots.
+        for hashes in [vec![], vec![vec![0; 32].into()]] {
+            let err = NapiClient::with_options(NapiClientOptions {
+                server_certificate_disable_verify: Some(true),
+                server_certificate_hashes: Some(hashes),
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+            assert!(err.reason.contains("cannot be used together"));
+        }
+    }
+
+    #[test]
+    fn client_and_server_reject_invalid_transport_options() {
+        let err = NapiClient::with_options(NapiClientOptions {
+            idle_timeout: Some(-1.0),
+            ..Default::default()
+        })
+        .err()
+        .unwrap();
+        assert!(err.reason.starts_with("idleTimeout "));
+        let err = NapiServer::bind_with_options(
+            "127.0.0.1:0".into(),
+            Vec::new().into(),
+            Vec::new().into(),
+            NapiServerOptions {
+                keep_alive_interval: Some(f64::NAN),
+                ..Default::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(err.reason.starts_with("keepAliveInterval "));
     }
 }
 

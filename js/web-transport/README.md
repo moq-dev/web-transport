@@ -51,6 +51,19 @@ await session.ready;
 console.log(session.protocol); // "moqt-16" (server-selected)
 ```
 
+### Idle timeout and keep-alive
+
+A session closes after 30 seconds without network activity, and sends no keep-alives, unless configured. Both options take milliseconds and must be non-negative safe integers:
+
+```ts
+const session = new Session("https://example.com:4443/path", {
+	idleTimeout: 60_000, // close after 60 seconds of inactivity; 0 disables this endpoint's timeout
+	keepAliveInterval: 10_000, // send a keep-alive after 10 seconds without sending; 0 or omitted sends none
+});
+```
+
+QUIC uses the smaller of both peers' idle timeouts, so disabling one endpoint's timeout leaves the peer's in effect. To keep an otherwise idle session open, set `keepAliveInterval` below the effective idle timeout on either endpoint.
+
 ### Polyfill
 
 Install `Session` as the global `WebTransport` for libraries that expect the browser API:
@@ -89,6 +102,12 @@ while (true) {
 	// Use the standard W3C WebTransport API from here on
 	handleSession(session);
 }
+```
+
+`Server.bind` accepts the same `idleTimeout` and `keepAliveInterval` options, applied to every accepted session:
+
+```ts
+const server = Server.bind("[::]:4443", cert, key, { keepAliveInterval: 10_000 });
 ```
 
 `server.close()` is synchronous and safe to call repeatedly. Pending and future
