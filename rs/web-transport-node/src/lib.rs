@@ -126,17 +126,17 @@ impl NapiClient {
             let builder = web_transport_quinn::ClientBuilder::new().with_transport_config(
                 transport_config(options.idle_timeout, options.keep_alive_interval)?,
             );
-            let hashes = options.server_certificate_hashes.unwrap_or_default();
-            let client = match (options.server_certificate_disable_verify, hashes.is_empty()) {
-                (Some(true), false) => {
+            let disable_verify = options.server_certificate_disable_verify.unwrap_or(false);
+            let client = match (disable_verify, options.server_certificate_hashes) {
+                (true, Some(_)) => {
                     return Err(Error::from_reason(
                         "serverCertificateDisableVerify and serverCertificateHashes cannot be used together",
                     ))
                 }
-                (Some(true), true) => builder.dangerous().with_no_certificate_verification(),
-                (_, false) => builder
+                (true, None) => builder.dangerous().with_no_certificate_verification(),
+                (false, Some(hashes)) => builder
                     .with_server_certificate_hashes(hashes.iter().map(|h| h.to_vec()).collect()),
-                (_, true) => builder.with_system_roots(),
+                (false, None) => builder.with_system_roots(),
             }
             .map_err(|e| Error::from_reason(e.to_string()))?;
             Ok(Self { inner: client })
@@ -187,7 +187,7 @@ pub struct NapiClientOptions {
     /// Skip all certificate verification. WARNING: Only use for testing.
     pub server_certificate_disable_verify: Option<bool>,
     /// Accept only server certificates with these SHA-256 hashes instead of system root CAs.
-    /// An empty list validates against system root CAs.
+    /// An empty list accepts no certificate.
     pub server_certificate_hashes: Option<Vec<Buffer>>,
     /// Milliseconds without network activity before a connection closes, or 0 to disable this
     /// endpoint's timeout. Omitted keeps the 30000 ms default. A connection uses the smaller of both
@@ -436,14 +436,17 @@ mod option_tests {
 
     #[test]
     fn client_rejects_conflicting_verification() {
-        let err = NapiClient::with_options(NapiClientOptions {
-            server_certificate_disable_verify: Some(true),
-            server_certificate_hashes: Some(vec![vec![0; 32].into()]),
-            ..Default::default()
-        })
-        .err()
-        .unwrap();
-        assert!(err.reason.contains("cannot be used together"));
+        // A present hash list pins, even when empty, so it cannot fall back to system roots.
+        for hashes in [vec![], vec![vec![0; 32].into()]] {
+            let err = NapiClient::with_options(NapiClientOptions {
+                server_certificate_disable_verify: Some(true),
+                server_certificate_hashes: Some(hashes),
+                ..Default::default()
+            })
+            .err()
+            .unwrap();
+            assert!(err.reason.contains("cannot be used together"));
+        }
     }
 
     #[test]

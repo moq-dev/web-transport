@@ -119,9 +119,12 @@ export default class Session implements WebTransport {
 
 			const client = NapiClient.withOptions({
 				serverCertificateDisableVerify: options?.serverCertificateDisableVerify,
-				serverCertificateHashes: hashes
-					?.filter((h): h is WebTransportHash & { value: BufferSource } => h.value != null)
-					.map((h) => Buffer.from(h.value as ArrayBuffer)),
+				serverCertificateHashes:
+					hashes && hashes.length > 0
+						? hashes
+								.filter((h): h is WebTransportHash & { value: BufferSource } => h.value != null)
+								.map((h) => Buffer.from(h.value as ArrayBuffer))
+						: undefined,
 				idleTimeout: options?.idleTimeout,
 				keepAliveInterval: options?.keepAliveInterval,
 			});

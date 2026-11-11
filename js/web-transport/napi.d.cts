@@ -120,7 +120,7 @@ export interface NapiClientOptions {
 	serverCertificateDisableVerify?: boolean;
 	/**
 	 * Accept only server certificates with these SHA-256 hashes instead of system root CAs.
-	 * An empty list validates against system root CAs.
+	 * An empty list accepts no certificate.
 	 */
 	serverCertificateHashes?: Array<Buffer>;
 	/**
