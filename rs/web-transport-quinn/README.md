@@ -55,6 +55,8 @@ error when it cannot, such as before the `Application` exists or when no `jni` 0
 Kotlin component either way. This crate leaves quinn's `platform-verifier` feature
 off; enable it on your own `quinn` dependency to use
 `quinn::ClientConfig::try_with_platform_verifier`.
+If you disable Quinn's default features, also ensure that `rustls-ring` or
+`rustls-aws-lc-rs` is enabled.
 
 For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
 lazy sockets. Set its ALPN to `web_transport_quinn::ALPN` (`h3`).
