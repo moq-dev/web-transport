@@ -10,6 +10,10 @@ edition = "2021"
 keywords = ["webtransport", "quic", "http3", "uniffi"]
 categories = ["network-programming", "web-programming"]
 
+[package.metadata.cargo-shear]
+# A version pin only; see the Android dependencies below.
+ignored = ["rustls-platform-verifier-android"]
+
 [lib]
 name = "web_transport_ffi"
 crate-type = ["staticlib", "cdylib"]
@@ -23,13 +27,23 @@ bytes = "1"
 http = "1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["std"] }
-rustls-native-certs = "0.8"
+rustls-platform-verifier = "0.7"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = "0.7"
 uniffi = { version = "0.32", features = ["cli"] }
 url = "2"
 web-transport-quinn = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# The platform verifier reaches Android's trust store through JNI (see `android.rs`).
+jni = "0.22"
+# Pins the Kotlin component that kt/ bundles (`rustlsPlatformVerifier.version` in
+# kt/gradle.properties); both must change together.
+rustls-platform-verifier-android = "=0.2.0"
+tracing = "0.1"
+# Trusted until the platform verifier is initialized.
+webpki-roots = "1"
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }

@@ -5,6 +5,8 @@
 //! take-out patterns for `finish()`/`reset()` and a single shared tokio
 //! runtime ([`ffi::RUNTIME`]).
 
+#[cfg(target_os = "android")]
+mod android;
 pub mod client;
 pub mod error;
 mod ffi;

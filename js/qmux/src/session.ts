@@ -1361,14 +1361,13 @@ export default class Session implements WebTransport {
 				},
 				(discarded, reason) => {
 					this.#accountConnConsumed(discarded);
+					// Stay registered until FIN/RESET, like a refused stream, so late data
+					// and the reset gap are still counted and credited back.
 					this.#sendPriorityFrame({
 						type: "stop_sending",
 						id: frame.id,
 						code: VarInt.from(resetCode(reason)),
 					});
-
-					this.#recvStreams.delete(streamId);
-					this.#maybeDeleteStreamFlow(streamId);
 				},
 				onTerminal,
 			);
@@ -1766,14 +1765,12 @@ export default class Session implements WebTransport {
 			},
 			(discarded, reason) => {
 				this.#accountConnConsumed(discarded);
+				// Stay registered until FIN/RESET so late data and the reset gap are credited.
 				this.#sendPriorityFrame({
 					type: "stop_sending",
 					id: streamId,
 					code: VarInt.from(resetCode(reason)),
 				});
-
-				this.#recvStreams.delete(streamIdVal);
-				this.#maybeDeleteStreamFlow(streamIdVal);
 			},
 		);
 		this.#recvStreams.set(streamIdVal, recvStream);
