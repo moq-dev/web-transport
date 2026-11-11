@@ -19,6 +19,12 @@ export declare class NapiClient {
 	static disableVerify(): NapiClient;
 	/** Create a client that validates server certificates by SHA-256 hash. */
 	static withCertificateHashes(hashes: Array<Buffer>): NapiClient;
+	/**
+	 * Create a client with certificate verification and QUIC transport options.
+	 *
+	 * Without certificate options, server certificates are validated against system root CAs.
+	 */
+	static withOptions(options: NapiClientOptions): NapiClient;
 	/** Connect to a WebTransport server at the given URL. */
 	connect(urlStr: string, options?: NapiConnectOptions | undefined | null): Promise<NapiSession>;
 }
@@ -76,6 +82,8 @@ export declare class NapiSendStream {
 export declare class NapiServer {
 	/** Create a server bound to the given address with the given TLS certificate. */
 	static bind(addr: string, certPem: Buffer, keyPem: Buffer): NapiServer;
+	/** Create a server like `bind`, with QUIC transport options. */
+	static bindWithOptions(addr: string, certPem: Buffer, keyPem: Buffer, options: NapiServerOptions): NapiServer;
 	/** Accept the next incoming WebTransport session request. */
 	accept(): Promise<NapiRequest | null>;
 	/** Close the server, stopping it from accepting new connections. */
@@ -106,6 +114,28 @@ export declare class NapiSession {
 	closed(): Promise<NapiCloseInfo>;
 }
 
+/** Options for creating a WebTransport client. */
+export interface NapiClientOptions {
+	/** Skip all certificate verification. WARNING: Only use for testing. */
+	serverCertificateDisableVerify?: boolean;
+	/**
+	 * Accept only server certificates with these SHA-256 hashes instead of system root CAs.
+	 * An empty list validates against system root CAs.
+	 */
+	serverCertificateHashes?: Array<Buffer>;
+	/**
+	 * Milliseconds without network activity before a connection closes, or 0 to disable this
+	 * endpoint's timeout. Omitted keeps the 30000 ms default. A connection uses the smaller of both
+	 * peers' timeouts, so a peer's own timeout still applies when this one is disabled.
+	 */
+	idleTimeout?: number;
+	/**
+	 * Milliseconds without sending before a keep-alive packet is sent, which keeps an otherwise
+	 * idle connection open when shorter than the idle timeout. Omitted or 0 sends none.
+	 */
+	keepAliveInterval?: number;
+}
+
 /** Info about why a session was closed, matching W3C WebTransportCloseInfo. */
 export interface NapiCloseInfo {
 	closeCode: number;
@@ -124,6 +154,21 @@ export declare enum NapiErrorSource {
 	Stream = "stream",
 	/** The whole session failed. */
 	Session = "session",
+}
+
+/** Options for binding a WebTransport server. */
+export interface NapiServerOptions {
+	/**
+	 * Milliseconds without network activity before a connection closes, or 0 to disable this
+	 * endpoint's timeout. Omitted keeps the 30000 ms default. A connection uses the smaller of both
+	 * peers' timeouts, so a peer's own timeout still applies when this one is disabled.
+	 */
+	idleTimeout?: number;
+	/**
+	 * Milliseconds without sending before a keep-alive packet is sent, which keeps an otherwise
+	 * idle connection open when shorter than the idle timeout. Omitted or 0 sends none.
+	 */
+	keepAliveInterval?: number;
 }
 
 /** A stream failure carrying the fields of W3C `WebTransportError`. */

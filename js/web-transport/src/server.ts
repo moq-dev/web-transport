@@ -1,5 +1,9 @@
 import napi from "../napi.cjs";
 import { Request } from "./request.ts";
+import type { TransportOptions } from "./session.ts";
+
+/** Options for {@link Server.bind}. */
+export type ServerOptions = TransportOptions;
 
 const { NapiServer } = napi;
 
@@ -10,8 +14,14 @@ export class Server {
 		this.#inner = inner;
 	}
 
-	static bind(addr: string, certPem: Buffer, keyPem: Buffer): Server {
-		return new Server(NapiServer.bind(addr, certPem, keyPem));
+	/** Bind a server to `addr`, serving the PEM-encoded certificate chain and private key. */
+	static bind(addr: string, certPem: Buffer, keyPem: Buffer, options?: ServerOptions): Server {
+		return new Server(
+			NapiServer.bindWithOptions(addr, certPem, keyPem, {
+				idleTimeout: options?.idleTimeout,
+				keepAliveInterval: options?.keepAliveInterval,
+			}),
+		);
 	}
 
 	async accept(): Promise<Request | null> {
