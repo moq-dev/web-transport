@@ -44,3 +44,17 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 [WebTransport]: https://www.ietf.org/archive/id/draft-ietf-webtrans-overview-11.html
 [`web-transport-quinn`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-quinn
 [`web-transport-trait`]: https://github.com/moq-dev/web-transport/tree/main/rs/web-transport-trait
+
+
+## CONNECT response metadata
+
+`H3Request::respond` and `H3Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Session::response()`. A rejected CONNECT
+is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

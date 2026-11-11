@@ -58,3 +58,23 @@ def test_all_inherit_from_base():
             f"{exc_name} does not inherit from WebTransportError"
         )
         assert issubclass(exc, Exception), f"{exc_name} does not inherit from Exception"
+
+
+def test_rejection_preserves_repeated_header_values():
+    import pytest
+    from web_transport import _errors, _uniffi
+
+    error = _uniffi.WebTransportError.SessionRejected(
+        status_code=403,
+        protocol="moq",
+        headers=[
+            _uniffi.HttpHeader(name="set-cookie", value=b"a=1"),
+            _uniffi.HttpHeader(name="set-cookie", value=b"b=2"),
+        ],
+        detail="rejected",
+    )
+    with pytest.raises(web_transport.SessionRejected) as caught:
+        _errors.reraise(error)
+    assert caught.value.status_code == 403
+    assert caught.value.protocol == "moq"
+    assert caught.value.headers == [("set-cookie", b"a=1"), ("set-cookie", b"b=2")]

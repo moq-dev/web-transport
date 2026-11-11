@@ -53,6 +53,8 @@ class SessionRejected(ConnectError):
     """The server rejected the WebTransport session request."""
 
     status_code: int
+    protocol: str | None
+    headers: list[tuple[str, bytes]]
 
 
 class SessionClosed(SessionError):
@@ -157,6 +159,8 @@ def reraise(err: BaseException) -> None:
     if isinstance(err, _uniffi.WebTransportError.SessionRejected):
         new = SessionRejected(err.detail)
         new.status_code = err.status_code
+        new.protocol = err.protocol
+        new.headers = [(header.name, bytes(header.value)) for header in err.headers]
         raise new from err
 
     if isinstance(err, _uniffi.WebTransportError.SessionClosedByPeer):

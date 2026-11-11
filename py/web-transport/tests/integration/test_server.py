@@ -95,7 +95,9 @@ async def test_reject_session_request(self_signed_cert, cert_hash):
         async def server_task():
             request = await server.accept()
             assert request is not None
-            await request.reject(403)
+            await request.reject(
+                403, headers=[("set-cookie", b"a=1"), ("set-cookie", b"b=2")]
+            )
 
         async def client_task():
             async with web_transport.Client(
@@ -104,6 +106,11 @@ async def test_reject_session_request(self_signed_cert, cert_hash):
                 with pytest.raises(web_transport.SessionRejected) as exc_info:
                     await client.connect(f"https://[::1]:{port}")
                 assert exc_info.value.status_code == 403
+                assert exc_info.value.protocol is None
+                assert exc_info.value.headers == [
+                    ("set-cookie", b"a=1"),
+                    ("set-cookie", b"b=2"),
+                ]
 
         await asyncio.gather(
             asyncio.create_task(server_task()),
@@ -138,6 +145,47 @@ async def test_reject_with_default_status(self_signed_cert, cert_hash):
             asyncio.create_task(server_task()),
             asyncio.create_task(client_task()),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"headers": [("bad name", b"x")]},
+        {"headers": [("x-test", b"bad\x00value")]},
+        {"headers": [("x-test", "café".encode())]},
+        {"headers": [("wt-protocol", b'"moq"')]},
+        {"headers": [("sec-webtransport-http3-draft", b"draft02")]},
+        {"headers": [("x-test", b" leading")]},
+        {"protocol": "not-offered"},
+    ],
+)
+async def test_invalid_rejection_arguments_leave_request_usable(
+    self_signed_cert, cert_hash, arguments
+):
+    cert, key = self_signed_cert
+    async with web_transport.Server(
+        certificate_chain=[cert], private_key=key, bind="[::1]:0"
+    ) as server:
+        _, port = server.local_addr
+
+        async def server_task():
+            request = await server.accept()
+            assert request is not None
+            with pytest.raises(ValueError):
+                await request.reject(403, **arguments)
+            await request.reject(403, headers=[("x-reason", b"retry")])
+
+        async def client_task():
+            async with web_transport.Client(
+                server_certificate_hashes=[cert_hash]
+            ) as client:
+                with pytest.raises(web_transport.SessionRejected) as error:
+                    await client.connect(f"https://[::1]:{port}")
+                assert error.value.status_code == 403
+                assert error.value.headers == [("x-reason", b"retry")]
+
+        await asyncio.gather(server_task(), client_task())
 
 
 @pytest.mark.asyncio

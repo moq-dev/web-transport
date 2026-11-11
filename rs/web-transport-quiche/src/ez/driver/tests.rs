@@ -231,6 +231,93 @@ fn accepting_a_live_send_half_registers_it() {
 }
 
 #[test]
+fn rejection_drain_waits_for_acknowledgment_or_peer_stop() {
+    for stopped in [false, true] {
+        let mut pair = Pair::new();
+        let mut driver = driver(true);
+        let id = StreamId::CLIENT_BI;
+        pair.client
+            .stream_send(id.into(), b"request", true)
+            .unwrap();
+        pair.pump();
+        driver.read(&mut pair.server).unwrap();
+
+        // Consume the receive half so collection can report send completion.
+        pair.server
+            .stream_shutdown(id.into(), quiche::Shutdown::Read, 0)
+            .unwrap();
+        pair.server
+            .stream_send(id.into(), b"response", true)
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        driver.state.lock().drain(id, sender);
+        driver.check_drained(&mut pair.server);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        if stopped {
+            pair.client
+                .stream_shutdown(id.into(), quiche::Shutdown::Read, 42)
+                .unwrap();
+        }
+        // Force two ack-eliciting packets, avoiding an ACK timer or sleeps.
+        for _ in 0..2 {
+            pair.server.send_ack_eliciting().unwrap();
+            pair.pump();
+        }
+        driver.read(&mut pair.server).unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Ok(Ok(()))),
+            "rejection was not retired (stopped={stopped})"
+        );
+        assert!(driver.state.lock().draining.is_empty());
+    }
+}
+
+#[test]
+fn cancelled_rejection_drain_is_removed() {
+    let mut pair = Pair::new();
+    let mut driver = driver(true);
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    driver.state.lock().drain(StreamId::CLIENT_BI, sender);
+    drop(receiver);
+    driver.check_drained(&mut pair.server);
+    assert!(driver.state.lock().draining.is_empty());
+}
+
+#[tokio::test]
+async fn rejection_accepts_a_peer_stop_before_finish() {
+    let mut pair = Pair::new();
+    let mut driver = driver(true);
+    let id = StreamId::CLIENT_BI;
+    pair.client
+        .stream_send(id.into(), b"request", false)
+        .unwrap();
+    pair.pump();
+    driver.read(&mut pair.server).unwrap();
+    let Poll::Ready(Ok((_, send, _recv))) = driver.state.lock().poll_accept_bi(&Waiter::noop())
+    else {
+        panic!("request was not accepted");
+    };
+    let mut send = super::super::SendStream::new(id, send, driver.state.clone());
+    send.write_all(b"response").await.unwrap();
+    driver.flush_send(&mut pair.server, id).unwrap();
+    pair.client
+        .stream_shutdown(id.into(), quiche::Shutdown::Read, 42)
+        .unwrap();
+    pair.pump();
+    driver.write(&mut pair.server).unwrap();
+    assert!(matches!(
+        send.finish(),
+        Err(super::super::StreamError::Stop(42) | super::super::StreamError::Closed)
+    ));
+    send.rejected().await.unwrap();
+    assert!(driver.state.lock().draining.is_empty());
+}
+
+#[test]
 fn notification_racing_with_send_retirement_is_harmless() {
     use super::super::SendStream;
     use tracing_subscriber::{layer::SubscriberExt, Layer};

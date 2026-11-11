@@ -79,6 +79,15 @@ Keep the Session object alive while using its streams. Streams do not retain the
 
 ## API overview
 
+Reject with ordinary response headers, retaining repeated values:
+
+```python
+await request.reject(403, headers=[("set-cookie", b"a=1"), ("set-cookie", b"b=2")])
+```
+
+`reject` also accepts keyword-only `protocol` when the peer offered a subprotocol.
+Malformed or reserved generic fields raise `ValueError` before consuming the request.
+
 | Name | Description |
 |---|---|
 | `Server` | Listens for incoming WebTransport sessions |
@@ -150,6 +159,25 @@ uv run pytest
 ## License
 
 MIT OR Apache-2.0
+
+## Rejection diagnostics
+
+`SessionRejected` exposes `status_code`, `protocol`, and
+`headers: list[tuple[str, bytes]]`. The list preserves repeated field names;
+convert it to a dictionary only when losing repeated values is acceptable.
+
+```python
+try:
+    session = await client.connect(url)
+except web_transport.SessionRejected as error:
+    print(error.status_code)
+    for name, value in error.headers:
+        if name == "www-authenticate":
+            print(value.decode("ascii"))
+```
+
+Rebuild the wheel when updating the UniFFI native library; the generated
+rejection error now carries protocol and header fields.
 
 ## Native crypto
 
