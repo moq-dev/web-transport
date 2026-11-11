@@ -23,6 +23,7 @@ async def test_concurrent_bidi_and_uni_streams(
     """3 bidi + 3 uni streams simultaneously, all echo/deliver correctly."""
     async with start_server() as (server, port, hash_b64):
         uni_received: list[bytes] = []
+        uni_complete = asyncio.Event()
 
         async def server_side() -> None:
             request = await server.accept()
@@ -35,6 +36,9 @@ async def test_concurrent_bidi_and_uni_streams(
                         send, recv = await session.accept_bi()
                         async with send:
                             data = await recv.read()
+                            # The echoes also acknowledge delivery of all uni
+                            # streams before the browser closes the session.
+                            await uni_complete.wait()
                             await send.write(data)
 
                 async def handle_uni_streams() -> None:
@@ -42,10 +46,15 @@ async def test_concurrent_bidi_and_uni_streams(
                         recv = await session.accept_uni()
                         data = await recv.read()
                         uni_received.append(data)
+                    uni_complete.set()
 
                 async with asyncio.TaskGroup() as inner_tg:
                     inner_tg.create_task(handle_bidi_streams())
                     inner_tg.create_task(handle_uni_streams())
+
+                # Finishing the writes does not mean the browser has consumed
+                # the echoes. Let run_js close after all its stream work ends.
+                await session.wait_closed()
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(server_side())
@@ -58,17 +67,16 @@ async def test_concurrent_bidi_and_uni_streams(
                 for (let i = 0; i < 3; i++) {
                     bidiPromises.push((async () => {
                         const stream = await transport.createBidirectionalStream();
-                        try { await writeAllString(stream.writable, "bidi-" + i); } catch (e) { }
+                        await writeAllString(stream.writable, "bidi-" + i);
                         return await readAllString(stream.readable);
                     })());
                     uniPromises.push((async () => {
                         const stream = await transport.createUnidirectionalStream();
-                        try { await writeAllString(stream, "uni-" + i); } catch (e) { }
+                        await writeAllString(stream, "uni-" + i);
                     })());
                 }
                 const bidiResults = await Promise.all(bidiPromises);
                 await Promise.all(uniPromises);
-                try { await transport.closed; } catch (e) { }
                 return bidiResults.sort();
             """,
             )

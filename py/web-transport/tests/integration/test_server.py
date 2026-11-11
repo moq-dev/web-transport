@@ -30,7 +30,8 @@ async def test_server_async_iterator(self_signed_cert, cert_hash):
         async def iterate():
             async for request in server:
                 requests.append(request)
-                await request.accept()
+                session = await request.accept()
+                await session.wait_closed()
 
         async def connect_and_close():
             async with web_transport.Client(
@@ -152,9 +153,10 @@ async def test_double_accept_raises(self_signed_cert, cert_hash):
         async def server_task():
             request = await server.accept()
             assert request is not None
-            await request.accept()
+            session = await request.accept()
             with pytest.raises(web_transport.SessionError, match="already"):
                 await request.accept()
+            session.close()
 
         async def client_task():
             async with web_transport.Client(
@@ -374,20 +376,25 @@ async def test_server_close_propagates_as_application(self_signed_cert, cert_has
     ) as server:
         _, port = server.local_addr
 
+        connected = asyncio.Event()
+
         async def server_task():
             request = await server.accept()
             assert request is not None
-            await request.accept()
-            await asyncio.sleep(0.1)
+            session = await request.accept()
+            await connected.wait()
+            assert session.close_reason is None
             # Close the entire server endpoint (not just the session)
             server.close(42, "shutdown")
             await server.wait_closed()
+            await session.wait_closed()
 
         async def client_task():
             async with web_transport.Client(
                 server_certificate_hashes=[cert_hash]
             ) as client:
                 session = await client.connect(f"https://[::1]:{port}")
+                connected.set()
                 # Endpoint-level close (QUIC CONNECTION_CLOSE) is inherently
                 # racy — the CLOSE frame may not arrive before the connection
                 # drops, so the client may see SessionClosedLocally.
@@ -396,6 +403,7 @@ async def test_server_close_propagates_as_application(self_signed_cert, cert_has
                     pytest.fail("Expected an exception from accept_bi()")
                 except web_transport.SessionClosedByPeer as e:
                     assert e.source == "application"
+                    assert e.reason == "shutdown"
                 except web_transport.SessionClosedLocally:
                     pass
 

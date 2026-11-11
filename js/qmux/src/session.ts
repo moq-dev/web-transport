@@ -838,6 +838,7 @@ export default class Session implements WebTransport {
 	}
 
 	#onData(data: Uint8Array) {
+		if (this.#closed) return;
 		this.#lastRecvAt = Date.now();
 		try {
 			if (usesRecords(this.#version)) {
@@ -874,6 +875,7 @@ export default class Session implements WebTransport {
 	}
 
 	#recvFrame(frame: Frame.Any) {
+		if (this.#closed) return;
 		// Draft-02: QX_TRANSPORT_PARAMETERS MUST be the first frame, and only the
 		// first. A non-params frame before params, or a second params frame, is a
 		// PROTOCOL_VIOLATION. (decodeRecord drops leading PADDING before we get here.)
@@ -908,11 +910,7 @@ export default class Session implements WebTransport {
 		} else if (frame.type === "max_data") {
 			this.#connCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_stream_data") {
-			// RFC 9000 §19.10: MAX_STREAM_DATA for a receive-only stream is a
-			// STREAM_STATE_ERROR.
-			if (!frame.id.canSend(this.#isServer)) {
-				throw new Error("MAX_STREAM_DATA on a receive-only stream");
-			}
+			this.#validateSendId(frame.id, "MAX_STREAM_DATA");
 			const flow = this.#streamFlow.get(frame.id.value.value);
 			if (flow) flow.sendCredit.increaseMax(frame.max);
 		} else if (frame.type === "max_streams_bidi") {
@@ -1505,7 +1503,19 @@ export default class Session implements WebTransport {
 		this.#maybeDeleteStreamFlow(streamId);
 	}
 
+	// RFC 9000 §19.5/§19.10 permit retired local IDs, but not unallocated IDs.
+	#validateSendId(id: Stream.Id, frame: "MAX_STREAM_DATA" | "STOP_SENDING") {
+		if (!id.canSend(this.#isServer)) {
+			throw new Error(`${frame} on a receive-only stream`);
+		}
+		if (id.serverInitiated === this.#isServer) {
+			const next = id.dir === Stream.Dir.Uni ? this.#nextUniStreamId : this.#nextBiStreamId;
+			if (id.index >= next) throw new Error(`${frame} on an unopened local stream`);
+		}
+	}
+
 	#handleStopSending(frame: Frame.StopSending) {
+		this.#validateSendId(frame.id, "STOP_SENDING");
 		const streamId = frame.id.value.value;
 		const stream = this.#sendStreams.get(streamId);
 		if (!stream) return;

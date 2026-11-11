@@ -61,7 +61,7 @@
           #
           # The WASM package pins its harness dev-dependency to this release;
           # update both together. Published library consumers keep a broad range.
-          pkgs.wasm-bindgen-cli_0_2_126
+          pkgs.wasm-bindgen-cli_0_2_130
           # Localhost certificate generation for the browser harness.
           pkgs.openssl
           pkgs.xxd
@@ -73,8 +73,9 @@
           pkgs.cmake
           # Required to compile boringssl (via bindgen loading libclang)
           pkgs.llvmPackages.libclang.lib
-          # Only for NPM publishing
+          # Node runtime tests and NPM publishing.
           pkgs.nodejs_24
+          pkgs.openssl
         ];
       in
       {

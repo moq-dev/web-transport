@@ -25,9 +25,9 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use rcgen::{CertifiedKey, KeyPair};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::time::timeout;
 use web_transport_proto::ConnectRequest;
-use web_transport_quinn::quinn::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use web_transport_quinn::{ClientBuilder, ServerBuilder};
 
 /// How many accepters give up, one after another. Well past any plausible bound on
@@ -57,20 +57,8 @@ impl Wake for FlagWaker {
     }
 }
 
-/// With both crypto features enabled — as `--all-features` does — the crate cannot
-/// pick a provider for us, so the test installs one.
-fn install_crypto_provider() {
-    #[cfg(all(feature = "aws-lc-rs", feature = "ring"))]
-    {
-        let _ = web_transport_quinn::quinn::rustls::crypto::aws_lc_rs::default_provider()
-            .install_default();
-    }
-}
-
 /// A client and server session, already connected.
 async fn pair() -> Result<(web_transport_quinn::Session, web_transport_quinn::Session)> {
-    install_crypto_provider();
-
     let CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
     let chain = vec![cert.der().clone()];

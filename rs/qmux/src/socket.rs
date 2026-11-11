@@ -14,7 +14,8 @@ use std::time::Duration;
 ///
 /// Implementations read through to the socket on each call rather than caching, so
 /// a caller polling this sees the transport's current view. Every metric is
-/// optional: `None` means this transport doesn't track it.
+/// optional: `None` means this transport doesn't track it. Sessions release their
+/// statistics handle during teardown and omit these metrics once closure is signalled.
 pub trait SocketStats: Send + Sync + 'static {
     /// Smoothed round-trip time, if the transport tracks one.
     fn rtt(&self) -> Option<Duration> {
@@ -43,9 +44,10 @@ mod unix {
     /// `TCP_CONNECTION_INFO` (macOS).
     ///
     /// Holds its own duplicate of the file descriptor, so it stays readable for as
-    /// long as the session needs it no matter what the transport does with the
+    /// long as this handle lives no matter what the transport does with the
     /// original. Construct it from the accepted socket and hand it to the transport
-    /// with `with_socket_stats`.
+    /// with `with_socket_stats`. The session releases its handle during teardown;
+    /// any copies retained by the caller keep the descriptor alive.
     ///
     /// Reports nothing for a non-TCP socket (a Unix socket, say): the `getsockopt`
     /// simply fails and every metric reads `None`.

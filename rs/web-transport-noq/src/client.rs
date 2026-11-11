@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::proto::ConnectRequest;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -148,11 +148,7 @@ impl ClientBuilder {
 
         client_config.transport_config(transport.into());
 
-        let client = noq::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
-        Ok(Client {
-            endpoint: client,
-            config: client_config,
-        })
+        Ok(Client::from_config(client_config))
     }
 }
 
@@ -199,7 +195,7 @@ impl DangerousClientBuilder {
 /// A client for connecting to a WebTransport server.
 #[derive(Clone, Debug)]
 pub struct Client {
-    endpoint: noq::Endpoint,
+    endpoints: Arc<Mutex<Binding>>,
     config: noq::ClientConfig,
 }
 
@@ -208,7 +204,10 @@ impl Client {
     ///
     /// The ALPN MUST be set to [ALPN].
     pub fn new(endpoint: noq::Endpoint, config: noq::ClientConfig) -> Self {
-        Self { endpoint, config }
+        Self {
+            endpoints: Arc::new(Mutex::new(Binding::Custom(endpoint))),
+            config,
+        }
     }
 
     /// Connect to the server.
@@ -217,7 +216,6 @@ impl Client {
         request: impl Into<ConnectRequest>,
     ) -> Result<Session, ClientError> {
         let request = request.into();
-
         let port = request.url.port().unwrap_or(443);
 
         // TODO error on username:password in host
@@ -248,13 +246,153 @@ impl Client {
 
         // Connect to the server using the addr we just resolved.
         let conn = self
-            .endpoint
-            .connect_with(self.config.clone(), remote, &host)?;
+            .endpoints
+            .lock()
+            .unwrap()
+            .connect(self.config.clone(), remote, &host)?;
         let conn = conn.await?;
 
         // Connect with the connection we established.
         Session::connect(conn, request).await
     }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl Client {
+    /// Create a client that lazily binds one socket for each server address family.
+    ///
+    /// The config must negotiate [`ALPN`]; socket setup errors are returned by [`Self::connect`].
+    fn from_config(config: noq::ClientConfig) -> Self {
+        Self {
+            endpoints: Arc::new(Mutex::new(Binding::Default {
+                ipv4: None,
+                ipv6: None,
+                runtime: ClientRuntime::current(),
+            })),
+            config,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Binding {
+    Custom(noq::Endpoint),
+    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+    Default {
+        ipv4: Option<noq::Endpoint>,
+        ipv6: Option<noq::Endpoint>,
+        runtime: Option<ClientRuntime>,
+    },
+}
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+impl Binding {
+    fn endpoints(&self) -> impl Iterator<Item = &noq::Endpoint> {
+        match self {
+            Self::Custom(endpoint) => [Some(endpoint), None],
+            #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+            Self::Default { ipv4, ipv6, .. } => [ipv4.as_ref(), ipv6.as_ref()],
+        }
+        .into_iter()
+        .flatten()
+    }
+}
+
+impl Binding {
+    fn connect(
+        &mut self,
+        config: noq::ClientConfig,
+        remote: SocketAddr,
+        host: &str,
+    ) -> Result<noq::Connecting, ClientError> {
+        let (endpoint, remote) = match self {
+            Binding::Custom(endpoint) => (endpoint, remote),
+            #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+            Binding::Default {
+                ipv4,
+                ipv6,
+                runtime,
+            } => {
+                let remote = match remote {
+                    SocketAddr::V6(addr) => addr
+                        .ip()
+                        .to_ipv4_mapped()
+                        .map(|ip| SocketAddr::from((ip, addr.port())))
+                        .unwrap_or(remote),
+                    _ => remote,
+                };
+                let slot = if remote.is_ipv4() { ipv4 } else { ipv6 };
+                if slot.is_none() {
+                    if runtime.is_none() {
+                        *runtime = ClientRuntime::current();
+                    }
+                    let runtime = runtime.as_ref().ok_or_else(|| {
+                        ClientError::IoError(Arc::new(std::io::Error::other(
+                            "no async runtime found",
+                        )))
+                    })?;
+                    *slot = Some(
+                        runtime
+                            .bind(remote)
+                            .map_err(|err| ClientError::IoError(Arc::new(err)))?,
+                    );
+                }
+                (slot.as_mut().unwrap(), remote)
+            }
+        };
+        Ok(endpoint.connect_with(config, remote, host)?)
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+#[derive(Debug)]
+struct ClientRuntime {
+    inner: Arc<dyn noq::Runtime>,
+    tokio: Option<tokio::runtime::Handle>,
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl ClientRuntime {
+    fn current() -> Option<Self> {
+        Some(Self {
+            inner: noq::default_runtime()?,
+            tokio: tokio::runtime::Handle::try_current().ok(),
+        })
+    }
+
+    fn bind(&self, remote: SocketAddr) -> std::io::Result<noq::Endpoint> {
+        // TokioRuntime registers sockets and spawns drivers in the current context.
+        let _guard = self.tokio.as_ref().map(tokio::runtime::Handle::enter);
+        bind_endpoint(remote, self.inner.clone())
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_endpoint(
+    remote: SocketAddr,
+    runtime: Arc<dyn noq::Runtime>,
+) -> std::io::Result<noq::Endpoint> {
+    let bind: SocketAddr = if remote.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = bind_socket(bind)?;
+    noq::Endpoint::new(noq::EndpointConfig::default(), None, socket, runtime)
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+fn bind_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if bind.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.bind(&bind.into())?;
+    Ok(socket.into())
 }
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
@@ -376,3 +514,6 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
+mod tests;

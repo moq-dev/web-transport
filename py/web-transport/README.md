@@ -73,6 +73,10 @@ async def main():
 asyncio.run(main())
 ```
 
+## Session lifetime
+
+Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
+
 ## API overview
 
 | Name | Description |
@@ -146,3 +150,11 @@ uv run pytest
 ## License
 
 MIT OR Apache-2.0
+
+## Native crypto
+
+The native Quinn backend uses rind through rind-rustls, with an installed process-wide
+rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
+Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
+returns an error if the CPU lacks a required feature. This also applies with another
+TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
