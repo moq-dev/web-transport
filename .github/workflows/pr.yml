@@ -59,3 +59,5 @@ jobs:
       # Make sure u guys don't write bad code
       - run: nix develop --command just check
       - run: nix develop --command just test
+      # `just test` regenerates the loader; it must match the committed copy.
+      - run: git diff --exit-code -- js/web-transport/napi.cjs js/web-transport/napi.d.cts
