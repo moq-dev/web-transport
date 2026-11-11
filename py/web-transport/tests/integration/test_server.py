@@ -548,6 +548,8 @@ async def test_reload_existing_session_survives(self_signed_cert, cert_hash):
             data = await recv.read()
             async with send:
                 await send.write(data)
+            # Dropping the session closes it, discarding the unread echo.
+            await session.wait_closed()
 
         async def client_task():
             async with web_transport.Client(
