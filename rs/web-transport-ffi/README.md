@@ -12,6 +12,30 @@ Socket setup errors are returned by `connect`. `close` and final client drop
 close both sockets, including pending connections. Call `close` before awaiting
 `wait_closed` to prevent new connections while both sockets drain.
 
+## Certificate verification
+
+With neither `server_certificate_hashes` nor `no_cert_verification`, clients verify
+with [rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier)
+on the crate's crypto provider, so the operating system's trust store decides on
+every platform. On Linux, building such a client fails when no system CA
+certificate can be loaded.
+
+Android needs the application `Context`. The library exports `JNI_OnLoad`, which
+initializes the verifier from `ActivityThread.currentApplication()` when the JVM
+loads it with `System.loadLibrary`; a failure is logged and never fails the load.
+Each new client retries until initialization succeeds, and a client built before
+then trusts the bundled webpki-roots and keeps them. The Kotlin AAR in `kt/`
+handles this. If you package the Android library yourself:
+
+- Load it with `System.loadLibrary("web_transport_ffi")` after the `Application`
+  exists and before building the first client. JNA alone does not run `JNI_OnLoad`.
+- Add rustls-platform-verifier's Kotlin component,
+  `org.rustls:rustls-platform-verifier`, at the version of the
+  `rustls-platform-verifier-android` crate pinned in `Cargo.toml`, as described in
+  [its Android setup](https://github.com/rustls/rustls-platform-verifier#android).
+- Keep it from shrinking with
+  `-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }`.
+
 ## Session lifetime
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.

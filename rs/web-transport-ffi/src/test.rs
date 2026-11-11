@@ -93,6 +93,47 @@ fn client_rejects_incompatible_args() {
     assert!(matches!(err, WebTransportError::InvalidArgument(_)));
 }
 
+#[tokio::test]
+async fn default_verification_rejects_untrusted_server() {
+    let cert = rcgen::generate_simple_self_signed(["127.0.0.1".to_string()])
+        .expect("generate self-signed cert");
+    let server = Server::new(ServerConfig {
+        certificate_chain: vec![cert.cert.der().to_vec()],
+        private_key: cert.signing_key.serialize_der(),
+        bind: "127.0.0.1:0".to_string(),
+        congestion_control: CongestionControl::Default,
+        max_idle_timeout_secs: Some(10.0),
+        keep_alive_interval_secs: None,
+    })
+    .expect("server");
+    let addr = server.local_addr();
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let _ = server.accept().await;
+        }
+    });
+
+    let client = Client::new(ClientConfig::default()).expect("client");
+    let err = match tokio::time::timeout(
+        TIMEOUT,
+        client.connect(format!("https://{}:{}", addr.host, addr.port)),
+    )
+    .await
+    .expect("connect timeout")
+    {
+        Ok(_) => panic!("connected to a server the OS does not trust"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, WebTransportError::Connect(msg) if msg.contains("certificate")),
+        "{err:?}"
+    );
+
+    server.close(0, String::new()).expect("close server");
+    server_task.abort();
+}
+
 fn sha256(cert_der: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
