@@ -66,13 +66,19 @@ impl ClientBuilder {
     /// roots to trust, including enterprise-installed roots, and applies
     /// revocation checks where the platform supports them.
     ///
-    /// On Android, the application must initialize the platform verifier before
-    /// the first handshake, or verification panics;
-    /// see the [rustls-platform-verifier Android setup](https://github.com/rustls/rustls-platform-verifier#android).
+    /// On Android, the verifier needs the application `Context`. If the
+    /// application has not initialized rustls-platform-verifier, this
+    /// initializes it from the current `Application`. The application must also
+    /// bundle the verifier's Kotlin component; see the
+    /// [rustls-platform-verifier Android setup](https://github.com/rustls/rustls-platform-verifier#android).
     ///
     /// Returns an error if the platform verifier cannot load its trust store,
-    /// such as on a Linux host with no CA certificates installed.
+    /// such as on a Linux host with no CA certificates installed, or cannot be
+    /// initialized on Android.
     pub fn with_system_roots(self) -> Result<Client, ClientError> {
+        #[cfg(target_os = "android")]
+        crate::android::init_platform_verifier()?;
+
         let verifier = rustls_platform_verifier::Verifier::new(self.provider.clone())?;
 
         let crypto = self
@@ -393,6 +399,8 @@ fn bind_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+/// Panics if [`ClientBuilder::with_system_roots`] fails, such as on a host with
+/// no CA certificates or Android when the platform verifier cannot be initialized.
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for Client {
     fn default() -> Self {

@@ -77,7 +77,9 @@ lifetime and key type; see
 [serverCertificateHashes](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/WebTransport#servercertificatehashes).
 Browsers provide no certificate-verification bypass. On native targets,
 `with_system_roots` verifies with the operating system's trust store through
-[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier).
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier);
+see the [web-transport-quinn README](../web-transport-quinn/README.md) for its
+errors and Android requirements.
 
 ## Native transport configuration
 
