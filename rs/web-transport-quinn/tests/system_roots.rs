@@ -12,7 +12,7 @@ use web_transport_quinn::{quinn, ClientBuilder, ClientError, ServerBuilder};
 #[tokio::test]
 async fn system_roots_reject_self_signed_server() -> Result<()> {
     let CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KeyPair::serialize_der(
         &signing_key,
     )));
@@ -23,7 +23,7 @@ async fn system_roots_reject_self_signed_server() -> Result<()> {
     let addr = server.local_addr()?;
     let server_task = tokio::spawn(async move { while server.accept().await.is_some() {} });
 
-    let url: url::Url = format!("https://localhost:{}/", addr.port()).parse()?;
+    let url: url::Url = format!("https://127.0.0.1:{}/", addr.port()).parse()?;
     let client = ClientBuilder::new().with_system_roots()?;
     let err = client
         .connect(ConnectRequest::new(url))
