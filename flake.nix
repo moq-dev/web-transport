@@ -86,6 +86,9 @@
           packages = tools;
 
           shellHook = ''
+            # Point bindgen at Nix's libclang; otherwise clang-sys may load a host
+            # LLVM (such as a CI runner's) whose dependencies the shell lacks.
+            export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
             # Linux Python extension wheels also need the compiler's C++ runtime.
             export LD_LIBRARY_PATH=${
               pkgs.lib.makeLibraryPath (
