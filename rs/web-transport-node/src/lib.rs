@@ -81,7 +81,7 @@ pub struct NapiClient {
 
 #[napi]
 impl NapiClient {
-    /// Create a client that validates server certificates against system root CAs.
+    /// Create a client that verifies server certificates with the operating system's trust store.
     #[napi(factory)]
     pub fn with_system_roots() -> Result<Self> {
         napi::bindgen_prelude::within_runtime_if_available(|| {
@@ -119,7 +119,7 @@ impl NapiClient {
 
     /// Create a client with certificate verification and QUIC transport options.
     ///
-    /// Without certificate options, server certificates are validated against system root CAs.
+    /// Without certificate options, server certificates are verified with the operating system's trust store.
     #[napi(factory)]
     pub fn with_options(options: NapiClientOptions) -> Result<Self> {
         napi::bindgen_prelude::within_runtime_if_available(|| {

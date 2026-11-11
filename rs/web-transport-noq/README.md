@@ -38,6 +38,13 @@ does not require IPv6 support or a running async runtime. Both sockets use the
 runtime present at construction, or at the first connection if constructed
 outside a runtime. Keep that runtime alive while using the client.
 
+`with_system_roots()` verifies server certificates with
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier),
+so the operating system's trust store decides, including enterprise-installed
+roots and revocation where the platform supports it. On Android, the application
+must [initialize the verifier](https://github.com/rustls/rustls-platform-verifier#android)
+before the first handshake.
+
 For an existing `noq::ClientConfig`, `Client::new(endpoint, config)` keeps
 the caller's endpoint and address handling. Set its ALPN to `h3`.
 

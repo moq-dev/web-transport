@@ -38,6 +38,13 @@ does not require IPv6 support or a running async runtime. Both sockets use the
 runtime present at construction, or at the first connection if constructed
 outside a runtime. Keep that runtime alive while using the client.
 
+`with_system_roots()` verifies server certificates with
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier),
+so the operating system's trust store decides, including enterprise-installed
+roots and revocation where the platform supports it. On Android, the application
+must [initialize the verifier](https://github.com/rustls/rustls-platform-verifier#android)
+before the first handshake.
+
 For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
 lazy sockets. Set its ALPN to `web_transport_quinn::ALPN` (`h3`).
 `Client::new(endpoint, config)` instead keeps the caller's endpoint and address
@@ -76,12 +83,13 @@ Those Quinn convenience methods require its ring or aws-lc-rs feature.
 use std::sync::Arc;
 use web_transport_quinn::{crypto, quinn};
 
-let mut roots = rustls::RootCertStore::empty();
-roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+let provider = crypto::default_provider()?;
+let verifier = rustls_platform_verifier::Verifier::new(provider.clone())?;
 
-let mut tls = rustls::ClientConfig::builder_with_provider(crypto::default_provider()?)
+let mut tls = rustls::ClientConfig::builder_with_provider(provider)
     .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(roots)
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(verifier))
     .with_no_client_auth();
 tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
 let config = quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls)?));

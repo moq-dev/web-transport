@@ -61,7 +61,9 @@ impl ClientBuilder {
         })
     }
 
-    /// Accept certificates using root CAs.
+    /// Verify the server certificate with the operating system's trust store.
+    ///
+    /// See [`web_transport_quinn::ClientBuilder::with_system_roots`].
     pub fn with_system_roots(self) -> Result<Client, Error> {
         Ok(Client {
             inner: self.inner.with_system_roots()?,

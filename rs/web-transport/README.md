@@ -73,7 +73,9 @@ uses browser-managed certificate trust. `with_server_certificate_hashes` accepts
 SHA-256 certificate pins, subject to the browser's requirements for certificate
 lifetime and key type; see
 [serverCertificateHashes](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport/WebTransport#servercertificatehashes).
-Browsers provide no certificate-verification bypass.
+Browsers provide no certificate-verification bypass. On native targets,
+`with_system_roots` verifies with the operating system's trust store through
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier).
 
 ## Native transport configuration
 
