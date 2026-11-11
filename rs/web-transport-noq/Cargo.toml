@@ -29,7 +29,6 @@ http = "1"
 kio = "0.6.2"
 noq = { version = "1", default-features = false, features = [
     "tracing-log",
-    "platform-verifier",
     "runtime-tokio",
     "rustls",
     "bloom",
@@ -38,7 +37,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "logging",
     "std",
 ] }
-rustls-native-certs = "0.8"
+rustls-platform-verifier = "0.7"
 socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = [
@@ -50,6 +49,11 @@ tracing = "0.1"
 url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Must be the `jni` version rustls-platform-verifier uses, so both see one VM
+# singleton; see `src/android.rs`.
+jni = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 anyhow = "1"

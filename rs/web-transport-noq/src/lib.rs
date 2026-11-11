@@ -24,6 +24,8 @@
 //! If you want to support multiple WebTransport sessions over the same QUIC connection... you should just dial a new QUIC connection instead.
 
 // External
+#[cfg(target_os = "android")]
+mod android;
 mod client;
 mod error;
 mod recv;

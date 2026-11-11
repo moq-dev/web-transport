@@ -10,7 +10,7 @@ export declare class NapiBiStream {
 
 /** A WebTransport client that can connect to servers. */
 export declare class NapiClient {
-	/** Create a client that validates server certificates against system root CAs. */
+	/** Create a client that verifies server certificates with the operating system's trust store. */
 	static withSystemRoots(): NapiClient;
 	/**
 	 * Create a client that skips certificate verification entirely.
@@ -22,7 +22,7 @@ export declare class NapiClient {
 	/**
 	 * Create a client with certificate verification and QUIC transport options.
 	 *
-	 * Without certificate options, server certificates are validated against system root CAs.
+	 * Without certificate options, server certificates are verified with the operating system's trust store.
 	 */
 	static withOptions(options: NapiClientOptions): NapiClient;
 	/** Connect to a WebTransport server at the given URL. */

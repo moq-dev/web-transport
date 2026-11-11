@@ -39,6 +39,8 @@
 //! Browsers always authenticate the server. Use [`ClientBuilder::with_system_roots`]
 //! for browser-managed trust or [`ClientBuilder::with_server_certificate_hashes`]
 //! for certificate pinning subject to the browser's certificate restrictions.
+//! On native targets, `with_system_roots` verifies with the operating system's
+//! trust store.
 
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 #[path = "quinn.rs"]

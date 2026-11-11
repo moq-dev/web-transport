@@ -60,27 +60,31 @@ impl ClientBuilder {
         self
     }
 
-    /// Accept any certificate from the server if it uses a known root CA.
+    /// Verify the server certificate with the operating system's trust store.
+    ///
+    /// Verification uses [`rustls_platform_verifier`], so the OS decides which
+    /// roots to trust, including enterprise-installed roots, and applies
+    /// revocation checks where the platform supports them.
+    ///
+    /// On Android, the verifier needs the application `Context`. If the
+    /// application has not initialized rustls-platform-verifier, this
+    /// initializes it from the current `Application`. The application must also
+    /// bundle the verifier's Kotlin component; see the
+    /// [rustls-platform-verifier Android setup](https://github.com/rustls/rustls-platform-verifier#android).
+    ///
+    /// Returns an error if the platform verifier cannot load its trust store,
+    /// such as on a Linux host with no CA certificates installed, or cannot be
+    /// initialized on Android.
     pub fn with_system_roots(self) -> Result<Client, ClientError> {
-        let mut roots = rustls::RootCertStore::empty();
+        #[cfg(target_os = "android")]
+        crate::android::init_platform_verifier()?;
 
-        let native = rustls_native_certs::load_native_certs();
-
-        // Log any errors that occurred while loading the native root certificates.
-        for err in native.errors {
-            tracing::warn!(?err, "failed to load root cert");
-        }
-
-        // Add the platform's native root certificates.
-        for cert in native.certs {
-            if let Err(err) = roots.add(cert) {
-                tracing::warn!(?err, "failed to add root cert");
-            }
-        }
+        let verifier = rustls_platform_verifier::Verifier::new(self.provider.clone())?;
 
         let crypto = self
             .builder()
-            .with_root_certificates(roots)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
 
         self.build(crypto)
@@ -395,6 +399,8 @@ fn bind_socket(bind: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+/// Panics if [`ClientBuilder::with_system_roots`] fails, such as on a host with
+/// no CA certificates or Android when the platform verifier cannot be initialized.
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for Client {
     fn default() -> Self {

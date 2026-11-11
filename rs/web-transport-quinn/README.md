@@ -40,6 +40,24 @@ does not require IPv6 support or a running async runtime. Both sockets use the
 runtime present at construction, or at the first connection if constructed
 outside a runtime. Keep that runtime alive while using the client.
 
+`with_system_roots()` verifies server certificates with
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier),
+so the operating system's trust store decides, including enterprise-installed
+roots and revocation where the platform supports it. It returns an error when the
+verifier cannot load a trust store, such as on a Linux host with no CA
+certificates installed.
+
+On Android, the verifier needs the application `Context`. If the application has
+not [initialized the verifier](https://github.com/rustls/rustls-platform-verifier#android),
+`with_system_roots()` initializes it from the current `Application`, and returns an
+error when it cannot, such as before the `Application` exists or when no `jni` 0.22
+`JavaVM` is registered in the process. The application must bundle the verifier's
+Kotlin component either way. This crate leaves quinn's `platform-verifier` feature
+off; enable it on your own `quinn` dependency to use
+`quinn::ClientConfig::try_with_platform_verifier`.
+If you disable Quinn's default features, also ensure that `rustls-ring` or
+`rustls-aws-lc-rs` is enabled.
+
 For an existing `quinn::ClientConfig`, `Client::from(config)` uses the same
 lazy sockets. Set its ALPN to `web_transport_quinn::ALPN` (`h3`).
 `Client::new(endpoint, config)` instead keeps the caller's endpoint and address
@@ -61,8 +79,9 @@ rind supports x86_64, aarch64 and 32-bit ARM. A CPU missing a required feature i
 rejected by the builders' finishing methods with `ClientError::UnsupportedCpu` or
 `ServerError::UnsupportedCpu`. `new()` stays infallible. This check also applies
 when the process installed another TLS provider, because endpoint keys use rind.
-`Client::default()` unwraps system-root setup and panics on an unsupported CPU;
-use `ClientBuilder::new().with_system_roots()` to handle the error.
+`Client::default()` unwraps `with_system_roots()` and panics when it fails, such as
+on an unsupported CPU; use `ClientBuilder::new().with_system_roots()` to handle the
+error.
 
 For manually configured endpoints, replace `quinn::crypto::rustls::QuicClientConfig`,
 `QuicServerConfig` and `HandshakeData` with the same names under
@@ -78,12 +97,13 @@ Those Quinn convenience methods require its ring or aws-lc-rs feature.
 use std::sync::Arc;
 use web_transport_quinn::{crypto, quinn};
 
-let mut roots = rustls::RootCertStore::empty();
-roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+let provider = crypto::default_provider()?;
+let verifier = rustls_platform_verifier::Verifier::new(provider.clone())?;
 
-let mut tls = rustls::ClientConfig::builder_with_provider(crypto::default_provider()?)
+let mut tls = rustls::ClientConfig::builder_with_provider(provider)
     .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_root_certificates(roots)
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(verifier))
     .with_no_client_auth();
 tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
 let config = quinn::ClientConfig::new(Arc::new(crypto::QuicClientConfig::try_from(tls)?));
@@ -91,6 +111,9 @@ let client = web_transport_quinn::Client::from(config);
 # Ok(())
 # }
 ```
+
+On Android, initialize rustls-platform-verifier before a manually configured
+client's first handshake; unlike `with_system_roots()`, this path does not check it.
 
 The adapter accepts any rustls provider exposing the QUIC AES-128-GCM-SHA256
 initial suite. Configure TLS 1.3, and set server `max_early_data_size` to zero or

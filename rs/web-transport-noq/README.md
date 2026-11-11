@@ -40,6 +40,22 @@ does not require IPv6 support or a running async runtime. Both sockets use the
 runtime present at construction, or at the first connection if constructed
 outside a runtime. Keep that runtime alive while using the client.
 
+`with_system_roots()` verifies server certificates with
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier),
+so the operating system's trust store decides, including enterprise-installed
+roots and revocation where the platform supports it. It returns an error when the
+verifier cannot load a trust store, such as on a Linux host with no CA
+certificates installed.
+
+On Android, the verifier needs the application `Context`. If the application has
+not [initialized the verifier](https://github.com/rustls/rustls-platform-verifier#android),
+`with_system_roots()` initializes it from the current `Application`, and returns an
+error when it cannot, such as before the `Application` exists or when no `jni` 0.22
+`JavaVM` is registered in the process. The application must bundle the verifier's
+Kotlin component either way. This crate leaves noq's `platform-verifier` feature
+off; enable it on your own `noq` dependency to use
+`noq::ClientConfig::try_with_platform_verifier`.
+
 For an existing `noq::ClientConfig`, `Client::new(endpoint, config)` keeps
 the caller's endpoint and address handling. Set its ALPN to `h3`.
 
