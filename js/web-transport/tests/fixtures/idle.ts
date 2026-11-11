@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { setTimeout as sleep } from "node:timers/promises";
-import Session, { Server, type ServerOptions, type SessionOptions } from "../../src/index.ts";
+import Session, { Server, type ServerOptions, type SessionOptions, WebTransportError } from "../../src/index.ts";
 
 const pem = execFileSync("openssl", [
 	"req",
@@ -47,8 +47,10 @@ const EXPIRY_BOUND_MS = 10_000;
 async function expectExpiry(serverOptions: ServerOptions | undefined, clientOptions: SessionOptions) {
 	const { client, peer } = await connect(serverOptions, clientOptions);
 	const start = performance.now();
-	const [info] = await Promise.all([client.closed, peer.closed]);
-	assert.match(info.reason ?? "", /timed out/);
+	// An idle timeout is a connection failure, so both sides reject with a session error.
+	const timedOut = (err: unknown) =>
+		err instanceof WebTransportError && err.source === "session" && /timed out/.test(err.message);
+	await Promise.all([assert.rejects(client.closed, timedOut), assert.rejects(peer.closed, timedOut)]);
 	assert(performance.now() - start < EXPIRY_BOUND_MS);
 }
 

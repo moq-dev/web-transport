@@ -7,26 +7,48 @@ use std::{
 
 use bytes::Bytes;
 
-use crate::{ClosedStream, ReadError, ReadExactError, ReadToEndError, SessionError};
+use crate::{
+    error::{decode_stream_code, encode_stream_code},
+    ClosedStream, ReadError, ReadExactError, ReadToEndError, SessionError,
+};
 
-/// A stream that can be used to receive bytes. See [`noq::RecvStream`].
+/// A stream that can receive bytes, stopping with application code 0 on drop. See [`noq::RecvStream`].
 #[derive(Debug)]
 pub struct RecvStream {
     inner: noq::RecvStream,
     error: Arc<OnceLock<SessionError>>,
+    raw: bool,
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // FIN, reset, or an earlier stop can already have made the stream terminal.
+        let _ = self.stop(0);
+    }
 }
 
 impl RecvStream {
-    pub(crate) fn new(stream: noq::RecvStream, error: Arc<OnceLock<SessionError>>) -> Self {
+    pub(crate) fn new(
+        stream: noq::RecvStream,
+        error: Arc<OnceLock<SessionError>>,
+        raw: bool,
+    ) -> Self {
         Self {
             inner: stream,
             error,
+            raw,
         }
     }
 
     /// Replace connection-level errors with the stored session error if available.
-    fn map_error(&self, e: impl Into<ReadError>) -> ReadError {
-        let e = e.into();
+    fn map_error(&self, e: noq::ReadError) -> ReadError {
+        let e = match e {
+            noq::ReadError::Reset(code) => match decode_stream_code(code, self.raw) {
+                Some(code) => ReadError::Reset(code),
+                None => ReadError::InvalidReset(code),
+            },
+            e => e.into(),
+        };
         if let Some(err) = self.error.get() {
             if matches!(&e, ReadError::SessionError(_)) {
                 return ReadError::SessionError(err.clone());
@@ -37,9 +59,9 @@ impl RecvStream {
 
     /// Tell the other end to stop sending data with the given error code. See [`noq::RecvStream::stop`].
     /// This is a u32 with WebTransport since it shares the error space with HTTP/3.
+    /// A raw QUIC session sends the code as is.
     pub fn stop(&mut self, code: u32) -> Result<(), noq::ClosedStream> {
-        let code = web_transport_proto::error_to_http3(code);
-        let code = noq::VarInt::try_from(code).unwrap();
+        let code = encode_stream_code(code, self.raw);
         self.inner.stop(code)
     }
 
@@ -94,7 +116,7 @@ impl RecvStream {
     pub async fn received_reset(&mut self) -> Result<Option<u32>, SessionError> {
         match self.inner.received_reset().await {
             Ok(None) => Ok(None),
-            Ok(Some(code)) => Ok(web_transport_proto::error_from_http3(code.into_inner())),
+            Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
             Err(noq::ResetError::ConnectionLost(conn_err)) => {
                 Err(self.error.get().cloned().unwrap_or_else(|| conn_err.into()))
             }

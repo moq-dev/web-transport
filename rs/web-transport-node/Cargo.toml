@@ -24,4 +24,7 @@ web-transport-quinn = { path = "../web-transport-quinn", version = "0.13" }
 napi-build = "2"
 
 [dev-dependencies]
+anyhow = "1"
 rcgen = "0.14"
+tokio = { version = "1", features = ["rt"] }
+web-transport-proto = { workspace = true }
