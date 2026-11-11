@@ -86,6 +86,8 @@
           packages = tools;
 
           shellHook = ''
+            # bindgen otherwise prefers a newer host libclang, which cannot load in this shell.
+            export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
             # Linux Python extension wheels also need the compiler's C++ runtime.
             export LD_LIBRARY_PATH=${
               pkgs.lib.makeLibraryPath (
