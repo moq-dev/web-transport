@@ -19,7 +19,3 @@ Update the Kotlin and Swift READMEs where they describe verification. Python, Ko
 ## Closes
 
 - [#506](https://github.com/moq-dev/web-transport/issues/506) - support for the platform verifier
-
-## Related
-
-- [Rust platform verifier](/quest/a1/platform-verifier.md) - the same switch in the Rust builders
