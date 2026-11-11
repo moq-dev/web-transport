@@ -29,8 +29,9 @@ export class RecvStream {
 	 * @param onCancel Invoked with the number of discarded buffered bytes, and the reason the
 	 *   application passed to `cancel()`, when the application cancels the readable
 	 *   (→ STOP_SENDING, whose code comes from that reason).
-	 * @param onTerminal Invoked once when FIN, RESET_STREAM, or local cancellation
-	 *   makes the receive side terminal.
+	 * @param onTerminal Invoked once when FIN or RESET_STREAM gives the stream its
+	 *   final size. Local cancellation does not count: the peer may still send up
+	 *   to that final size, so the stream holds its stream-count credit until then.
 	 */
 	constructor(
 		onConsume: (bytes: number) => void,
@@ -65,7 +66,6 @@ export class RecvStream {
 				cancel: (reason: unknown) => {
 					this.#error ??= new Error("stream cancelled");
 					onCancel(this.#discard(), reason);
-					this.#notifyTerminal();
 					this.#signal();
 				},
 			},

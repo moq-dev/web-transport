@@ -4,7 +4,7 @@
 
 Stopping or dropping a Rust QMux `RecvStream` with unread data no longer shrinks the connection's `MAX_DATA` window. Per RFC 9000 §4.5, every byte the peer sent on a stopped stream, up to its final size, is credited back to connection flow control exactly once, so abandoned streams can never wedge a healthy session.
 
-Ships on `main` as the next `qmux` 0.6.x patch. No `qmux-v0.5.x` backport. The TypeScript QMux is out of scope here; [its own quest](/quest/a0/qmux-recv-credit-js.md) fixes the same leak there.
+Ships on `main` as the next `qmux` 0.6.x patch. No `qmux-v0.5.x` backport. The TypeScript QMux (`@moq/qmux`) already returns this credit.
 
 ## Plan
 
