@@ -6,6 +6,8 @@
 A wrapper around the Quiche, abstracting away the annoying API and HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Limitations
 This library builds on top of [tokio-quiche](https://docs.rs/tokio-quiche/latest/tokio_quiche/); the "official" Tokio runtime for [quiche](https://github.com/cloudflare/quiche).
 

@@ -4,6 +4,8 @@ Kotlin/Android bindings for [web-transport-ffi](../rs/web-transport-ffi) via [Un
 
 Single Kotlin Multiplatform module that publishes `dev.moq:web-transport` with both JVM and Android variants under one coordinate. Consumers add `dev.moq:web-transport:VERSION` and Gradle metadata resolution picks the right artifact for their target.
 
+See the [package and backend selection guide](../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 ```kotlin

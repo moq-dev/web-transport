@@ -29,6 +29,8 @@ still owns its networking and runtime integration.
 The [web-transport](../web-transport) crate provides a concrete API that selects
 Quinn or the browser backend at compile time.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Receive defaults
 
 The default async and poll receive helpers initialize at most 8 KiB of destination

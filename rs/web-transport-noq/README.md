@@ -6,6 +6,8 @@
 A wrapper around the Noq API (a Quinn fork), abstracting away the annoying HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## WebTransport
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new web API that allows for low-level, bidirectional communication between a client and a server.
 It's [available in the browser](https://caniuse.com/webtransport) as an alternative to HTTP and WebSockets.

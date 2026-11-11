@@ -4,6 +4,8 @@ A [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_A
 
 QMux brings QUIC's multiplexed streams and flow control to reliable, ordered byte-stream transports like WebSockets. This allows WebTransport applications to seamlessly fall back when QUIC/UDP is blocked by network middleboxes.
 
+See the [package and backend selection guide](https://github.com/moq-dev/web-transport/blob/main/PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 ```bash
