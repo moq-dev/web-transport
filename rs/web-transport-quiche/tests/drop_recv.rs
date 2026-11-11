@@ -4,11 +4,9 @@
 //! moq-lite-05 opens a unidirectional TRACK stream, writes a header, and holds the
 //! stream open. The subscriber reads the header and drops the receiver because it
 //! needs nothing else, which sends STOP_SENDING. quiche resets the sender's half in
-//! response and collects it entirely once that RESET_STREAM is acked, so anything
-//! the sender does next lands on a stream quiche no longer knows about and comes
-//! back as `quiche::Error::Done`. That is per-stream teardown, but it used to be
-//! promoted into a fatal connection error: application close code 500, reason
-//! `Done`.
+//! response, so the sender's next call on that stream fails with a per-stream error
+//! (`StreamStopped`, or `Done` once quiche has collected the stream). That error
+//! must end only the stream, never the connection.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -108,8 +106,8 @@ async fn drop_recv_keeps_connection_alive() -> Result<()> {
     // Server: open a batch of unidirectional streams, write a header on each, and
     // hold the send halves open. A bidirectional stream sequences the rest: the
     // second "ping" only arrives after the client has acked the RESET_STREAM for
-    // every dropped receiver, which is what makes the streams collected — and the
-    // resulting `Done` — deterministic.
+    // every dropped receiver, which makes the resulting per-stream errors
+    // deterministic.
     let server_task = tokio::spawn(async move {
         let request = server.accept().await.context("server accept")?;
         let session = request.ok().await.context("server session")?;
@@ -193,9 +191,9 @@ async fn drop_recv_keeps_connection_alive() -> Result<()> {
     Ok(())
 }
 
-/// Once quiche has collected the stream, the sender's cached capacity is stale. A
-/// write must fail rather than queue bytes onto state the driver has already
-/// retired, which nothing will ever flush or wake again.
+/// Once the peer has stopped the stream, the sender's cached capacity is stale. A
+/// write must fail with the peer's code rather than queue bytes onto state the
+/// driver has already retired, which nothing will ever flush or wake again.
 #[tokio::test(flavor = "current_thread")]
 async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
     init_tracing();
@@ -220,7 +218,7 @@ async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
             .await
             .context("ping 2")?;
 
-        // The stream is stopped and collected by now. The first writes may still be
+        // The stream is stopped by now. The first writes may still be
         // accepted against the stale capacity, but the stream has to fail them before
         // that capacity runs out, or the writer parks with nothing left to wake it.
         let chunk = vec![0u8; 64 * 1024];
@@ -232,16 +230,16 @@ async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
             }
         })
         .await
-        .context("writing to a collected stream never returned")?;
+        .context("writing to a stopped stream never returned")?;
 
         // Neither may report success: the queued bytes were discarded, not sent, so an
         // `Ok` here would tell the application they reached the peer.
         let flushed = tokio::time::timeout(Duration::from_secs(10), send.flush())
             .await
-            .context("flushing a collected stream never returned")?;
+            .context("flushing a stopped stream never returned")?;
         let closed = tokio::time::timeout(Duration::from_secs(10), send.closed())
             .await
-            .context("closing a collected stream never returned")?;
+            .context("closing a stopped stream never returned")?;
 
         assert!(flushed.is_err(), "flush reported success for unsent bytes");
         assert!(closed.is_err(), "closed reported success for unsent bytes");
@@ -274,7 +272,7 @@ async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
     let mut done = [0u8; 4];
     read_exact(&mut sync_recv, &mut done)
         .await
-        .context("server never finished writing to the collected stream")?;
+        .context("server never finished writing to the stopped stream")?;
     assert_eq!(&done, b"done");
 
     session.close(0, "bye");
@@ -284,8 +282,9 @@ async fn write_after_drop_recv_ends_the_stream() -> Result<()> {
         .await
         .context("server task panicked")?
         .context("server task errored")?;
+    // A dropped `RecvStream` stops the stream with "DECV".
     assert!(
-        matches!(err, StreamError::Closed),
+        matches!(err, StreamError::Stop(0x44454356)),
         "unexpected stream error: {err}"
     );
 

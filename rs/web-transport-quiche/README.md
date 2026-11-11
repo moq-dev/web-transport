@@ -9,13 +9,10 @@ Provides a QUIC-like API but with web support!
 ## Limitations
 This library builds on top of [tokio-quiche](https://docs.rs/tokio-quiche/latest/tokio_quiche/); the "official" Tokio runtime for [quiche](https://github.com/cloudflare/quiche).
 
-[quiche-ez](ez) is a wrapper around `tokio-quiche` that provides an async API.
-It tries to cover as many warts as possible but it's still limited by the poor `tokio_quiche` API.
-For example, `tokio_quiche` only accepts a single TLS certificate loaded from disk, so certificates
-are configured through a BoringSSL hook instead.
-
-If this library becomes popular, I can spin `quiche-ez` off into a separate crate that performs the Tokio networking itself.
-It should result in better performance too.
+The [`ez` module](src/ez) wraps `tokio-quiche` with async and poll-based QUIC APIs.
+The [`h3` module](src/h3) handles the HTTP/3 setup for WebTransport.
+Certificates are configured through a BoringSSL hook because `tokio-quiche`'s
+file-based configuration only accepts a single TLS certificate.
 
 ## WebTransport
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new web API that allows for low-level, bidirectional communication between a client and a server.

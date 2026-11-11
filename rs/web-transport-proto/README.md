@@ -4,6 +4,7 @@
 # web-transport-proto
 The gritty WebTransport protocol implementation.
 Not meant to be used directly, but as a dependency for the [Quinn](../web-transport-quinn), [Noq](../web-transport-noq), [Quiche](../web-transport-quiche), and [Iroh](../web-transport-iroh) backends.
+[QMux](../qmux) also uses its shared framing primitives, including QUIC variable-length integers.
 
 CONNECT requests and responses accept a HEADERS payload and decoded field section
 of at most 16 KiB. Decoded size counts every field line as its name and value

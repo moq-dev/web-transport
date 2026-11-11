@@ -154,10 +154,10 @@ impl SendState {
             }
             quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
                 tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
-                // Only a peer STOP_SENDING gets a live stream collected, so this is a
-                // stop whose code quiche has already thrown away. It is not a `fin`:
-                // the application's bytes never left, and saying otherwise would report
-                // a successful flush for data the peer refused.
+                // quiche reports a peer STOP_SENDING before collecting the stream, so
+                // this is a fallback for state quiche retired without a code. It is not
+                // a `fin`: the application's bytes never left, and saying otherwise
+                // would report a successful flush for data the peer refused.
                 self.gone = true;
             }
             e => return Err(e),
