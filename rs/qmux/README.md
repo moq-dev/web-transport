@@ -32,10 +32,11 @@ keeps its own entry point in its own module, so the shared names don't collide:
 | Module | Entry point | Feature |
 | --- | --- | --- |
 | `qmux::tcp` | `tcp::Config` | `tcp` |
-| `qmux::uds` | `uds::Config` | `uds` |
+| `qmux::uds` | `uds::Config` | `uds` (Unix only) |
 | `qmux::tls` | `tls::Client`, `tls::Server` | `tls` |
 | `qmux::ws` | `ws::Client`, `ws::Server`, `ws::Upgraded` | `ws` |
-| `qmux::transport` | `transport::Stream` | `tcp` or `uds` |
+| `qmux::transport` | `transport::Transport` | Always available |
+| `qmux::transport` | `transport::Stream` | `tcp` or `uds` (Unix only for `uds`) |
 
 ```rust
 use qmux::{tcp, Error, Session, Version};
@@ -108,4 +109,4 @@ violations use the existing CONNECTION_CLOSE code 1002.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE) or [MIT license](../../LICENSE-MIT) at your option.

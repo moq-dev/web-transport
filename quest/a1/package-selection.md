@@ -13,7 +13,3 @@ Create a standalone guide linked from the root and relevant package READMEs. Thi
 ## Closes
 
 - [#117](https://github.com/moq-dev/web-transport/issues/117) - the implementation completes this report
-
-## Related
-
-- [Current architecture documentation](/quest/a1/docs-current.md) - repairs existing stale descriptions independently
