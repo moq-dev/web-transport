@@ -8,9 +8,9 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::{ez, waiters::Parked, StreamError};
 
-// "recv" in ascii; if you see this then read everything or close(code)
+// "DECV" in ascii; if you see this then read everything or close(code)
 // hex: 0x44454356, or 0x52E4EA9B7F80 as an HTTP error code
-// decimal: 1146556178, or 91143142080384 as an HTTP error code
+// decimal: 1145389910, or 91143142080384 as an HTTP error code
 const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x44454356);
 
 /// A stream that can be used to receive bytes.
