@@ -12,6 +12,12 @@ For now, consume the package locally by downloading the `web-transport-ffi-${VER
 .package(path: "/path/to/web-transport-ffi-${VERSION}-swift"),
 ```
 
+## Certificate verification
+
+Without `serverCertificateHashes` or `noCertVerification`, clients verify servers with
+the operating system's trust store, on iOS and macOS through the Security framework,
+using [rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier).
+
 ## Session lifetime
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.

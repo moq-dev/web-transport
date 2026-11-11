@@ -23,6 +23,14 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // rustls-platform-verifier publishes its Android component only here;
+        // web-transport/build.gradle.kts bundles it into the AAR.
+        exclusiveContent {
+            forRepository {
+                maven("https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/")
+            }
+            filter { includeGroup("org.rustls") }
+        }
     }
 }
 

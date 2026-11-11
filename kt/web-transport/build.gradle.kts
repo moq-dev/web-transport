@@ -7,7 +7,8 @@
 //   commonMain                       (empty today; reserved for future K/N targets)
 //   └─ jvmAndAndroidMain             Wrappers + UniFFI-generated kotlin (uses JNA)
 //      ├─ jvmMain                    JVM-specific: native libs as JAR resources
-//      └─ androidMain                Android-specific: native libs in jniLibs
+//      └─ androidMain                Android-specific: native libs in jniLibs, and a
+//                                    startup provider that loads them via System.loadLibrary
 //
 // Native libraries are populated by `kt/scripts/package.sh`:
 //   src/jvmMain/resources/<os>-<arch>/<libname>              (JNA classpath layout)
@@ -36,6 +37,7 @@
 // the signing key) don't trip on "no configured signatory".
 
 import com.vanniktech.maven.publish.SonatypeHost
+import java.security.MessageDigest
 import java.time.Duration
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -59,6 +61,36 @@ plugins {
 // contributors without Google maven access can still build the JVM variant.
 if (androidEnabled) {
     apply(plugin = "com.android.library")
+}
+
+// rustls-platform-verifier verifies on Android through a small Kotlin component
+// that is not on Maven Central. Bundle its classes into the AAR so consumers need
+// no extra repository. Only the classes are taken: its manifest would impose an
+// app-wide network security config, which only aids best-effort revocation fetches.
+val rustlsPlatformVerifierJar: FileCollection? = if (androidEnabled) {
+    val aar = configurations.create("rustlsPlatformVerifier") {
+        isCanBeConsumed = false
+        isTransitive = false
+    }
+    val version = providers.gradleProperty("rustlsPlatformVerifier.version").get()
+    dependencies.add(aar.name, "org.rustls:rustls-platform-verifier:$version@aar")
+    val expectedSha256 = providers.gradleProperty("rustlsPlatformVerifier.sha256").get()
+    val extract = tasks.register<Copy>("extractRustlsPlatformVerifier") {
+        val aarFiles: FileCollection = aar
+        inputs.property("sha256", expectedSha256)
+        from({ zipTree(aarFiles.singleFile) }) { include("classes.jar") }
+        into(layout.buildDirectory.dir("rustls-platform-verifier"))
+        doFirst {
+            val digest = MessageDigest.getInstance("SHA-256").digest(aarFiles.singleFile.readBytes())
+            val actual = digest.joinToString("") { "%02x".format(it) }
+            check(actual == expectedSha256) {
+                "rustls-platform-verifier AAR SHA-256 is $actual, expected $expectedSha256"
+            }
+        }
+    }
+    files(layout.buildDirectory.file("rustls-platform-verifier/classes.jar")).builtBy(extract)
+} else {
+    null
 }
 
 kotlin {
@@ -114,6 +146,7 @@ kotlin {
                 dependsOn(jvmAndAndroidMain)
                 dependencies {
                     implementation("net.java.dev.jna:jna:5.15.0@aar")
+                    implementation(rustlsPlatformVerifierJar!!)
                 }
             }
             val androidUnitTest by getting {
@@ -132,6 +165,7 @@ if (androidEnabled) {
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
             }
+            consumerProguardFiles("consumer-rules.pro")
         }
         compileOptions {
             sourceCompatibility = JavaVersion.VERSION_17

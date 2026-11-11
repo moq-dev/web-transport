@@ -8,11 +8,10 @@
 
 Follow moq-dev/moq#1968, which made the same switch in moq-native. Replace the `rustls_native_certs` root loading in both builders with the platform verifier on the crate's existing provider (`crypto::default_provider()`), so rind stays the default provider. Drop the `rustls-native-certs` dependency from both crates. Also drop quinn's and noq's `platform-verifier` feature, which nothing uses: it only enables `ClientConfig::try_with_platform_verifier`, which bypasses this crate's provider-neutral crypto adapter.
 
-The FFI client does not use these builders and is handled in [FFI platform verifier](/quest/a1/ffi-platform-verifier.md). Android needs JNI initialization that only that quest provides. Here, document in the builders that on Android the platform verifier requires app initialization.
+The FFI client does not use these builders; it already verifies with the platform verifier and initializes it on Android from its own `JNI_OnLoad` (see `rs/web-transport-ffi/README.md`). Here, document in the builders that on Android the platform verifier requires app initialization.
 
 Coordinate with [Noq on rind](/quest/a1/rind/noq.md), which rewrites the noq client builder; whichever lands second resolves the conflict. Update the crate READMEs and doc comments that describe `with_system_roots()`.
 
 ## Related
 
-- [Issue #506](https://github.com/moq-dev/web-transport/issues/506) - platform verifier support; closed by the FFI quest
-- [FFI platform verifier](/quest/a1/ffi-platform-verifier.md) - same switch for the language bindings
+- [Issue #506](https://github.com/moq-dev/web-transport/issues/506) - platform verifier support; closed by the FFI platform verifier PR

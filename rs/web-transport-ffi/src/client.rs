@@ -86,15 +86,11 @@ impl Client {
                 .with_custom_certificate_verifier(fingerprints)
                 .with_no_client_auth()
         } else {
-            let mut roots = rustls::RootCertStore::empty();
-            let native = rustls_native_certs::load_native_certs();
-            // Errors loading individual certs are non-fatal; we still want
-            // whatever the platform yielded.
-            for cert in native.certs {
-                let _ = roots.add(cert);
-            }
+            let verifier = platform_verifier(provider.clone())
+                .map_err(|e| WebTransportError::invalid(format!("platform verifier: {e}")))?;
             tls_builder
-                .with_root_certificates(roots)
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth()
         };
 
@@ -195,6 +191,17 @@ fn default_crypto_provider() -> Result<Arc<rustls::crypto::CryptoProvider>, WebT
     web_transport_quinn::crypto::default_provider()
         .map_err(|e| WebTransportError::invalid(e.to_string()))
 }
+
+/// Verify with the OS trust store; Android falls back to webpki roots until initialized.
+#[cfg(not(target_os = "android"))]
+fn platform_verifier(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, rustls::Error> {
+    Ok(Arc::new(rustls_platform_verifier::Verifier::new(provider)?))
+}
+
+#[cfg(target_os = "android")]
+use crate::android::verifier as platform_verifier;
 
 // ---------------------------------------------------------------------------
 // Certificate verifiers — preserved from web-transport-python.

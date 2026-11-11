@@ -14,6 +14,22 @@ dependencies {
 }
 ```
 
+## Certificate verification
+
+Without `serverCertificateHashes` or `noCertVerification`, clients verify servers with
+the operating system's trust store through
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier),
+including user-installed and enterprise roots where the OS allows them.
+
+On Android the verifier needs the application `Context`. The AAR handles this with no
+app code: a manifest-merged `ContentProvider` loads the native library with
+`System.loadLibrary` during app startup, and the library's `JNI_OnLoad` initializes
+the verifier from the Application. The AAR also bundles the verifier's Kotlin
+component and ships its R8/ProGuard keep rule. If initialization has not succeeded,
+for example because the provider was removed from the merged manifest and the
+library was first loaded by JNA, each new client retries it; a client built before
+it succeeds trusts the bundled Mozilla roots from webpki-roots instead and keeps them.
+
 ## Session lifetime
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
@@ -75,11 +91,13 @@ kt/
   gradle.properties         Defaults: version, android.useAndroidX, etc.
   web-transport/
     build.gradle.kts        KMP plugin, jvm() always, androidTarget() conditional
+    consumer-rules.pro      Android keep rule for the bundled verifier component
     src/
       commonMain/           Public Kotlin facade (reserved for future K/N)
       jvmAndAndroidMain/    UniFFI-generated kotlin (populated, gitignored)
       jvmMain/resources/    Native libs at JNA paths (populated, gitignored)
-      androidMain/jniLibs/  JNI .so per ABI (populated, gitignored)
+      androidMain/          Startup provider that loads the library via System.loadLibrary
+        jniLibs/            JNI .so per ABI (populated, gitignored)
       jvmArtifactTest/      Opt-in packaged-artifact lifecycle smoke
   scripts/                  check.sh, package.sh
 ```

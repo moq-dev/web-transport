@@ -73,6 +73,14 @@ async def main():
 asyncio.run(main())
 ```
 
+## Certificate verification
+
+Without `server_certificate_hashes` or `no_cert_verification`, `Client()` verifies
+servers with the operating system's trust store through
+[rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier):
+the Security framework on macOS, CryptoAPI on Windows, and the system CA bundle on
+Linux. Construction fails on Linux when no system CA certificate can be loaded.
+
 ## Session lifetime
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.

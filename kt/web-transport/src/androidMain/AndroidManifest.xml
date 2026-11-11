@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Loads the native library at startup; see NativeLibraryInitializer. -->
+        <provider
+            android:name="dev.moq.webtransport.NativeLibraryInitializer"
+            android:authorities="${applicationId}.dev.moq.webtransport.initializer"
+            android:exported="false" />
+    </application>
+</manifest>
