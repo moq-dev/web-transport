@@ -60,7 +60,7 @@ const session = new Session("https://example.com:4443/path", {
 });
 ```
 
-QUIC uses the smaller of both peers' idle timeouts, so disabling one endpoint's timeout leaves the peer's in effect. To keep an otherwise idle session open, set `keepAliveInterval` below the effective idle timeout on either endpoint.
+QUIC uses the smaller of both peers' idle timeouts, so disabling one endpoint's timeout leaves the peer's in effect. To keep an otherwise idle session open, set `keepAliveInterval` below the effective idle timeout on either endpoint. An expired idle timeout is a connection failure, so it rejects `session.closed` with a session `WebTransportError`.
 
 ### Polyfill
 
