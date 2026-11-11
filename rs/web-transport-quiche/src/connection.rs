@@ -1134,8 +1134,12 @@ mod tests {
     #[tokio::test]
     async fn truncated_capsule_is_a_protocol_error() -> Result<()> {
         let mut pair = http_pair().await?;
-        // The first byte of a two-byte capsule type, with no second byte.
-        pair._connect.send.write_all(&[0x68]).await?;
+        // A DATA frame carrying the first byte of a two-byte capsule type, with no second byte.
+        let mut frame = BytesMut::new();
+        web_transport_proto::Frame::DATA.encode(&mut frame);
+        VarInt::from_u32(1).encode(&mut frame);
+        frame.extend_from_slice(&[0x68]);
+        pair._connect.send.write_all(&frame).await?;
         pair._connect.send.finish()?;
         let closed = timeout(TIMEOUT, pair.session.closed()).await?;
         assert!(matches!(
