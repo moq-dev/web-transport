@@ -1,9 +1,10 @@
-//! Writing to a peer-collected send stream reports Closed without stalling its session.
+//! Writing to a send stream the peer stopped reports the peer's code without stalling
+//! its session.
 //!
-//! Once the peer's STOP_SENDING has quiche collect the send half, `SendState::flush`
-//! marks the stream closed and the driver drops its entry. The application usually
-//! finds out one write later. A separate bidirectional stream must still make
-//! progress after that write fails.
+//! Once quiche reports the peer's STOP_SENDING, `SendState::flush` marks the stream
+//! closed and the driver drops its entry. The application usually finds out one
+//! write later. A separate bidirectional stream must still make progress after that
+//! write fails.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -76,7 +77,7 @@ async fn write_msg(send: &mut SendStream, msg: &[u8]) -> Result<()> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn writing_to_a_collected_stream_returns_closed() -> Result<()> {
+async fn writing_to_a_stopped_stream_returns_the_stop_code() -> Result<()> {
     let (mut server, addr) = start_server()?;
 
     let server_task = tokio::spawn(async move {
@@ -86,8 +87,8 @@ async fn writing_to_a_collected_stream_returns_closed() -> Result<()> {
         let mut send = session.open_uni().await.context("server open_uni")?;
         write_msg(&mut send, HEADER).await.context("header")?;
 
-        // The second ping only lands after the client has acked the RESET_STREAM,
-        // which is what makes the stream collected rather than merely stopped.
+        // The second ping only lands after the client's STOP_SENDING has arrived and
+        // the server's RESET_STREAM has been acked.
         let (mut sync_send, mut sync_recv) = session.accept_bi().await.context("server sync")?;
         let mut ping = [0u8; 4];
         read_exact(&mut sync_recv, &mut ping)
@@ -98,7 +99,7 @@ async fn writing_to_a_collected_stream_returns_closed() -> Result<()> {
             .await
             .context("ping 2")?;
 
-        // Keep writing until the collected stream reports itself over.
+        // Keep writing until the stopped stream reports itself over.
         let chunk = vec![0u8; 64 * 1024];
         let err: StreamError = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -108,7 +109,7 @@ async fn writing_to_a_collected_stream_returns_closed() -> Result<()> {
             }
         })
         .await
-        .context("writing to a collected stream never returned")?;
+        .context("writing to a stopped stream never returned")?;
 
         write_msg(&mut sync_send, b"done").await?;
         session.closed().await;
@@ -146,9 +147,10 @@ async fn writing_to_a_collected_stream_returns_closed() -> Result<()> {
         .context("server task panicked")?
         .context("server task errored")?;
 
+    // A dropped `RecvStream` stops the stream with "DECV".
     assert!(
-        matches!(err, StreamError::Closed),
-        "expected the retired stream to end the write, got: {err}"
+        matches!(err, StreamError::Stop(0x44454356)),
+        "expected the peer's stop code to end the write, got: {err}"
     );
 
     Ok(())

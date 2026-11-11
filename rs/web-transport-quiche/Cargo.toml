@@ -14,6 +14,10 @@ categories = ["network-programming", "web-programming"]
 [package.metadata.docs.rs]
 all-features = true
 
+[package.metadata.cargo-shear]
+# `quiche` is a version floor for the copy tokio-quiche re-exports.
+ignored = ["quiche"]
+
 [features]
 # Honor `Settings::keylog_file` and `SSLKEYLOGFILE`. tokio-quiche gates the keylog
 # behind its own feature, so without this it warns and logs nothing. Off by default:
@@ -27,6 +31,9 @@ flume = "0.12"
 futures = "0.3"
 http = "1"
 kio = "0.6.2"
+# Only a floor: quiche 0.30.1 reports a peer's STOP_SENDING code before collecting
+# the stream, which `SendStream` surfaces as `StreamError::Stop`.
+quiche = { version = "0.30.1", default-features = false }
 rustls-pki-types = "1"
 
 socket2 = "0.6"
