@@ -55,7 +55,7 @@ exclude = ["python/web_transport/_uniffi"]
 [dependency-groups]
 dev = [
     "maturin>=1.0,<2.0",
-    "playwright>=1.40",
+    "playwright>=1.57",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
