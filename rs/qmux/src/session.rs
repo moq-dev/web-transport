@@ -3880,7 +3880,12 @@ mod recv_open_tests {
     }
 
     fn uni_stream_at(index: u64, offset: u64, data: &'static [u8], fin: bool) -> Bytes {
-        stream_at(StreamId::new(index, StreamDir::Uni, true), offset, data, fin)
+        stream_at(
+            StreamId::new(index, StreamDir::Uni, true),
+            offset,
+            data,
+            fin,
+        )
     }
 
     fn stream_at(id: StreamId, offset: u64, data: &'static [u8], fin: bool) -> Bytes {
