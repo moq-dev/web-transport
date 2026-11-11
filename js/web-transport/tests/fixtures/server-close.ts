@@ -78,7 +78,7 @@ holding = false;
 assert(remoteClient);
 for (const flight of flights) proxy.send(flight, remoteClient.port, remoteClient.address);
 await rejected;
-await stalled.closed;
+await assert.rejects(stalled.closed);
 await new Promise<void>((resolve) => proxy.close(resolve));
 
 // Stopping the listener must not close sessions it already accepted.

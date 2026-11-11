@@ -2,6 +2,8 @@
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::{
+    crypto::{KeyPair, PacketKey, Session},
+    transport_parameters::TransportParameters,
     Connection, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, Side,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -240,7 +242,7 @@ fn client_config(tls: rustls::ClientConfig, ours: bool) -> quinn::ClientConfig {
 }
 
 #[test]
-fn upstream_handshake_retry_key_update_and_reset() {
+fn upstream_handshake_retry_and_reset() {
     for suite in [
         rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
         rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
@@ -272,15 +274,8 @@ fn upstream_handshake_retry_key_update_and_reset() {
                 .export_keying_material(&mut server_export, b"test", b"context")
                 .unwrap();
             assert_eq!(client_export, server_export);
-            for side in [Side::Client, Side::Server] {
-                pair.traffic(side, b"before key update");
-                match side {
-                    Side::Client => pair.client.conn(),
-                    Side::Server => pair.server.conn(),
-                }
-                .force_key_update();
-                pair.traffic(side, b"after key update");
-            }
+            pair.traffic(Side::Client, b"from client");
+            pair.traffic(Side::Server, b"from server");
             // Restart the rind endpoint and require the unmodified peer to recognize its reset.
             let (restarted, remote) = if ours_server {
                 (&mut pair.server, &mut pair.client)
@@ -303,6 +298,86 @@ fn upstream_handshake_retry_key_update_and_reset() {
                     reason: quinn::ConnectionError::Reset
                 })
             ));
+        }
+    }
+}
+
+/// Runs a TLS handshake between two sessions and returns each side's 1-RTT packet keys.
+fn handshake(
+    client: &mut dyn Session,
+    server: &mut dyn Session,
+) -> [KeyPair<Box<dyn PacketKey>>; 2] {
+    // Moves one flight from `from` to `to`, recording keys `from` switched to.
+    fn flight(
+        from: &mut dyn Session,
+        to: &mut dyn Session,
+        keys: &mut Option<KeyPair<Box<dyn PacketKey>>>,
+    ) -> bool {
+        let mut buf = Vec::new();
+        let next = from.write_handshake(&mut buf);
+        let progress = next.is_some() || !buf.is_empty();
+        if let Some(next) = next {
+            *keys = Some(next.packet);
+        }
+        if !buf.is_empty() {
+            to.read_handshake(&buf).unwrap();
+        }
+        progress
+    }
+
+    let (mut client_keys, mut server_keys) = (None, None);
+    for _ in 0..16 {
+        let progress = flight(client, server, &mut client_keys);
+        if !(flight(server, client, &mut server_keys) || progress) {
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            return [client_keys.unwrap(), server_keys.unwrap()];
+        }
+    }
+    panic!("handshake failed to quiesce");
+}
+
+const HEADER: &[u8] = b"header";
+
+fn seal(key: &dyn PacketKey, packet: u64) -> Vec<u8> {
+    let mut buf = [HEADER, b"payload", &[0; 16]].concat();
+    key.encrypt(packet, &mut buf, HEADER.len());
+    buf
+}
+
+fn opens(key: &dyn PacketKey, packet: u64, sealed: &[u8]) -> bool {
+    let mut payload = BytesMut::from(&sealed[HEADER.len()..]);
+    key.decrypt(packet, HEADER, &mut payload).is_ok() && &payload[..] == b"payload"
+}
+
+// Quinn's `force_key_update` can start an update before the peer has seen a packet in the current
+// key phase (RFC 9001 section 6.1) when it follows Quinn's randomly timed routine key update, so
+// a connection that forces updates is flaky. Check key updates on the sessions directly instead.
+#[test]
+fn upstream_key_updates() {
+    let params = TransportParameters::read(Side::Client, &mut std::io::Cursor::new([])).unwrap();
+    for suite in [
+        rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+        rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+    ] {
+        for ours_server in [false, true] {
+            let (tls, server) = configs(ours_server, suite);
+            let mut client = client_crypto(tls, !ours_server)
+                .start_session(1, "localhost", &params)
+                .unwrap();
+            let mut server = server.crypto.start_session(1, &params);
+            let mut keys = handshake(&mut *client, &mut *server);
+            for packet in 0..4 {
+                let sealed = keys.each_ref().map(|k| seal(&*k.local, packet));
+                assert!(opens(&*keys[1].remote, packet, &sealed[0]));
+                assert!(opens(&*keys[0].remote, packet, &sealed[1]));
+                keys = [
+                    client.next_1rtt_keys().unwrap(),
+                    server.next_1rtt_keys().unwrap(),
+                ];
+                assert!(!opens(&*keys[1].remote, packet, &sealed[0]));
+                assert!(!opens(&*keys[0].remote, packet, &sealed[1]));
+            }
         }
     }
 }
@@ -380,11 +455,8 @@ fn upstream_retry_authentication_rejects_tampering() {
                 .start_session(
                     version,
                     "localhost",
-                    &quinn_proto::transport_parameters::TransportParameters::read(
-                        Side::Client,
-                        &mut std::io::Cursor::new([]),
-                    )
-                    .unwrap(),
+                    &TransportParameters::read(Side::Client, &mut std::io::Cursor::new([]))
+                        .unwrap(),
                 )
                 .unwrap();
             let cid = quinn::ConnectionId::new(b"original");
