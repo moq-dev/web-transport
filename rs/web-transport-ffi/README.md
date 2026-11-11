@@ -4,6 +4,8 @@ Low-level UniFFI bindings for WebTransport over HTTP/3 (QUIC). Generates Python,
 
 For an ergonomic Python API (async context managers, legacy exception hierarchy), see [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) which wraps this package.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 Clients lazily share one socket per destination address family: IPv4 uses
 `0.0.0.0:0`, IPv6 uses IPv6-only `[::]:0`, and IPv4-mapped IPv6 uses IPv4.
 Socket setup errors are returned by `connect`. `close` and final client drop
