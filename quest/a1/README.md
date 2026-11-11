@@ -14,5 +14,7 @@ The Required list is ordered by priority. Independent children may proceed concu
 - [Binding runtime coverage](/quest/a1/bindings/README.md) - independent language jobs
 - [Node idle configuration](/quest/a1/node-idle/README.md) - typed native input and Node options
 - [Response headers](/quest/a1/response-headers.md) - preserve success and rejection metadata
+- [Rust platform verifier](/quest/a1/platform-verifier.md) - `with_system_roots()` verifies with the OS trust store
+- [FFI platform verifier](/quest/a1/ffi-platform-verifier.md) - bindings verify on iOS and Android
 - [Current architecture docs](/quest/a1/docs-current.md) - repair stale workspace descriptions
 - [Package selection](/quest/a1/package-selection.md) - verified comparison and selection guide
