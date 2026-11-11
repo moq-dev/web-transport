@@ -23,7 +23,7 @@ const STREAMS_BLOCKED_UNI: VarInt = VarInt::from_u32(0x17);
 const APPLICATION_CLOSE: VarInt = VarInt::from_u32(0x1d);
 const CONNECTION_CLOSE: VarInt = VarInt::from_u32(0x1c);
 // RFC 9000 §19.11: a stream count above 2^60 can't be encoded as a stream ID.
-const MAX_STREAM_COUNT: u64 = 1 << 60;
+pub(super) const MAX_STREAM_COUNT: u64 = 1 << 60;
 // DATAGRAM frames (RFC 9221). 0x30 has no length (the payload runs to the end of
 // the record); 0x31 prefixes a length varint. Datagrams are only ever sent on
 // QMux01, where each rides its own record, so the record boundary would already

@@ -2,7 +2,7 @@
 
 ## Goal
 
-web-transport-quinn uses quinn's own provider-neutral `rustls` support and deletes the adapter from [Quinn on rind](/quest/a1/rind/quinn.md).
+web-transport-quinn uses quinn's own provider-neutral `rustls` support and deletes the local `web_transport_quinn::crypto` adapter.
 
 ## Plan
 
@@ -10,5 +10,4 @@ Bump the quinn pin in web-transport-quinn and web-transport-ffi together (FFI ha
 
 ## Required
 
-- [Quinn on rind](/quest/a1/rind/quinn.md) - the adapter this replaces
 - [Quinn provider-neutral rustls release](/quest/a2/quinn-provider-release.md) - the upstream release this switches to

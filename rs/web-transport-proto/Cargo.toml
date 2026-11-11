@@ -15,7 +15,7 @@ categories = ["network-programming", "web-programming"]
 [dependencies]
 bytes = "1"
 http = "1"
-sfv = "0.15"
+sfv = "0.16"
 thiserror = "2"
 
 # Just for AsyncRead and AsyncWrite traits
@@ -24,3 +24,7 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
+
+[[bench]]
+name = "buffering"
+harness = false

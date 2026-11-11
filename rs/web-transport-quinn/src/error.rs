@@ -7,6 +7,18 @@ use crate::{ConnectError, SettingsError};
 /// An error returned when connecting to a WebTransport endpoint.
 #[derive(Error, Debug, Clone)]
 pub enum ClientError {
+    /// Creating or binding a client endpoint failed.
+    #[error("failed to bind client endpoint: {0}")]
+    IoError(Arc<std::io::Error>),
+
+    /// A CPU feature required by rind is unavailable.
+    #[error(transparent)]
+    UnsupportedCpu(#[from] crate::crypto::UnsupportedCpu),
+
+    /// Constructing QUIC cryptography failed.
+    #[error(transparent)]
+    Crypto(#[from] crate::crypto::ConfigError),
+
     #[error("unexpected end of stream")]
     UnexpectedEnd,
 
@@ -31,7 +43,6 @@ pub enum ClientError {
     #[error("invalid DNS name: {0}")]
     InvalidDnsName(String),
 
-    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
 }
@@ -294,6 +305,14 @@ impl From<quinn::ClosedStream> for ClosedStream {
 /// An error returned when receiving a new WebTransport session.
 #[derive(Error, Debug, Clone)]
 pub enum ServerError {
+    /// A CPU feature required by rind is unavailable.
+    #[error(transparent)]
+    UnsupportedCpu(#[from] crate::crypto::UnsupportedCpu),
+
+    /// Constructing QUIC cryptography failed.
+    #[error(transparent)]
+    Crypto(#[from] crate::crypto::ConfigError),
+
     #[error("unexpected end of stream")]
     UnexpectedEnd,
 
@@ -315,7 +334,6 @@ pub enum ServerError {
     #[error("io error: {0}")]
     IoError(Arc<std::io::Error>),
 
-    #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
     #[error("rustls error: {0}")]
     Rustls(#[from] rustls::Error),
 }

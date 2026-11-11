@@ -781,12 +781,13 @@ fn row(name: &str, ok: bool, detail: &str) -> Object {
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim().as_bytes();
-    let pairs = hex.chunks_exact(2);
-    if !pairs.remainder().is_empty() {
+    let (pairs, remainder) = hex.as_chunks::<2>();
+    if !remainder.is_empty() {
         return None;
     }
 
     pairs
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).ok()?;
             u8::from_str_radix(pair, 16).ok()

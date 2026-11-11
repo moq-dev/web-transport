@@ -3,8 +3,8 @@
 // Swift Package Manager manifest for WebTransport.
 //
 // The XCFramework is attached to the matching web-transport-ffi-v* GitHub Release.
-// For local development pre-release, swap WebTransportFFI's `.binaryTarget` for
-// `.binaryTarget(name: "WebTransportFFI", path: "WebTransportFFI.xcframework")`.
+// Run `just test-swift` from the repository root to test an isolated host package
+// without a published release or changes to this release manifest.
 
 import PackageDescription
 

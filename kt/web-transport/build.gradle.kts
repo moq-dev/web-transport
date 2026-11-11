@@ -36,9 +36,12 @@
 // the signing key) don't trip on "no configured signatory".
 
 import com.vanniktech.maven.publish.SonatypeHost
+import java.time.Duration
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true"
+val artifactSmokeEnabled = providers.gradleProperty("artifactSmoke").orNull == "true"
 
 plugins {
     kotlin("multiplatform") version "2.0.21"
@@ -101,6 +104,9 @@ kotlin {
         }
         val jvmTest by getting {
             dependsOn(jvmAndAndroidTest)
+            if (artifactSmokeEnabled) {
+                kotlin.srcDir("src/jvmArtifactTest/kotlin")
+            }
         }
 
         if (androidEnabled) {
@@ -137,6 +143,23 @@ if (androidEnabled) {
             }
         }
         sourceSets.getByName("main").jniLibs.srcDirs("src/androidMain/jniLibs")
+    }
+}
+
+// Exercise the same JAR consumers load, without loose main classes/resources.
+if (artifactSmokeEnabled) {
+    tasks.named<Test>("jvmTest") {
+        val jar = tasks.named<Jar>("jvmJar")
+        val main = kotlin.targets.getByName("jvm").compilations.getByName("main")
+        classpath = files(jar) + (classpath - main.output.allOutputs)
+        systemProperty("jna.tmpdir", temporaryDir.resolve("jna").apply { mkdirs() })
+        systemProperty("jna.debug_load", "true")
+        timeout.set(Duration.ofMinutes(2))
+        testLogging {
+            events("passed", "skipped", "failed")
+            exceptionFormat = TestExceptionFormat.FULL
+            showStandardStreams = true
+        }
     }
 }
 

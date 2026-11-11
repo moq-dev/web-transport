@@ -7,6 +7,9 @@ use crate::{ConnectError, SettingsError};
 /// An error returned when connecting to a WebTransport endpoint.
 #[derive(Error, Debug, Clone)]
 pub enum ClientError {
+    #[error("failed to bind client endpoint: {0}")]
+    IoError(Arc<std::io::Error>),
+
     #[error("unexpected end of stream")]
     UnexpectedEnd,
 

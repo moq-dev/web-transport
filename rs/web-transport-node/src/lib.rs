@@ -168,7 +168,34 @@ pub struct NapiConnectOptions {
 /// A WebTransport server that accepts incoming sessions.
 #[napi]
 pub struct NapiServer {
-    inner: Arc<Mutex<Option<web_transport_quinn::Server>>>,
+    inner: Arc<ServerState>,
+}
+
+struct ServerState {
+    server: Mutex<Option<web_transport_quinn::Server>>,
+    closed: watch::Sender<bool>,
+}
+
+impl ServerState {
+    async fn finish_accept(
+        &self,
+        mut guard: tokio::sync::MutexGuard<'_, Option<web_transport_quinn::Server>>,
+        request: Option<web_transport_quinn::Request>,
+    ) -> Option<web_transport_quinn::Request> {
+        if request.is_none() {
+            guard.take();
+            return None;
+        }
+        // Unlock before checking shutdown, so close either takes the server itself or is
+        // observed here even when it raced with an accept that already produced a request.
+        drop(guard);
+        if *self.closed.borrow() {
+            self.server.lock().await.take();
+            None
+        } else {
+            request
+        }
+    }
 }
 
 #[napi]
@@ -194,7 +221,10 @@ impl NapiServer {
                 .map_err(|e| Error::from_reason(e.to_string()))?;
 
             Ok(Self {
-                inner: Arc::new(Mutex::new(Some(server))),
+                inner: Arc::new(ServerState {
+                    server: Mutex::new(Some(server)),
+                    closed: watch::channel(false).0,
+                }),
             })
         })
     }
@@ -204,28 +234,130 @@ impl NapiServer {
     pub async fn accept(&self) -> Result<Option<NapiRequest>> {
         // Own the shared state for the duration of the future (see module note).
         let inner = self.inner.clone();
-        let mut guard = inner.lock().await;
+        let mut closed = inner.closed.subscribe();
+        let mut guard = inner.server.lock().await;
         let server = match guard.as_mut() {
             Some(server) => server,
             None => return Ok(None),
         };
-        match server.accept().await {
-            Some(request) => Ok(Some(NapiRequest {
+        let request = tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => None,
+            request = server.accept() => request,
+        };
+        Ok(inner
+            .finish_accept(guard, request)
+            .await
+            .map(|request| NapiRequest {
                 inner: Arc::new(Mutex::new(Some(request))),
-            })),
-            None => {
-                guard.take();
-                Ok(None)
-            }
-        }
+            }))
     }
 
     /// Close the server, stopping it from accepting new connections.
     #[napi]
     pub fn close(&self) {
         within_runtime_if_available(|| {
-            self.inner.blocking_lock().take();
+            // A pending accept owns the lock. Wake it to drop the server; otherwise drop it now.
+            self.inner.closed.send_replace(true);
+            if let Ok(mut server) = self.inner.server.try_lock() {
+                server.take();
+            }
         });
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Wake, Waker},
+    };
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn bind() -> NapiServer {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key = rustls_pemfile::private_key(&mut cert.signing_key.serialize_pem().as_bytes())
+            .unwrap()
+            .unwrap();
+        let server = web_transport_quinn::ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        NapiServer {
+            inner: Arc::new(ServerState {
+                server: Mutex::new(Some(server)),
+                closed: watch::channel(false).0,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_wakes_pending_and_queued_accepts() {
+        let server = bind();
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut pending = std::pin::pin!(server.accept());
+        let mut queued = std::pin::pin!(server.accept());
+
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        // Prove that accept is suspended in native code holding the server, without a sleep.
+        assert!(server.inner.server.try_lock().is_err());
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        wake.0.store(false, Ordering::SeqCst);
+
+        server.close();
+        server.close();
+        assert!(wake.0.load(Ordering::SeqCst));
+        let (pending, queued) = tokio::join!(pending, queued);
+        assert!(pending.unwrap().is_none());
+        assert!(queued.unwrap().is_none());
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drops_an_idle_server() {
+        let server = bind();
+        server.close();
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(server.accept().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn close_drops_server_when_a_request_is_already_ready() {
+        let server = bind();
+        let mut guard = server.inner.server.lock().await;
+        let backend = guard.as_mut().unwrap();
+        let url: url::Url = format!("https://{}", backend.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let client = web_transport_quinn::ClientBuilder::new()
+            .dangerous()
+            .with_no_certificate_verification()
+            .unwrap();
+        let connecting = tokio::spawn(async move { client.connect(url).await });
+        let request = backend.accept().await.unwrap();
+
+        // Reproduce close losing try_lock after accept has already selected a ready request.
+        server.close();
+        assert!(server.inner.server.try_lock().is_err());
+        assert!(server
+            .inner
+            .finish_accept(guard, Some(request))
+            .await
+            .is_none());
+        assert!(server.inner.server.try_lock().unwrap().is_none());
+        assert!(connecting.await.unwrap().is_err());
     }
 }
 
@@ -287,7 +419,7 @@ impl NapiRequest {
     }
 }
 
-/// An established WebTransport session.
+/// An established WebTransport session; call close explicitly because pending async methods own handles.
 #[napi]
 pub struct NapiSession {
     inner: web_transport_quinn::Session,

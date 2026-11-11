@@ -39,7 +39,10 @@ Both endpoints can send datagrams below the MTU size (~1.2kb minimum) and they m
 They are basically UDP packets, except they are encrypted and congestion controlled.
 
 # Usage
-To use web-transport-quiche, figure it out yourself lul.
+The default client resolves the remote before binding an ephemeral socket of
+the same address family. IPv6 sockets are IPv6-only; IPv4-mapped IPv6 remotes
+use IPv4. Explicit `with_bind` and `with_socket` inputs retain their address
+handling.
 
 ## Session lifetime
 
@@ -56,6 +59,53 @@ The CONNECT reader decodes capsules inside HTTP/3 DATA frames. A clean FIN
 without a close capsule closes the session with application code 0 and an empty
 reason. Malformed capsules fail with H3_MESSAGE_ERROR, preserving any native
 connection failure already observed.
+
+## Send-rate statistics
+
+`Connection::stats()` returns `ez::ConnectionStats`; its `send_rate` field and
+`web_transport_trait::Stats::estimated_send_rate()` expose the same estimate in
+bits per second. The driver snapshots Quiche's public `PathStats::delivery_rate`
+and converts bytes per second with saturating multiplication by eight.
+`None` means no path statistics have been sampled yet; `Some(0)` is possible
+before a usable sample. The estimate is not a guarantee of link capacity or application throughput,
+and it can remain stale while the application sends too little to measure capacity.
+
+For the audited tokio-quiche 0.20.1 and Quiche 0.30.0 releases, both client and
+server use the [default `cubic` controller][cc-default]. Pass `Settings` to either builder's
+`with_settings` method to select another `cc_algorithm`:
+
+| `Settings::cc_algorithm` | Meaning of the reported estimate |
+| --- | --- |
+| `cubic` (default), `reno` | Latest accepted delivery-rate sample. A sample marked app-limited may raise the rate but cannot lower it. There is no windowed maximum or expiry of the retained estimate. |
+| `bbr`, `bbr2`, `bbr2_gcongestion` | All select BBR2. Its maximum-bandwidth filter rejects lower app-limited samples; the reported estimate is also capped by BBR2's congestion-derived `bandwidth_lo` when present. |
+
+The client builder's `with_settings` replaces its defaults, and
+`Settings::default()` leaves `verify_peer` false. When starting a client from
+`Settings::default()`, set `verify_peer = true` or configure
+`with_root_certificates` or `with_server_certificate_hashes`; otherwise the
+client skips certificate verification.
+
+Quiche's [controller selector][cc-selector] accepts those five names and rejects
+others. The [CUBIC/Reno sampler][legacy-rate] already checks the app-limited flag
+before replacing its stored rate, so this value is not an unfiltered raw sample.
+Its per-sample flag is internal, and `PathStats::max_bandwidth` is `None` for
+these controllers. The public statistics therefore cannot support a separate
+application-side windowed filter that distinguishes app-limited samples.
+Deriving `cwnd / rtt` would give a send-window heuristic rather than a measured
+delivery rate, and would not recover that missing flag.
+
+For BBR2, [the network model][bbr-model] reports
+`min(max_bandwidth, bandwidth_lo)` when the congestion bound exists, and
+`max_bandwidth` otherwise. Using the public `PathStats::max_bandwidth` instead
+would discard that bound. Keeping `delivery_rate` preserves both upstream sample
+filtering and the controller's response to congestion. Delivery-rate accuracy
+also depends on respecting Quiche's pacing hints: disabling pacing or ignoring
+those hints in the transport or platform can distort the estimate.
+
+[cc-default]: https://github.com/cloudflare/quiche/blob/925b225825e2188f8e58e359114150500557bf61/tokio-quiche/src/settings/quic.rs
+[cc-selector]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/mod.rs
+[legacy-rate]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/congestion/delivery_rate.rs
+[bbr-model]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/gcongestion/bbr2/network_model.rs
 
 ## Testing
 
