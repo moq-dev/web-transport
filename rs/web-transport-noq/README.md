@@ -65,3 +65,17 @@ UTF-8 reason; the native fallback carries a prefix of at most 16 bytes at a char
 boundary. Already observed native errors are preserved. Peer delivery, endpoint
 draining and execution of awakened tasks require a live runtime. Forgotten
 futures, non-yielding tasks and process abort are outside this guarantee.
+
+
+## CONNECT response metadata
+
+`Request::respond` and `Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Session::response()`. A rejected CONNECT
+is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

@@ -26,6 +26,23 @@ Keep the Session object alive while using its streams. Streams do not retain the
 
 Artifacts land in `dist/`.
 
+## Rejection diagnostics
+
+`WebTransportError::SessionRejected` preserves `status_code`, `protocol`, and
+`headers`, a sequence of `HttpHeader { name, value }` field lines. Names are
+lowercase and values are bytes; repeated names retain all values. `detail`
+contains the diagnostic message without dumping credentials from the headers.
+This extends the exported error record and changes the UniFFI ABI: regenerate
+Python, Kotlin, and Swift bindings together with the native library. Existing
+Rust matches should include `..` or bind the new fields.
+
+`SessionRequest.reject(status_code = 404, headers = [], protocol = None)` sends
+the supplied repeated `HttpHeader` lines through the native rejection path and
+waits for delivery or peer termination. The optional protocol must have been
+offered by the peer. Managed generic fields, malformed values and oversized
+responses are rejected before consuming the request. Default arguments preserve
+existing foreign-language calls; direct Rust callers must supply the new fields.
+
 ## Crypto
 
 The native Quinn backend uses rind through rind-rustls, with an installed process-wide

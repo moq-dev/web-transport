@@ -155,7 +155,11 @@ impl Wake for FlagWaker {
 /// holding its waker — and so the polling task's allocation — until something polls it
 /// again. A stream whose last read completed and then sat idle would hold one for the
 /// rest of the connection.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Single-threaded on purpose: the driver releases the stream lock before it wakes the
+/// waker it took, so on another worker the read can turn `Ready` while that in-flight
+/// wake still holds a clone, which is not a retention.
+#[tokio::test]
 async fn a_finished_poll_releases_the_poller() -> Result<()> {
     let (mut client, mut server) = pair().await?;
 

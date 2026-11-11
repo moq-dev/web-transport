@@ -21,8 +21,9 @@ pub enum ConnectError {
     #[error("write error")]
     WriteError(#[from] quinn::WriteError),
 
-    #[error("http error status: {0}")]
-    ErrorStatus(http::StatusCode),
+    #[error("http error status: {}", .0.status)]
+    /// The peer rejected the session; includes its status, protocol and headers.
+    ErrorStatus(Box<ConnectResponse>),
 
     #[error("server returned protocol not in request: {0}")]
     ProtocolMismatch(String),
@@ -80,9 +81,28 @@ impl Connecting {
         })
     }
 
-    pub async fn reject(self, status: http::StatusCode) -> Result<(), ConnectError> {
-        let mut connect = self.respond(status).await?;
-        connect.send.finish().ok();
+    /// Reject the CONNECT request with a status code or a response containing headers.
+    ///
+    /// Waits for delivery or peer termination, subject to the QUIC idle timeout.
+    /// Cancel the future to impose an application deadline.
+    pub async fn reject(self, response: impl Into<ConnectResponse>) -> Result<(), ConnectError> {
+        let mut connect = self.respond(response).await?;
+        connect
+            .send
+            .finish()
+            .map_err(|_| quinn::WriteError::ClosedStream)?;
+        // Keep the final connection handle alive until the response is acknowledged
+        // or the peer stops reading, instead of closing with queued response bytes.
+        match connect.send.stopped().await {
+            Ok(_) => (),
+            // A client may close immediately after reading the rejection, before
+            // its delayed ACK. Peer termination needs no further response bytes.
+            Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::ApplicationClosed(_)
+                | quinn::ConnectionError::ConnectionClosed(_),
+            )) => (),
+            Err(err) => return Err(quinn::WriteError::from(err).into()),
+        }
         Ok(())
     }
 }
@@ -129,7 +149,7 @@ impl Connected {
 
         // Throw an error if we didn't get a 200 OK.
         if response.status != http::StatusCode::OK {
-            return Err(ConnectError::ErrorStatus(response.status));
+            return Err(ConnectError::ErrorStatus(Box::new(response)));
         }
 
         // Validate that the server's protocol was in our request.

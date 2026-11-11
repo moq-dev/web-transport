@@ -562,7 +562,7 @@ async fn h3_capsule_close_then(quic_close: bool) -> n0_error::Result<()> {
     let mut connect = crate::Connecting::accept(&conn)
         .await
         .unwrap()
-        .respond(ConnectResponse::OK)
+        .respond(ConnectResponse::default())
         .await
         .unwrap();
 
@@ -641,5 +641,89 @@ async fn h3_local_close_reason() -> n0_error::Result<()> {
         .expect("server task timed out")
         .unwrap();
     client.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn h3_response_and_rejection_preserve_headers() -> n0_error::Result<()> {
+    use crate::{ClientError, ConnectError, H3Request};
+    use http::{HeaderValue, StatusCode, header::SET_COOKIE};
+    use web_transport_proto::ConnectResponse;
+
+    for status in [
+        StatusCode::OK,
+        StatusCode::FORBIDDEN,
+        StatusCode::NO_CONTENT,
+    ] {
+        let client = Client::new(Endpoint::bind(presets::Minimal).await?);
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_H3.as_bytes().to_vec()])
+            .bind()
+            .await?;
+        let url: Url = format!("https://{}/", server.id()).parse().unwrap();
+        let serving = async {
+            let conn = server.accept().await.unwrap().await?;
+            let request = H3Request::accept(conn).await?;
+            let response = ConnectResponse::new(status)
+                .with_header(SET_COOKIE, HeaderValue::from_static("a=1"))
+                .with_header(SET_COOKIE, HeaderValue::from_static("b=2"))
+                .with_header(
+                    http::HeaderName::from_static("x-padding"),
+                    HeaderValue::from_str(&"x".repeat(
+                        16 * 1024
+                            - (32 + 7 + 3)
+                            - (32 + "sec-webtransport-http3-draft".len() + 7)
+                            - 2 * (32 + "set-cookie".len() + 3)
+                            - (32 + "x-padding".len()),
+                    ))
+                    .unwrap(),
+                );
+            if status == StatusCode::OK {
+                Ok(Some(request.respond(response).await?))
+            } else {
+                request.reject(response).await?;
+                Ok::<_, n0_error::AnyError>(None)
+            }
+        };
+        let (served, connected) = tokio::join!(serving, client.connect_h3(server.addr(), url));
+        let served = served?;
+        let response = if status == StatusCode::OK {
+            let session = connected?;
+            assert_eq!(
+                served
+                    .as_ref()
+                    .unwrap()
+                    .response()
+                    .unwrap()
+                    .headers
+                    .get_all(SET_COOKIE)
+                    .iter()
+                    .count(),
+                2
+            );
+            let response = session.response().unwrap().clone();
+            session.close(0, b"done");
+            response
+        } else {
+            let error = connected.expect_err("rejection established a session");
+            let ClientError::HttpError(ConnectError::ErrorStatus(response)) = error else {
+                panic!("rejection lost response: {error:?}")
+            };
+            *response
+        };
+        assert_eq!(response.status, status);
+        assert_eq!(
+            response
+                .headers
+                .get_all(SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["a=1", "b=2"]
+        );
+        drop(served);
+        client.close().await;
+        server.close().await;
+    }
     Ok(())
 }

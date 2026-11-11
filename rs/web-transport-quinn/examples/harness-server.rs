@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_conn(request: web_transport_quinn::Request) -> anyhow::Result<()> {
     let session = request
-        .respond(ConnectResponse::OK)
+        .respond(ConnectResponse::default())
         .await
         .context("failed to accept session")?;
     tracing::info!("accepted session");

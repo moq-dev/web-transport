@@ -110,3 +110,17 @@ sleep. Certificates are generated in memory; no fixture files are needed.
 For a focused run, use `cargo test -p web-transport-quiche --lib ez::driver::tests`.
 The pair pumps queued packets only; tests that need QUIC timer expiry require a
 separate clock-driving seam.
+
+
+## CONNECT response metadata
+
+`Request::respond` and `Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Connection::response()`. A rejected CONNECT
+is a structured `h3::ConnectError::Status(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

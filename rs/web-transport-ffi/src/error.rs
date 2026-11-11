@@ -9,6 +9,15 @@
 //! Not `#[uniffi(flat_error)]` — we need structured field access on the
 //! foreign side (e.g. `SessionClosedByPeer.code`, `StreamIncompleteRead.partial`).
 
+/// One HTTP field line, preserving repeated names and the exact value bytes.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HttpHeader {
+    /// The lowercase HTTP field name.
+    pub name: String,
+    /// The HTTP field value bytes.
+    pub value: Vec<u8>,
+}
+
 /// Error returned by all UniFFI-exported functions.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum WebTransportError {
@@ -17,7 +26,13 @@ pub enum WebTransportError {
     Connect(String),
 
     #[error("session rejected: HTTP {status_code}: {detail}")]
-    SessionRejected { status_code: u16, detail: String },
+    /// The peer rejected CONNECT with a status, negotiated protocol and ordinary headers.
+    SessionRejected {
+        status_code: u16,
+        protocol: Option<String>,
+        headers: Vec<HttpHeader>,
+        detail: String,
+    },
 
     #[error("session closed by peer ({closed_by}): {reason}")]
     SessionClosedByPeer {
@@ -220,11 +235,18 @@ pub fn map_send_datagram_error(err: quinn::SendDatagramError) -> WebTransportErr
 pub fn map_client_error(err: web_transport_quinn::ClientError) -> WebTransportError {
     match &err {
         web_transport_quinn::ClientError::HttpError(
-            web_transport_quinn::ConnectError::ProtoError(
-                web_transport_quinn::proto::ConnectError::WrongStatus(Some(status)),
-            ),
+            web_transport_quinn::ConnectError::ErrorStatus(response),
         ) => WebTransportError::SessionRejected {
-            status_code: status.as_u16(),
+            status_code: response.status.as_u16(),
+            protocol: response.protocol.clone(),
+            headers: response
+                .headers
+                .iter()
+                .map(|(name, value)| HttpHeader {
+                    name: name.to_string(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect(),
             detail: err.to_string(),
         },
         _ => WebTransportError::Connect(err.to_string()),
@@ -251,6 +273,45 @@ pub fn map_server_error(err: web_transport_quinn::ServerError) -> WebTransportEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_response_preserves_fields() {
+        use web_transport_quinn::{proto::ConnectResponse, ClientError, ConnectError};
+        let response = ConnectResponse::new(http::StatusCode::FORBIDDEN)
+            .with_protocol("moq")
+            .with_header(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_static("a=1"),
+            )
+            .with_header(
+                http::header::SET_COOKIE,
+                http::HeaderValue::from_static("b=2"),
+            );
+        let error = map_client_error(ClientError::HttpError(ConnectError::ErrorStatus(Box::new(
+            response,
+        ))));
+        let WebTransportError::SessionRejected {
+            status_code,
+            protocol,
+            headers,
+            ..
+        } = error
+        else {
+            panic!("not a rejection")
+        };
+        assert_eq!(status_code, 403);
+        assert_eq!(protocol.as_deref(), Some("moq"));
+        assert_eq!(
+            headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_slice()))
+                .collect::<Vec<_>>(),
+            [
+                ("set-cookie", b"a=1".as_slice()),
+                ("set-cookie", b"b=2".as_slice())
+            ]
+        );
+    }
 
     #[test]
     fn timeout_maps_to_session_timeout() {

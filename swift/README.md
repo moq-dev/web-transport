@@ -71,6 +71,19 @@ swift/
   scripts/                            check.sh, package.sh
 ```
 
+## Rejection diagnostics
+
+The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
+lowercase names and byte values. Repeated names retain all values. Regenerate
+the bindings and native library together when migrating to this expanded error
+record; update exhaustive matches or constructors for the new fields.
+
+Generated `SessionRequest.reject` accepts defaulted `headers` (`HttpHeader`
+field lines) and `protocol` arguments alongside the status code. Existing calls
+keep their defaults. The selected protocol must have been offered by the peer;
+malformed or reserved generic fields fail before consuming the request.
+
 ## Native crypto
 
 The native Quinn backend uses rind through rind-rustls, with an installed process-wide
