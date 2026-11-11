@@ -30,8 +30,3 @@ Decision prompts (✅ chosen):
 - CPU refusal: ✅ error at finish / fallible `new()` / panic.
 - Split: ✅ a1 epic, per crate / one quest / a2 epic.
 - Docs: ✅ inline only / migration page.
-
-## Required
-
-- [Noq on rind](/quest/a1/rind/noq.md) - Noq's rustls without ring, with rind keys
-- [iroh on rind](/quest/a1/rind/iroh.md) - iroh endpoint built with rind's provider

@@ -6,10 +6,4 @@ Add honest optional metrics and measured optimizations while tracking external p
 
 ## Plan
 
-The Required list is ordered by priority. Independent children may proceed concurrently; only their explicit Required links are blockers.
-
-## Required
-
-- [QMux draft readiness](/quest/a2/qmux-draft-readiness.md) - establish strict-validation compatibility boundary
-- [Quinn provider-neutral rustls release](/quest/a2/quinn-provider-release.md) - waiting on quinn-rs/quinn#2341
-- [Quinn adapter removal](/quest/a2/quinn-adapter-removal.md) - switch to upstream and delete the port
+Independent children may proceed concurrently; only their explicit Required links are blockers.
