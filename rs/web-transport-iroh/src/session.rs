@@ -866,12 +866,14 @@ mod tests {
 
     /// [`pair`], with the client using `transport`.
     async fn pair_with(transport: QuicTransportConfig) -> (Connection, Connection, [Endpoint; 2]) {
-        let client = Endpoint::builder(presets::Minimal)
+        let client = Endpoint::builder(presets::Empty)
+            .crypto_provider(crate::crypto::default_provider().unwrap())
             .transport_config(transport)
             .bind()
             .await
             .unwrap();
-        let server = Endpoint::builder(presets::Minimal)
+        let server = Endpoint::builder(presets::Empty)
+            .crypto_provider(crate::crypto::default_provider().unwrap())
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await

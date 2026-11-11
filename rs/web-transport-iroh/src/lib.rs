@@ -10,6 +10,12 @@
 //! The latter includes the WebTransport request-response handshake, through which a request target and headers can
 //! be set.
 //!
+//! # TLS provider
+//!
+//! Configure caller-created endpoints with [`crypto::default_provider`], which uses
+//! the installed rustls provider or checks CPU support and returns rind's provider.
+//! No provider is installed globally. See [`crypto`] for endpoint setup and CPU requirements.
+//!
 //! # Limitations
 //!
 //! WebTransport is able to be pooled with HTTP/3 and multiple WebTransport sessions.
@@ -24,6 +30,7 @@
 
 mod client;
 mod connect;
+pub mod crypto;
 mod error;
 mod recv;
 mod send;
