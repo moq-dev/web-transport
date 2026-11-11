@@ -11,3 +11,4 @@ The Required list is ordered by priority. Independent children may proceed concu
 ## Required
 
 - [Quiche lifecycle](/quest/a0/quiche/README.md) - deterministic harness and retirement handling
+- [QMux receive credit](/quest/a0/qmux-recv-credit.md) - stopped or dropped streams return their connection flow-control credit
