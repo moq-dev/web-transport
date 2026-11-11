@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    // Create a bidirectional stream.
+    // Keep the Session alive while using its streams; streams do not own its lifetime.
     let (mut send, mut recv) = session.open_bi().await?;
 
     tracing::info!("created stream");
@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let msg = recv.read_to_end(1024).await?;
     tracing::info!(msg = %String::from_utf8_lossy(&msg), "recv");
 
+    // Keep the runtime alive until the bounded graceful close finishes.
     session.close(42069, b"bye");
     session.closed().await;
 

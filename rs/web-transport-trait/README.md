@@ -7,14 +7,27 @@
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new browser API powered by [QUIC](https://www.rfc-editor.org/rfc/rfc9000.html) intended as a replacement for WebSockets.
 Most importantly, QUIC supports multiple independent data streams.
 
-This crate provides a WebTransport trait for Send runtimes.
+This crate defines WebTransport session and stream traits with async and poll-based
+interfaces.
 
--   Quinn: [web-transport-quinn](../web-transport-quinn)
--   Noq: [web-transport-noq](../web-transport-noq)
--   WebSocket / TCP / TLS: [qmux](../qmux)
-- Quiche+Tokio: TODO
+| Implementation | Async traits | Poll traits |
+| --- | --- | --- |
+| [web-transport-quinn](../web-transport-quinn) | Yes | Yes |
+| [web-transport-noq](../web-transport-noq) | Yes | No |
+| [web-transport-quiche](../web-transport-quiche) (tokio-quiche) | Yes | Yes |
+| [web-transport-iroh](../web-transport-iroh) | Yes | No |
+| [web-transport-wasm](../web-transport-wasm) (browser WASM) | Yes | Yes |
+| [qmux](../qmux) (WebSocket / TCP / TLS / Unix domain sockets) | Yes | No |
 
-If you don't care about the underyling runtime, use the [web-transport](../web-transport) crate.
+The crate root exposes the async `Session`, `SendStream`, and `RecvStream` traits.
+The [`poll` module](https://docs.rs/web-transport-trait/latest/web_transport_trait/poll/)
+exposes their poll-based counterparts for callers that drive operations from their
+own loop. Their `poll_*` operations use `&mut self`; sessions and streams do not
+require `Clone`, `Send`, or `Sync`. They describe the session API; the backend
+still owns its networking and runtime integration.
+
+The [web-transport](../web-transport) crate provides a concrete API that selects
+Quinn or the browser backend at compile time.
 
 See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
 
@@ -40,9 +53,11 @@ check that inspecting a destination never reads uninitialized memory.
 Run `cargo bench -p web-transport-trait --bench receive` to measure initialization
 across independent streams, destination capacities, and fragment sizes.
 
-## Why Send?
-Async traits are awful because you have to choose either `Send` or `!Send`.
-We could define a separate `!Send` trait but I currently don't have a use-case for it.
+## Send and Sync
 
-I would like to implement a sans I/O trait at some point for `quiche` and `quinn-proto`.
-Again, I just currently don't have a use-case, and I'm not even sure how feasible it would be.
+`MaybeSend` and `MaybeSync` require `Send` and `Sync` when `target_family` is not
+`wasm` and impose no such bounds on the `wasm` target family, including browser
+and WASI targets. The async `Session` trait and the shared `Error` trait,
+including errors returned by the poll traits, require both bounds. The async stream
+traits and the futures returned by the async traits require only `MaybeSend`. This
+lets the same interface support native runtimes and browser types.

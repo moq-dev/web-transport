@@ -154,10 +154,10 @@ impl SendState {
             }
             quiche::Error::Done | quiche::Error::InvalidStreamState(_) => {
                 tracing::trace!(stream_id = ?self.id, "stream already collected by quiche");
-                // Only a peer STOP_SENDING gets a live stream collected, so this is a
-                // stop whose code quiche has already thrown away. It is not a `fin`:
-                // the application's bytes never left, and saying otherwise would report
-                // a successful flush for data the peer refused.
+                // quiche reports a peer STOP_SENDING before collecting the stream, so
+                // this is a fallback for state quiche retired without a code. It is not
+                // a `fin`: the application's bytes never left, and saying otherwise
+                // would report a successful flush for data the peer refused.
                 self.gone = true;
             }
             e => return Err(e),
@@ -313,9 +313,8 @@ impl SendStream {
 
     /// Tell the driver this stream has work to flush.
     ///
-    /// Skipped once the state is closed: the driver retires a stream as soon as it
-    /// observes that, so a notification afterwards names a stream it no longer
-    /// tracks and is reported as a spurious wakeup.
+    /// Skipped once the state is closed to avoid unnecessary driver wakeups.
+    /// Retirement can race with the enqueue below; the driver ignores stale IDs.
     fn notify(&self) {
         // Take the two locks in sequence, never both at once.
         let closed = self.state.lock().is_closed();

@@ -18,10 +18,10 @@ impossible or absent from every related project.
 
 | Package | Use it when | Boundary |
 | --- | --- | --- |
-| [`web-transport`](rs/web-transport) | You want one concrete client/session API for native Rust and browser WASM. | The [platform router][router-code] fixes the implementation at compile time. Native server setup comes from Quinn, with conversions into the router's types. There is no browser server API. |
+| [`web-transport`](rs/web-transport) | You want one concrete client/session API for native Rust and browser WASM. | The [platform router][router-code] fixes the implementation at compile time. Configured native clients and servers come from Quinn, with conversions into the router's types. There is no browser server API. |
 | [`web-transport-trait`](rs/web-transport-trait) | Your application should accept different session implementations. | The [async session/stream traits][traits-code] cover streams, datagrams, closure and metadata. They do not create endpoints or choose a backend. The [conditional bounds][trait-bounds] require `Send`/`Sync` outside `target_family = "wasm"` and relax them within that family, including WASI. |
 | A native backend below | You need backend configuration or access to its connection and stream types. | Endpoint, TLS and runtime integration remain backend-specific. A shared trait does not make their builders interchangeable. |
-| [`qmux`](rs/qmux) | You need the session abstraction over an ordered byte transport such as TCP, TLS or WebSocket. | Implements the async traits using QMux framing, with its own setup and wire protocol. |
+| [`qmux`](rs/qmux) | You need the session abstraction over an ordered byte transport such as TCP, TLS or WebSocket. | Implements the async traits using QMux framing, with its own setup and wire protocol. Being retired; see [When to use QMux](#when-to-use-qmux). |
 | [`web-transport-proto`](rs/web-transport-proto) | You are implementing protocol integration inside a backend. | Shared HTTP/3/WebTransport framing; it is not an application client or server. |
 
 The async traits are implemented by Quinn, Noq, Quiche, iroh and QMux, and by
@@ -66,6 +66,12 @@ reliable ordered connection still share its retransmission and head-of-line
 blocking behavior; they do not acquire QUIC's independent packet delivery.
 See the [QMux draft][qmux-draft] and the package's negotiation documentation.
 
+The QMux packages here, [`qmux`](rs/qmux) and [`@moq/qmux`](js/qmux), receive
+bug fixes only and will be retired in favour of the copy in
+[moq-dev/moq][moq-qmux]. That copy implements moq-net's traits rather than
+`web-transport-trait`; read its [migration guide][moq-qmux-migrate] before
+starting a new QMux integration.
+
 ## Browser and language packages
 
 | Environment | Package | Integration surface |
@@ -73,7 +79,7 @@ See the [QMux draft][qmux-draft] and the package's negotiation documentation.
 | Rust in a browser | [`web-transport-wasm`](rs/web-transport-wasm), or the router | Wraps the browser's WebTransport API through `web-sys`; client only. The browser owns networking and TLS policy. Build with the [required unstable web-sys flags](rs/web-transport-wasm/README.md#requirements). |
 | JavaScript in a browser | The browser's [WebTransport API][browser-api] | A browser client can connect to a native HTTP/3 WebTransport server. Browser interoperability does not require compiling the native server library to WASM. Check the target browser's support for the APIs you use. |
 | Node.js | [`@moq/web-transport`](js/web-transport) | Custom client/server setup, followed by a WebTransport-shaped Web Streams/datagram/session API. Uses the [Quinn-backed NAPI-RS bridge](rs/web-transport-node/Cargo.toml), not the browser's network stack. |
-| JavaScript over WebSocket | [`@moq/qmux`](js/qmux) | A browser polyfill plus server-side sessions over an accepted WebSocket. The host performs the HTTP upgrade and negotiates the subprotocol. Requires a QMux-compatible peer. |
+| JavaScript over WebSocket | [`@moq/qmux`](js/qmux) | A browser polyfill plus server-side sessions over an accepted WebSocket. The host performs the HTTP upgrade and negotiates the subprotocol. Requires a QMux-compatible peer. Being retired; see [When to use QMux](#when-to-use-qmux). |
 | Python | [`web-transport-rs`](py/web-transport) | Typed `asyncio` wrapper over UniFFI, with native client/server, streams and datagrams. |
 | Kotlin / Android | [`dev.moq:web-transport`](kt) | UniFFI bindings packaged for JVM and Android. See its README for artifact and target requirements. |
 | Swift | [`WebTransport`](swift) | Swift wrapper and generated UniFFI bindings, distributed through release archives. See its README for the supported installation path. |
@@ -116,6 +122,8 @@ No performance, reliability or production-readiness ranking is established here.
 [poll-traits]: rs/web-transport-trait/src/poll.rs
 [wasm-traits]: rs/web-transport-wasm/src/traits.rs
 [qmux-draft]: https://www.ietf.org/archive/id/draft-ietf-quic-qmux-02.html
+[moq-qmux]: https://github.com/moq-dev/moq/tree/main/rs/qmux
+[moq-qmux-migrate]: https://github.com/moq-dev/moq/blob/main/rs/qmux/MIGRATE.md
 [browser-api]: https://www.w3.org/TR/webtransport/
 [wt-manifest]: https://github.com/BiagioFesta/wtransport/blob/0.7.2/wtransport/Cargo.toml
 [wt-readme]: https://github.com/BiagioFesta/wtransport/blob/0.7.2/README.md

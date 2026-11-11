@@ -1,4 +1,3 @@
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -7,42 +6,38 @@ use futures::{
     stream::FuturesUnordered,
     StreamExt,
 };
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::client::{controller_factory, transport_config, ControllerFactory};
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 use crate::{crypto, CongestionControl};
 use crate::{
     proto::{ConnectRequest, ConnectResponse},
     Connecting, ServerError, Session, Settings,
 };
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 /// Construct a WebTransport [Server] using sane defaults.
 ///
 /// This is optional; advanced users may use [Server::new] directly.
 pub struct ServerBuilder {
-    provider: crypto::Provider,
+    provider: Result<crypto::Provider, crypto::UnsupportedCpu>,
     addr: std::net::SocketAddr,
+    transport: quinn::TransportConfig,
     congestion_controller: Option<ControllerFactory>,
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl Default for ServerBuilder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ServerBuilder {
     /// Create a server builder with sane defaults.
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
             addr: "[::]:443".parse().unwrap(),
+            transport: quinn::TransportConfig::default(),
             congestion_controller: None,
         }
     }
@@ -52,7 +47,19 @@ impl ServerBuilder {
         Self { addr, ..self }
     }
 
-    /// Enable the specified congestion controller.
+    /// Use the supplied QUIC transport configuration instead of Quinn's defaults.
+    ///
+    /// An explicit [`Self::with_congestion_control`] choice overrides only its
+    /// congestion controller, regardless of the order these methods are called.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Override the transport configuration's congestion controller.
+    ///
+    /// [`CongestionControl::Default`] preserves the supplied configuration's
+    /// controller, or Quinn's default when no configuration is supplied.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
         self.congestion_controller = controller_factory(algorithm);
         self
@@ -65,34 +72,41 @@ impl ServerBuilder {
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Server, ServerError> {
-        let transport = transport_config(self.congestion_controller.as_ref());
-        let config = self.config(chain, key, transport)?;
+        let addr = self.addr;
+        let config = self.config(chain, key)?;
 
-        let server = quinn::Endpoint::server(config, self.addr)
-            .map_err(|e| ServerError::IoError(e.into()))?;
+        let server = quinn::Endpoint::new(
+            crypto::endpoint_config()?,
+            Some(config),
+            std::net::UdpSocket::bind(addr).map_err(|e| ServerError::IoError(e.into()))?,
+            quinn::default_runtime().ok_or_else(|| {
+                ServerError::IoError(std::io::Error::other("no async runtime found").into())
+            })?,
+        )
+        .map_err(|e| ServerError::IoError(e.into()))?;
 
         Ok(Server::new(server))
     }
 
-    /// Build the quinn config, taking the transport separately so the caller (and the
-    /// tests) can tell which one ends up attached.
     fn config(
-        &self,
+        self,
         chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
-        transport: Arc<quinn::TransportConfig>,
     ) -> Result<quinn::ServerConfig, ServerError> {
         // Standard Quinn setup
-        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone())
+        let mut config = rustls::ServerConfig::builder_with_provider(self.provider.clone()?)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // this one is important
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-        config.transport_config(transport);
+        let config: crate::crypto::QuicServerConfig = config.try_into()?;
+        let mut config = crypto::server_config(Arc::new(config))?;
+        config.transport_config(transport_config(
+            self.transport,
+            self.congestion_controller.as_ref(),
+        ));
 
         Ok(config)
     }
@@ -238,9 +252,10 @@ impl core::ops::Deref for Request {
     }
 }
 
-#[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
-mod tests {
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
+    use crate::client::tests::{assert_transport, custom_transport};
     use rustls::pki_types::PrivatePkcs8KeyDer;
 
     fn self_signed() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
@@ -251,34 +266,96 @@ mod tests {
         (chain, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
     }
 
-    /// `ServerBuilder::new` goes through [crypto::default_provider], which panics when
-    /// both backends are compiled in and no process-wide default is installed. Pick one
-    /// here rather than mutating global state from a test.
-    fn builder() -> ServerBuilder {
-        #[cfg(feature = "aws-lc-rs")]
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-        ServerBuilder {
-            provider,
-            addr: "[::]:0".parse().unwrap(),
-            congestion_controller: None,
-        }
+    pub(crate) fn builder() -> ServerBuilder {
+        ServerBuilder::new().with_addr("[::]:0".parse().unwrap())
     }
 
     /// quinn installs its own default transport config, so the builder's has to be
-    /// attached explicitly or every server knob (congestion control) silently no-ops.
+    /// attached explicitly or every server knob silently no-ops.
     #[test]
     fn builder_transport_reaches_the_config() {
         let (chain, key) = self_signed();
 
-        let builder = builder().with_congestion_control(CongestionControl::LowLatency);
-        assert!(builder.congestion_controller.is_some());
+        let config = builder().config(chain, key).unwrap();
+        assert_transport(&config.transport, false);
 
-        let transport = transport_config(builder.congestion_controller.as_ref());
-        let config = builder.config(chain, key, transport.clone()).unwrap();
+        for transport_first in [false, true] {
+            let (chain, key) = self_signed();
+            let (transport, _) = custom_transport();
+            let builder = if transport_first {
+                builder()
+                    .with_transport_config(transport)
+                    .with_congestion_control(CongestionControl::LowLatency)
+            } else {
+                builder()
+                    .with_congestion_control(CongestionControl::LowLatency)
+                    .with_transport_config(transport)
+            };
+            let config = builder.config(chain, key).unwrap();
+            assert_transport(&config.transport, true);
+        }
+    }
 
-        assert!(Arc::ptr_eq(&config.transport, &transport));
+    #[tokio::test]
+    async fn builder_transport_reaches_the_server_endpoint() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for transport_first in [false, true] {
+                for algorithm in [
+                    CongestionControl::Default,
+                    CongestionControl::LowLatency,
+                    CongestionControl::Throughput,
+                ] {
+                    let (chain, key) = self_signed();
+                    let (transport, built) = custom_transport();
+                    let expected = match algorithm {
+                        CongestionControl::Default => {
+                            std::any::TypeId::of::<quinn::congestion::NewReno>()
+                        }
+                        CongestionControl::LowLatency => {
+                            std::any::TypeId::of::<quinn::congestion::Bbr>()
+                        }
+                        CongestionControl::Throughput => {
+                            std::any::TypeId::of::<quinn::congestion::Cubic>()
+                        }
+                    };
+                    let builder = if transport_first {
+                        builder()
+                            .with_transport_config(transport)
+                            .with_congestion_control(algorithm)
+                    } else {
+                        builder()
+                            .with_congestion_control(algorithm)
+                            .with_transport_config(transport)
+                    };
+                    let mut server = builder.with_certificate(chain, key).unwrap();
+                    let client = crate::client::tests::builder()
+                        .dangerous()
+                        .with_no_certificate_verification()
+                        .unwrap();
+                    let url = format!("https://[::1]:{}/", server.local_addr().unwrap().port())
+                        .parse::<url::Url>()
+                        .unwrap();
+                    let (client_session, server_session) =
+                        tokio::join!(client.connect(url), async {
+                            server.accept().await.unwrap().ok().await.unwrap()
+                        });
+                    let client_session = client_session.unwrap();
+                    let controller = server_session.congestion_state().into_any();
+                    assert_eq!(controller.as_ref().type_id(), expected);
+                    assert_eq!(
+                        built.load(Ordering::SeqCst),
+                        usize::from(controller.is::<quinn::congestion::NewReno>())
+                    );
+                    server.close(0u32.into(), b"done");
+                    client_session.closed().await;
+                    server.wait_idle().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 }
