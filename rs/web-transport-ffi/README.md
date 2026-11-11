@@ -4,6 +4,8 @@ Low-level UniFFI bindings for WebTransport over HTTP/3 (QUIC). Generates Python,
 
 For an ergonomic Python API (async context managers, legacy exception hierarchy), see [`web-transport-rs`](https://pypi.org/project/web-transport-rs/) which wraps this package.
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 Clients lazily share one socket per destination address family: IPv4 uses
 `0.0.0.0:0`, IPv6 uses IPv6-only `[::]:0`, and IPv4-mapped IPv6 uses IPv4.
 Socket setup errors are returned by `connect`. `close` and final client drop
@@ -25,6 +27,23 @@ Keep the Session object alive while using its streams. Streams do not retain the
 ```
 
 Artifacts land in `dist/`.
+
+## Rejection diagnostics
+
+`WebTransportError::SessionRejected` preserves `status_code`, `protocol`, and
+`headers`, a sequence of `HttpHeader { name, value }` field lines. Names are
+lowercase and values are bytes; repeated names retain all values. `detail`
+contains the diagnostic message without dumping credentials from the headers.
+This extends the exported error record and changes the UniFFI ABI: regenerate
+Python, Kotlin, and Swift bindings together with the native library. Existing
+Rust matches should include `..` or bind the new fields.
+
+`SessionRequest.reject(status_code = 404, headers = [], protocol = None)` sends
+the supplied repeated `HttpHeader` lines through the native rejection path and
+waits for delivery or peer termination. The optional protocol must have been
+offered by the peer. Managed generic fields, malformed values and oversized
+responses are rejected before consuming the request. Default arguments preserve
+existing foreign-language calls; direct Rust callers must supply the new fields.
 
 ## Crypto
 

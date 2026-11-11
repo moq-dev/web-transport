@@ -6,6 +6,8 @@
 A wrapper around the Quinn API, abstracting away the annoying HTTP/3 internals.
 Provides a QUIC-like API but with web support!
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## WebTransport
 [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API) is a new web API that allows for low-level, bidirectional communication between a client and a server.
 It's [available in the browser](https://caniuse.com/webtransport) as an alternative to HTTP and WebSockets.
@@ -149,3 +151,17 @@ When possible, `Deref` is used to expose the underlying Quinn API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
 - Stream IDs are not avaialble.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
+
+
+## CONNECT response metadata
+
+`Request::respond` and `Request::reject` accept a
+[`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
+with ordinary headers, including repeated values.
+Inspect successful headers with `Session::response()`. A rejected CONNECT
+is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
+`response.status` and `response.headers.get_all(name)`. The response stays inside
+the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
+CONNECT response. See the protocol crate's migration notes for the breaking
+error payload change and replacement of `ConnectResponse::OK` with
+`ConnectResponse::default()`.

@@ -2,6 +2,8 @@
 
 A Swift wrapper around the [web-transport-ffi](../rs/web-transport-ffi) UniFFI bindings for [WebTransport over HTTP/3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/).
 
+See the [package and backend selection guide](../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Install
 
 The package is distributed as a GitHub Release asset on the [moq-dev/web-transport](https://github.com/moq-dev/web-transport) repo. There is **no SPM mirror yet**, so SPM cannot resolve a `https://github.com/...` URL directly until one is set up.
@@ -70,6 +72,19 @@ swift/
   Tests/HostTests/                    macOS host runtime tests (check.sh only)
   scripts/                            check.sh, package.sh
 ```
+
+## Rejection diagnostics
+
+The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
+lowercase names and byte values. Repeated names retain all values. Regenerate
+the bindings and native library together when migrating to this expanded error
+record; update exhaustive matches or constructors for the new fields.
+
+Generated `SessionRequest.reject` accepts defaulted `headers` (`HttpHeader`
+field lines) and `protocol` arguments alongside the status code. Existing calls
+keep their defaults. The selected protocol must have been offered by the peer;
+malformed or reserved generic fields fail before consuming the request.
 
 ## Native crypto
 

@@ -15,6 +15,8 @@ This crate provides a generic WebTransport implementation depending on the platf
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
+See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for alternatives and integration boundaries.
+
 ## Platform API and traits
 
 This crate exposes concrete types selected at compile time for the target platform.
@@ -86,6 +88,38 @@ The native `ClientBuilder` does not implement `Clone`. Construct a builder for e
 ## Native session lifetime
 
 Dropping the final `Session` clone closes the Quinn connection, even if streams or native handles remain. Keep a Session clone while using its streams. An explicit `Session::close` already in progress finishes its bounded graceful close after the final handle drops. Keep the runtime alive and await `Session::closed` to allow capsule delivery; a timeout or cancellation can prevent delivery.
+
+## Native CONNECT diagnostics
+
+On native builds, `Session::response()` exposes the CONNECT response and
+ordinary headers. `Error::response()` exposes the complete rejection response:
+
+```rust,ignore
+match client.connect(url).await {
+    Ok(session) => {
+        if let Some(response) = session.response() {
+            for value in response.headers.get_all("x-request-id") {
+                eprintln!("request id: {value:?}");
+            }
+        }
+    }
+    Err(error) => {
+        if let Some(response) = error.response() {
+            eprintln!("CONNECT rejected: {}", response.status);
+            for value in response.headers.get_all("www-authenticate") {
+                eprintln!("challenge: {value:?}");
+            }
+        }
+        return Err(error);
+    }
+}
+```
+
+These accessors are native-only. The WASM wrapper exposes what its browser
+bindings provide and does not synthesize HTTP response or rejection headers.
+The [W3C API](https://www.w3.org/TR/webtransport/) is evolving independently;
+its draft response-header features do not imply support in this wrapper or in
+every browser. Raw QUIC sessions have no CONNECT response.
 
 ## Native crypto
 

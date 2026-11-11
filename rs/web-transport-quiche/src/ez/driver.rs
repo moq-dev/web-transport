@@ -40,6 +40,7 @@ type OpenUniResult = Poll<Result<(Option<Waker>, StreamId, Lock<SendState>), Con
 pub(super) struct DriverState {
     send: HashSet<StreamId>,
     recv: HashSet<StreamId>,
+    draining: HashMap<StreamId, tokio::sync::oneshot::Sender<quiche::Result<()>>>,
     waker: Option<Waker>,
 
     bi: DriverOpen<(Lock<SendState>, Lock<RecvState>)>,
@@ -113,6 +114,7 @@ impl DriverState {
         Self {
             send: HashSet::new(),
             recv: HashSet::new(),
+            draining: HashMap::new(),
             waker: None,
             close_requested: ConnectionClosed::default(),
             closed: ConnectionClosed::default(),
@@ -222,6 +224,15 @@ impl DriverState {
         }
 
         // You should call wake() without holding the lock.
+        self.waker.take()
+    }
+
+    pub fn drain(
+        &mut self,
+        id: StreamId,
+        sender: tokio::sync::oneshot::Sender<quiche::Result<()>>,
+    ) -> Option<Waker> {
+        self.draining.insert(id, sender);
         self.waker.take()
     }
 
@@ -512,6 +523,7 @@ impl Driver {
     }
 
     fn read(&mut self, qconn: &mut QuicheConnection) -> Result<(), ConnectionError> {
+        self.check_drained(qconn);
         while let Some(stream_id) = qconn.stream_readable_next() {
             let stream_id = StreamId::from(stream_id);
 
@@ -743,6 +755,10 @@ impl Driver {
 
         uni_waiters.unwrap_or_default().wake();
 
+        // Inspect drains after publishing the driver's waker, so registration
+        // racing this poll is either observed here or wakes another poll.
+        self.check_drained(qconn);
+
         // Before the flushes, so a stream created above sends its first bytes at
         // the urgency it was opened with rather than quiche's default.
         self.apply_priorities(qconn)?;
@@ -861,6 +877,34 @@ impl Driver {
     fn abort(&mut self, err: ConnectionError) {
         let mut waiters = self.state.lock().close_requested.abort(err);
         waiters.wake();
+    }
+
+    fn check_drained(&mut self, qconn: &mut QuicheConnection) {
+        let state = self.state.lock();
+        let mut completed = Vec::new();
+        for (&id, sender) in &state.draining {
+            if sender.is_closed() {
+                completed.push((id, Ok(())));
+                continue;
+            }
+            let result = match qconn.stream_capacity(id.into()) {
+                Ok(_) => continue,
+                // A rejected CONNECT's receive half is stopped. Collection thus
+                // implies acknowledgment of the finished send half; a peer stop
+                // also ends our obligation to deliver its response.
+                Err(quiche::Error::InvalidStreamState(_) | quiche::Error::StreamStopped(_)) => {
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            };
+            completed.push((id, result));
+        }
+        drop(state);
+        for (id, result) in completed {
+            let sender = self.state.lock().draining.remove(&id).unwrap();
+            // Cancellation is allowed; a dropped receiver needs no notification.
+            let _ = sender.send(result);
+        }
     }
 }
 
