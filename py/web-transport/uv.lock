@@ -368,7 +368,7 @@ requires-dist = [{ name = "cryptography", specifier = ">=50.0.0" }]
 [package.metadata.requires-dev]
 dev = [
     { name = "maturin", specifier = ">=1.0,<2.0" },
-    { name = "playwright", specifier = ">=1.40" },
+    { name = "playwright", specifier = ">=1.57" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.8" },
