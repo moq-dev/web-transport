@@ -27,7 +27,8 @@ On Android the verifier needs the application `Context`. The AAR handles this wi
 app code: a manifest-merged `ContentProvider` loads the native library with
 `System.loadLibrary` during app startup, and the library's `JNI_OnLoad` initializes
 the verifier from the Application. The AAR also bundles the verifier's Kotlin
-component and ships its R8/ProGuard keep rule. If initialization has not succeeded,
+component and ships the R8/ProGuard keep rules for it, JNA, and the UniFFI bindings,
+so minified apps need no rules of their own. If initialization has not succeeded,
 for example because the provider was removed from the merged manifest and the
 library was first loaded by JNA, each new client retries it; a client built before
 it succeeds trusts the bundled Mozilla roots from webpki-roots instead and keeps them.
@@ -84,6 +85,8 @@ after explicit lifecycle cleanup.
 
 The Android target is opt-in via `-Pandroid.enabled=true`. Local dev without the Android SDK still builds the JVM variant.
 
+With the Android target enabled and the bindings staged, `:r8-check:checkKeepRules` minifies a consumer app with R8 and fails if it removed or renamed anything in the JNA, UniFFI, or verifier packages. The Kotlin release workflow runs it on every PR that touches `kt/` or the FFI crate.
+
 ## Layout
 
 ```
@@ -93,7 +96,7 @@ kt/
   gradle.properties         Defaults: version, android.useAndroidX, etc.
   web-transport/
     build.gradle.kts        KMP plugin, jvm() always, androidTarget() conditional
-    consumer-rules.pro      Android keep rule for the bundled verifier component
+    consumer-rules.pro      R8 keep rules for JNA, the UniFFI bindings, and the verifier
     src/
       commonMain/           Public Kotlin facade (reserved for future K/N)
       jvmAndAndroidMain/    UniFFI-generated kotlin (populated, gitignored)
@@ -101,6 +104,7 @@ kt/
       androidMain/          Startup provider that loads the library via System.loadLibrary
         jniLibs/            JNI .so per ABI (populated, gitignored)
       jvmArtifactTest/      Opt-in packaged-artifact lifecycle smoke
+  r8-check/                 Minified consumer app that checks the keep rules (Android only)
   scripts/                  check.sh, package.sh
 ```
 
