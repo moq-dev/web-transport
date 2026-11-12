@@ -13,7 +13,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 
 /// Ensure the platform verifier is initialized, initializing it from the
 /// application `Context` when the application has not.
-pub(crate) fn init_platform_verifier() -> Result<(), rustls::Error> {
+pub fn init_platform_verifier() -> Result<(), rustls::Error> {
     if READY.load(Ordering::Acquire) {
         return Ok(());
     }

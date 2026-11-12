@@ -24,8 +24,10 @@
 //! If you want to support multiple WebTransport sessions over the same QUIC connection... you should just dial a new QUIC connection instead.
 
 // External
+// Public only so web-transport-ffi shares the JNI lookup; not a supported API.
 #[cfg(target_os = "android")]
-mod android;
+#[doc(hidden)]
+pub mod android;
 mod client;
 mod error;
 mod op;
