@@ -4,6 +4,11 @@ on:
   pull_request:
     branches: ["main"]
 
+# Cancel a superseded run so a newer push to the PR frees its runner.
+concurrency:
+  group: test-py-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
