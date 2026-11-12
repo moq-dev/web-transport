@@ -122,8 +122,8 @@ impl Client {
 ///
 /// NOTE: This is not supported in the WASM runtime, as browsers are clients.
 ///
-/// Use a [web_transport_quinn::ServerBuilder] to create a [web_transport_quinn::Server] and then [Into<Server>].
-/// Alternatively, establish a [web_transport_quinn::Session] directly and then [Into<Session>].
+/// Use a [web_transport_quinn::ServerBuilder] to create a [web_transport_quinn::Server] and then `Into<Server>`.
+/// Alternatively, establish a [web_transport_quinn::Session] directly and then `Into<Session>`.
 pub struct Server {
     inner: quinn::Server,
 }

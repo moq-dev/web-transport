@@ -11,7 +11,7 @@ use crate::{ez, waiters::Parked, StreamError};
 
 // "send" in ascii; if you see this then call finish().await or close(code)
 // hex: 0x73656E64, or 0x52E51B4DCE20 as an HTTP error code
-// decimal: 1685221232, or 91143959072288 as an HTTP error code
+// decimal: 1936027236, or 91143959072288 as an HTTP error code
 const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x73656E64);
 
 /// A stream that can be used to send bytes.
