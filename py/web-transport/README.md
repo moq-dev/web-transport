@@ -1,7 +1,7 @@
 # web-transport-rs
 
 [![PyPI](https://img.shields.io/pypi/v/web-transport-rs)](https://pypi.org/project/web-transport-rs/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/moq-dev/web-transport/blob/main/LICENSE-MIT)
 
 Python bindings for [web-transport-quinn](https://docs.rs/web-transport-quinn/) — a pure-Rust WebTransport library built on QUIC.
 
@@ -111,7 +111,7 @@ Malformed or reserved generic fields raise `ValueError` before consuming the req
 
 `Server` and `Client` accept DER-encoded `bytes` for certificates and keys, so you can use any TLS library (e.g. [`cryptography`](https://cryptography.io/)) to generate or load them.
 
-All exceptions inherit from `web_transport.WebTransportError`. See the [typed Python wrapper](python/web_transport/__init__.py) for the full API reference.
+All exceptions inherit from `web_transport.WebTransportError`. See the [typed Python wrapper](https://github.com/moq-dev/web-transport/blob/main/py/web-transport/python/web_transport/__init__.py) for the full API reference.
 
 ## Certificate pinning
 

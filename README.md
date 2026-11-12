@@ -59,6 +59,17 @@ Built from `rs/web-transport-ffi` via UniFFI; all three release workflows fire f
 | Kotlin   | `dev.moq:web-transport` (Maven Central)                                      | [kt/](kt/)   |
 | Swift    | `WebTransportFFI.xcframework.zip` (attached to GitHub Releases)              | [swift/](swift/) |
 
+### Runtime coverage
+
+Each binding's runtime job runs on every PR to `main` with no path filter, so any Rust, FFI, build script, or workspace change exercises every package. The release workflows also run as path-filtered PR smoke builds covering `rs/web-transport-ffi`, the workspace crates it depends on, `Cargo.toml`, `Cargo.lock`, and their own sources. Mobile emulators are out of scope; Android and iOS are only cross-compiled by those smoke builds.
+
+| Package | PR job | Host | Local command |
+|---------|--------|------|---------------|
+| Python  | [`test-py.yml`](.github/workflows/test-py.yml) | Linux | `nix develop --command ./py/web-transport/test-wheel.sh` |
+| Node    | [`node.yml`](.github/workflows/node.yml) | Linux | `nix develop --command bun run --cwd js/web-transport test:runtime` |
+| Kotlin/JVM | `kotlin` in [`pr.yml`](.github/workflows/pr.yml) | Linux | `nix develop --command just test-kotlin` |
+| Swift   | [`test-swift.yml`](.github/workflows/test-swift.yml) | macOS | `just test-swift` |
+
 ## Quests
 
 Development plans live in [`quest/`](quest/README.md). Enter `nix develop` to

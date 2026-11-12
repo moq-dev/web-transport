@@ -13,7 +13,7 @@ use std::{
     task::{ready, Context, Poll, Waker},
 };
 
-// "conn" in ascii; if you see this then close(code)
+// "cnno" in ascii; if you see this then close(code)
 // hex: 0x636E6E6F, or 0x52E50ACE926F as an HTTP error code
 // decimal: 1668181615, or 91143682298479 as an HTTP error code
 const DROP_CODE: u64 = web_transport_proto::error_to_http3(0x636E6E6F);

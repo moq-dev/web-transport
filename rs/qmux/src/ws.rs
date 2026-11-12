@@ -220,10 +220,10 @@ impl Client {
     /// Set the WebSocket configuration (e.g. max message/frame sizes).
     ///
     /// On record-framed drafts (QMux01+), the advertised record size is clamped
-    /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
+    /// to these limits; a limit below `DEFAULT_MAX_RECORD_SIZE` fails
     /// establishment locally, before any QMux parameters are sent.
     /// For bare-frame versions, callers must allow the peer's frame sizes:
-    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// QMux00 permits up to `MAX_FRAME_SIZE`; legacy `webtransport`
     /// negotiates no size bound.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
@@ -248,7 +248,7 @@ impl Client {
     /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
     /// and 64 MiB by default), since each record is one message. Establishment
     /// fails with [`Error::TransportParameter`] before any QMux parameters are
-    /// sent if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
+    /// sent if the resulting limit is below `DEFAULT_MAX_RECORD_SIZE`.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self
@@ -392,10 +392,10 @@ impl Server {
     /// Set the WebSocket configuration (e.g. max message/frame sizes).
     ///
     /// On record-framed drafts (QMux01+), the advertised record size is clamped
-    /// to these limits; a limit below [`crate::DEFAULT_MAX_RECORD_SIZE`] fails
+    /// to these limits; a limit below `DEFAULT_MAX_RECORD_SIZE` fails
     /// establishment locally, before any QMux parameters are sent.
     /// For bare-frame versions, callers must allow the peer's frame sizes:
-    /// QMux00 permits up to [`crate::MAX_FRAME_SIZE`]; legacy `webtransport`
+    /// QMux00 permits up to `MAX_FRAME_SIZE`; legacy `webtransport`
     /// negotiates no size bound.
     pub fn with_config(mut self, config: tungstenite::protocol::WebSocketConfig) -> Self {
         self.config = Some(config);
@@ -420,7 +420,7 @@ impl Server {
     /// (QMux01+) is clamped to the WebSocket's frame and message limits (16 MiB
     /// and 64 MiB by default), since each record is one message. Establishment
     /// fails with [`Error::TransportParameter`] before any QMux parameters are
-    /// sent if the resulting limit is below [`crate::DEFAULT_MAX_RECORD_SIZE`].
+    /// sent if the resulting limit is below `DEFAULT_MAX_RECORD_SIZE`.
     pub fn with_session_config(mut self, config: Config) -> Self {
         self.session = config;
         self

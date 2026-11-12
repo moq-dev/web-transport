@@ -12,6 +12,11 @@ on:
   pull_request:
     paths:
       - "rs/web-transport-ffi/**"
+      - "rs/web-transport-quinn/**"
+      - "rs/web-transport-proto/**"
+      - "rs/web-transport-trait/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "kt/**"
       - ".github/workflows/release-kt.yml"
       - ".github/scripts/release.sh"
@@ -193,6 +198,9 @@ jobs:
             --lib-dir libs \
             --bindings-dir bindings \
             --output release-out
+
+      - name: Check R8 keep rules
+        run: gradle -p kt -Pandroid.enabled=true :r8-check:checkKeepRules
 
       - name: Publish to Maven Central
         # Tag pushes only, and only once PUBLISH_KOTLIN=true is set in repo

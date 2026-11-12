@@ -1,7 +1,7 @@
 //! WebTransport session wrapped for UniFFI.
 //!
 //! Wraps `web_transport_quinn::Session` in `Option` so [`Drop`] can release
-//! quinn-owned resources inside the [`RUNTIME`] context (see moq ae506266
+//! quinn-owned resources inside the `RUNTIME` context (see moq ae506266
 //! for the bug this avoids).
 
 use std::sync::Arc;

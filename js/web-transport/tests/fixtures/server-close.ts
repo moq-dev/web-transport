@@ -22,7 +22,7 @@ const socket = createSocket("udp4");
 await new Promise<void>((resolve) => socket.bind(0, "127.0.0.1", resolve));
 const { port } = socket.address();
 await new Promise<void>((resolve) => socket.close(resolve));
-const server = Server.bind("127.0.0.1:" + port, pem, pem);
+const server = Server.bind(`127.0.0.1:${port}`, pem, pem);
 const peerReady = Promise.withResolvers<Session>();
 let result: Request | null | undefined;
 const loop = (async () => {
@@ -32,7 +32,7 @@ const loop = (async () => {
 		peerReady.resolve(await result.ok());
 	}
 })();
-const client = new Session("https://127.0.0.1:" + port, { serverCertificateDisableVerify: true });
+const client = new Session(`https://127.0.0.1:${port}`, { serverCertificateDisableVerify: true });
 await client.ready;
 const peer = await peerReady.promise;
 
@@ -62,7 +62,7 @@ proxy.on("message", (data, remote) => {
 		proxy.send(data, port, "127.0.0.1");
 	}
 });
-const stalled = new Session("https://127.0.0.1:" + proxy.address().port, {
+const stalled = new Session(`https://127.0.0.1:${proxy.address().port}`, {
 	serverCertificateDisableVerify: true,
 });
 const rejected = assert.rejects(stalled.ready);

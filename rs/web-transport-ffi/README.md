@@ -33,8 +33,8 @@ handles this. If you package the Android library yourself:
   `org.rustls:rustls-platform-verifier`, at the version of the
   `rustls-platform-verifier-android` crate pinned in `Cargo.toml`, as described in
   [its Android setup](https://github.com/rustls/rustls-platform-verifier#android).
-- Keep it from shrinking with
-  `-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }`.
+- Keep it, JNA, and the UniFFI bindings from shrinking, as
+  [`kt/web-transport/consumer-rules.pro`](../../kt/web-transport/consumer-rules.pro) does.
 
 ## Session lifetime
 

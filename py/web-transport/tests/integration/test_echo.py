@@ -26,6 +26,8 @@ async def test_echo_bidirectional(self_signed_cert, cert_hash):
                 async with send:
                     data = await recv.read()
                     await send.write(data)
+                # Closing before the client reads would discard the echo.
+                await session.wait_closed()
 
         async def client_task():
             async with web_transport.Client(
@@ -67,6 +69,8 @@ async def test_echo_unidirectional(self_signed_cert, cert_hash):
                 send = await session.open_uni()
                 async with send:
                     await send.write(data)
+                # Closing before the client reads would discard the echo.
+                await session.wait_closed()
 
         async def client_task():
             async with web_transport.Client(

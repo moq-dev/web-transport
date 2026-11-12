@@ -15,6 +15,7 @@ pluginManagement {
     // the plugin marker is never resolved.
     plugins {
         id("com.android.library") version "8.7.3"
+        id("com.android.application") version "8.7.3"
     }
 }
 
@@ -36,3 +37,8 @@ dependencyResolutionManagement {
 
 rootProject.name = "web-transport"
 include(":web-transport")
+
+// Minified consumer that checks the AAR's R8 keep rules; needs the Android SDK.
+if (providers.gradleProperty("android.enabled").orNull == "true") {
+    include(":r8-check")
+}

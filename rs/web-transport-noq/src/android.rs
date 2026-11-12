@@ -4,6 +4,9 @@
 //! panics during verification if it was never given the application `Context`.
 //! It does not expose whether it is initialized, so [`init_platform_verifier`]
 //! initializes it idempotently and returns an error when that is impossible.
+//!
+//! A copy of web-transport-quinn's `android` module, which web-transport-ffi
+//! shares; this crate cannot depend on web-transport-quinn.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
