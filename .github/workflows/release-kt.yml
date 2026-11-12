@@ -12,6 +12,11 @@ on:
   pull_request:
     paths:
       - "rs/web-transport-ffi/**"
+      - "rs/web-transport-quinn/**"
+      - "rs/web-transport-proto/**"
+      - "rs/web-transport-trait/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "kt/**"
       - ".github/workflows/release-kt.yml"
       - ".github/scripts/release.sh"
