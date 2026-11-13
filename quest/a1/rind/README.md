@@ -2,7 +2,7 @@
 
 ## Goal
 
-Every Rust crate here except Quiche and QMux takes its TLS crypto only from [rind](https://github.com/moq-dev/rind) through `rind-rustls`, so their builds compile no C crypto. For those crates on every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. Their `aws-lc-rs` and `ring` features are removed.
+Every Rust crate here except Quiche and QMux takes its TLS crypto only from [rind](https://github.com/kixel-ai/rind) through `rind-rustls`, so their builds compile no C crypto. For those crates on every release target, `cargo tree -e normal,build -i` finds no aws-lc-sys, ring, or `cc` reached through a crypto crate. Their `aws-lc-rs` and `ring` features are removed.
 
 Non-goals: web-transport-quiche, which is BoringSSL (rind doesn't apply); qmux, which is being retired in favour of [moq-dev/moq's qmux](https://github.com/moq-dev/moq/blob/main/rs/qmux/MIGRATE.md), already on rind; and WASM, which uses the browser's TLS.
 
@@ -24,7 +24,7 @@ The epic's own work, once every child has merged:
 Decision prompts (✅ chosen):
 
 - Goal: ✅ rind only, like moq / rind default, others opt-in / rind as opt-in feature.
-- Library policy, given MIGRATE.md: ✅ rind only, and plan rind support for every target ring or aws-lc-rs builds, minus wasm, in moq-dev/rind / rind default / opt-in rind.
+- Library policy, given MIGRATE.md: ✅ rind only, and plan rind support for every target ring or aws-lc-rs builds, minus wasm, in kixel-ai/rind / rind default / opt-in rind.
 - Crates: ✅ every crate / only qmux / all but iroh.
 - Order: wait for rind targets / ✅ switch now.
 - CPU refusal: ✅ error at finish / fallible `new()` / panic.

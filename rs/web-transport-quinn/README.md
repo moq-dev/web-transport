@@ -70,7 +70,7 @@ wait for every bound endpoint to drain.
 ## Crypto and migration
 
 TLS uses the process-wide rustls provider if one is installed, otherwise
-[rind-rustls](https://github.com/moq-dev/rind/tree/main/rind-rustls). Retry integrity,
+[rind-rustls](https://github.com/kixel-ai/rind/tree/main/rind-rustls). Retry integrity,
 stateless resets and handshake tokens always use rind. The normal and build
 dependency graph contains no ring or aws-lc-rs; aws-lc-rs is a development dependency
 for interop tests. The `ring` and `aws-lc-rs` crate features have been removed.
