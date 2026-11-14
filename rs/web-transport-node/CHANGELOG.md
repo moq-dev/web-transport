@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.8...web-transport-node-v0.0.9) - 2026-11-14
+
+### Added
+
+- *(quinn,noq)* verify system roots with the OS platform verifier ([#512](https://github.com/moq-dev/web-transport/pull/512))
+- *(node)* expose idle timeout and keep-alive options ([#509](https://github.com/moq-dev/web-transport/pull/509))
+- *(quinn)* [**breaking**] use rind through a provider-neutral QUIC adapter ([#488](https://github.com/moq-dev/web-transport/pull/488))
+
+### Fixed
+
+- *(node)* [**breaking**] reject session failures and unblock reader cancellation ([#486](https://github.com/moq-dev/web-transport/pull/486))
+- *(quinn)* [**breaking**] close the connection when the final Session drops ([#480](https://github.com/moq-dev/web-transport/pull/480))
+
+### Other
+
+- Fix Node server close with pending accepts ([#485](https://github.com/moq-dev/web-transport/pull/485))
+
 ## [0.0.8](https://github.com/moq-dev/web-transport/compare/web-transport-node-v0.0.7...web-transport-node-v0.0.8) - 2026-11-03
 
 ### Fixed

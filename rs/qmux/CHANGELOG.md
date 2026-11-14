@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.6...qmux-v0.7.0) - 2026-11-14
+
+### Added
+
+- [**breaking**] preserve CONNECT response and rejection headers ([#499](https://github.com/moq-dev/web-transport/pull/499))
+
+### Fixed
+
+- *(qmux)* return connection credit for stopped receive streams ([#520](https://github.com/moq-dev/web-transport/pull/520))
+- *(qmux)* bound initial stream-count transport parameters ([#483](https://github.com/moq-dev/web-transport/pull/483))
+- *(qmux)* release retained socket stats at teardown ([#481](https://github.com/moq-dev/web-transport/pull/481))
+- *(qmux)* bound WebSocket record advertisements ([#498](https://github.com/moq-dev/web-transport/pull/498))
+- *(qmux)* reject send controls for unopened local streams ([#484](https://github.com/moq-dev/web-transport/pull/484))
+- *(qmux)* enforce a shared handshake deadline ([#482](https://github.com/moq-dev/web-transport/pull/482))
+
+### Other
+
+- Fix stale comments and broken doc links ([#526](https://github.com/moq-dev/web-transport/pull/526))
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+- align current architecture and package maps ([#500](https://github.com/moq-dev/web-transport/pull/500))
+
 ## [0.6.6](https://github.com/moq-dev/web-transport/compare/qmux-v0.6.5...qmux-v0.6.6) - 2026-10-23
 
 ### Fixed

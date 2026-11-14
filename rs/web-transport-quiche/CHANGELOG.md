@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.4...web-transport-quiche-v0.9.0) - 2026-11-14
+
+### Added
+
+- [**breaking**] preserve CONNECT response and rejection headers ([#499](https://github.com/moq-dev/web-transport/pull/499))
+
+### Fixed
+
+- *(node)* [**breaking**] reject session failures and unblock reader cancellation ([#486](https://github.com/moq-dev/web-transport/pull/486))
+- *(ci)* build and test on the Ubuntu 26.04 runner and quiche 0.30.1 ([#510](https://github.com/moq-dev/web-transport/pull/510))
+- *(native)* [**breaking**] bind default client sockets by address family ([#490](https://github.com/moq-dev/web-transport/pull/490))
+
+### Other
+
+- Fix stale comments and broken doc links ([#526](https://github.com/moq-dev/web-transport/pull/526))
+- finish the Quiche lifecycle epic ([#515](https://github.com/moq-dev/web-transport/pull/515))
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+- align current architecture and package maps ([#500](https://github.com/moq-dev/web-transport/pull/500))
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#468](https://github.com/moq-dev/web-transport/pull/468))
+- *(quiche)* audit connection send-rate estimates ([#503](https://github.com/moq-dev/web-transport/pull/503))
+- Treat retired-stream notifications as harmless ([#479](https://github.com/moq-dev/web-transport/pull/479))
+
 ## [0.8.4](https://github.com/moq-dev/web-transport/compare/web-transport-quiche-v0.8.3...web-transport-quiche-v0.8.4) - 2026-11-03
 
 ### Fixed

@@ -22,6 +22,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.6.4...web-transport-proto-v0.7.0) - 2026-11-14
+
+### Added
+
+- [**breaking**] preserve CONNECT response and rejection headers ([#499](https://github.com/moq-dev/web-transport/pull/499))
+
+### Other
+
+- align current architecture and package maps ([#500](https://github.com/moq-dev/web-transport/pull/500))
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#468](https://github.com/moq-dev/web-transport/pull/468))
+- Remove measured redundant protocol buffering ([#504](https://github.com/moq-dev/web-transport/pull/504))
+
 ## [0.6.4](https://github.com/moq-dev/web-transport/compare/web-transport-proto-v0.6.3...web-transport-proto-v0.6.4) - 2026-11-03
 
 ### Fixed
