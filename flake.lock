@@ -36,11 +36,11 @@
     },
     "nixpkgs-bun": {
       "locked": {
-        "lastModified": 1793735720,
-        "narHash": "sha256-smoxPKrzAhdGuFd2LLnG4m8P6IrZuW95DVyzjnlab7w=",
+        "lastModified": 1793826729,
+        "narHash": "sha256-D5H7H+qMoTGI/jJtxKP4u7BdjkFnUyhOovTrf3pTOr0=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "9d3b8db48266c17be0b5f9c6360c3ecfbac3d1f5",
+        "rev": "6dadaf4375be35033e1c84395adbd53ff5fded96",
         "type": "github"
       },
       "original": {
@@ -63,11 +63,11 @@
         "token-max": "token-max"
       },
       "locked": {
-        "lastModified": 1794682729,
-        "narHash": "sha256-8pTvkOuHtGmqSFHREU6+V+MffFGsUNKI/4a5IuHLkxA=",
+        "lastModified": 1794684784,
+        "narHash": "sha256-B+b48LVY4yUh+Uny0FUOpvmO9cSmhbs3KqvUwefRdkk=",
         "owner": "moq-dev",
         "repo": "quest",
-        "rev": "45c7be6c6c957ab689945749e3328fc3319d6494",
+        "rev": "076a8c727ca309fc9194e92c60b61aa8f66d4aec",
         "type": "github"
       },
       "original": {
