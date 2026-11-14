@@ -6,4 +6,4 @@ A quinn release lets quinn-proto's `rustls` support run on any rustls provider w
 
 ## Plan
 
-This waits on an outside party. Check #2341 and quinn's releases. rind's own [quinn adoption quest](https://github.com/moq-dev/rind/blob/main/quest/m2/adoption/quinn.md) drives the upstream PR, building on ctz's work-in-progress branch. Advance it there rather than opening a competing PR (posting to quinn-rs needs the maintainer's approval).
+This waits on an outside party. Check #2341 and quinn's releases. rind's own [quinn adoption quest](https://github.com/kixel-ai/rind/blob/main/quest/m2/adoption/quinn.md) drives the upstream PR, building on ctz's work-in-progress branch. Advance it there rather than opening a competing PR (posting to quinn-rs needs the maintainer's approval).
