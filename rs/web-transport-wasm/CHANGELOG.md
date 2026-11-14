@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.8...web-transport-wasm-v0.8.9) - 2026-11-14
+
+### Other
+
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#468](https://github.com/moq-dev/web-transport/pull/468))
+- *(deps-dev)* bump the bun group across 1 directory with 4 updates ([#505](https://github.com/moq-dev/web-transport/pull/505))
+
 ## [0.8.8](https://github.com/moq-dev/web-transport/compare/web-transport-wasm-v0.8.7...web-transport-wasm-v0.8.8) - 2026-11-03
 
 ### Other

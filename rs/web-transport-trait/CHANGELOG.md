@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.5.2...web-transport-trait-v0.5.3) - 2026-11-14
+
+### Other
+
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+- align current architecture and package maps ([#500](https://github.com/moq-dev/web-transport/pull/500))
+
 ## [0.5.2](https://github.com/moq-dev/web-transport/compare/web-transport-trait-v0.5.1...web-transport-trait-v0.5.2) - 2026-10-22
 
 ### Other

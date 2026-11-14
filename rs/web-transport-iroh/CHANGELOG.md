@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.0](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.4...web-transport-iroh-v0.9.0) - 2026-11-14
+
+### Added
+
+- [**breaking**] preserve CONNECT response and rejection headers ([#499](https://github.com/moq-dev/web-transport/pull/499))
+
+### Fixed
+
+- *(node)* [**breaking**] reject session failures and unblock reader cancellation ([#486](https://github.com/moq-dev/web-transport/pull/486))
+
+### Other
+
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+
 ## [0.8.4](https://github.com/moq-dev/web-transport/compare/web-transport-iroh-v0.8.3...web-transport-iroh-v0.8.4) - 2026-10-20
 
 ### Other

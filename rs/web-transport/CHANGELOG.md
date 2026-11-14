@@ -27,6 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.13.9...web-transport-v0.14.0) - 2026-11-14
+
+### Added
+
+- *(quinn,noq)* verify system roots with the OS platform verifier ([#512](https://github.com/moq-dev/web-transport/pull/512))
+- [**breaking**] preserve CONNECT response and rejection headers ([#499](https://github.com/moq-dev/web-transport/pull/499))
+- *(quinn)* [**breaking**] use rind through a provider-neutral QUIC adapter ([#488](https://github.com/moq-dev/web-transport/pull/488))
+- *(quinn)* [**breaking**] accept caller-provided transport configuration ([#489](https://github.com/moq-dev/web-transport/pull/489))
+
+### Fixed
+
+- *(quinn)* [**breaking**] close the connection when the final Session drops ([#480](https://github.com/moq-dev/web-transport/pull/480))
+- *(native)* [**breaking**] bind default client sockets by address family ([#490](https://github.com/moq-dev/web-transport/pull/490))
+
+### Other
+
+- Fix stale comments and broken doc links ([#526](https://github.com/moq-dev/web-transport/pull/526))
+- Document package and backend selection ([#501](https://github.com/moq-dev/web-transport/pull/501))
+- align current architecture and package maps ([#500](https://github.com/moq-dev/web-transport/pull/500))
+- Compose a configured native client with the generic API ([#497](https://github.com/moq-dev/web-transport/pull/497))
+
 ## [0.13.9](https://github.com/moq-dev/web-transport/compare/web-transport-v0.13.8...web-transport-v0.13.9) - 2026-11-03
 
 ### Other
