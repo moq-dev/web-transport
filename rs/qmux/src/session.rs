@@ -2534,8 +2534,14 @@ impl RecvStream {
     fn discard(&mut self) {
         self.inbound_data.close();
         let mut unread: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
-        while let Ok(stream) = self.inbound_data.try_recv() {
-            unread += stream.data.len() as u64;
+        // A send the reader began before `close` succeeds even if it lands after
+        // the queue looks empty; `Disconnected` means none is still in flight.
+        loop {
+            match self.inbound_data.try_recv() {
+                Ok(stream) => unread += stream.data.len() as u64,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+            }
         }
         if self.version.is_qmux() && unread > 0 {
             if let Some(new_max) = self.conn_recv_credit.consume(unread) {
@@ -3666,6 +3672,45 @@ mod recv_open_tests {
             tx.send(uni_stream(i, b"y", false)).unwrap();
             drop(recv);
         }
+    }
+
+    /// The reader's send lands in a window of a few instructions, so this race
+    /// needs more iterations than the others to hit it.
+    const DROP_RACE_ITERATIONS: u64 = 100_000;
+
+    /// Data the reader delivers while a dropped `RecvStream` drains its queue is
+    /// credited exactly once, by one side or the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_racing_drop_is_credited() {
+        // Wide enough that a peer sending 90 bytes a stream never outruns the
+        // credit `Credit` holds back below its update threshold.
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 1_000;
+        config.max_streams_uni = DROP_RACE_ITERATIONS + 1;
+        let (session, tx) = scripted_session_with_config(config);
+        for i in 0..DROP_RACE_ITERATIONS {
+            tx.send(uni_stream(i, &[0; 60], false)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("accept_uni timed out")
+                .expect("accept_uni failed");
+            tx.send(uni_stream_at(i, 60, &[0; 30], false)).unwrap();
+            drop(recv);
+            tx.send(uni_reset(i, 90)).unwrap();
+        }
+
+        // The reader handles frames in order, so once this stream is read every
+        // frame above has been credited, or lost.
+        tx.send(uni_stream(DROP_RACE_ITERATIONS, b"x", true))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed")
+            .read_all()
+            .await
+            .unwrap();
+        assert_eq!(session.conn_recv_credit.window(), 1_000);
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a
