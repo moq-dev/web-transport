@@ -12,6 +12,11 @@ connection stalls.
 
 ## Plan
 
+Decided 2026-11-15 (maintainer, /quest-run on
+[#541](https://github.com/moq-dev/web-transport/pull/541)): ✅ keep this quest
+at a0 (rejected: move to a1, drop), so main's race fix lands before any qmux
+release from main.
+
 Port the fix from
 [moq-dev/web-transport#543](https://github.com/moq-dev/web-transport/pull/543)
 (the 0.5.4 release): a per-stream `Unread` counter (an `AtomicU64` with a
