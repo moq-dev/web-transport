@@ -6,4 +6,10 @@ A quinn release lets quinn-proto's `rustls` support run on any rustls provider w
 
 ## Plan
 
-This waits on an outside party. Check #2341 and quinn's releases. rind's own [quinn adoption quest](https://github.com/kixel-ai/rind/blob/main/quest/m2/adoption/quinn.md) drives the upstream PR, building on ctz's work-in-progress branch. Advance it there rather than opening a competing PR (posting to quinn-rs needs the maintainer's approval).
+This waits passively on quinn-rs: we open no upstream PR, and rind no longer drives one (it dropped its quinn adoption quest in [kixel-ai/rind#635](https://github.com/kixel-ai/rind/pull/635)).
+
+Decision prompt: ✅ wait passively on quinn-rs (rejected: we drive the upstream quinn PR; delete this quest and [quinn-adapter-removal](/quest/a2/quinn-adapter-removal.md)).
+
+## Waiting
+
+- quinn-rs: ship a quinn release that closes [quinn-rs/quinn#2341](https://github.com/quinn-rs/quinn/issues/2341); check the issue's state and quinn's releases.
