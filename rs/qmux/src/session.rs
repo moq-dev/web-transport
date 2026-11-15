@@ -36,8 +36,8 @@ const DATAGRAM_SEND_BUFFER: usize = 64;
 
 /// Shared, lock-guarded per-stream backend state. The reader task inserts/looks
 /// up entries as inbound frames arrive; the writer task retires an entry when it
-/// emits that stream's terminal frame (FIN/RESET/STOP_SENDING). Guarded by a
-/// plain `std::sync::Mutex` — never held across an `.await` — so both tasks share
+/// emits that stream's terminal frame (FIN/RESET, or STOP_SENDING on the legacy
+/// binding). Guarded by a plain `std::sync::Mutex` — never held across an `.await` — so both tasks share
 /// it without message passing, the way a QUIC endpoint shares connection state.
 #[derive(Default)]
 struct Streams {
@@ -521,7 +521,10 @@ impl<W: Writer> WriterState<W> {
             Frame::Stream(stream) if stream.fin => {
                 self.streams.lock().unwrap().send.remove(&stream.id);
             }
-            Frame::StopSending(stop) => {
+            // QMux keeps a stopped stream until its final size is known (see
+            // `RecvState`). The legacy binding has no flow control to return and
+            // no promise of a RESET_STREAM, so it retires the stream here.
+            Frame::StopSending(stop) if !self.version.is_qmux() => {
                 self.streams.lock().unwrap().recv.remove(&stop.id);
             }
             _ => {}
@@ -977,6 +980,13 @@ impl<R: Reader> SessionState<R> {
         }
     }
 
+    /// Return `len` received bytes that nothing will read to the connection window.
+    fn credit_conn(&self, len: u64) {
+        if let Some(new_max) = self.conn_recv_credit.consume(len) {
+            self.control.send(Frame::MaxData(new_max)).ok();
+        }
+    }
+
     /// Per-direction open/closed bookkeeping for peer-initiated recv streams.
     fn recv_open(&self, dir: StreamDir) -> &RecvOpen {
         match dir {
@@ -1009,10 +1019,10 @@ impl<R: Reader> SessionState<R> {
                 let data_len = stream.data.len() as u64;
 
                 // Fast path: an existing stream. Look it up once and deliver under
-                // that lock (never held across an await). The writer task removes
-                // the entry concurrently when a dropped `RecvStream` queues
-                // STOP_SENDING, so a separate existence check can go stale and
-                // resurrect the stream below.
+                // that lock (never held across an await). On the legacy binding the
+                // writer task removes the entry concurrently when a dropped
+                // `RecvStream` queues STOP_SENDING, so a separate existence check
+                // can go stale and resurrect the stream below.
                 {
                     let mut streams = self.streams.lock().unwrap();
                     if let Some(recv) = streams.recv.get_mut(&stream.id) {
@@ -1032,7 +1042,11 @@ impl<R: Reader> SessionState<R> {
                         }
                         let id = stream.id;
                         let fin = stream.fin;
-                        recv.inbound_data.send(stream).ok();
+                        // The frontend stopped: nothing will read this, so credit
+                        // it back now.
+                        if !recv.deliver(stream) && self.config.version.is_qmux() {
+                            self.credit_conn(data_len);
+                        }
                         if fin {
                             streams.recv.remove(&id);
                         }
@@ -1053,14 +1067,16 @@ impl<R: Reader> SessionState<R> {
                     return Ok(());
                 }
 
+                // A frame on one of our own (already-retired) streams: ignore it
+                // like a retired peer stream, without charging connection credit
+                // that nothing would return.
+                if self.is_server == stream.id.server_initiated() {
+                    return Ok(());
+                }
+
                 // Connection-level flow control.
                 if data_len > 0 && !self.conn_recv_credit.receive(data_len) {
                     return Err(Error::FlowControlError);
-                }
-
-                // A frame on one of our own (already-retired) streams: ignore it.
-                if self.is_server == stream.id.server_initiated() {
-                    return Ok(());
                 }
 
                 // New peer-initiated stream. Enforce the stream-count limit — per
@@ -1105,26 +1121,32 @@ impl<R: Reader> SessionState<R> {
                     return Err(Error::FlowControlError);
                 }
 
+                let slot = self.config.version.is_qmux().then(|| {
+                    Arc::new(StreamSlot {
+                        credit: match stream.id.dir() {
+                            StreamDir::Bi => self.recv_bi_credit.clone(),
+                            StreamDir::Uni => self.recv_uni_credit.clone(),
+                        },
+                        control: self.control.clone(),
+                        dir: stream.id.dir(),
+                    })
+                });
+
+                let unread = Unread::default();
                 let recv_backend = RecvState {
                     inbound_data: tx,
                     inbound_reset: tx2,
+                    unread: unread.clone(),
                     recv_credit: recv_credit.clone(),
                     recv_offset: data_len,
-                };
-
-                let recv_streams_credit = if self.config.version.is_qmux() {
-                    Some(match stream.id.dir() {
-                        StreamDir::Bi => self.recv_bi_credit.clone(),
-                        StreamDir::Uni => self.recv_uni_credit.clone(),
-                    })
-                } else {
-                    None
+                    _slot: slot.clone(),
                 };
 
                 let recv_frontend = RecvStream {
                     id: stream.id,
                     inbound_data: rx,
                     inbound_reset: rx2,
+                    unread,
                     outbound_priority: self.control.clone(),
                     buffer: VecDeque::new(),
                     closed: None,
@@ -1132,7 +1154,7 @@ impl<R: Reader> SessionState<R> {
                     recv_credit,
                     conn_recv_credit: self.conn_recv_credit.clone(),
                     version: self.config.version,
-                    recv_streams_credit,
+                    _slot: slot,
                 };
 
                 match stream.id.dir() {
@@ -1198,8 +1220,13 @@ impl<R: Reader> SessionState<R> {
                 let fin = stream.fin;
                 // The first empty non-FIN frame still opens the stream, but does
                 // not need to reach the application-facing receive queue.
-                if data_len > 0 || fin {
-                    recv_backend.inbound_data.send(stream).ok();
+                // The application may already have dropped the stream; credit
+                // the data back as the fast path does.
+                if (data_len > 0 || fin)
+                    && !recv_backend.deliver(stream)
+                    && self.config.version.is_qmux()
+                {
+                    self.credit_conn(data_len);
                 }
 
                 if !fin {
@@ -1224,9 +1251,9 @@ impl<R: Reader> SessionState<R> {
                 let reset_id = reset.id;
                 let peer_initiated = reset_id.server_initiated() != self.is_server;
 
-                // Take the entry in one lookup. The writer task removes it
-                // concurrently when a dropped `RecvStream` queues STOP_SENDING, so a
-                // separate existence check can go stale before the entry is used.
+                // Take the entry in one lookup. On the legacy binding the writer task
+                // removes it concurrently when a dropped `RecvStream` queues
+                // STOP_SENDING, so a separate existence check can go stale.
                 let live = self.streams.lock().unwrap().recv.remove(&reset_id);
 
                 if !self.config.version.is_qmux() {
@@ -1290,9 +1317,7 @@ impl<R: Reader> SessionState<R> {
                 // The gap consumes connection flow control, but no bytes in it can
                 // ever occupy receive memory. Make it immediately eligible to
                 // replenish the connection window.
-                if let Some(new_max) = self.conn_recv_credit.consume(gap) {
-                    self.control.send(Frame::MaxData(new_max)).ok();
-                }
+                self.credit_conn(gap);
 
                 match live {
                     // Deliver the reset. The id was recorded in `recv_open` at
@@ -2003,16 +2028,20 @@ impl generic::Session for Session {
             u64::MAX
         };
         let recv_credit = Credit::new(recv_window);
+        let unread = Unread::default();
         let recv_backend = RecvState {
             inbound_data: tx,
             inbound_reset: tx2,
+            unread: unread.clone(),
             recv_credit: recv_credit.clone(),
             recv_offset: 0,
+            _slot: None,
         };
         let recv_frontend = RecvStream {
             id,
             inbound_data: rx,
             inbound_reset: rx2,
+            unread,
             outbound_priority: self.outbound_priority.clone(),
             buffer: VecDeque::new(),
             closed: None,
@@ -2020,7 +2049,7 @@ impl generic::Session for Session {
             recv_credit,
             conn_recv_credit: self.conn_recv_credit.clone(),
             version: self.config.version,
-            recv_streams_credit: None, // We initiated this stream, no stream count tracking
+            _slot: None, // We initiated this stream, so it holds no MAX_STREAMS slot.
         };
 
         // Register both backends before returning the frontends (see `open_uni`).
@@ -2398,11 +2427,97 @@ impl generic::SendStream for SendStream {
     }
 }
 
+/// Backend half of a receive stream, retired on FIN or RESET_STREAM. Under QMux it
+/// outlives a stopped or dropped [`RecvStream`] until then, so bytes the peer
+/// still sends up to the final size are credited back to the connection window
+/// (RFC 9000 §4.5). [`Unread`] tells the reader when to credit late data
+/// instead of queueing it.
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
+    unread: Unread,
     recv_credit: Credit,
     recv_offset: u64,
+    // Held until retired; see `StreamSlot`.
+    _slot: Option<Arc<StreamSlot>>,
+}
+
+impl RecvState {
+    /// Queue `stream` for the frontend. Returns false, queueing nothing, once
+    /// the frontend has stopped: its data is then the caller's to credit.
+    fn deliver(&self, stream: Stream) -> bool {
+        if !self.unread.add(stream.data.len() as u64) {
+            return false;
+        }
+        self.inbound_data.send(stream).ok();
+        true
+    }
+}
+
+/// Bytes the reader has queued for a [`RecvStream`] that it has not taken yet,
+/// plus whether it has stopped. Every queued byte is credited exactly once: by
+/// the frontend when it reads or discards it, or by the reader when it arrives
+/// after the stop.
+#[derive(Clone, Default)]
+struct Unread(Arc<AtomicU64>);
+
+impl Unread {
+    const STOPPED: u64 = 1 << 63;
+
+    /// Count `len` bytes about to be queued, unless the frontend stopped.
+    fn add(&self, len: u64) -> bool {
+        let mut queued = self.0.load(Ordering::Acquire);
+        while queued & Self::STOPPED == 0 {
+            match self.0.compare_exchange_weak(
+                queued,
+                queued + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => queued = actual,
+            }
+        }
+        false
+    }
+
+    /// Uncount `len` bytes the frontend took off the queue.
+    fn take(&self, len: u64) {
+        self.0.fetch_sub(len, Ordering::AcqRel);
+    }
+
+    /// Mark the frontend stopped, returning the bytes still queued the first
+    /// time and zero after.
+    fn stop(&self) -> u64 {
+        let queued = self.0.fetch_or(Self::STOPPED, Ordering::AcqRel);
+        if queued & Self::STOPPED == 0 {
+            queued
+        } else {
+            0
+        }
+    }
+}
+
+/// A peer-initiated QMux stream's MAX_STREAMS slot, shared by the backend entry
+/// and the [`RecvStream`]. Returned once both are gone: the application is done
+/// with the stream and its final size is known, so a peer that ignores
+/// STOP_SENDING cannot grow the retained entries past its stream limit.
+struct StreamSlot {
+    credit: Credit,
+    control: mpsc::UnboundedSender<Frame>,
+    dir: StreamDir,
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        if let Some(new_max) = self.credit.consume(1) {
+            let frame = match self.dir {
+                StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
+                StreamDir::Uni => Frame::MaxStreamsUni(new_max),
+            };
+            self.control.send(frame).ok();
+        }
+    }
 }
 
 /// The receive half of a multiplexed stream.
@@ -2413,6 +2528,7 @@ pub struct RecvStream {
     outbound_priority: mpsc::UnboundedSender<Frame>, // STOP_SENDING
     inbound_data: mpsc::UnboundedReceiver<Stream>,
     inbound_reset: mpsc::UnboundedReceiver<ResetStream>,
+    unread: Unread,
 
     /// Received but unread chunks, in stream order. A queue rather than a single
     /// chunk because `closed` also drains STREAM frames to observe the FIN, so
@@ -2431,8 +2547,8 @@ pub struct RecvStream {
     recv_credit: Credit,
     conn_recv_credit: Credit,
 
-    // Stream count credit — consume(1) on drop triggers MAX_STREAMS
-    recv_streams_credit: Option<Credit>,
+    // Held until drop; see `StreamSlot`.
+    _slot: Option<Arc<StreamSlot>>,
 }
 
 impl RecvStream {
@@ -2472,6 +2588,21 @@ impl RecvStream {
         Some(data)
     }
 
+    /// Stop accepting data and return every unread byte to the connection window.
+    /// Data the reader queues afterwards is its own to credit; see [`Unread`].
+    fn discard(&mut self) {
+        let buffered: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
+        let unread = buffered + self.unread.stop();
+        // Already counted in `unread`; drop the queue to free it now.
+        self.inbound_data.close();
+        while self.inbound_data.try_recv().is_ok() {}
+        if self.version.is_qmux() && unread > 0 {
+            if let Some(new_max) = self.conn_recv_credit.consume(unread) {
+                self.outbound_priority.send(Frame::MaxData(new_max)).ok();
+            }
+        }
+    }
+
     /// Report consumed bytes to flow control, sending window updates as needed.
     fn report_consumed(&self, len: u64) {
         if !self.version.is_qmux() {
@@ -2500,17 +2631,7 @@ impl Drop for RecvStream {
         if !self.fin && self.closed.is_none() {
             generic::RecvStream::stop(self, 0);
         }
-
-        // Replenish stream count when this recv half is done
-        if let Some(credit) = &self.recv_streams_credit {
-            if let Some(new_max) = credit.consume(1) {
-                let frame = match self.id.dir() {
-                    StreamDir::Bi => Frame::MaxStreamsBidi(new_max),
-                    StreamDir::Uni => Frame::MaxStreamsUni(new_max),
-                };
-                self.outbound_priority.send(frame).ok();
-            }
-        }
+        self.discard();
     }
 }
 
@@ -2534,6 +2655,7 @@ impl generic::RecvStream for RecvStream {
             tokio::select! {
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
+                    self.unread.take(stream.data.len() as u64);
                     self.fin = stream.fin;
                     self.recv_data(stream.data);
                 }
@@ -2575,6 +2697,7 @@ impl generic::RecvStream for RecvStream {
 
         self.outbound_priority.send(frame.into()).ok();
         self.closed = Some(Error::StreamStop(code));
+        self.discard();
     }
 
     async fn closed(&mut self) -> Result<(), Self::Error> {
@@ -2595,6 +2718,7 @@ impl generic::RecvStream for RecvStream {
                 // queue behind anything a partial read left unread.
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
+                    self.unread.take(stream.data.len() as u64);
                     self.recv_data(stream.data);
                     self.fin = stream.fin;
                 }
@@ -3067,18 +3191,21 @@ mod recv_open_tests {
     use web_transport_proto::VarInt;
 
     use super::{Reader, Session, Transport, Writer};
-    use crate::proto::{Frame, ResetStream, Stream};
+    use crate::proto::{Frame, Ping, ResetStream, Stream};
     use crate::{Config, Error, StreamDir, StreamId, Version};
 
-    /// A transport whose inbound frames are scripted through a channel; outbound
-    /// writes are discarded. Once the script is drained, `recv` parks forever so
-    /// the session's run loop keeps running (rather than seeing a closed
-    /// transport and tearing down).
+    /// A transport whose inbound frames are scripted through a channel and whose
+    /// outbound records are forwarded to another. Once the script is drained,
+    /// `recv` parks forever so the session's run loop keeps running (rather than
+    /// seeing a closed transport and tearing down).
     struct ScriptedTransport {
         incoming: mpsc::UnboundedReceiver<Bytes>,
+        outgoing: mpsc::UnboundedSender<Bytes>,
     }
 
-    struct ScriptedWriter;
+    struct ScriptedWriter {
+        outgoing: mpsc::UnboundedSender<Bytes>,
+    }
 
     struct ScriptedReader {
         incoming: mpsc::UnboundedReceiver<Bytes>,
@@ -3090,7 +3217,9 @@ mod recv_open_tests {
 
         fn split(self) -> (ScriptedWriter, ScriptedReader) {
             (
-                ScriptedWriter,
+                ScriptedWriter {
+                    outgoing: self.outgoing,
+                },
                 ScriptedReader {
                     incoming: self.incoming,
                 },
@@ -3099,7 +3228,9 @@ mod recv_open_tests {
     }
 
     impl Writer for ScriptedWriter {
-        async fn send(&mut self, _data: Bytes) -> Result<(), Error> {
+        async fn send(&mut self, data: Bytes) -> Result<(), Error> {
+            // Most tests ignore what the session writes.
+            self.outgoing.send(data).ok();
             Ok(())
         }
 
@@ -3117,11 +3248,28 @@ mod recv_open_tests {
         }
     }
 
-    /// A client session fed by a scripted transport, plus the sender for inbound
-    /// frames. QMux01, where the closed-stream tracking is active.
-    fn scripted_session_with_config(config: Config) -> (Session, mpsc::UnboundedSender<Bytes>) {
+    /// A client session fed by a scripted transport, the sender for inbound
+    /// frames, and the receiver of the records it writes.
+    fn scripted_peer(
+        config: Config,
+    ) -> (
+        Session,
+        mpsc::UnboundedSender<Bytes>,
+        mpsc::UnboundedReceiver<Bytes>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let session = Session::new(ScriptedTransport { incoming: rx }, false, config);
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let transport = ScriptedTransport {
+            incoming: rx,
+            outgoing: out_tx,
+        };
+        (Session::new(transport, false, config), tx, out_rx)
+    }
+
+    /// A client session fed by a scripted transport, plus the sender for inbound
+    /// frames.
+    fn scripted_session_with_config(config: Config) -> (Session, mpsc::UnboundedSender<Bytes>) {
+        let (session, tx, _) = scripted_peer(config);
         (session, tx)
     }
 
@@ -3136,8 +3284,17 @@ mod recv_open_tests {
     }
 
     fn uni_stream_at(index: u64, offset: u64, data: &'static [u8], fin: bool) -> Bytes {
+        stream_at(
+            StreamId::new(index, StreamDir::Uni, true),
+            offset,
+            data,
+            fin,
+        )
+    }
+
+    fn stream_at(id: StreamId, offset: u64, data: &'static [u8], fin: bool) -> Bytes {
         Frame::Stream(Stream {
-            id: StreamId::new(index, StreamDir::Uni, true),
+            id,
             offset,
             data: Bytes::from_static(data),
             fin,
@@ -3148,8 +3305,12 @@ mod recv_open_tests {
 
     /// Encode a RESET_STREAM frame on a server-initiated uni stream.
     fn uni_reset(index: u64, final_size: u64) -> Bytes {
+        reset(StreamId::new(index, StreamDir::Uni, true), final_size)
+    }
+
+    fn reset(id: StreamId, final_size: u64) -> Bytes {
         Frame::ResetStream(ResetStream {
-            id: StreamId::new(index, StreamDir::Uni, true),
+            id,
             code: VarInt::from_u32(0),
             final_size,
             reliable_size: None,
@@ -3334,6 +3495,160 @@ mod recv_open_tests {
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"12345");
     }
 
+    /// A 100-byte connection and stream window, so a few streams exhaust it.
+    fn small_window() -> Config {
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 100;
+        config.max_stream_data_uni = 100;
+        config.max_stream_data_bidi_local = 100;
+        config
+    }
+
+    /// Send a QX_PING request and collect every frame the session writes up to
+    /// its response, which follows everything the frames before it caused.
+    async fn sync(
+        tx: &mpsc::UnboundedSender<Bytes>,
+        out: &mut mpsc::UnboundedReceiver<Bytes>,
+        sequence: u64,
+    ) -> Vec<Frame> {
+        let ping = Frame::Ping(Ping {
+            sequence,
+            response: false,
+        });
+        tx.send(ping.encode(Version::QMux01).unwrap()).unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let record = tokio::time::timeout(Duration::from_secs(1), out.recv())
+                .await
+                .expect("no ping response")
+                .expect("session stopped writing");
+            frames.extend(Frame::decode_record(record).unwrap());
+            if frames
+                .iter()
+                .any(|f| matches!(f, Frame::Ping(p) if p.response && p.sequence == sequence))
+            {
+                return frames;
+            }
+        }
+    }
+
+    fn max_data(frames: &[Frame]) -> Vec<u64> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::MaxData(max) => Some(*max),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn accept(session: &Session) -> super::RecvStream {
+        tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed")
+    }
+
+    /// Streams dropped with unread data return it to the connection window, so
+    /// a peer that fills more than the window across them can still open a
+    /// fresh stream.
+    #[tokio::test]
+    async fn dropped_streams_return_connection_credit() {
+        let (session, tx) = scripted_session_with_config(small_window());
+
+        for index in 0..4 {
+            tx.send(uni_stream(index, &[0; 60], false)).unwrap();
+            drop(accept(&session).await);
+        }
+
+        tx.send(uni_stream(4, &[0; 60], true)).unwrap();
+        let mut recv = accept(&session).await;
+        assert_eq!(recv.read_all().await.unwrap().len(), 60);
+    }
+
+    /// RFC 9000 §4.5: data the peer sends after STOP_SENDING, up to its final
+    /// size, still counts against MAX_DATA, so it is credited back exactly once.
+    #[tokio::test]
+    async fn stopped_stream_credits_late_data() {
+        let (session, tx, mut out) = scripted_peer(small_window());
+
+        tx.send(uni_stream(0, &[0; 10], false)).unwrap();
+        accept(&session).await.stop(0);
+
+        // In flight before the peer saw STOP_SENDING. 70 of 100 consumed crosses
+        // the half-window threshold, so MAX_DATA advances to 70 + 100.
+        tx.send(uni_stream_at(0, 10, &[0; 60], false)).unwrap();
+        tx.send(uni_reset(0, 70)).unwrap();
+        // Retired: neither may count again.
+        tx.send(uni_stream_at(0, 70, &[0; 5], false)).unwrap();
+        tx.send(uni_reset(0, 70)).unwrap();
+
+        assert_eq!(max_data(&sync(&tx, &mut out, 0).await), [170]);
+    }
+
+    /// The RESET_STREAM gap on a stopped stream, bytes we never see, is
+    /// credited back once.
+    #[tokio::test]
+    async fn stopped_stream_credits_reset_gap() {
+        let (session, tx, mut out) = scripted_peer(small_window());
+
+        tx.send(uni_stream(0, &[0; 10], false)).unwrap();
+        accept(&session).await.stop(0);
+
+        tx.send(uni_reset(0, 70)).unwrap();
+        tx.send(uni_reset(0, 70)).unwrap();
+
+        assert_eq!(max_data(&sync(&tx, &mut out, 0).await), [170]);
+    }
+
+    /// The same accounting holds for a stream we opened, whose late frames
+    /// after retirement must not be charged either.
+    #[tokio::test]
+    async fn stopped_local_stream_credits_late_data() {
+        let (session, tx, mut out) = scripted_peer(small_window());
+        let params = Config::new(Version::QMux01).to_transport_params();
+        tx.send(
+            Frame::TransportParameters(params)
+                .encode(Version::QMux01)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (_send, mut recv) = tokio::time::timeout(Duration::from_secs(1), session.open_bi())
+            .await
+            .expect("open_bi timed out")
+            .expect("open_bi failed");
+        let id = StreamId::new(0, StreamDir::Bi, false);
+        tx.send(stream_at(id, 0, &[0; 10], false)).unwrap();
+        recv.stop(0);
+
+        // 40 of 100 consumed crosses the half-window threshold: MAX_DATA 140.
+        // The 30-byte reset gap then leaves the window short of another update.
+        tx.send(stream_at(id, 10, &[0; 30], false)).unwrap();
+        tx.send(reset(id, 70)).unwrap();
+        tx.send(stream_at(id, 70, &[0; 5], false)).unwrap();
+
+        assert_eq!(max_data(&sync(&tx, &mut out, 0).await), [140]);
+    }
+
+    /// A stopped stream keeps its MAX_STREAMS slot until its final size is
+    /// known, so a peer ignoring STOP_SENDING cannot open streams without bound.
+    #[tokio::test]
+    async fn stopped_stream_holds_its_stream_slot_until_reset() {
+        let mut config = Config::new(Version::QMux01);
+        config.max_streams_uni = 1;
+        let (session, tx, mut out) = scripted_peer(config);
+
+        tx.send(uni_stream(0, b"x", false)).unwrap();
+        drop(accept(&session).await);
+        let frames = sync(&tx, &mut out, 0).await;
+        assert!(!frames.iter().any(|f| matches!(f, Frame::MaxStreamsUni(_))));
+
+        tx.send(uni_reset(0, 1)).unwrap();
+        let frames = sync(&tx, &mut out, 1).await;
+        assert!(frames.iter().any(|f| matches!(f, Frame::MaxStreamsUni(2))));
+    }
+
     /// `closed` has to drain STREAM frames to observe the FIN, so the data it
     /// pulls off the wire must queue behind whatever a partial `read_chunk` left
     /// unread. Overwriting the unread remainder instead doesn't just lose those
@@ -3366,10 +3681,9 @@ mod recv_open_tests {
         assert_eq!(recv.read_all().await.unwrap().as_ref(), b"lloworld!");
     }
 
-    /// Streams raced against a dropped `RecvStream`: dropping it queues
-    /// STOP_SENDING, and the writer task removes the receive entry while the
-    /// reader handles the peer's next frame on that stream. Enough iterations
-    /// to land the removal mid-frame; a single lookup makes the race benign.
+    /// Streams raced against a dropped `RecvStream`: dropping it stops the
+    /// stream while the reader handles the peer's next frame on that stream.
+    /// Enough iterations to land the stop mid-frame.
     const RACE_ITERATIONS: u64 = 10_000;
 
     fn race_session() -> (Session, mpsc::UnboundedSender<Bytes>) {
@@ -3413,6 +3727,45 @@ mod recv_open_tests {
             tx.send(uni_stream(i, b"y", false)).unwrap();
             drop(recv);
         }
+    }
+
+    /// The reader's send lands in a window of a few instructions, so this race
+    /// needs more iterations than the others to hit it.
+    const DROP_RACE_ITERATIONS: u64 = 100_000;
+
+    /// Data the reader delivers while a dropped `RecvStream` drains its queue is
+    /// credited exactly once, by one side or the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_racing_drop_is_credited() {
+        // Wide enough that a peer sending 90 bytes a stream never outruns the
+        // credit `Credit` holds back below its update threshold.
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 1_000;
+        config.max_streams_uni = DROP_RACE_ITERATIONS + 1;
+        let (session, tx) = scripted_session_with_config(config);
+        for i in 0..DROP_RACE_ITERATIONS {
+            tx.send(uni_stream(i, &[0; 60], false)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("accept_uni timed out")
+                .expect("accept_uni failed");
+            tx.send(uni_stream_at(i, 60, &[0; 30], false)).unwrap();
+            drop(recv);
+            tx.send(uni_reset(i, 90)).unwrap();
+        }
+
+        // The reader handles frames in order, so once this stream is read every
+        // frame above has been credited, or lost.
+        tx.send(uni_stream(DROP_RACE_ITERATIONS, b"x", true))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed")
+            .read_all()
+            .await
+            .unwrap();
+        assert_eq!(session.conn_recv_credit.window(), 1_000);
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a
