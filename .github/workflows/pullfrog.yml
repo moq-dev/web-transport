@@ -36,17 +36,22 @@ jobs:
         with:
           determinate: false
       - name: Put the dev shell's tools on PATH
+        # bash, not the default shell, for pipefail: a failing print-dev-env
+        # must fail the step, not write an empty PATH.
+        shell: bash
         run: |
           nix print-dev-env --json |
             jq -r '.variables.PATH.value' |
             tr ':' '\n' | grep '^/nix/store/' | paste -sd: >>"$GITHUB_PATH"
-      # The installer wrote the job's token into world-readable nix.conf,
-      # where the agent's shell could read it.
+      # The installer wrote the job's token into world-readable nix.conf and
+      # nix.custom.conf, and into /nix/receipt.json's plan, where the agent's
+      # shell could read it.
       - name: Remove the job token from Nix's config
         env:
           TOKEN: ${{ github.token }}
         run: |
-          sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
+          sudo find /etc/nix -type f -exec sed -i '/^access-tokens/d' {} +
+          sudo chmod 0600 /nix/receipt.json
           if sudo grep -rqF "$TOKEN" /etc/nix; then
             echo "the job token is still under /etc/nix" >&2
             exit 1
