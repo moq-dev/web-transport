@@ -14,17 +14,20 @@ connection stalls.
 
 Port the fix from
 [moq-dev/web-transport#543](https://github.com/moq-dev/web-transport/pull/543)
-(the 0.5.4 release): drain until `TryRecvError::Disconnected`, which tokio
-returns for a closed receiver only once no send is in flight, and
-`std::thread::yield_now()` on `Empty`. Port its `data_racing_drop_is_credited`
-test, which needs a `#[cfg(test)]` `Credit::window` accessor (adapt it to
-main's `Credit`). On 0.5 that test failed about one run in three without the
-fix at 100k iterations (about 1.2 s) and passed every run with it.
+(the 0.5.4 release): a per-stream `Unread` counter (an `AtomicU64` with a
+stopped bit) shared by the backend `RecvState` and the `RecvStream`. The reader
+counts a chunk's bytes before queueing it, or credits them itself once the
+frontend has stopped. The frontend uncounts a chunk when it takes it, and
+`discard` sets the stopped bit and credits whatever is still counted.
+
+Don't drain until `TryRecvError::Disconnected` instead: tokio returns that for
+a closed receiver with a live sender only since 1.49, and qmux allows
+`tokio >= 1.27`, so on older tokio that loop spins forever (reproduced on #543).
+
+Port #543's `data_racing_drop_is_credited` test, which needs a `#[cfg(test)]`
+`Credit::window` accessor (adapt it to main's `Credit`). On 0.5, without the
+fix, that test failed about one run in three at 100k iterations (about 1.2 s);
+with it, it passed every run.
 
 Caused by: [moq-dev/web-transport#520](https://github.com/moq-dev/web-transport/pull/520)
 added `discard` with the `Empty`-terminated drain.
-
-## Related
-
-- [@moq/qmux 0.3.5](/quest/a0/qmux-js-release.md) - the JS side runs on one
-  thread, so it has no such race
