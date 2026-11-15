@@ -57,6 +57,10 @@ jobs:
             echo "the job token reached Nix's config" >&2
             exit 1
           fi
+          if ! nix store info --json | jq -e '.trusted == false or .trusted == 0' >/dev/null; then
+            echo "the Nix daemon trusts the runner user" >&2
+            exit 1
+          fi
       - name: Run agent
         uses: pullfrog/pullfrog@0741f79ecebfa4469a010644d2aed2d96d32d489 # v0.1.127
         with:
