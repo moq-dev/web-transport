@@ -35,25 +35,26 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@1d87d45818068401a10cf16bdc5f00b24994a83f # main
         with:
           determinate: false
+          # The agent's shell can reach the daemon and read /etc/nix and
+          # /nix/receipt.json: keep the job's token out of both, and keep the
+          # runner user untrusted, since a trusted user's settings, such as a
+          # post-build-hook, run as root.
+          github-token: ""
+          trust-runner-user: false
       - name: Put the dev shell's tools on PATH
         # bash, not the default shell, for pipefail: a failing print-dev-env
         # must fail the step, not write an empty PATH.
         shell: bash
+        env:
+          # Authenticated fetches of the flake's inputs, for this step only.
+          NIX_CONFIG: access-tokens = github.com=${{ github.token }}
+          TOKEN: ${{ github.token }}
         run: |
           nix print-dev-env --json |
             jq -r '.variables.PATH.value' |
             tr ':' '\n' | grep '^/nix/store/' | paste -sd: >>"$GITHUB_PATH"
-      # The installer wrote the job's token into world-readable nix.conf and
-      # nix.custom.conf, and into /nix/receipt.json's plan, where the agent's
-      # shell could read it.
-      - name: Remove the job token from Nix's config
-        env:
-          TOKEN: ${{ github.token }}
-        run: |
-          sudo find /etc/nix -type f -exec sed -i '/^access-tokens/d' {} +
-          sudo chmod 0600 /nix/receipt.json
-          if sudo grep -rqF "$TOKEN" /etc/nix; then
-            echo "the job token is still under /etc/nix" >&2
+          if sudo grep -rqF "$TOKEN" /etc/nix /nix/receipt.json; then
+            echo "the job token reached Nix's config" >&2
             exit 1
           fi
       - name: Run agent
