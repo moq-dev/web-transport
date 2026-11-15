@@ -25,8 +25,9 @@ Decided 2026-11-14 (maintainer, /quest-plan):
   published.
 - ✅ An agent publishes after the maintainer merges (rejected: the maintainer
   publishes by hand). Merging the audited PR is the approval. Then run
-  `cargo publish -p qmux` from the merged head, and push the tag with
-  `git push origin refs/tags/qmux-v0.5.4`, as for 0.5.3
+  `cargo publish -p qmux` from the merged head, tag that commit with
+  `git tag qmux-v0.5.4 <merged-head>` (`cargo publish` makes no tag), and push
+  it with `git push origin refs/tags/qmux-v0.5.4`, as for 0.5.3
   ([#461](https://github.com/moq-dev/web-transport/pull/461)). This host's
   crates.io credentials allow it.
 

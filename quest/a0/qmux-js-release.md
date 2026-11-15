@@ -6,8 +6,8 @@
 [#516](https://github.com/moq-dev/web-transport/pull/516): cancelling a receive
 stream returns its connection credit. Browsers on the WebSocket fallback no
 longer stall once a connection window's worth of cancelled group data has piled
-up. 0.3.4 lacks the fix, and `@moq/net`'s `^0.3.3` range picks 0.3.5 up on
-install.
+up. 0.3.4 lacks the fix. `@moq/net`'s `^0.3.3` range allows 0.3.5, but a
+lockfile pinned to 0.3.4 stays there until moq-dev/moq#8780 bumps it.
 
 ## Plan
 
