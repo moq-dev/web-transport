@@ -40,8 +40,6 @@ binding still retires on STOP_SENDING.
 One PR, based on `qmux-v0.5.x`, holds the port, the 0.5.4 version bump, and the
 CHANGELOG entry. That branch has no release-plz and no `quest/`, so once 0.5.4
 is published, delete this quest in a main PR.
-[@moq/qmux 0.3.5](/quest/a0/qmux-js-release.md) can carry the deletion if it
-lands later.
 
 Validation: run the stall on the real crate before and after. Over TCP on
 localhost, a sender opens 16 KiB uni streams and the receiver accepts each and
@@ -54,7 +52,5 @@ connection flow control and credited only bytes the application reads.
 
 ## Related
 
-- [@moq/qmux 0.3.5](/quest/a0/qmux-js-release.md) - the same fix for the
-  browser side
 - [#507](https://github.com/moq-dev/web-transport/issues/507) - the leak, fixed
   on main by #520
