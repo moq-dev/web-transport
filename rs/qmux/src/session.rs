@@ -980,7 +980,6 @@ impl<R: Reader> SessionState<R> {
         }
     }
 
-    /// Per-direction open/closed bookkeeping for peer-initiated recv streams.
     /// Return `len` received bytes that nothing will read to the connection window.
     fn credit_conn(&self, len: u64) {
         if let Some(new_max) = self.conn_recv_credit.consume(len) {
@@ -988,6 +987,7 @@ impl<R: Reader> SessionState<R> {
         }
     }
 
+    /// Per-direction open/closed bookkeeping for peer-initiated recv streams.
     fn recv_open(&self, dir: StreamDir) -> &RecvOpen {
         match dir {
             StreamDir::Bi => &self.recv_open_bi,
@@ -1044,10 +1044,7 @@ impl<R: Reader> SessionState<R> {
                         let fin = stream.fin;
                         // The frontend stopped: nothing will read this, so credit
                         // it back now.
-                        if recv.inbound_data.send(stream).is_err()
-                            && self.config.version.is_qmux()
-                            && data_len > 0
-                        {
+                        if !recv.deliver(stream) && self.config.version.is_qmux() {
                             self.credit_conn(data_len);
                         }
                         if fin {
@@ -1135,9 +1132,11 @@ impl<R: Reader> SessionState<R> {
                     })
                 });
 
+                let unread = Unread::default();
                 let recv_backend = RecvState {
                     inbound_data: tx,
                     inbound_reset: tx2,
+                    unread: unread.clone(),
                     recv_credit: recv_credit.clone(),
                     recv_offset: data_len,
                     _slot: slot.clone(),
@@ -1147,6 +1146,7 @@ impl<R: Reader> SessionState<R> {
                     id: stream.id,
                     inbound_data: rx,
                     inbound_reset: rx2,
+                    unread,
                     outbound_priority: self.control.clone(),
                     buffer: VecDeque::new(),
                     closed: None,
@@ -1223,9 +1223,8 @@ impl<R: Reader> SessionState<R> {
                 // The application may already have dropped the stream; credit
                 // the data back as the fast path does.
                 if (data_len > 0 || fin)
-                    && recv_backend.inbound_data.send(stream).is_err()
+                    && !recv_backend.deliver(stream)
                     && self.config.version.is_qmux()
-                    && data_len > 0
                 {
                     self.credit_conn(data_len);
                 }
@@ -2029,9 +2028,11 @@ impl generic::Session for Session {
             u64::MAX
         };
         let recv_credit = Credit::new(recv_window);
+        let unread = Unread::default();
         let recv_backend = RecvState {
             inbound_data: tx,
             inbound_reset: tx2,
+            unread: unread.clone(),
             recv_credit: recv_credit.clone(),
             recv_offset: 0,
             _slot: None,
@@ -2040,6 +2041,7 @@ impl generic::Session for Session {
             id,
             inbound_data: rx,
             inbound_reset: rx2,
+            unread,
             outbound_priority: self.outbound_priority.clone(),
             buffer: VecDeque::new(),
             closed: None,
@@ -2428,15 +2430,72 @@ impl generic::SendStream for SendStream {
 /// Backend half of a receive stream, retired on FIN or RESET_STREAM. Under QMux it
 /// outlives a stopped or dropped [`RecvStream`] until then, so bytes the peer
 /// still sends up to the final size are credited back to the connection window
-/// (RFC 9000 §4.5). The frontend closes `inbound_data` when it stops, which is how
-/// the reader learns to credit late data instead of queueing it.
+/// (RFC 9000 §4.5). [`Unread`] tells the reader when to credit late data
+/// instead of queueing it.
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
+    unread: Unread,
     recv_credit: Credit,
     recv_offset: u64,
     // Held until retired; see `StreamSlot`.
     _slot: Option<Arc<StreamSlot>>,
+}
+
+impl RecvState {
+    /// Queue `stream` for the frontend. Returns false, queueing nothing, once
+    /// the frontend has stopped: its data is then the caller's to credit.
+    fn deliver(&self, stream: Stream) -> bool {
+        if !self.unread.add(stream.data.len() as u64) {
+            return false;
+        }
+        self.inbound_data.send(stream).ok();
+        true
+    }
+}
+
+/// Bytes the reader has queued for a [`RecvStream`] that it has not taken yet,
+/// plus whether it has stopped. Every queued byte is credited exactly once: by
+/// the frontend when it reads or discards it, or by the reader when it arrives
+/// after the stop.
+#[derive(Clone, Default)]
+struct Unread(Arc<AtomicU64>);
+
+impl Unread {
+    const STOPPED: u64 = 1 << 63;
+
+    /// Count `len` bytes about to be queued, unless the frontend stopped.
+    fn add(&self, len: u64) -> bool {
+        let mut queued = self.0.load(Ordering::Acquire);
+        while queued & Self::STOPPED == 0 {
+            match self.0.compare_exchange_weak(
+                queued,
+                queued + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => queued = actual,
+            }
+        }
+        false
+    }
+
+    /// Uncount `len` bytes the frontend took off the queue.
+    fn take(&self, len: u64) {
+        self.0.fetch_sub(len, Ordering::AcqRel);
+    }
+
+    /// Mark the frontend stopped, returning the bytes still queued the first
+    /// time and zero after.
+    fn stop(&self) -> u64 {
+        let queued = self.0.fetch_or(Self::STOPPED, Ordering::AcqRel);
+        if queued & Self::STOPPED == 0 {
+            queued
+        } else {
+            0
+        }
+    }
 }
 
 /// A peer-initiated QMux stream's MAX_STREAMS slot, shared by the backend entry
@@ -2469,6 +2528,7 @@ pub struct RecvStream {
     outbound_priority: mpsc::UnboundedSender<Frame>, // STOP_SENDING
     inbound_data: mpsc::UnboundedReceiver<Stream>,
     inbound_reset: mpsc::UnboundedReceiver<ResetStream>,
+    unread: Unread,
 
     /// Received but unread chunks, in stream order. A queue rather than a single
     /// chunk because `closed` also drains STREAM frames to observe the FIN, so
@@ -2529,20 +2589,13 @@ impl RecvStream {
     }
 
     /// Stop accepting data and return every unread byte to the connection window.
-    /// Closing the channel first makes the drain exact: anything the reader sends
-    /// afterwards fails, and the reader credits it instead.
+    /// Data the reader queues afterwards is its own to credit; see [`Unread`].
     fn discard(&mut self) {
+        let buffered: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
+        let unread = buffered + self.unread.stop();
+        // Already counted in `unread`; drop the queue to free it now.
         self.inbound_data.close();
-        let mut unread: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
-        // A send the reader began before `close` succeeds even if it lands after
-        // the queue looks empty; `Disconnected` means none is still in flight.
-        loop {
-            match self.inbound_data.try_recv() {
-                Ok(stream) => unread += stream.data.len() as u64,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-                Err(mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
-            }
-        }
+        while self.inbound_data.try_recv().is_ok() {}
         if self.version.is_qmux() && unread > 0 {
             if let Some(new_max) = self.conn_recv_credit.consume(unread) {
                 self.outbound_priority.send(Frame::MaxData(new_max)).ok();
@@ -2602,6 +2655,7 @@ impl generic::RecvStream for RecvStream {
             tokio::select! {
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
+                    self.unread.take(stream.data.len() as u64);
                     self.fin = stream.fin;
                     self.recv_data(stream.data);
                 }
@@ -2664,6 +2718,7 @@ impl generic::RecvStream for RecvStream {
                 // queue behind anything a partial read left unread.
                 Some(stream) = self.inbound_data.recv() => {
                     assert_eq!(stream.id, self.id);
+                    self.unread.take(stream.data.len() as u64);
                     self.recv_data(stream.data);
                     self.fin = stream.fin;
                 }
