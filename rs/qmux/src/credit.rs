@@ -252,6 +252,14 @@ impl Credit {
         drop(inner);
         wake_all(wakers);
     }
+
+    /// The receive window once every consumed byte is advertised: the initial
+    /// window when every received byte has been consumed.
+    #[cfg(test)]
+    pub fn window(&self) -> u64 {
+        let state = &self.inner.lock().unwrap().state;
+        state.max - state.used + state.released
+    }
 }
 
 #[cfg(test)]
