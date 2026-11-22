@@ -2123,7 +2123,7 @@ describe("cancelling a send stream", () => {
 		const { writable, id } = await openSendStream(session, peer, "outgoing uni");
 		await waitFor(() => peer.has("transport_parameters"));
 
-		// Hold the write in the socket so the sink's abort() can't run yet.
+		// Hold the write in the socket so STOP_SENDING arrives after the local abort's reset.
 		peer.blockWrites();
 		const writer = writable.getWriter();
 		const write = settleTo(writer.write(new Uint8Array([1, 2, 3])));
