@@ -503,9 +503,19 @@ interface StreamFlowState {
 	sendCredit: Credit;
 	/** Bytes that have actually reached the transport for this send half. */
 	sendOffset: bigint;
+	/** Bytes in this send half's frame queued in the scheduler, which reach the
+	 *  wire unless a reset drops the frame before the socket takes it. */
+	sendQueued: bigint;
 	recvMax: bigint;
 	recvOffset: bigint;
 	recvConsumed: bigint;
+}
+
+/** A local send half: its writable's controller, and the controller that
+ *  cancels its pending write once the stream is reset. */
+interface SendStream {
+	controller: WritableStreamDefaultController;
+	cancel: AbortController;
 }
 
 /** Compact open/terminal tracking for peer-initiated receive streams.
@@ -551,7 +561,7 @@ export default class Session implements WebTransport {
 	#closed?: Error;
 	#closeReason?: Error;
 
-	#sendStreams = new Map<bigint, WritableStreamDefaultController>();
+	#sendStreams = new Map<bigint, SendStream>();
 	#recvStreams = new Map<bigint, RecvStream>();
 
 	#nextUniStreamId = 0n;
@@ -1094,17 +1104,14 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	async #claimSendCredit(streamId: bigint, desired: bigint): Promise<bigint> {
-		const flow = this.#streamFlow.get(streamId);
-		if (!flow) return desired;
-
+	async #claimSendCredit(flow: StreamFlowState, desired: bigint, signal: AbortSignal): Promise<bigint> {
 		while (true) {
 			// 1. Try stream credit
 			const streamClaimed = flow.sendCredit.tryClaim(desired);
 			if (streamClaimed === 0n) {
 				if (this.#closed) throw this.#closed;
 				// Wait for stream credit, then release and retry to coordinate with conn credit
-				const claimed = await flow.sendCredit.claim(desired);
+				const claimed = await flow.sendCredit.claim(desired, signal);
 				flow.sendCredit.release(claimed);
 				continue;
 			}
@@ -1114,7 +1121,7 @@ export default class Session implements WebTransport {
 			if (connClaimed === 0n) {
 				flow.sendCredit.release(streamClaimed);
 				if (this.#closed) throw this.#closed;
-				const claimed = await this.#connCredit.claim(1n);
+				const claimed = await this.#connCredit.claim(1n, signal);
 				this.#connCredit.release(claimed);
 				continue;
 			}
@@ -1324,6 +1331,7 @@ export default class Session implements WebTransport {
 				this.#streamFlow.set(streamId, {
 					sendCredit: new Credit(sendMax),
 					sendOffset: 0n,
+					sendQueued: 0n,
 					recvMax,
 					recvOffset: 0n,
 					recvConsumed: 0n,
@@ -1381,34 +1389,7 @@ export default class Session implements WebTransport {
 
 			if (frame.id.dir === Stream.Dir.Bi) {
 				// Incoming bidirectional stream
-				const writer = new WritableStream<Uint8Array>({
-					start: (controller) => {
-						this.#sendStreams.set(streamId, controller);
-					},
-					write: async (chunk) => {
-						await this.#sendStreamData(frame.id, chunk);
-					},
-					abort: (e) => {
-						this.#scheduler?.dropStream(streamId, e instanceof Error ? e : new Error("stream aborted"));
-						this.#sendPriorityFrame({
-							type: "reset_stream",
-							id: frame.id,
-							code: VarInt.from(resetCode(e)),
-							finalSize: this.#sendFinalSize(streamId),
-						});
-
-						this.#sendStreams.delete(streamId);
-						this.#maybeDeleteStreamFlow(streamId);
-					},
-					close: async () => {
-						await this.#sendStreamFin(frame.id);
-
-						this.#sendStreams.delete(streamId);
-						this.#scheduler?.forget(streamId);
-						this.#maybeDeleteStreamFlow(streamId);
-					},
-				});
-				this.#attachSendOrder(writer, streamId, DEFAULT_SEND_ORDER);
+				const writer = this.#createSendStream(frame.id, DEFAULT_SEND_ORDER);
 
 				if (!this.#incomingBidirectionalQueue.push({ readable: reader, writable: writer }, onAccept, onDrop)) {
 					// Keep the refused stream registered until FIN/RESET so in-flight frames
@@ -1515,27 +1496,64 @@ export default class Session implements WebTransport {
 
 	#handleStopSending(frame: Frame.StopSending) {
 		this.#validateSendId(frame.id, "STOP_SENDING");
-		const streamId = frame.id.value.value;
-		const stream = this.#sendStreams.get(streamId);
+		const stream = this.#sendStreams.get(frame.id.value.value);
 		if (!stream) return;
 
 		const stopped = new StreamError(streamCode(frame.code.value), "STOP_SENDING");
-		stream.error(stopped);
-		this.#sendStreams.delete(streamId);
-		this.#scheduler?.dropStream(streamId, stopped);
+		stream.controller.error(stopped);
+		this.#resetSendStream(frame.id, frame.code, stopped);
+	}
 
-		this.#sendPriorityFrame({
-			type: "reset_stream",
-			id: frame.id,
-			code: frame.code,
-			finalSize: this.#sendFinalSize(streamId),
-		});
+	/** Reset a send half: cancel its pending write, drop its queued frame, and
+	 *  send RESET_STREAM. Runs once, for whichever of a local abort or the
+	 *  peer's STOP_SENDING comes first. */
+	#resetSendStream(id: Stream.Id, code: VarInt, reason: unknown) {
+		const streamId = id.value.value;
+		const stream = this.#sendStreams.get(streamId);
+		if (!stream) return;
+		this.#sendStreams.delete(streamId);
+		stream.cancel.abort(reason);
+
+		const err = reason instanceof Error ? reason : new Error("stream aborted");
+		const dropped = this.#scheduler?.dropStream(streamId, err) ?? false;
+		// A frame the scheduler already handed to the socket still reaches the
+		// peer, so the final size must count it.
+		const flow = this.#streamFlow.get(streamId);
+		const finalSize = flow ? flow.sendOffset + (dropped ? 0n : flow.sendQueued) : 0n;
+		this.#sendPriorityFrame({ type: "reset_stream", id, code, finalSize });
 
 		this.#maybeDeleteStreamFlow(streamId);
 	}
 
-	#sendFinalSize(streamId: bigint): bigint {
-		return this.#streamFlow.get(streamId)?.sendOffset ?? 0n;
+	/** Create a send half's writable, registered until it closes or resets. */
+	#createSendStream(id: Stream.Id, sendOrder: number): WritableStream<Uint8Array> {
+		const streamId = id.value.value;
+		const cancel = new AbortController();
+		const writable = new WritableStream<Uint8Array>({
+			start: (controller) => {
+				this.#sendStreams.set(streamId, { controller, cancel });
+				// The sink's abort() runs only after an in-flight write settles, and
+				// that write may be waiting for credit, so reset on the signal instead.
+				controller.signal.addEventListener(
+					"abort",
+					() => {
+						const reason: unknown = controller.signal.reason;
+						this.#resetSendStream(id, VarInt.from(resetCode(reason)), reason);
+					},
+					{ once: true },
+				);
+			},
+			write: (chunk) => this.#sendStreamData(id, chunk, cancel.signal),
+			close: async () => {
+				await this.#sendStreamFin(id);
+
+				this.#sendStreams.delete(streamId);
+				this.#scheduler?.forget(streamId);
+				this.#maybeDeleteStreamFlow(streamId);
+			},
+		});
+		this.#attachSendOrder(writable, streamId, sendOrder);
+		return writable;
 	}
 
 	#sendTransportParameters() {
@@ -1595,11 +1613,13 @@ export default class Session implements WebTransport {
 		await scheduler.enqueueStream(streamId, bytes);
 	}
 
-	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array) {
+	async #sendStreamDataWithFlowControl(id: Stream.Id, streamId: bigint, data: Uint8Array, signal: AbortSignal) {
 		const flow = this.#streamFlow.get(streamId);
 		if (!flow) throw new Error(`missing flow state for stream ${streamId}`);
 
 		for (let offset = 0; offset < data.byteLength; ) {
+			// A reset may have landed while the previous frame was in the socket.
+			signal.throwIfAborted();
 			const remaining = BigInt(data.byteLength - offset);
 			// Size from the peer's frame budget and this frame's actual header, then
 			// apply the compatibility ceiling for released receivers.
@@ -1607,45 +1627,52 @@ export default class Session implements WebTransport {
 			const chunkMax = Number(payloadMax < remaining ? payloadMax : remaining);
 
 			// Claim flow control credit (stream + connection)
-			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax));
+			const allowed = await this.#claimSendCredit(flow, BigInt(chunkMax), signal);
+			const release = () => {
+				flow.sendCredit.release(allowed);
+				this.#connCredit.release(allowed);
+			};
+			// The stream may have reset while the claim resolved; no STREAM frame
+			// may follow its RESET_STREAM.
+			if (signal.aborted) {
+				release();
+				throw signal.reason;
+			}
+
 			const sendable = Number(allowed);
-
 			const chunk = data.subarray(offset, offset + sendable);
-			const sendOffset = flow.sendOffset;
-
+			flow.sendQueued = allowed;
 			try {
 				await this.#enqueueStreamFrame(streamId, {
 					type: "stream",
 					id,
-					offset: sendOffset,
+					offset: flow.sendOffset,
 					data: chunk,
 					fin: false,
 				});
 			} catch (e) {
-				// Return claimed credits on send failure
-				if (sendable > 0) {
-					const flow = this.#streamFlow.get(streamId);
-					if (flow) flow.sendCredit.release(BigInt(sendable));
-					this.#connCredit.release(BigInt(sendable));
-				}
-				throw e;
+				release();
+				throw signal.aborted ? signal.reason : e;
+			} finally {
+				flow.sendQueued = 0n;
 			}
 
-			flow.sendOffset += BigInt(sendable);
+			flow.sendOffset += allowed;
 			offset += sendable;
 		}
 	}
 
-	async #sendStreamData(id: Stream.Id, data: Uint8Array) {
+	async #sendStreamData(id: Stream.Id, data: Uint8Array, signal: AbortSignal) {
 		const streamId = id.value.value;
 		if (isQmux(this.#version)) {
-			await this.#sendStreamDataWithFlowControl(id, streamId, data);
+			await this.#sendStreamDataWithFlowControl(id, streamId, data, signal);
 		} else {
 			// The legacy binding carries no offset field, so every frame's header —
 			// and therefore its payload budget — is the same size. The budget is
 			// MAX_FRAME_SIZE there, so it always fits in a number.
 			const chunkMax = Number(this.#maxStreamPayload(id, 0n));
 			for (let offset = 0; offset < data.byteLength; offset += chunkMax) {
+				signal.throwIfAborted();
 				const end = Math.min(offset + chunkMax, data.byteLength);
 				const chunk = data.subarray(offset, end);
 				await this.#enqueueStreamFrame(streamId, { type: "stream", id, data: chunk, fin: false });
@@ -1723,40 +1750,14 @@ export default class Session implements WebTransport {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataBidiRemote),
 				sendOffset: 0n,
+				sendQueued: 0n,
 				recvMax: this.#ourParams.initialMaxStreamDataBidiLocal,
 				recvOffset: 0n,
 				recvConsumed: 0n,
 			});
 		}
 
-		const writer = new WritableStream<Uint8Array>({
-			start: (controller) => {
-				this.#sendStreams.set(streamIdVal, controller);
-			},
-			write: async (chunk) => {
-				await this.#sendStreamData(streamId, chunk);
-			},
-			abort: (e) => {
-				this.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
-				this.#sendPriorityFrame({
-					type: "reset_stream",
-					id: streamId,
-					code: VarInt.from(resetCode(e)),
-					finalSize: this.#sendFinalSize(streamIdVal),
-				});
-
-				this.#sendStreams.delete(streamIdVal);
-				this.#maybeDeleteStreamFlow(streamIdVal);
-			},
-			close: async () => {
-				await this.#sendStreamFin(streamId);
-
-				this.#sendStreams.delete(streamIdVal);
-				this.#scheduler?.forget(streamIdVal);
-				this.#maybeDeleteStreamFlow(streamIdVal);
-			},
-		});
-		this.#attachSendOrder(writer, streamIdVal, sendOrder);
+		const writer = this.#createSendStream(streamId, sendOrder);
 
 		const recvStream = new RecvStream(
 			(bytes) => {
@@ -1799,42 +1800,14 @@ export default class Session implements WebTransport {
 			this.#streamFlow.set(streamIdVal, {
 				sendCredit: new Credit(this.#peerParams.initialMaxStreamDataUni),
 				sendOffset: 0n,
+				sendQueued: 0n,
 				recvMax: 0n,
 				recvOffset: 0n,
 				recvConsumed: 0n,
 			});
 		}
 
-		const session = this;
-
-		const writer = new WritableStream<Uint8Array>({
-			start: (controller) => {
-				session.#sendStreams.set(streamIdVal, controller);
-			},
-			async write(chunk) {
-				await session.#sendStreamData(streamId, chunk);
-			},
-			abort(e) {
-				session.#scheduler?.dropStream(streamIdVal, e instanceof Error ? e : new Error("stream aborted"));
-				session.#sendPriorityFrame({
-					type: "reset_stream",
-					id: streamId,
-					code: VarInt.from(resetCode(e)),
-					finalSize: session.#sendFinalSize(streamIdVal),
-				});
-
-				session.#sendStreams.delete(streamIdVal);
-				session.#maybeDeleteStreamFlow(streamIdVal);
-			},
-			async close() {
-				await session.#sendStreamFin(streamId);
-
-				session.#sendStreams.delete(streamIdVal);
-				session.#scheduler?.forget(streamIdVal);
-				session.#maybeDeleteStreamFlow(streamIdVal);
-			},
-		});
-		this.#attachSendOrder(writer, streamIdVal, sendOrder);
+		const writer = this.#createSendStream(streamId, sendOrder);
 
 		return writer;
 	}
@@ -1866,9 +1839,9 @@ export default class Session implements WebTransport {
 		// readable closes cleanly instead of erroring, matching the incoming
 		// stream controllers below.
 		this.datagrams.close(this.#closeReason);
-		for (const c of this.#sendStreams.values()) {
+		for (const { controller } of this.#sendStreams.values()) {
 			try {
-				c.error(this.#closed);
+				controller.error(this.#closed);
 			} catch {}
 		}
 		const closeErr = this.#closed ?? this.#closeReason ?? new Error("Connection closed");

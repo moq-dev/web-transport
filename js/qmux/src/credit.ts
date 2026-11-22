@@ -27,7 +27,7 @@ export class Credit {
 	#released = 0n;
 	#closed = false;
 	#closeReason?: Error;
-	#waiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+	#waiters = new Set<{ resolve: () => void; reject: (err: Error) => void }>();
 
 	constructor(max: bigint) {
 		this.#used = 0n;
@@ -45,18 +45,35 @@ export class Credit {
 	}
 
 	/** Claim up to `limit` units, waiting until credit is available.
-	 *  Rejects if the credit has been closed. Returns 0n for zero-limit requests. */
-	async claim(limit: bigint): Promise<bigint> {
+	 *  Rejects if the credit has been closed, or with `signal`'s reason once it
+	 *  aborts. Returns 0n for zero-limit requests. */
+	async claim(limit: bigint, signal?: AbortSignal): Promise<bigint> {
 		if (limit === 0n) return 0n;
 
 		while (true) {
+			signal?.throwIfAborted();
 			if (this.#closed) throw this.#closeReason ?? new Error("closed");
 
 			const claimed = this.tryClaim(limit);
 			if (claimed > 0n) return claimed;
 
 			await new Promise<void>((resolve, reject) => {
-				this.#waiters.push({ resolve, reject });
+				const onAbort = () => {
+					this.#waiters.delete(waiter);
+					reject(signal?.reason);
+				};
+				const waiter = {
+					resolve: () => {
+						signal?.removeEventListener("abort", onAbort);
+						resolve();
+					},
+					reject: (err: Error) => {
+						signal?.removeEventListener("abort", onAbort);
+						reject(err);
+					},
+				};
+				this.#waiters.add(waiter);
+				signal?.addEventListener("abort", onAbort, { once: true });
 			});
 		}
 	}
@@ -81,7 +98,7 @@ export class Credit {
 		this.#closed = true;
 		this.#closeReason ??= reason ?? new Error("closed");
 		const waiters = this.#waiters;
-		this.#waiters = [];
+		this.#waiters = new Set();
 		for (const { reject } of waiters) reject(this.#closeReason);
 	}
 
@@ -126,7 +143,7 @@ export class Credit {
 
 	#wake(): void {
 		const waiters = this.#waiters;
-		this.#waiters = [];
+		this.#waiters = new Set();
 		for (const { resolve } of waiters) resolve();
 	}
 }
