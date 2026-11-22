@@ -12,11 +12,16 @@ a quest-only change, and on the release PR's run 44079826227 on 2026-11-17.
 ## Plan
 
 Find whether this is a real bug or the test racing. The server calls
-`server.close()` right after `request.accept()` returns. If `accept()` returns
-before the CONNECT's 200 response reaches the socket, close tears the
-connection down first and the browser never sees an established session.
-That would be a backend bug: an accepted session must be established for the
-peer before a later close. Otherwise, the test closes before the browser has
-handled the response it already sent, and it should wait for the browser's
-`ready`, without a sleep or retry. Reproduce by running the test in a loop
-under `just` or the `test-py.yml` steps until it fails.
+`server.close()` right after `request.accept()` returns. `accept()` returns once
+quinn's `Request::ok()` (`rs/web-transport-quinn/src/connect.rs`) has written
+the 200 to the CONNECT stream, not once the peer has it, and a QUIC close
+discards stream data not yet sent. So the browser may never see the 200 and
+reports a failed handshake. Decide whether `server.close()` should be graceful,
+flushing pending responses before CONNECTION_CLOSE as a server's
+close-everything call reasonably implies, or whether the test should first
+wait for the browser's `transport.ready`, without a sleep or retry. Record the
+choice and its reason in the PR.
+
+`py/web-transport/test-wheel.sh` runs the whole suite and takes no test
+selector, so add one, such as pytest arguments passed through, to repeat just
+this test in a loop until it fails.
