@@ -14,8 +14,8 @@
 		"test:browser": "playwright test --config rs/web-transport-wasm/browser/playwright.config.ts"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "^2.6.6",
-		"@playwright/test": "1.65.0",
+		"@biomejs/biome": "^2.6.7",
+		"@playwright/test": "1.65.1",
 		"publint": "^0.3.25"
 	}
 }
