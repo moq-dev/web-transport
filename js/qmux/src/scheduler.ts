@@ -170,14 +170,16 @@ export class SendScheduler {
 		});
 	}
 
-	/** Drop a stream's pending data (reset / abort). Rejects its in-flight frame. */
-	dropStream(streamId: bigint, err: Error): void {
+	/** Drop a stream's pending data (reset / abort), rejecting its queued frame.
+	 *  Returns false when no frame was queued: a frame already handed to the
+	 *  socket can't be recalled and still reaches the peer. */
+	dropStream(streamId: bigint, err: Error): boolean {
 		this.#sendOrders.delete(streamId);
 		const waiter = this.#ready.get(streamId);
-		if (waiter) {
-			this.#ready.delete(streamId);
-			waiter.reject(err);
-		}
+		if (!waiter) return false;
+		this.#ready.delete(streamId);
+		waiter.reject(err);
+		return true;
 	}
 
 	/** Forget a stream that finished cleanly (its FIN is already queued/sent).

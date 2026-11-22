@@ -90,3 +90,37 @@ describe("Credit.increaseMax ignores stale limits", () => {
 		expect(credit.max).toBe(3n);
 	});
 });
+
+describe("Credit.claim cancellation", () => {
+	test("an already-aborted signal rejects with its reason, even with credit free", async () => {
+		const credit = new Credit(10n);
+		const reason = new Error("cancelled");
+		expect(await settle(credit.claim(1n, AbortSignal.abort(reason)))).toBe(reason);
+		expect(credit.available).toBe(10n);
+	});
+
+	test("aborting a parked claim rejects it and leaves later credit for others", async () => {
+		const credit = new Credit(0n);
+		const controller = new AbortController();
+		const reason = new Error("cancelled");
+		const cancelled = settle(credit.claim(5n, controller.signal));
+		const other = credit.claim(5n);
+
+		controller.abort(reason);
+		expect(await cancelled).toBe(reason);
+
+		credit.increaseMax(5n);
+		expect(await other).toBe(5n);
+		expect(credit.available).toBe(0n);
+	});
+
+	test("a claim satisfied before the abort keeps its credit", async () => {
+		const credit = new Credit(0n);
+		const controller = new AbortController();
+		const claim = credit.claim(3n, controller.signal);
+		credit.increaseMax(3n);
+		expect(await claim).toBe(3n);
+		controller.abort();
+		expect(credit.used).toBe(3n);
+	});
+});
