@@ -1993,3 +1993,177 @@ describe("STREAM frame size", () => {
 		session.close();
 	});
 });
+
+type SendSink = "outgoing bidi" | "outgoing uni" | "incoming bidi";
+type CreditWait = "stream" | "connection";
+
+/** Open a send half of the given kind and return it with its stream id. */
+async function openSendStream(
+	session: Session,
+	peer: FakePeer,
+	sink: SendSink,
+): Promise<{ writable: WritableStream<Uint8Array>; id: Stream.Id }> {
+	if (sink === "outgoing uni") {
+		return {
+			writable: await session.createUnidirectionalStream(),
+			id: Stream.Id.create(0n, Stream.Dir.Uni, false),
+		};
+	}
+	if (sink === "outgoing bidi") {
+		const { writable } = await session.createBidirectionalStream();
+		return { writable, id: Stream.Id.create(0n, Stream.Dir.Bi, false) };
+	}
+	const id = Stream.Id.create(0n, Stream.Dir.Bi, true);
+	peer.send({ type: "stream", id, offset: 0n, data: new Uint8Array([9]), fin: false });
+	const reader = session.incomingBidirectionalStreams.getReader();
+	const { value } = await reader.read();
+	reader.releaseLock();
+	return { writable: (value as WebTransportBidirectionalStream).writable, id };
+}
+
+/** The STREAM and RESET_STREAM frames the session sent on `id`, in wire order. */
+function sendFrames(peer: FakePeer, id: Stream.Id): Array<Frame.Data | Frame.ResetStream> {
+	return peer
+		.received()
+		.filter(
+			(f): f is Frame.Data | Frame.ResetStream =>
+				(f.type === "stream" || f.type === "reset_stream") && f.id.value.value === id.value.value,
+		);
+}
+
+/** Round-trip a ping, then let any frame queued behind it reach the wire. */
+async function drain(peer: FakePeer, sequence: bigint) {
+	peer.send({ type: "ping_request", sequence });
+	await peer.waitForFrame((f) => f.type === "ping_response" && f.sequence === sequence);
+	await settle();
+}
+
+describe("cancelling a send stream", () => {
+	afterEach(() => {
+		if (ORIGINAL_WSS === undefined) {
+			delete (globalThis as { WebSocketStream?: unknown }).WebSocketStream;
+		} else {
+			(globalThis as { WebSocketStream?: unknown }).WebSocketStream = ORIGINAL_WSS;
+		}
+	});
+
+	const sinks: SendSink[] = ["outgoing bidi", "outgoing uni", "incoming bidi"];
+	const waits: CreditWait[] = ["stream", "connection"];
+	const cases = sinks.flatMap((sink) => waits.map((wait) => [sink, wait] as const));
+
+	/** A 4-byte write that sends 2 bytes, then parks waiting for `wait` credit. */
+	async function blockedWrite(sink: SendSink, wait: CreditWait) {
+		const window = (kind: CreditWait) => (kind === wait ? 2n : 100_000n);
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({
+			type: "transport_parameters",
+			params: peerParams({
+				initialMaxData: window("connection"),
+				initialMaxStreamDataBidiLocal: window("stream"),
+				initialMaxStreamDataBidiRemote: window("stream"),
+				initialMaxStreamDataUni: window("stream"),
+			}),
+		});
+		const { writable, id } = await openSendStream(session, peer, sink);
+		const writer = writable.getWriter();
+		const write = settleTo(writer.write(new Uint8Array([1, 2, 3, 4])));
+		await peer.waitForFrame((f) => f.type === "stream" && f.id.value.value === id.value.value);
+		await flushMicrotasks();
+		return { session, peer, writer, write, id };
+	}
+
+	/** Grant more credit than the write needs, then check the stream ended in
+	 *  one RESET_STREAM whose final size counts the 2 bytes sent before it. */
+	async function expectOneReset(peer: FakePeer, id: Stream.Id) {
+		peer.send({ type: "max_data", max: 1_000_000n });
+		peer.send({ type: "max_stream_data", id, max: 1_000_000n });
+		await drain(peer, 1n);
+
+		const frames = sendFrames(peer, id);
+		const resets = frames.filter((f) => f.type === "reset_stream");
+		expect(resets.length).toBe(1);
+		expect(frames.at(-1)?.type).toBe("reset_stream");
+		expect((resets[0] as Frame.ResetStream).finalSize).toBe(2n);
+		const sent = frames
+			.filter((f) => f.type === "stream")
+			.reduce((n, f) => n + (f as Frame.Data).data.byteLength, 0);
+		expect(sent).toBe(2);
+	}
+
+	test.each(cases)("%s: writer.abort() rejects a write waiting for %s credit", async (sink, wait) => {
+		const { session, peer, writer, write, id } = await blockedWrite(sink, wait);
+
+		const reason = new StreamError(7, "RESET_STREAM");
+		const abort = settleTo(writer.abort(reason));
+		expect(await write).toBe(reason);
+		expect(await abort).toBeUndefined();
+
+		await expectOneReset(peer, id);
+		expect((sendFrames(peer, id).at(-1) as Frame.ResetStream).code.value).toBe(7n);
+		session.close();
+	});
+
+	test.each(cases)("%s: STOP_SENDING rejects a write waiting for %s credit", async (sink, wait) => {
+		const { session, peer, write, id } = await blockedWrite(sink, wait);
+
+		peer.send({ type: "stop_sending", id, code: VarInt.from(5) });
+		const err = await write;
+		expect(err).toBeInstanceOf(StreamError);
+		expect((err as StreamError).streamErrorCode).toBe(5);
+
+		await expectOneReset(peer, id);
+		session.close();
+	});
+
+	test("STOP_SENDING racing writer.abort() sends one RESET_STREAM", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+		const { writable, id } = await openSendStream(session, peer, "outgoing uni");
+		await waitFor(() => peer.has("transport_parameters"));
+
+		// Hold the write in the socket so the sink's abort() can't run yet.
+		peer.blockWrites();
+		const writer = writable.getWriter();
+		const write = settleTo(writer.write(new Uint8Array([1, 2, 3])));
+		await flushMicrotasks();
+		const abort = settleTo(writer.abort(new Error("cancel")));
+		peer.send({ type: "stop_sending", id, code: VarInt.from(5) });
+		peer.send({ type: "ping_request", sequence: 1n });
+		await flushMicrotasks();
+		peer.unblockWrites();
+
+		await write;
+		expect(await abort).toBeUndefined();
+		await drain(peer, 2n);
+		const resets = sendFrames(peer, id).filter((f) => f.type === "reset_stream");
+		expect(resets.length).toBe(1);
+		expect((resets[0] as Frame.ResetStream).finalSize).toBe(3n);
+		session.close();
+	});
+
+	test("STOP_SENDING during a frame's socket write counts it in the final size", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+		const { writable, id } = await openSendStream(session, peer, "outgoing uni");
+		await waitFor(() => peer.has("transport_parameters"));
+
+		peer.blockWrites();
+		const writer = writable.getWriter();
+		const write = settleTo(writer.write(new Uint8Array([1, 2, 3])));
+		await flushMicrotasks();
+		peer.send({ type: "stop_sending", id, code: VarInt.from(5) });
+		peer.send({ type: "ping_request", sequence: 1n });
+		await flushMicrotasks();
+		peer.unblockWrites();
+
+		await write;
+		await drain(peer, 2n);
+		const frames = sendFrames(peer, id);
+		expect(frames.map((f) => f.type)).toEqual(["stream", "reset_stream"]);
+		expect((frames[1] as Frame.ResetStream).finalSize).toBe(3n);
+		session.close();
+	});
+});
