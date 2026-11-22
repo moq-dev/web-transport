@@ -1104,10 +1104,7 @@ export default class Session implements WebTransport {
 		}
 	}
 
-	async #claimSendCredit(streamId: bigint, desired: bigint, signal: AbortSignal): Promise<bigint> {
-		const flow = this.#streamFlow.get(streamId);
-		if (!flow) return desired;
-
+	async #claimSendCredit(flow: StreamFlowState, desired: bigint, signal: AbortSignal): Promise<bigint> {
 		while (true) {
 			// 1. Try stream credit
 			const streamClaimed = flow.sendCredit.tryClaim(desired);
@@ -1621,6 +1618,8 @@ export default class Session implements WebTransport {
 		if (!flow) throw new Error(`missing flow state for stream ${streamId}`);
 
 		for (let offset = 0; offset < data.byteLength; ) {
+			// A reset may have landed while the previous frame was in the socket.
+			signal.throwIfAborted();
 			const remaining = BigInt(data.byteLength - offset);
 			// Size from the peer's frame budget and this frame's actual header, then
 			// apply the compatibility ceiling for released receivers.
@@ -1628,7 +1627,7 @@ export default class Session implements WebTransport {
 			const chunkMax = Number(payloadMax < remaining ? payloadMax : remaining);
 
 			// Claim flow control credit (stream + connection)
-			const allowed = await this.#claimSendCredit(streamId, BigInt(chunkMax), signal);
+			const allowed = await this.#claimSendCredit(flow, BigInt(chunkMax), signal);
 			const release = () => {
 				flow.sendCredit.release(allowed);
 				this.#connCredit.release(allowed);

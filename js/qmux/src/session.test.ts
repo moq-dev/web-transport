@@ -2143,6 +2143,66 @@ describe("cancelling a send stream", () => {
 		session.close();
 	});
 
+	test("aborting a multi-frame write mid-socket-write keeps connection credit spent", async () => {
+		const maxData = 30_000n;
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams({ initialMaxData: maxData }) });
+		const first = await openSendStream(session, peer, "outgoing uni");
+		await waitFor(() => peer.has("transport_parameters"));
+
+		// The first frame sits in the socket write when the stream resets.
+		peer.blockWrites();
+		const writer = first.writable.getWriter();
+		const write = settleTo(writer.write(new Uint8Array(20_000)));
+		await flushMicrotasks();
+		const abort = settleTo(writer.abort(new Error("cancel")));
+		peer.unblockWrites();
+		expect(await write).toBeInstanceOf(Error);
+		await abort;
+
+		// A later stream may send only what the reset stream left of MAX_DATA.
+		const second = (await session.createUnidirectionalStream()).getWriter();
+		void settleTo(second.write(new Uint8Array(Number(maxData))));
+		await drain(peer, 1n);
+		const secondId = Stream.Id.create(1n, Stream.Dir.Uni, false);
+		const bytes = (id: Stream.Id) =>
+			sendFrames(peer, id)
+				.filter((f) => f.type === "stream")
+				.reduce((n, f) => n + BigInt((f as Frame.Data).data.byteLength), 0n);
+		const reset = sendFrames(peer, first.id).find((f) => f.type === "reset_stream") as Frame.ResetStream;
+		expect(reset.finalSize).toBe(bytes(first.id));
+		expect(reset.finalSize + bytes(secondId)).toBe(maxData);
+		session.close();
+	});
+
+	test("writer.abort() after close() drops the queued FIN and resets", async () => {
+		const { session, peer } = connect();
+		await session.ready;
+		peer.send({ type: "transport_parameters", params: peerParams() });
+		const { writable, id } = await openSendStream(session, peer, "outgoing uni");
+		await waitFor(() => peer.has("transport_parameters"));
+
+		// Hold the data frame in the socket so the FIN waits in the scheduler.
+		peer.blockWrites();
+		const writer = writable.getWriter();
+		const write = settleTo(writer.write(new Uint8Array([1, 2, 3])));
+		const close = settleTo(writer.close());
+		await flushMicrotasks();
+		const abort = settleTo(writer.abort(new Error("cancel")));
+		peer.unblockWrites();
+
+		await write;
+		expect(await close).toBeInstanceOf(Error);
+		expect(await abort).toBeUndefined();
+		await drain(peer, 1n);
+		const frames = sendFrames(peer, id);
+		expect(frames.map((f) => f.type)).toEqual(["stream", "reset_stream"]);
+		expect((frames[0] as Frame.Data).fin).toBe(false);
+		expect((frames[1] as Frame.ResetStream).finalSize).toBe(3n);
+		session.close();
+	});
+
 	test("STOP_SENDING during a frame's socket write counts it in the final size", async () => {
 		const { session, peer } = connect();
 		await session.ready;
