@@ -285,6 +285,11 @@ async def test_server_close_all_connections(
             assert request is not None
             session = await request.accept()
             assert session.close_reason is None
+            # accept() returns once the 200 is queued, not delivered, and
+            # closing the endpoint discards queued data. The browser opens this
+            # stream only after `ready`, so it proves the 200 arrived.
+            recv = await session.accept_uni()
+            await recv.read()
             server.close()
             await session.wait_closed()
 
@@ -295,6 +300,7 @@ async def test_server_close_all_connections(
                 {setup}
                 const transport = new WebTransport(url, transportOptions);
                 await transport.ready;
+                await writeAllString(await transport.createUnidirectionalStream(), "ready");
                 try {{
                     await transport.closed;
                     return {{ closed: true }};
