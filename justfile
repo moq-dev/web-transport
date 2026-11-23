@@ -13,11 +13,7 @@ default:
 setup:
 	# Install cargo-binstall for faster tool installation.
 	cargo install cargo-binstall
-	just setup-tools
-
-# A separate entrypoint for CI.
-setup-tools:
-	cargo binstall -y cargo-edit cargo-hack cargo-shear cargo-sort cargo-upgrades wasm-bindgen-cli
+	cargo binstall -y cargo-edit cargo-hack cargo-shear cargo-sort wasm-bindgen-cli
 
 # Run the CI checks
 check:
@@ -113,14 +109,6 @@ harness-build:
 test-browser: harness-build
 	bun run test:browser
 
-# Build the FFI staticlib/cdylib for the host and generate language bindings.
-build-ffi:
-	./rs/web-transport-ffi/build.sh --bindings-only --output rs/web-transport-ffi/dist
-
-# Build the FFI crate for a single target (use `just build-ffi-target aarch64-apple-darwin`).
-build-ffi-target target:
-	./rs/web-transport-ffi/build.sh --target {{target}} --output rs/web-transport-ffi/dist
-
 # Build and exercise generated Swift bindings against the native macOS host library.
 test-swift:
 	./swift/scripts/check.sh
@@ -186,5 +174,5 @@ clean:
 upgrade:
 	rustup upgrade
 
-	# Requires: cargo install cargo-upgrades cargo-edit
+	# Requires: cargo install cargo-edit
 	cargo upgrade
