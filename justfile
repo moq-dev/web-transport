@@ -72,6 +72,7 @@ test:
 
 	bun run --cwd js/qmux test
 	bun run --cwd js/qmux test:interop
+	bun run --cwd js/web-socket-stream test
 
 	# The Node polyfill's tests load its native module.
 	bun run --cwd js/web-transport build
