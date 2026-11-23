@@ -33,9 +33,10 @@ impl RecvStream {
         })
     }
 
-    /// Whether a read currently holds the stream, so `stop()` must interrupt it.
+    /// Whether an operation, such as a pending read, holds the stream, so
+    /// `stop()` must interrupt it rather than stop the stream itself.
     #[cfg(test)]
-    pub(crate) fn read_in_flight(&self) -> bool {
+    pub(crate) fn held(&self) -> bool {
         self.inner.try_lock().is_err()
     }
 

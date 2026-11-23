@@ -398,9 +398,10 @@ async fn stop_interrupts_a_read_in_flight() {
         let recv = recv.clone();
         async move { recv.read(1).await }
     });
-    // The read runs on the FFI runtime, so there is no event to await here.
+    // The read runs on the FFI runtime, so there is no event to await here. It
+    // is the only operation on the stream, so the stream is held by it.
     tokio::time::timeout(TIMEOUT, async {
-        while !recv.read_in_flight() {
+        while !recv.held() {
             tokio::task::yield_now().await;
         }
     })
