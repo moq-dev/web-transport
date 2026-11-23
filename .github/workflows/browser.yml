@@ -8,6 +8,7 @@ on:
     paths:
       - 'rs/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.cargo/**'
       - 'rust-toolchain*'
       - 'flake.nix'

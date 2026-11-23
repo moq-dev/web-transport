@@ -20,6 +20,7 @@ on:
       - "rs/web-transport-proto/**"
       - "rs/web-transport-trait/**"
       - "Cargo.toml"
+      - "Cargo.lock"
       - "py/web-transport/**"
       - ".github/workflows/release-py.yml"
       - ".github/scripts/release.sh"
