@@ -51,6 +51,10 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    env:
+      # Backtraces keep file:line, and the cache and test binaries shrink by
+      # about 40% without full debuginfo.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
     steps:
       - uses: actions/checkout@v7
