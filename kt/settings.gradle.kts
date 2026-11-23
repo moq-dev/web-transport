@@ -9,13 +9,11 @@ pluginManagement {
         mavenCentral()
     }
 
-    // Pinning the Android plugin version here lets `build.gradle.kts` apply
-    // it via `apply(plugin = "com.android.library")` without redeclaring the
-    // version. When `-Pandroid.enabled=true` isn't set, this is dormant and
-    // the plugin marker is never resolved.
+    // Pins the Android plugins for r8-check, which applies them without a version.
+    // Without `-Pandroid.enabled=true` the plugin markers are never resolved.
     plugins {
-        id("com.android.library") version "8.7.3"
-        id("com.android.application") version "8.7.3"
+        id("com.android.kotlin.multiplatform.library") version "9.5.2"
+        id("com.android.application") version "9.5.2"
     }
 }
 

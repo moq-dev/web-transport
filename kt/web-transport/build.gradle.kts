@@ -15,19 +15,15 @@
 //   src/androidMain/jniLibs/<abi>/libweb_transport_ffi.so    (Android packaging layout)
 //
 // Android target is opt-in via `-Pandroid.enabled=true` so contributors
-// without the Android SDK (or Google maven access) can still build/test
-// the JVM variant. CI always sets the flag. The Android-specific config is
-// inlined here (gated by androidEnabled) instead of in a separate
-// `apply(from = "android.gradle.kts")` script because Gradle Kotlin DSL
-// doesn't generate type-safe accessors for plugins applied from
-// `apply(from = ...)` files — that path failed in CI with "Unresolved
-// reference: kotlin / androidTarget / compileOptions" once -Pandroid.enabled
-// was set.
+// without the Android SDK can still build/test the JVM variant. CI always sets
+// the flag. AGP's Kotlin Multiplatform plugin is on the build classpath either
+// way, so the Android configuration below compiles; it is applied only when
+// enabled.
 //
 // Publishing uses com.vanniktech.maven.publish, which handles the Sonatype
 // Central Portal upload protocol + GPG signing in a single Gradle task.
 // CI runs `:web-transport:publishAndReleaseToMavenCentral`. Credentials are picked
-// up from env vars set by kotlin.yml:
+// up from env vars set by release-kt.yml:
 //   ORG_GRADLE_PROJECT_mavenCentralUsername
 //   ORG_GRADLE_PROJECT_mavenCentralPassword
 //   ORG_GRADLE_PROJECT_signingInMemoryKey
@@ -36,7 +32,7 @@
 // being present so PR smoke tests (which run publishToMavenLocal without
 // the signing key) don't trip on "no configured signatory".
 
-import com.vanniktech.maven.publish.SonatypeHost
+import com.android.build.api.dsl.KotlinMultiplatformAndroidLibraryTarget
 import java.security.MessageDigest
 import java.time.Duration
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
@@ -46,21 +42,14 @@ val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true
 val artifactSmokeEnabled = providers.gradleProperty("artifactSmoke").orNull == "true"
 
 plugins {
-    kotlin("multiplatform") version "2.0.21"
-    id("com.vanniktech.maven.publish") version "0.30.0"
-    // AGP needs to be on the buildscript classpath (so the Kotlin DSL
-    // resolves `androidTarget {}`, `LibraryExtension`, `ndk {}`, etc.)
-    // *and* its version pinned here, but `apply false` keeps it off the
-    // project unless `-Pandroid.enabled=true`. The pluginManagement block
-    // in settings.gradle.kts only resolves the plugin marker; the
-    // classpath/types come from this block.
-    id("com.android.library") version "8.7.3" apply false
+    kotlin("multiplatform") version "2.4.21"
+    id("com.vanniktech.maven.publish") version "0.37.0"
+    // On the classpath for the Android types below; settings.gradle.kts pins the version.
+    id("com.android.kotlin.multiplatform.library") apply false
 }
 
-// AGP is applied imperatively only when the Android target is enabled, so
-// contributors without Google maven access can still build the JVM variant.
 if (androidEnabled) {
-    apply(plugin = "com.android.library")
+    apply(plugin = "com.android.kotlin.multiplatform.library")
 }
 
 // rustls-platform-verifier verifies on Android through a small Kotlin component
@@ -78,7 +67,7 @@ val rustlsPlatformVerifierJar: FileCollection? = if (androidEnabled) {
     val extract = tasks.register<Copy>("extractRustlsPlatformVerifier") {
         val aarFiles: FileCollection = aar
         inputs.property("sha256", expectedSha256)
-        from({ zipTree(aarFiles.singleFile) }) { include("classes.jar") }
+        from(aarFiles.elements.map { zipTree(it.single()) }) { include("classes.jar") }
         into(layout.buildDirectory.dir("rustls-platform-verifier"))
         doFirst {
             val digest = MessageDigest.getInstance("SHA-256").digest(aarFiles.singleFile.readBytes())
@@ -97,86 +86,62 @@ kotlin {
     jvm()
 
     if (androidEnabled) {
-        androidTarget {
-            publishLibraryVariants("release")
+        // Registered by the Android plugin, so it has no generated accessor.
+        extensions.configure<KotlinMultiplatformAndroidLibraryTarget>("android") {
+            namespace = "dev.moq.webtransport"
+            compileSdk = 37
+            minSdk = 24
+            // AGP otherwise makes consumers compile against at least our compileSdk.
+            aarMetadata.minCompileSdk = minSdk
             compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
+            optimization {
+                consumerKeepRules.apply {
+                    publish = true
+                    file("consumer-rules.pro")
+                }
+            }
         }
     }
 
-    @Suppress("UNUSED_VARIABLE")
     sourceSets {
-        val commonMain by getting {
+        val commonMain = getByName("commonMain") {
             dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
             }
         }
-        val commonTest by getting {
+        getByName("commonTest") {
             dependencies {
                 implementation(kotlin("test"))
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
             }
         }
 
-        val jvmAndAndroidMain by creating {
+        val jvmAndAndroidMain = create("jvmAndAndroidMain") {
             dependsOn(commonMain)
             dependencies {
                 // compileOnly: each platform's runtime adds its own JNA artifact.
-                compileOnly("net.java.dev.jna:jna:5.15.0")
+                compileOnly("net.java.dev.jna:jna:5.19.1")
             }
-        }
-        val jvmAndAndroidTest by creating {
-            dependsOn(commonTest)
         }
 
-        val jvmMain by getting {
+        getByName("jvmMain") {
             dependsOn(jvmAndAndroidMain)
             dependencies {
-                implementation("net.java.dev.jna:jna:5.15.0")
+                implementation("net.java.dev.jna:jna:5.19.1")
             }
         }
-        val jvmTest by getting {
-            dependsOn(jvmAndAndroidTest)
-            if (artifactSmokeEnabled) {
-                kotlin.srcDir("src/jvmArtifactTest/kotlin")
-            }
+        if (artifactSmokeEnabled) {
+            getByName("jvmTest").kotlin.srcDir("src/jvmArtifactTest/kotlin")
         }
 
         if (androidEnabled) {
-            val androidMain by getting {
+            getByName("androidMain") {
                 dependsOn(jvmAndAndroidMain)
                 dependencies {
-                    implementation("net.java.dev.jna:jna:5.15.0@aar")
+                    implementation("net.java.dev.jna:jna:5.19.1@aar")
                     implementation(rustlsPlatformVerifierJar!!)
                 }
             }
-            val androidUnitTest by getting {
-                dependsOn(jvmAndAndroidTest)
-            }
         }
-    }
-}
-
-if (androidEnabled) {
-    extensions.configure<com.android.build.gradle.LibraryExtension>("android") {
-        namespace = "dev.moq.webtransport"
-        compileSdk = 35
-        defaultConfig {
-            minSdk = 24
-            ndk {
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-            }
-            consumerProguardFiles("consumer-rules.pro")
-        }
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_17
-            targetCompatibility = JavaVersion.VERSION_17
-        }
-        publishing {
-            singleVariant("release") {
-                withSourcesJar()
-            }
-        }
-        sourceSets.getByName("main").jniLibs.srcDirs("src/androidMain/jniLibs")
     }
 }
 
@@ -198,7 +163,7 @@ if (artifactSmokeEnabled) {
 }
 
 mavenPublishing {
-    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
+    publishToMavenCentral(automaticRelease = true)
     // Only sign when a non-empty signing key is configured. PR smoke tests
     // run gradle `:web-transport:publishToMavenLocal` (via package.sh)
     // without the SIGNING_* env vars; if SIGNING_KEY is declared in repo

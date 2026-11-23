@@ -109,7 +109,4 @@ if [[ "$HAVE_ANDROID_LIBS" == true ]]; then
     GRADLE_ARGS+=("-Pandroid.enabled=true")
 fi
 
-GRADLE_CMD="${GRADLE_CMD:-$(command -v gradle || true)}"
-[[ -n "$GRADLE_CMD" ]] || { echo "Error: gradle not on PATH" >&2; exit 1; }
-
-"$GRADLE_CMD" -p "$KT_DIR" "${GRADLE_ARGS[@]}" :web-transport:assemble :web-transport:publishToMavenLocal
+"$KT_DIR/gradlew" -p "$KT_DIR" "${GRADLE_ARGS[@]}" :web-transport:assemble :web-transport:publishToMavenLocal
