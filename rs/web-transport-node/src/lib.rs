@@ -22,6 +22,11 @@ use tokio::sync::{watch, Mutex};
 // clones back into `self.inner.lock()` across an await -- that reintroduces the
 // crash.
 
+/// Convert an error into a JavaScript error carrying its message.
+fn reason(err: impl std::fmt::Display) -> Error {
+    Error::from_reason(err.to_string())
+}
+
 fn session_error_to_close_info(
     err: &web_transport_quinn::SessionError,
     local: Option<NapiCloseInfo>,
@@ -44,8 +49,8 @@ fn session_error_to_close_info(
         }
         web_transport_quinn::SessionError::ConnectionError(
             web_transport_quinn::quinn::ConnectionError::LocallyClosed,
-        ) => local.ok_or_else(|| Error::from_reason(err.to_string())),
-        other => Err(Error::from_reason(other.to_string())),
+        ) => local.ok_or_else(|| reason(err)),
+        other => Err(reason(other)),
     }
 }
 
@@ -94,42 +99,6 @@ pub struct NapiClient {
 
 #[napi]
 impl NapiClient {
-    /// Create a client that verifies server certificates with the operating system's trust store.
-    #[napi(factory)]
-    pub fn with_system_roots() -> Result<Self> {
-        napi::bindgen_prelude::within_runtime_if_available(|| {
-            let client = web_transport_quinn::ClientBuilder::new()
-                .with_system_roots()
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            Ok(Self { inner: client })
-        })
-    }
-
-    /// Create a client that skips certificate verification entirely.
-    /// WARNING: Only use for testing with self-signed certificates.
-    #[napi(factory)]
-    pub fn disable_verify() -> Result<Self> {
-        napi::bindgen_prelude::within_runtime_if_available(|| {
-            let client = web_transport_quinn::ClientBuilder::new()
-                .dangerous()
-                .with_no_certificate_verification()
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            Ok(Self { inner: client })
-        })
-    }
-
-    /// Create a client that validates server certificates by SHA-256 hash.
-    #[napi(factory)]
-    pub fn with_certificate_hashes(hashes: Vec<Buffer>) -> Result<Self> {
-        napi::bindgen_prelude::within_runtime_if_available(|| {
-            let hashes: Vec<Vec<u8>> = hashes.into_iter().map(|b| b.to_vec()).collect();
-            let client = web_transport_quinn::ClientBuilder::new()
-                .with_server_certificate_hashes(hashes)
-                .map_err(|e| Error::from_reason(e.to_string()))?;
-            Ok(Self { inner: client })
-        })
-    }
-
     /// Create a client with certificate verification and QUIC transport options.
     ///
     /// Without certificate options, server certificates are verified with the operating system's trust store.
@@ -151,7 +120,7 @@ impl NapiClient {
                     .with_server_certificate_hashes(hashes.iter().map(|h| h.to_vec()).collect()),
                 (false, None) => builder.with_system_roots(),
             }
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+            .map_err(reason)?;
             Ok(Self { inner: client })
         })
     }
@@ -165,23 +134,15 @@ impl NapiClient {
     ) -> Result<NapiSession> {
         // Own the client handle for the duration of the future (see module note).
         let client = self.inner.clone();
-        let url: url::Url = url_str
-            .parse()
-            .map_err(|e: url::ParseError| Error::from_reason(e.to_string()))?;
+        let url: url::Url = url_str.parse().map_err(reason)?;
         let mut request = web_transport_quinn::proto::ConnectRequest::new(url);
         if let Some(opts) = options {
             if let Some(protocols) = opts.protocols {
                 request = request.with_protocols(protocols);
             }
         }
-        let session = client
-            .connect(request)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiSession {
-            inner: session.clone(),
-            closed: Arc::new(std::sync::Mutex::new(None)),
-        })
+        let session = client.connect(request).await.map_err(reason)?;
+        Ok(NapiSession::new(session))
     }
 }
 
@@ -292,20 +253,15 @@ impl ServerState {
 
 #[napi]
 impl NapiServer {
-    /// Create a server bound to the given address with the given TLS certificate.
+    /// Create a server bound to the given address with the given TLS certificate and QUIC transport options.
     #[napi(factory)]
-    pub fn bind(addr: String, cert_pem: Buffer, key_pem: Buffer) -> Result<Self> {
-        Self::bind_with_options(addr, cert_pem, key_pem, NapiServerOptions::default())
-    }
-
-    /// Create a server like `bind`, with QUIC transport options.
-    #[napi(factory)]
-    pub fn bind_with_options(
+    pub fn bind(
         addr: String,
         cert_pem: Buffer,
         key_pem: Buffer,
-        options: NapiServerOptions,
+        options: Option<NapiServerOptions>,
     ) -> Result<Self> {
+        let options = options.unwrap_or_default();
         napi::bindgen_prelude::within_runtime_if_available(|| {
             let transport = transport_config(options.idle_timeout, options.keep_alive_interval)?;
 
@@ -315,15 +271,13 @@ impl NapiServer {
             let key = PrivateKeyDer::from_pem_slice(&key_pem)
                 .map_err(|e| Error::from_reason(format!("invalid private key PEM: {e}")))?;
 
-            let addr: std::net::SocketAddr = addr
-                .parse()
-                .map_err(|e: std::net::AddrParseError| Error::from_reason(e.to_string()))?;
+            let addr: std::net::SocketAddr = addr.parse().map_err(reason)?;
 
             let server = web_transport_quinn::ServerBuilder::new()
                 .with_addr(addr)
                 .with_transport_config(transport)
                 .with_certificate(certs, key)
-                .map_err(|e| Error::from_reason(e.to_string()))?;
+                .map_err(reason)?;
 
             Ok(Self {
                 inner: Arc::new(ServerState {
@@ -470,14 +424,14 @@ mod option_tests {
         .err()
         .unwrap();
         assert!(err.reason.starts_with("idleTimeout "));
-        let err = NapiServer::bind_with_options(
+        let err = NapiServer::bind(
             "127.0.0.1:0".into(),
             Vec::new().into(),
             Vec::new().into(),
-            NapiServerOptions {
+            Some(NapiServerOptions {
                 keep_alive_interval: Some(f64::NAN),
                 ..Default::default()
-            },
+            }),
         )
         .err()
         .unwrap();
@@ -608,14 +562,8 @@ impl NapiRequest {
             .await
             .take()
             .ok_or_else(|| Error::from_reason("request already consumed"))?;
-        let session = request
-            .ok()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiSession {
-            inner: session.clone(),
-            closed: Arc::new(std::sync::Mutex::new(None)),
-        })
+        let session = request.ok().await.map_err(reason)?;
+        Ok(NapiSession::new(session))
     }
 
     /// Reject the session with the given HTTP status code.
@@ -629,10 +577,7 @@ impl NapiRequest {
             .ok_or_else(|| Error::from_reason("request already consumed"))?;
         let status = http::StatusCode::from_u16(status)
             .map_err(|e| Error::from_reason(format!("invalid status code: {e}")))?;
-        request
-            .reject(status)
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        request.reject(status).await.map_err(reason)?;
         Ok(())
     }
 }
@@ -643,6 +588,15 @@ pub struct NapiSession {
     inner: web_transport_quinn::Session,
     // The backend reports local closes as LocallyClosed, without their application details.
     closed: Arc<std::sync::Mutex<Option<NapiCloseInfo>>>,
+}
+
+impl NapiSession {
+    fn new(inner: web_transport_quinn::Session) -> Self {
+        Self {
+            inner,
+            closed: Arc::default(),
+        }
+    }
 }
 
 /// Info about why a session was closed, matching W3C WebTransportCloseInfo.
@@ -658,6 +612,15 @@ pub struct NapiCloseInfo {
 pub struct NapiBiStream {
     send: Option<NapiSendStream>,
     recv: Option<NapiRecvStream>,
+}
+
+impl NapiBiStream {
+    fn new(send: web_transport_quinn::SendStream, recv: web_transport_quinn::RecvStream) -> Self {
+        Self {
+            send: Some(NapiSendStream::new(send)),
+            recv: Some(NapiRecvStream::new(recv)),
+        }
+    }
 }
 
 #[napi]
@@ -692,10 +655,7 @@ impl NapiSession {
     pub async fn accept_uni(&self) -> Result<NapiRecvStream> {
         // Own the session handle for the duration of the future (see module note).
         let session = self.inner.clone();
-        let recv = session
-            .accept_uni()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let recv = session.accept_uni().await.map_err(reason)?;
         Ok(NapiRecvStream::new(recv))
     }
 
@@ -703,45 +663,24 @@ impl NapiSession {
     #[napi]
     pub async fn accept_bi(&self) -> Result<NapiBiStream> {
         let session = self.inner.clone();
-        let (send, recv) = session
-            .accept_bi()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiBiStream {
-            send: Some(NapiSendStream {
-                inner: Arc::new(Mutex::new(send)),
-            }),
-            recv: Some(NapiRecvStream::new(recv)),
-        })
+        let (send, recv) = session.accept_bi().await.map_err(reason)?;
+        Ok(NapiBiStream::new(send, recv))
     }
 
     /// Open a new unidirectional stream.
     #[napi]
     pub async fn open_uni(&self) -> Result<NapiSendStream> {
         let session = self.inner.clone();
-        let send = session
-            .open_uni()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiSendStream {
-            inner: Arc::new(Mutex::new(send)),
-        })
+        let send = session.open_uni().await.map_err(reason)?;
+        Ok(NapiSendStream::new(send))
     }
 
     /// Open a new bidirectional stream.
     #[napi]
     pub async fn open_bi(&self) -> Result<NapiBiStream> {
         let session = self.inner.clone();
-        let (send, recv) = session
-            .open_bi()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(NapiBiStream {
-            send: Some(NapiSendStream {
-                inner: Arc::new(Mutex::new(send)),
-            }),
-            recv: Some(NapiRecvStream::new(recv)),
-        })
+        let (send, recv) = session.open_bi().await.map_err(reason)?;
+        Ok(NapiBiStream::new(send, recv))
     }
 
     /// Send a datagram.
@@ -750,7 +689,7 @@ impl NapiSession {
         within_runtime_if_available(|| {
             self.inner
                 .send_datagram(bytes::Bytes::from(data.to_vec()))
-                .map_err(|e| Error::from_reason(e.to_string()))
+                .map_err(reason)
         })
     }
 
@@ -758,10 +697,7 @@ impl NapiSession {
     #[napi]
     pub async fn recv_datagram(&self) -> Result<Buffer> {
         let session = self.inner.clone();
-        let data = session
-            .read_datagram()
-            .await
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let data = session.read_datagram().await.map_err(reason)?;
         Ok(Buffer::from(data.to_vec()))
     }
 
@@ -804,6 +740,14 @@ impl NapiSession {
 #[napi]
 pub struct NapiSendStream {
     inner: Arc<Mutex<web_transport_quinn::SendStream>>,
+}
+
+impl NapiSendStream {
+    fn new(send: web_transport_quinn::SendStream) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(send)),
+        }
+    }
 }
 
 #[napi]
@@ -850,9 +794,7 @@ impl NapiSendStream {
     pub async fn finish(&self) -> Result<()> {
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        stream
-            .finish()
-            .map_err(|e| Error::from_reason(e.to_string()))
+        stream.finish().map_err(reason)
     }
 
     /// Abruptly reset the stream with an error code.
@@ -860,19 +802,7 @@ impl NapiSendStream {
     pub async fn reset(&self, code: u32) -> Result<()> {
         let inner = self.inner.clone();
         let mut stream = inner.lock().await;
-        stream
-            .reset(code)
-            .map_err(|e| Error::from_reason(e.to_string()))
-    }
-
-    /// Set the priority of the stream.
-    #[napi]
-    pub async fn set_priority(&self, priority: i32) -> Result<()> {
-        let inner = self.inner.clone();
-        let stream = inner.lock().await;
-        stream
-            .set_priority(priority)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        stream.reset(code).map_err(reason)
     }
 }
 

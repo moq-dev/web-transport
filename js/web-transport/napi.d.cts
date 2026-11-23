@@ -19,15 +19,6 @@ export declare class NapiBiStream {
 
 /** A WebTransport client that can connect to servers. */
 export declare class NapiClient {
-	/** Create a client that verifies server certificates with the operating system's trust store. */
-	static withSystemRoots(): NapiClient;
-	/**
-	 * Create a client that skips certificate verification entirely.
-	 * WARNING: Only use for testing with self-signed certificates.
-	 */
-	static disableVerify(): NapiClient;
-	/** Create a client that validates server certificates by SHA-256 hash. */
-	static withCertificateHashes(hashes: Array<Buffer>): NapiClient;
 	/**
 	 * Create a client with certificate verification and QUIC transport options.
 	 *
@@ -83,16 +74,17 @@ export declare class NapiSendStream {
 	finish(): Promise<void>;
 	/** Abruptly reset the stream with an error code. */
 	reset(code: number): Promise<void>;
-	/** Set the priority of the stream. */
-	setPriority(priority: number): Promise<void>;
 }
 
 /** A WebTransport server that accepts incoming sessions. */
 export declare class NapiServer {
-	/** Create a server bound to the given address with the given TLS certificate. */
-	static bind(addr: string, certPem: Buffer, keyPem: Buffer): NapiServer;
-	/** Create a server like `bind`, with QUIC transport options. */
-	static bindWithOptions(addr: string, certPem: Buffer, keyPem: Buffer, options: NapiServerOptions): NapiServer;
+	/** Create a server bound to the given address with the given TLS certificate and QUIC transport options. */
+	static bind(
+		addr: string,
+		certPem: Buffer,
+		keyPem: Buffer,
+		options?: NapiServerOptions | undefined | null,
+	): NapiServer;
 	/** Accept the next incoming WebTransport session request. */
 	accept(): Promise<NapiRequest | null>;
 	/** Close the server, stopping it from accepting new connections. */

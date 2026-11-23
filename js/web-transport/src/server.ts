@@ -16,12 +16,7 @@ export class Server {
 
 	/** Bind a server to `addr`, serving the PEM-encoded certificate chain and private key. */
 	static bind(addr: string, certPem: Buffer, keyPem: Buffer, options?: ServerOptions): Server {
-		return new Server(
-			NapiServer.bindWithOptions(addr, certPem, keyPem, {
-				idleTimeout: options?.idleTimeout,
-				keepAliveInterval: options?.keepAliveInterval,
-			}),
-		);
+		return new Server(NapiServer.bind(addr, certPem, keyPem, options));
 	}
 
 	async accept(): Promise<Request | null> {

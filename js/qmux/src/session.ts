@@ -351,18 +351,6 @@ function toWebSocketStream(socket: WebSocketLike | WebSocketStreamLike, highWate
 	return "opened" in socket ? socket : WebSocketStream.adopt(socket, { highWaterMark });
 }
 
-/** Get the subprotocol prefix for a QMux wire-format version. */
-function versionPrefix(version: Version): string {
-	switch (version) {
-		case "qmux-02":
-			return "qmux-02.";
-		case "qmux-01":
-			return "qmux-01.";
-		case "qmux-00":
-			return "qmux-00.";
-	}
-}
-
 /** QMux versions recognized as prefixed ALPNs, newest first. */
 const QMUX_VERSIONS = ["qmux-02", "qmux-01", "qmux-00"] as const satisfies readonly Version[];
 
@@ -407,7 +395,7 @@ export function resolveSubprotocols(
 ): string[] {
 	const out: string[] = [];
 	for (const entry of protocols) {
-		const known = QMUX_VERSIONS.find((v) => entry.startsWith(versionPrefix(v)));
+		const known = QMUX_VERSIONS.find((v) => entry.startsWith(`${v}.`));
 		if (known !== undefined) {
 			out.push(entry);
 			continue;
@@ -420,7 +408,7 @@ export function resolveSubprotocols(
 		const value = versions[entry];
 		const expanded: readonly Version[] = value === null ? QMUX_VERSIONS : Array.isArray(value) ? value : [value];
 		for (const v of expanded) {
-			out.push(`${versionPrefix(v)}${entry}`);
+			out.push(`${v}.${entry}`);
 		}
 	}
 	if (!requireProtocol) {
@@ -477,7 +465,7 @@ export function selectSubprotocol(
 /** Pick the QMux wire-format version from a negotiated subprotocol. */
 function detectVersion(negotiated: string): WireFormat {
 	for (const v of QMUX_VERSIONS) {
-		if (negotiated === v || negotiated.startsWith(versionPrefix(v))) {
+		if (negotiated === v || negotiated.startsWith(`${v}.`)) {
 			return v;
 		}
 	}
@@ -494,7 +482,7 @@ function detectVersion(negotiated: string): WireFormat {
 function parseProtocol(raw: string, version: WireFormat): string {
 	if (raw === "" || version === "webtransport") return "";
 	if (raw === version) return "";
-	const prefix = versionPrefix(version);
+	const prefix = `${version}.`;
 	return raw.startsWith(prefix) ? raw.slice(prefix.length) : "";
 }
 
