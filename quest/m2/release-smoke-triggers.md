@@ -15,6 +15,7 @@ Every pull request still exercises the FFI through the Swift host (macOS), Kotli
 
 Keep the pull-request trigger for each workflow's own packaging paths (`kt/`, `swift/`, `py/web-transport/`, `rs/web-transport-ffi/build.sh`, `.github/scripts/release.sh`, and the workflow file), and run the full matrix on pushes to `main` that touch the crate paths.
 A failure on `main` then shows on the merged commit, one merge later than today.
+Also keep `rs/web-transport-ffi/Cargo.toml` in the pull-request trigger: release-plz pushes the `web-transport-ffi-v*` tag as soon as its release PR merges, before the `main` matrix finishes, and that PR always bumps this file, so it runs the full matrix on the tree it tags.
 Coordinate with the `ffi-release-pipeline` quest from [moq-dev/web-transport#579](https://github.com/moq-dev/web-transport/pull/579), which reshapes the same workflows.
 
 ## Waiting
