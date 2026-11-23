@@ -165,10 +165,22 @@ async def test_reset_cancels_pending_write(session_pair):
         with pytest.raises(web_transport.StreamClosedLocally):
             await send.write(UNBOUNDED)
 
+    async def peer_reads():
+        send_s, recv_s = await server_session.accept_bi()
+        assert await recv_s.read(1) == b"x"
+        return send_s, recv_s  # kept open, so the peer never stops the stream
+
     write_task = asyncio.create_task(write_large())
     # Once the peer sees data the write is in flight, and flow control blocks it.
-    _send_s, recv_s = await server_session.accept_bi()
-    assert await recv_s.read(1) == b"x"
+    peer = asyncio.create_task(peer_reads())
+    done, _ = await asyncio.wait(
+        {write_task, peer}, timeout=5.0, return_when=asyncio.FIRST_COMPLETED
+    )
+    if write_task in done:
+        write_task.result()  # raises the writer's failure
+        pytest.fail("write finished before the peer read it")
+    assert peer in done, "peer never read the write"
+    _streams = peer.result()
     send.reset()
     await asyncio.wait_for(write_task, timeout=5.0)
 

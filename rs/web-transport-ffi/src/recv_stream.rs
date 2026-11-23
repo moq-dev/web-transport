@@ -33,6 +33,12 @@ impl RecvStream {
         })
     }
 
+    /// Whether a read currently holds the stream, so `stop()` must interrupt it.
+    #[cfg(test)]
+    pub(crate) fn read_in_flight(&self) -> bool {
+        self.inner.try_lock().is_err()
+    }
+
     async fn cancellable<R, F, Fut>(&self, op: F) -> Result<R, WebTransportError>
     where
         R: Send + 'static,

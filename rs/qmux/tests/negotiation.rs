@@ -134,11 +134,16 @@ mod tcp {
         });
 
         // Real time over real TCP: paused time would auto-advance past the
-        // timeout while loopback I/O is still in flight.
-        let result = qmux::tcp::Config::new(Version::QMux01)
-            .handshake_timeout(Duration::from_millis(100))
-            .connect(addr)
-            .await;
+        // timeout while loopback I/O is still in flight. The outer bound turns a
+        // deadline that never fires into a failure rather than a hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            qmux::tcp::Config::new(Version::QMux01)
+                .handshake_timeout(Duration::from_millis(100))
+                .connect(addr),
+        )
+        .await
+        .expect("handshake deadline never fired");
 
         match result {
             Err(Error::HandshakeTimeout) => {}

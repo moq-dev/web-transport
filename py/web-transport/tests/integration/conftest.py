@@ -41,7 +41,12 @@ async def session_pair(self_signed_cert, cert_hash):
 
 
 async def suspended(task: asyncio.Future) -> None:
-    """Run ``task`` up to its first await and assert it is still pending there."""
+    """Run ``task`` up to its first await and assert it is still pending there.
+
+    This shows only that the Python task is parked: the native call it awaits
+    runs on the FFI runtime and may not have started yet. The FFI's own
+    ``stop_interrupts_a_read_in_flight`` test covers a read that has.
+    """
     await asyncio.sleep(0)
     assert not task.done()
 

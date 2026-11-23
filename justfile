@@ -70,6 +70,8 @@ test:
 	cargo test --target wasm32-unknown-unknown -p web-transport --doc --all-features
 	cargo test --target wasm32-unknown-unknown -p web-transport-wasm --doc --all-features
 
+	# `check` installs too, but CI runs the tests even when a lint stops it first.
+	bun install
 	bun run --cwd js/qmux test
 	bun run --cwd js/qmux test:interop
 	bun run --cwd js/web-socket-stream test

@@ -355,3 +355,73 @@ async fn closing_unused_client_prevents_first_bind() {
         assert!(client.connect(url.into()).await.is_err());
     }
 }
+
+// Python can only see its own task parked, not whether the spawned native read
+// holds the stream yet; this pins `stop()` against a read that does.
+#[tokio::test]
+async fn stop_interrupts_a_read_in_flight() {
+    let (chain, key) = self_signed_cert();
+    let cert_hash = sha256(&chain[0]);
+    let server = Server::new(ServerConfig {
+        certificate_chain: chain,
+        private_key: key,
+        bind: "127.0.0.1:0".to_string(),
+        congestion_control: CongestionControl::Default,
+        max_idle_timeout_secs: Some(10.0),
+        keep_alive_interval_secs: None,
+    })
+    .expect("server");
+    let addr = server.local_addr();
+
+    let server_task = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let req = server.accept().await.expect("accept");
+            let session = req.accept().await.expect("ok");
+            let stream = session.accept_bi().await.expect("accept_bi");
+            stream.send.wait_closed().await.expect("wait_closed")
+        }
+    });
+
+    let client = Client::new(client_config_for(cert_hash)).expect("client");
+    let session = tokio::time::timeout(
+        TIMEOUT,
+        client.connect(format!("https://{}:{}", addr.host, addr.port)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect");
+    let stream = session.open_bi().await.expect("open_bi");
+    let recv = stream.recv.clone();
+
+    let read = tokio::spawn({
+        let recv = recv.clone();
+        async move { recv.read(1).await }
+    });
+    // The read runs on the FFI runtime, so there is no event to await here.
+    tokio::time::timeout(TIMEOUT, async {
+        while !recv.read_in_flight() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read never took the stream");
+
+    recv.stop(42).expect("stop");
+    let result = tokio::time::timeout(TIMEOUT, read)
+        .await
+        .expect("read not interrupted")
+        .expect("read task");
+    assert!(
+        matches!(result, Err(WebTransportError::StreamClosedLocally)),
+        "{result:?}"
+    );
+
+    let code = tokio::time::timeout(TIMEOUT, server_task)
+        .await
+        .expect("STOP_SENDING never arrived")
+        .expect("server task");
+    assert_eq!(code, Some(42));
+
+    session.close(0, String::new());
+}
