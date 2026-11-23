@@ -8,7 +8,7 @@ A quinn release lets quinn-proto's `rustls` support run on any rustls provider w
 
 This waits passively on quinn-rs: we open no upstream PR, and rind no longer drives one (it dropped its quinn adoption quest in [kixel-ai/rind#635](https://github.com/kixel-ai/rind/pull/635)).
 
-Decision prompt: ✅ wait passively on quinn-rs (rejected: we drive the upstream quinn PR; delete this quest and [quinn-adapter-removal](/quest/a2/quinn-adapter-removal.md)).
+Decision prompt: ✅ wait passively on quinn-rs (rejected: we drive the upstream quinn PR; delete this quest and [quinn-adapter-removal](/quest/m2/quinn-adapter-removal.md)).
 
 ## Waiting
 
