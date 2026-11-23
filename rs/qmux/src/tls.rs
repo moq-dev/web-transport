@@ -10,8 +10,9 @@ use crate::{alpn, Config, Error, Session, Version};
 ///
 /// Each entry's `versions` slice is expanded into the TLS ALPN list as
 /// `{v.prefix()}{alpn}` per version (empty = every QMux draft this crate knows
-/// about). The bare version ALPNs ([`ALPNS`](crate::ALPNS)) are appended as well unless [`require_protocol`](Client::require_protocol) is
-/// set, in which case only the prefixed pairs are offered. The peer's chosen
+/// about). The bare version ALPNs ([`ALPNS`](crate::ALPNS)) are appended as
+/// well unless [`require_protocol`](Client::require_protocol) is set, in which
+/// case only the prefixed pairs are offered. The peer's chosen
 /// ALPN determines the QMux wire-format version; the `alpn_protocols` field on
 /// the supplied `rustls::ClientConfig` is ignored and rebuilt from the entries.
 #[derive(Clone)]

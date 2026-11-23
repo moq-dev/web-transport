@@ -394,8 +394,8 @@ const BARE_ALPNS = ["qmux-02", "qmux-01", "qmux-00", "webtransport"] as const;
  * emits one pair; an array emits one pair per element; `null` emits one
  * pair per [[QMUX_VERSIONS]] entry. Entries already in `{qmux-VV}.{alpn}`
  * pair form pass through. Unless `requireProtocol` is true, the bare version
- * ALPNs ([[BARE_ALPNS]]) are appended after the prefixed pairs so a peer that doesn't pin an app protocol can still
- * negotiate a wire format.
+ * ALPNs ([[BARE_ALPNS]]) are appended after the prefixed pairs so a peer
+ * that doesn't pin an app protocol can still negotiate a wire format.
  *
  * Throws if any bare entry has no matching `versions` mapping.
  */

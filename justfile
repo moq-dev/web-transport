@@ -24,7 +24,8 @@ check:
 	quest check
 
 	# Local Markdown links and anchors must resolve; quest check covers quest/.
-	git ls-files -z '*.md' ':!:quest/' | xargs -0 lychee --offline --include-fragments --no-progress
+	# Absolute links into this repository's main branch, which published READMEs need, are checked against the checkout.
+	git ls-files -z '*.md' ':!:quest/' | xargs -0 lychee --offline --include-fragments --no-progress --remap '^https://github\.com/moq-dev/web-transport/(blob|tree)/main/ file://{{ justfile_directory() }}/'
 
 	cargo check --workspace --all-targets --all-features
 	cargo clippy --workspace --all-targets --all-features -- -D warnings

@@ -1,6 +1,7 @@
 //! QMux protocol (draft-ietf-quic-qmux-02) over reliable transports.
 //!
-//! Provides QUIC-style multiplexed streams over TCP, Unix domain sockets, TLS, and WebSocket.
+//! Provides QUIC-style multiplexed streams over TCP, Unix domain sockets, TLS,
+//! and WebSocket.
 //! Speaks draft-02 by default, negotiating down to draft-01 or draft-00, with
 //! backwards compatibility for the legacy `webtransport` wire format.
 //!
