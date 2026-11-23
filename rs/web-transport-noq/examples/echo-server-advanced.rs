@@ -1,14 +1,9 @@
-use std::{
-    fs,
-    io::{self, Read},
-    path,
-    sync::Arc,
-};
+use std::{path, sync::Arc};
 
 use anyhow::Context;
 
 use clap::Parser;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use web_transport_noq::Session;
 
 #[derive(Parser, Debug)]
@@ -39,27 +34,15 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Read the PEM certificate chain
-    let chain = fs::File::open(args.tls_cert).context("failed to open cert file")?;
-    let mut chain = io::BufReader::new(chain);
-
-    let chain: Vec<CertificateDer> = rustls_pemfile::certs(&mut chain)
+    let chain: Vec<CertificateDer> = CertificateDer::pem_file_iter(args.tls_cert)
+        .context("failed to open cert file")?
         .collect::<Result<_, _>>()
         .context("failed to load certs")?;
 
     anyhow::ensure!(!chain.is_empty(), "could not find certificate");
 
     // Read the PEM private key
-    let mut keys = fs::File::open(args.tls_key).context("failed to open key file")?;
-
-    // Read the keys into a Vec so we can parse it twice.
-    let mut buf = Vec::new();
-    keys.read_to_end(&mut buf)?;
-
-    // Try to parse a PKCS#8 key
-    // -----BEGIN PRIVATE KEY-----
-    let key = rustls_pemfile::private_key(&mut io::Cursor::new(&buf))
-        .context("failed to load private key")?
-        .context("missing private key")?;
+    let key = PrivateKeyDer::from_pem_file(args.tls_key).context("failed to load private key")?;
 
     // Standard Noq setup
     let mut config =

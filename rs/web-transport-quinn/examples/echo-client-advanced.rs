@@ -1,8 +1,8 @@
-use std::{fs, io, path, sync::Arc};
+use std::{path, sync::Arc};
 
 use anyhow::Context;
 use clap::Parser;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use url::Url;
 
 #[derive(Parser, Debug)]
@@ -29,10 +29,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Read the PEM certificate chain
-    let chain = fs::File::open(args.tls_cert).context("failed to open cert file")?;
-    let mut chain = io::BufReader::new(chain);
-
-    let chain: Vec<CertificateDer> = rustls_pemfile::certs(&mut chain)
+    let chain: Vec<CertificateDer> = CertificateDer::pem_file_iter(args.tls_cert)
+        .context("failed to open cert file")?
         .collect::<Result<_, _>>()
         .context("failed to load certs")?;
 

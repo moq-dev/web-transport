@@ -45,7 +45,7 @@ updates:
           - "*"
 
   - package-ecosystem: "uv"
-    directory: "/"
+    directory: "/py/web-transport"
     schedule:
       interval: "weekly"
     cooldown:
@@ -54,3 +54,17 @@ updates:
       uv:
         patterns:
           - "*"
+
+  # Majors stay out of the group so a toolchain migration, such as a new Android
+  # Gradle Plugin, cannot hold back routine library bumps.
+  - package-ecosystem: "gradle"
+    directory: "/kt"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      gradle:
+        update-types:
+          - "minor"
+          - "patch"

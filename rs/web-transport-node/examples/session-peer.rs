@@ -3,6 +3,7 @@
 use std::{io::Read, ops::Deref};
 
 use anyhow::Context;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -18,12 +19,10 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let pem = std::env::var("WEB_TRANSPORT_TEST_PEM").context("read test certificate")?;
         let pem = pem.as_bytes();
-        let certs = rustls_pemfile::certs(&mut &pem[..])
+        let certs = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<Vec<_>, _>>()
             .context("parse certificate")?;
-        let key = rustls_pemfile::private_key(&mut &pem[..])
-            .context("parse private key")?
-            .context("missing key")?;
+        let key = PrivateKeyDer::from_pem_slice(pem).context("parse private key")?;
         let mut server = web_transport_quinn::ServerBuilder::new()
             .with_addr("127.0.0.1:0".parse()?)
             .with_certificate(certs, key)

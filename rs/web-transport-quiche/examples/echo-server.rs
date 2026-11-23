@@ -4,6 +4,7 @@ use anyhow::Context;
 
 use bytes::Bytes;
 use clap::Parser;
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -33,16 +34,14 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Load the certificate chain from PEM.
-    let cert_pem = std::fs::read(&args.tls_cert).context("failed to read certificate file")?;
-    let chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+    let chain: Vec<_> = CertificateDer::pem_file_iter(&args.tls_cert)
+        .context("failed to read certificate file")?
         .collect::<Result<_, _>>()
         .context("failed to parse certificate PEM")?;
 
     // Load the private key from PEM.
-    let key_pem = std::fs::read(&args.tls_key).context("failed to read private key file")?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .context("failed to parse private key PEM")?
-        .context("no private key found in PEM file")?;
+    let key =
+        PrivateKeyDer::from_pem_file(&args.tls_key).context("failed to load private key PEM")?;
 
     let mut server = web_transport_quiche::ServerBuilder::default()
         .with_bind(args.bind)?

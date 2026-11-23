@@ -75,7 +75,6 @@
           pkgs.llvmPackages.libclang.lib
           # Node runtime tests and NPM publishing.
           pkgs.nodejs_24
-          pkgs.openssl
         ];
       in
       {
