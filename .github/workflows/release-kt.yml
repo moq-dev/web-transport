@@ -200,7 +200,7 @@ jobs:
             --output release-out
 
       - name: Check R8 keep rules
-        run: gradle -p kt -Pandroid.enabled=true :r8-check:checkKeepRules
+        run: ./kt/gradlew -p kt -Pandroid.enabled=true :r8-check:checkKeepRules
 
       - name: Publish to Maven Central
         # Tag pushes only, and only once PUBLISH_KOTLIN=true is set in repo
@@ -209,7 +209,7 @@ jobs:
         # require MAVEN_CENTRAL_* and SIGNING_* secrets to be configured.
         if: github.event_name != 'pull_request' && vars.PUBLISH_KOTLIN == 'true'
         run: |
-          gradle -p kt \
+          ./kt/gradlew -p kt \
             -Pwebtransportffi.version="${{ needs.parse-version.outputs.version }}" \
             -Pandroid.enabled=true \
             :web-transport:publishAndReleaseToMavenCentral --no-configuration-cache
