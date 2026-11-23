@@ -7,9 +7,6 @@ license = "MIT OR Apache-2.0"
 version = "0.0.9"
 edition = "2021"
 
-[lints]
-workspace = true
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
@@ -31,3 +28,6 @@ anyhow = "1"
 rcgen = "0.14"
 tokio = { version = "1", features = ["rt"] }
 web-transport-proto = { workspace = true }
+
+[lints]
+workspace = true

@@ -11,9 +11,6 @@ edition = "2021"
 keywords = ["quic", "http3", "webtransport"]
 categories = ["network-programming", "web-programming"]
 
-[lints]
-workspace = true
-
 [package.metadata.docs.rs]
 all-features = true
 
@@ -59,3 +56,6 @@ rcgen = "0.14"
 sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true
