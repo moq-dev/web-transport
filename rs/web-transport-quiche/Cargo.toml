@@ -31,7 +31,7 @@ kio = "0.6.2"
 # a peer's STOP_SENDING code before collecting the stream, which `SendStream`
 # surfaces as `StreamError::Stop`.
 quiche = { version = "0.30.1", default-features = false }
-rustls-pki-types = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
 
 socket2 = "0.6"
 thiserror = "2"

@@ -43,6 +43,9 @@ check:
 	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
+	# Each package's examples and tests on their own, so workspace feature unification
+	# cannot hide a feature a single package forgets to enable.
+	cargo hack check --workspace --all-targets --keep-going
 
 	# requires: cargo install cargo-shear
 	cargo shear
