@@ -72,25 +72,16 @@ reading consume exactly one HEADERS frame, including rejections and malformed
 field sections. Both request and response debug output redact header values by
 default, so diagnostic code must deliberately select fields to print.
 
-### Migration and compatibility
+### Backend rejections
 
-This is a breaking Rust API change. Replace `ConnectResponse::OK` with
-`ConnectResponse::default()` (or `ConnectResponse::new(StatusCode::OK)`):
-`HeaderMap` cannot be initialized in a constant. `ConnectResponse` remains
-non-exhaustive and gains `headers`. Code expecting non-success `decode` / `read`
-to return `WrongStatus` must inspect the returned `response.status` instead;
-`WrongStatus` and the unused `ErrorStatus` protocol error variants are removed,
-and a missing status returns `MissingStatus`.
-
-Quinn, Noq and Iroh `ConnectError::ErrorStatus`, and Quiche
-`h3::ConnectError::Status`, now contain `Box<ConnectResponse>` rather than a
-status code. Match `response.status` for the old value and `response.headers`
-for diagnostics. Their server `reject` methods now accept
-`impl Into<ConnectResponse>`, so existing status-code calls still work and a
-header-bearing response can be passed directly. Quinn, Noq and Iroh wait for
-response acknowledgement or the peer to stop reading before releasing the
-handshake, preventing a final connection drop from discarding queued headers.
-Quiche waits for the rejected stream to retire. All native rejection futures
+`ConnectResponse::default()` is a 200 response. Quinn, Noq and iroh
+`ConnectError::ErrorStatus`, and Quiche `h3::ConnectError::Status`, carry the
+complete `Box<ConnectResponse>`: match `response.status` for the code and
+`response.headers` for diagnostics. Their server `reject` methods accept
+`impl Into<ConnectResponse>`, so a status code or a header-bearing response both
+work. Quinn, Noq and iroh wait for response acknowledgement or the peer to stop
+reading before releasing the handshake, so a final connection drop cannot discard
+queued headers. Quiche waits for the rejected stream to retire. All native rejection futures
 also complete if the peer terminates the connection; an unresponsive peer can
 hold them until the transport idle timeout, so cancel the future to impose an
 application deadline.
@@ -99,8 +90,5 @@ Request decoding rejects duplicate, unknown and misplaced pseudo-headers.
 Repeated `wt-available-protocols` lines are combined as a structured list before
 parsing, retaining all offered protocols in order.
 
-The wire format remains standard HTTP/3 HEADERS with static/literal QPACK, no
-new extension or setting. Repeated ordinary lines are preserved instead of
-collapsed. Malformed response fields and conflicting managed fields are now
-rejected. Legacy draft output and field-section limits are unchanged. No package
-versions are bumped in this change.
+The wire format is standard HTTP/3 HEADERS with static/literal QPACK and no
+extension or setting. Repeated ordinary lines are preserved rather than collapsed.

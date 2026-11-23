@@ -222,14 +222,14 @@ leaked handles and reports the last completed phase. Temporary files and timed-o
 process groups are removed; no registry publishing is needed. OpenSSL generates a
 short-lived test certificate.
 
-The independent Node runtime PR workflow runs this command on Linux for all pull
-requests, including changes to shared Rust code and build/workflow files.
+The independent Node runtime PR workflow runs this command on Linux for every pull
+request to `main`, including changes to shared Rust code and build/workflow files.
 
 `bun run --cwd js/web-transport build` builds the native module and its JavaScript
 wrapper. Packing or publishing runs `build:js` through `prepack`, so the package
 exports JavaScript and declarations from `dist/` without requiring a TypeScript
-loader in Node. Platform-specific native packages and their release layout are
-unchanged.
+loader in Node. Prebuilt native packages cover the `napi.targets` listed in
+`package.json`; build other targets from source.
 
 ## License
 
@@ -237,8 +237,6 @@ MIT OR Apache-2.0
 
 ## Native crypto
 
-The native Quinn backend uses rind through rind-rustls, with an installed process-wide
-rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
-Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
-returns an error if the CPU lacks a required feature. This also applies with another
-TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+The native library follows web-transport-quinn's TLS provider selection and CPU
+requirements; see [its crypto section](https://github.com/moq-dev/web-transport/blob/main/rs/web-transport-quinn/README.md#crypto).
+Constructing a client or server on an unsupported CPU throws.

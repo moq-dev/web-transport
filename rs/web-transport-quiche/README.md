@@ -69,8 +69,7 @@ and converts bytes per second with saturating multiplication by eight.
 before a usable sample. The estimate is not a guarantee of link capacity or application throughput,
 and it can remain stale while the application sends too little to measure capacity.
 
-For the audited tokio-quiche 0.20.1 and Quiche 0.30.0 releases, both client and
-server use the [default `cubic` controller][cc-default]. Pass `Settings` to either builder's
+Both client and server use tokio-quiche's [default `cubic` controller][cc-default]. Pass `Settings` to either builder's
 `with_settings` method to select another `cc_algorithm`:
 
 | `Settings::cc_algorithm` | Meaning of the reported estimate |
@@ -101,10 +100,10 @@ filtering and the controller's response to congestion. Delivery-rate accuracy
 also depends on respecting Quiche's pacing hints: disabling pacing or ignoring
 those hints in the transport or platform can distort the estimate.
 
-[cc-default]: https://github.com/cloudflare/quiche/blob/925b225825e2188f8e58e359114150500557bf61/tokio-quiche/src/settings/quic.rs
-[cc-selector]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/mod.rs
-[legacy-rate]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/congestion/delivery_rate.rs
-[bbr-model]: https://github.com/cloudflare/quiche/blob/be47c5011215b9f13bad06bd7627d3ae49888a19/quiche/src/recovery/gcongestion/bbr2/network_model.rs
+[cc-default]: https://github.com/cloudflare/quiche/blob/b364fdfee3799d8c469d5cd8f5693fafb420a466/tokio-quiche/src/settings/quic.rs
+[cc-selector]: https://github.com/cloudflare/quiche/blob/b364fdfee3799d8c469d5cd8f5693fafb420a466/quiche/src/recovery/mod.rs
+[legacy-rate]: https://github.com/cloudflare/quiche/blob/b364fdfee3799d8c469d5cd8f5693fafb420a466/quiche/src/recovery/congestion/delivery_rate.rs
+[bbr-model]: https://github.com/cloudflare/quiche/blob/b364fdfee3799d8c469d5cd8f5693fafb420a466/quiche/src/recovery/gcongestion/bbr2/network_model.rs
 
 ## Testing
 
@@ -121,13 +120,11 @@ separate clock-driving seam.
 
 ## CONNECT response metadata
 
-`Request::respond` and `Request::reject` accept a
+`h3::Request::respond` and `h3::Request::reject` accept a
 [`proto::ConnectResponse`](../web-transport-proto/README.md#connect-response-headers)
 with ordinary headers, including repeated values.
 Inspect successful headers with `Connection::response()`. A rejected CONNECT
 is a structured `h3::ConnectError::Status(Box<ConnectResponse>)` error; inspect
 `response.status` and `response.headers.get_all(name)`. The response stays inside
 the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
-CONNECT response. See the protocol crate's migration notes for the breaking
-error payload change and replacement of `ConnectResponse::OK` with
-`ConnectResponse::default()`.
+CONNECT response.

@@ -167,9 +167,9 @@ where
 /// version, in order; an empty `versions` slice expands to every QMux draft
 /// this crate knows about. Add multiple entries to negotiate across drafts in
 /// a single handshake; the wire-format version comes from the negotiated
-/// subprotocol. By default the bare version ALPNs (`qmux-01`, `qmux-00`,
-/// `webtransport`) are also offered for peers that don't pin an app protocol;
-/// call [`Client::require_protocol`] to offer only the configured pairs.
+/// subprotocol. By default the bare version ALPNs ([`ALPNS`](crate::ALPNS))
+/// are also offered for peers that don't pin an app protocol; call
+/// [`Client::require_protocol`] to offer only the configured pairs.
 #[derive(Default, Clone)]
 pub struct Client {
     protocols: Vec<(String, Vec<Version>)>,
@@ -209,9 +209,9 @@ impl Client {
     }
 
     /// Offer only the prefixed `(alpn, version)` pairs, suppressing the bare
-    /// version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) that are offered by
-    /// default. Use this when the peer must commit to one of the application
-    /// protocols you've configured.
+    /// version ALPNs ([`ALPNS`](crate::ALPNS)) that are offered by default.
+    /// Use this when the peer must commit to one of the application protocols
+    /// you've configured.
     pub fn require_protocol(mut self) -> Self {
         self.require_protocol = true;
         self
@@ -339,10 +339,10 @@ impl Client {
 /// ride on. The handshake callback matches each `{v.prefix()}{alpn}`
 /// permutation against the client's offered `Sec-WebSocket-Protocol` in
 /// declaration order. An empty `versions` slice expands to every QMux draft
-/// this crate knows about. By default bare version ALPNs (`qmux-01`,
-/// `qmux-00`, `webtransport`) are also accepted for peers that don't pin an
-/// app protocol; call [`Server::require_protocol`] to accept only the
-/// configured pairs.
+/// this crate knows about. By default bare version ALPNs
+/// ([`ALPNS`](crate::ALPNS)) are also accepted for peers that don't pin an app
+/// protocol; call [`Server::require_protocol`] to accept only the configured
+/// pairs.
 #[derive(Default, Clone)]
 pub struct Server {
     protocols: Vec<(String, Vec<Version>)>,
@@ -380,9 +380,9 @@ impl Server {
     }
 
     /// Accept only the configured prefixed pairs, rejecting clients that offer
-    /// just a bare version ALPN (`qmux-01`, `qmux-00`, `webtransport`) with no
-    /// application protocol. By default those bare ALPNs are accepted, yielding
-    /// a session with `Config::protocol == None` and the wire-format version
+    /// just a bare version ALPN ([`ALPNS`](crate::ALPNS)) with no application
+    /// protocol. By default those bare ALPNs are accepted, yielding a session
+    /// with `Config::protocol == None` and the wire-format version
     /// implied by the ALPN.
     pub fn require_protocol(mut self) -> Self {
         self.require_protocol = true;
@@ -474,9 +474,8 @@ impl Server {
                 }
             }
 
-            // Default fallback: accept bare version ALPNs (qmux-01, qmux-00,
-            // webtransport) for clients that didn't request an app protocol,
-            // unless require_protocol was set. The session ends up with
+            // Default fallback: accept bare version ALPNs for clients that
+            // didn't request an app protocol, unless require_protocol was set. The session ends up with
             // `protocol = None` and the wire-format version implied by
             // whichever bare ALPN won.
             if !require_protocol {

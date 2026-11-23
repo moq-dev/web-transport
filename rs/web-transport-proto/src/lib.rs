@@ -18,3 +18,8 @@ pub use http;
 
 mod huffman;
 mod qpack;
+
+// Compile the README examples as doctests so they track the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

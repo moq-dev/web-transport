@@ -67,13 +67,13 @@ handling, and `Server::new(endpoint)` accepts a caller's server endpoint.
 connections through any clone. Await `client.wait_idle()` after closing to
 wait for every bound endpoint to drain.
 
-## Crypto and migration
+## Crypto
 
 TLS uses the process-wide rustls provider if one is installed, otherwise
 [rind-rustls](https://github.com/kixel-ai/rind/tree/main/rind-rustls). Retry integrity,
 stateless resets and handshake tokens always use rind. The normal and build
 dependency graph contains no ring or aws-lc-rs; aws-lc-rs is a development dependency
-for interop tests. The `ring` and `aws-lc-rs` crate features have been removed.
+for interop tests.
 
 rind supports x86_64, aarch64 and 32-bit ARM. A CPU missing a required feature is
 rejected by the builders' finishing methods with `ClientError::UnsupportedCpu` or
@@ -83,14 +83,15 @@ when the process installed another TLS provider, because endpoint keys use rind.
 on an unsupported CPU; use `ClientBuilder::new().with_system_roots()` to handle the
 error.
 
-For manually configured endpoints, replace `quinn::crypto::rustls::QuicClientConfig`,
-`QuicServerConfig` and `HandshakeData` with the same names under
-`web_transport_quinn::crypto`. `crypto::default_provider()` and `crypto::sha256()` now return a `Result`.
-Import rustls directly instead of through the feature-gated `quinn::rustls` re-export.
-Use `crypto::server_config(Arc::new(crypto))?` instead of
-`quinn::ServerConfig::with_crypto`, and `quinn::Endpoint::new` with
-`crypto::endpoint_config()?` instead of `Endpoint::client` or `Endpoint::server`.
-Those Quinn convenience methods require its ring or aws-lc-rs feature.
+Manually configured endpoints use `QuicClientConfig`, `QuicServerConfig` and
+`HandshakeData` from `web_transport_quinn::crypto` in place of Quinn's
+`quinn::crypto::rustls` types, and import rustls directly rather than through
+the feature-gated `quinn::rustls` re-export. Build server configs with
+`crypto::server_config(Arc::new(crypto))?` and endpoints with `quinn::Endpoint::new`
+and `crypto::endpoint_config()?`: Quinn's `ServerConfig::with_crypto`,
+`Endpoint::client` and `Endpoint::server` require its ring or aws-lc-rs feature.
+`crypto::default_provider()` and `crypto::sha256()` return a `Result`, failing on
+an unsupported CPU.
 
 ```rust,no_run
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -165,15 +166,14 @@ a close capsule reports `WebTransportError::Closed(0, "")`; malformed or interru
 capsules report `WebTransportError::CapsuleError` unless the underlying connection has
 already reported its own error. An explicit local close reports `ConnectionError::LocallyClosed`.
 
-`WebTransportError::CapsuleError(String)` adds a diagnostic variant to the public
-enum; exhaustive matches must handle it. Dropping a receive stream sends
+Dropping a receive stream sends
 application code 0 in the session's code space, preserving raw QUIC code 0 for raw sessions.
 
 The `web-transport-quinn` API is almost identical to the Quinn API, except that [Connection](https://docs.rs/quinn/latest/quinn/struct.Connection.html) is called [Session](https://docs.rs/web-transport-quinn/latest/web_transport_quinn/struct.Session.html).
 
 When possible, `Deref` is used to expose the underlying Quinn API.
 However some of the API is wrapped or unavailable due to WebTransport limitations.
-- Stream IDs are not avaialble.
+- Stream IDs are not available.
 - Error codes are not full VarInts (62-bits) and significantly smaller.
 
 
@@ -186,6 +186,4 @@ Inspect successful headers with `Session::response()`. A rejected CONNECT
 is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
 `response.status` and `response.headers.get_all(name)`. The response stays inside
 the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
-CONNECT response. See the protocol crate's migration notes for the breaking
-error payload change and replacement of `ConnectResponse::OK` with
-`ConnectResponse::default()`.
+CONNECT response.

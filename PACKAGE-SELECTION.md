@@ -8,8 +8,9 @@ using their APIs directly or writing against `web-transport-trait`.
 This guide describes the code in this checkout. The external comparison was
 checked on 2026-11-07 against [wtransport 0.7.2][wt-manifest] and its public
 reference documentation. Recheck the linked sources when changing versions.
-The browser WASM paths below exclude WASI: the [router source][router-code] also
-selects Quinn for WASI, whose build support is unverified here.
+The browser WASM paths below exclude WASI: the [router source][router-code] selects
+Quinn for WASI, but its manifest adds Quinn only outside `wasm32`, so the router does
+not build for WASI.
 **Unsupported** means the cited API excludes a capability. **Unverified** means
 these sources do not establish support; it does not mean the capability is
 impossible or absent from every related project.

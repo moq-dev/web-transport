@@ -583,10 +583,7 @@ class Server:
             self._inner.close(0, "")
         except _UniffiError:
             pass
-        try:
-            await self._inner.wait_closed()
-        except (_UniffiError, AttributeError):
-            pass
+        await self._inner.wait_closed()
         return None
 
     def __aiter__(self) -> AsyncIterator[SessionRequest]:
@@ -615,15 +612,8 @@ class Server:
             reraise(e)
 
     async def wait_closed(self) -> None:
-        # The FFI Server has no `wait_closed`; provide a no-op shim so
-        # the legacy API still resolves.
-        fn = getattr(self._inner, "wait_closed", None)
-        if fn is None:
-            return None
-        try:
-            await fn()
-        except _UniffiError:
-            pass
+        """Wait for all connections to shut down cleanly."""
+        await self._inner.wait_closed()
 
     @property
     def local_addr(self) -> tuple[str, int]:

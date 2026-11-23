@@ -105,6 +105,4 @@ Inspect successful headers with `Session::response()`. A rejected CONNECT
 is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
 `response.status` and `response.headers.get_all(name)`. The response stays inside
 the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
-CONNECT response. See the protocol crate's migration notes for the breaking
-error payload change and replacement of `ConnectResponse::OK` with
-`ConnectResponse::default()`.
+CONNECT response.

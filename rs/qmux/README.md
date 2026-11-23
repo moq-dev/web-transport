@@ -10,9 +10,8 @@ See the [package and backend selection guide](../../PACKAGE-SELECTION.md) for al
 
 ## Install
 
-```toml
-[dependencies]
-qmux = "0.6"
+```bash
+cargo add qmux
 ```
 
 ### Features
