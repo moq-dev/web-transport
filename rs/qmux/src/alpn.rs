@@ -20,15 +20,6 @@ use crate::Version;
 /// QMux versions that can ride under a `{prefix}{alpn}` pair, newest first.
 pub(crate) const QMUX_VERSIONS: &[Version] = &[Version::QMux02, Version::QMux01, Version::QMux00];
 
-/// Bare version ALPNs added (offered by clients, accepted by servers) unless
-/// the caller opts out via `require_protocol`. Newest first.
-pub(crate) const BARE_ALPNS: &[Version] = &[
-    Version::QMux02,
-    Version::QMux01,
-    Version::QMux00,
-    Version::WebTransport,
-];
-
 /// Resolve an entry's `versions` slice: empty falls back to every supported
 /// QMux draft, mirroring JS's `null` value.
 pub(crate) fn expand_versions(versions: &[Version]) -> &[Version] {
@@ -66,7 +57,8 @@ pub(crate) fn build<'a>(
         }
     }
     if !require_protocol {
-        for &v in BARE_ALPNS {
+        // Every bare version ALPN, newest first.
+        for &v in Version::ALL {
             out.push(v.alpn().to_string());
         }
     }

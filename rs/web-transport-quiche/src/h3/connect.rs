@@ -29,10 +29,8 @@ pub struct Connecting {
     // The request that was sent by the client.
     pub request: ConnectRequest,
 
-    // A reference to the send/recv stream, so we don't close it until dropped.
+    // The CONNECT stream, kept open for the session's lifetime.
     send: ez::SendStream,
-
-    #[allow(dead_code)]
     recv: ez::RecvStream,
 }
 

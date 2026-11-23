@@ -28,12 +28,9 @@ pub enum SettingsError {
 /// Maintains the HTTP/3 control stream by holding references to the send/recv streams.
 #[derive(Debug)]
 pub struct Settings {
-    // A reference to the send/recv stream, so we don't close it until dropped.
-    #[allow(dead_code)]
-    send: endpoint::SendStream,
-
-    #[allow(dead_code)]
-    recv: endpoint::RecvStream,
+    // Held only so the control streams stay open until dropped.
+    _send: endpoint::SendStream,
+    _recv: endpoint::RecvStream,
 }
 
 impl Settings {
@@ -44,7 +41,10 @@ impl Settings {
 
         // Run both tasks concurrently until one errors or they both complete.
         let (send, recv) = try_join!(send, recv)?;
-        Ok(Self { send, recv })
+        Ok(Self {
+            _send: send,
+            _recv: recv,
+        })
     }
 
     async fn accept(conn: &endpoint::Connection) -> Result<endpoint::RecvStream, SettingsError> {

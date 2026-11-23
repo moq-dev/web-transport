@@ -15,7 +15,7 @@
 //!
 //! ```no_run
 //! fn client() -> Result<web_transport::Client, web_transport::Error> {
-//!     #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+//!     #[cfg(not(target_arch = "wasm32"))]
 //!     {
 //!         // For trusted development networks only: this disables server authentication.
 //!         let native = web_transport::quinn::ClientBuilder::new()
@@ -23,7 +23,7 @@
 //!             .with_no_certificate_verification()?;
 //!         Ok(web_transport::Client::from(native).with_protocols(["example"]))
 //!     }
-//!     #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+//!     #[cfg(target_arch = "wasm32")]
 //!     {
 //!         web_transport::ClientBuilder::new()
 //!             .with_protocols(["example"])
@@ -42,11 +42,11 @@
 //! On native targets, `with_system_roots` verifies with the operating system's
 //! trust store.
 
-#[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+#[cfg(not(target_arch = "wasm32"))]
 #[path = "quinn.rs"]
 mod quic;
 
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 #[path = "wasm.rs"]
 mod quic;
 

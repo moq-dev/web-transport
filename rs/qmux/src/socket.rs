@@ -143,9 +143,6 @@ mod unix {
             pub delivery_rate: u64,
         }
 
-        const IPPROTO_TCP: libc::c_int = 6;
-        const TCP_INFO: libc::c_int = 11;
-
         /// Read `tcp_info`, returning it alongside the number of bytes the kernel
         /// filled in. `None` if the socket isn't TCP.
         pub fn tcp_info(fd: BorrowedFd<'_>) -> Option<(TcpInfo, usize)> {
@@ -158,8 +155,8 @@ mod unix {
             let rc = unsafe {
                 libc::getsockopt(
                     fd.as_raw_fd(),
-                    IPPROTO_TCP,
-                    TCP_INFO,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_INFO,
                     (&mut info as *mut TcpInfo).cast(),
                     &mut len,
                 )

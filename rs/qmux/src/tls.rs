@@ -3,6 +3,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
+use crate::tcp::socket_stats;
 use crate::transport::Stream;
 use crate::{alpn, Config, Error, Session, Version};
 
@@ -181,20 +182,5 @@ impl Server {
         }
         // `accept` awaits the peer's transport parameters so `protocol()` is resolved.
         Session::accept(transport, session_config).await
-    }
-}
-
-/// The kernel's view of `stream`, when this platform exposes one.
-fn socket_stats(stream: &TcpStream) -> Option<crate::SharedSocketStats> {
-    #[cfg(unix)]
-    {
-        crate::TcpStats::new(stream)
-            .ok()
-            .map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = stream;
-        None
     }
 }

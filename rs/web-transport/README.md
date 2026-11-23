@@ -42,7 +42,7 @@ Split setup by target, then share `Client::connect` and application code:
 
 ```rust
 fn client() -> Result<web_transport::Client, web_transport::Error> {
-    #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         // For trusted development networks only: this disables server authentication.
         let native = web_transport::quinn::ClientBuilder::new()
@@ -50,7 +50,7 @@ fn client() -> Result<web_transport::Client, web_transport::Error> {
             .with_no_certificate_verification()?;
         Ok(web_transport::Client::from(native).with_protocols(["example"]))
     }
-    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+    #[cfg(target_arch = "wasm32")]
     {
         web_transport::ClientBuilder::new()
             .with_protocols(["example"])

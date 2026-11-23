@@ -122,9 +122,7 @@ impl RecvStream {
         match self.inner.received_reset().await {
             Ok(None) => Ok(None),
             Ok(Some(code)) => Ok(decode_stream_code(code, self.raw)),
-            Err(quinn::ResetError::ConnectionLost(conn_err)) => {
-                Err(self.error.map(conn_err.into()))
-            }
+            Err(quinn::ResetError::ConnectionLost(conn_err)) => Err(self.error.map(conn_err)),
             Err(quinn::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
         }
     }

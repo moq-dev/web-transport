@@ -408,7 +408,10 @@ impl Default for Client {
     }
 }
 
-#[cfg_attr(not(any(feature = "aws-lc-rs", feature = "ring")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "aws-lc-rs", feature = "ring")),
+    expect(dead_code, reason = "only the crypto features read it")
+)]
 #[derive(Debug)]
 struct ServerFingerprints {
     provider: crypto::Provider,

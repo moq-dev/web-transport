@@ -11,6 +11,9 @@ edition = "2021"
 keywords = ["quic", "qmux", "webtransport", "multiplexing"]
 categories = ["network-programming"]
 
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 

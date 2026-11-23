@@ -13,9 +13,6 @@ pub use frame::*;
 pub(crate) use params::*;
 pub use version::*;
 
-/// Default maximum record size per draft-01 (16382 bytes).
-pub use params::DEFAULT_MAX_RECORD_SIZE;
-
 /// Maximum size of a single QMux frame on the wire (type + fields + payload).
 ///
 /// This is draft-00's `max_frame_size`, which bounds the whole frame. The

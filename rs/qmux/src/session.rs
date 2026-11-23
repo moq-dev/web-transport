@@ -1503,6 +1503,29 @@ impl<R: Reader> SessionState<R> {
         }
     }
 
+    fn recv_open_mut(&mut self, dir: StreamDir) -> &mut RecvOpen {
+        match dir {
+            StreamDir::Bi => &mut self.recv_open_bi,
+            StreamDir::Uni => &mut self.recv_open_uni,
+        }
+    }
+
+    /// The MAX_STREAMS credit for peer-initiated streams in `dir`.
+    fn recv_stream_credit(&self, dir: StreamDir) -> &Credit {
+        match dir {
+            StreamDir::Bi => &self.recv_bi_credit,
+            StreamDir::Uni => &self.recv_uni_credit,
+        }
+    }
+
+    /// Our initial receive window for a peer-initiated stream in `dir`.
+    fn recv_stream_window(&self, dir: StreamDir) -> u64 {
+        match dir {
+            StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
+            StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
+        }
+    }
+
     // RFC 9000 §19.5/§19.10 forbid send controls for receive-only streams
     // and local IDs we have not allocated. Retired IDs remain valid.
     fn validate_send_id(&self, id: StreamId) -> Result<(), Error> {
@@ -1610,10 +1633,7 @@ impl<R: Reader> SessionState<R> {
                 // New peer-initiated stream. Enforce the stream-count limit — per
                 // RFC 9000 §4.6 opening index N implicitly opens all of 0..N.
                 if self.config.version.is_qmux() {
-                    let credit = match stream.id.dir() {
-                        StreamDir::Bi => &self.recv_bi_credit,
-                        StreamDir::Uni => &self.recv_uni_credit,
-                    };
+                    let credit = self.recv_stream_credit(stream.id.dir());
                     if !credit.receive_up_to(stream.id.index() + 1) {
                         return Err(Error::StreamLimitExceeded);
                     }
@@ -1622,11 +1642,8 @@ impl<R: Reader> SessionState<R> {
                     // later frame on it (once retired) reads as closed rather than
                     // resurrecting a new stream. After the credit gate, which bounds
                     // the hole set to MAX_STREAMS.
-                    match stream.id.dir() {
-                        StreamDir::Bi => &mut self.recv_open_bi,
-                        StreamDir::Uni => &mut self.recv_open_uni,
-                    }
-                    .record(stream.id.index());
+                    self.recv_open_mut(stream.id.dir())
+                        .record(stream.id.index());
                 }
 
                 let (tx, rx) = mpsc::unbounded_channel();
@@ -1634,10 +1651,7 @@ impl<R: Reader> SessionState<R> {
 
                 // Determine initial stream recv window
                 let recv_window = if self.config.version.is_qmux() {
-                    match stream.id.dir() {
-                        StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
-                        StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
-                    }
+                    self.recv_stream_window(stream.id.dir())
                 } else {
                     u64::MAX
                 };
@@ -1651,10 +1665,7 @@ impl<R: Reader> SessionState<R> {
 
                 let slot = self.config.version.is_qmux().then(|| {
                     Arc::new(StreamSlot {
-                        credit: match stream.id.dir() {
-                            StreamDir::Bi => self.recv_bi_credit.clone(),
-                            StreamDir::Uni => self.recv_uni_credit.clone(),
-                        },
+                        credit: self.recv_stream_credit(stream.id.dir()).clone(),
                         control: self.control.clone(),
                         dir: stream.id.dir(),
                     })
@@ -1822,19 +1833,12 @@ impl<R: Reader> SessionState<R> {
 
                         // RESET_STREAM can be the first frame for a peer-initiated
                         // stream and therefore implicitly opens its index.
-                        let credit = match reset_id.dir() {
-                            StreamDir::Bi => &self.recv_bi_credit,
-                            StreamDir::Uni => &self.recv_uni_credit,
-                        };
+                        let credit = self.recv_stream_credit(reset_id.dir());
                         if !credit.receive_up_to(reset_id.index() + 1) {
                             return Err(Error::StreamLimitExceeded);
                         }
 
-                        let recv_max = match reset_id.dir() {
-                            StreamDir::Bi => self.our_params.initial_max_stream_data_bidi_remote,
-                            StreamDir::Uni => self.our_params.initial_max_stream_data_uni,
-                        };
-                        if reset.final_size > recv_max {
+                        if reset.final_size > self.recv_stream_window(reset_id.dir()) {
                             return Err(Error::FlowControlError);
                         }
                         reset.final_size
@@ -1859,17 +1863,12 @@ impl<R: Reader> SessionState<R> {
                     // Reset-first stream: retire the id, and replenish MAX_STREAMS
                     // since no frontend exists to do it on Drop.
                     None => {
-                        match reset_id.dir() {
-                            StreamDir::Bi => &mut self.recv_open_bi,
-                            StreamDir::Uni => &mut self.recv_open_uni,
-                        }
-                        .record(reset_id.index());
-
-                        let credit = match reset_id.dir() {
-                            StreamDir::Bi => &self.recv_bi_credit,
-                            StreamDir::Uni => &self.recv_uni_credit,
-                        };
-                        credit.consume(1, &self.control, max_streams_frame(reset_id.dir()));
+                        self.recv_open_mut(reset_id.dir()).record(reset_id.index());
+                        self.recv_stream_credit(reset_id.dir()).consume(
+                            1,
+                            &self.control,
+                            max_streams_frame(reset_id.dir()),
+                        );
                     }
                 }
             }

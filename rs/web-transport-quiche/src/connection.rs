@@ -52,8 +52,7 @@ pub struct Connection {
     conn: ez::Connection,
 
     // Shared only by frontend clones, never by background tasks or streams.
-    #[allow(dead_code)]
-    drop: Arc<ConnectionDrop>,
+    _drop: Arc<ConnectionDrop>,
 
     // The session ID, as determined by the stream ID of the connect request.
     session_id: Option<VarInt>,
@@ -64,12 +63,10 @@ pub struct Connection {
     // Cache the headers in front of each stream we open.
     header_uni: Vec<u8>,
     header_bi: Vec<u8>,
-    #[allow(unused)]
     header_datagram: Vec<u8>,
 
     // Keep a reference to the settings and connect stream to avoid closing them until dropped.
-    #[allow(dead_code)]
-    settings: Option<Arc<h3::Settings>>,
+    _settings: Option<Arc<h3::Settings>>,
 
     // The request and response that were sent and received.
     // Both are None for a raw QUIC session.
@@ -184,7 +181,7 @@ impl Connection {
 
         Self {
             conn,
-            drop,
+            _drop: drop,
             accept: Some(Arc::new(Mutex::new(accept))),
             session_id: Some(session_id),
             header_uni,
@@ -193,7 +190,7 @@ impl Connection {
             request: Some(request),
             response: Some(response),
             alpn: Default::default(),
-            settings: Some(Arc::new(settings)),
+            _settings: Some(Arc::new(settings)),
             open_uni: OpenUni::Idle,
             open_bi: OpenBi::Idle,
             parked_accept_uni: Parked::default(),
@@ -422,13 +419,13 @@ impl Connection {
 
         Self {
             conn,
-            drop,
+            _drop: drop,
             session_id: None,
             header_uni: Default::default(),
             header_bi: Default::default(),
             header_datagram: Default::default(),
             accept: None,
-            settings: None,
+            _settings: None,
             request: None,
             response: None,
             alpn: Default::default(),
@@ -1015,8 +1012,7 @@ impl web_transport_trait::poll::Session for Connection {
             .map(Into::into)
     }
 
-    #[allow(refining_impl_trait)]
-    fn stats(&self) -> ez::ConnectionStats {
+    fn stats(&self) -> impl web_transport_trait::Stats {
         Self::stats(self)
     }
 }
@@ -1158,8 +1154,8 @@ mod tests {
             _settings,
             _connect,
         } = http_pair().await?;
-        let guard = Arc::downgrade(&session.drop);
-        let reader = session.drop.reader.clone().expect("HTTP/3 reader");
+        let guard = Arc::downgrade(&session._drop);
+        let reader = session._drop.reader.clone().expect("HTTP/3 reader");
         let streams = session.open_bi().await?;
         drop(session);
         assert!(

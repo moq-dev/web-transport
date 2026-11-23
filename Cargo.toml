@@ -19,3 +19,12 @@ web-transport-proto = { path = "rs/web-transport-proto", version = "0.7" }
 web-transport-quinn = { path = "rs/web-transport-quinn", version = "0.14", default-features = false }
 web-transport-trait = { path = "rs/web-transport-trait", version = "0.5" }
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(web_sys_unstable_apis)'] }
+
+# Suppress a lint with `#[expect(lint, reason = "...")]`, so one that stops
+# applying fails clippy instead of lingering.
+[workspace.lints.clippy]
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+

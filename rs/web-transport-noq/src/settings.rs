@@ -24,12 +24,9 @@ pub enum SettingsError {
 }
 
 pub struct Settings {
-    // A reference to the send/recv stream, so we don't close it until dropped.
-    #[allow(dead_code)]
-    send: noq::SendStream,
-
-    #[allow(dead_code)]
-    recv: noq::RecvStream,
+    // Held only so the control streams stay open until dropped.
+    _send: noq::SendStream,
+    _recv: noq::RecvStream,
 }
 
 impl Settings {
@@ -40,7 +37,10 @@ impl Settings {
 
         // Run both tasks concurrently until one errors or they both complete.
         let (send, recv) = try_join!(send, recv)?;
-        Ok(Self { send, recv })
+        Ok(Self {
+            _send: send,
+            _recv: recv,
+        })
     }
 
     async fn accept(conn: &noq::Connection) -> Result<noq::RecvStream, SettingsError> {

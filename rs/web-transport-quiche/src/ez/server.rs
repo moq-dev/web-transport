@@ -339,8 +339,7 @@ pub struct Server<M: Metrics = DefaultMetrics> {
     accept: mpsc::Receiver<Incoming>,
     local_addrs: Vec<SocketAddr>,
     // Cancels socket tasks when dropped.
-    #[allow(dead_code)]
-    tasks: JoinSet<io::Result<()>>,
+    _tasks: JoinSet<io::Result<()>>,
     _metrics: PhantomData<M>,
 }
 
@@ -364,7 +363,7 @@ impl<M: Metrics> Server<M> {
             accept: accept.1,
             local_addrs,
             _metrics: PhantomData,
-            tasks,
+            _tasks: tasks,
         }
     }
 

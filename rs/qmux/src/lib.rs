@@ -34,6 +34,7 @@ mod config;
 mod credit;
 mod error;
 mod proto;
+#[cfg(any(feature = "tcp", feature = "ws", all(unix, feature = "uds")))]
 mod protocol;
 mod rtt;
 mod sched;

@@ -49,6 +49,11 @@ impl VarInt {
         self.0
     }
 
+    /// Whether this is a reserved HTTP/3 value (`0x1f * N + 0x21`) that receivers must ignore.
+    pub(crate) fn is_grease(self) -> bool {
+        self.0 >= 0x21 && (self.0 - 0x21).is_multiple_of(0x1f)
+    }
+
     /// Compute the number of bytes needed to encode this value
     pub fn size(self) -> usize {
         let x = self.0;

@@ -362,22 +362,9 @@ impl Session {
     /// Datagrams are unreliable and may be dropped or delivered out of order.
     /// The data must be smaller than [`max_datagram_size`](Self::max_datagram_size).
     pub fn send_datagram(&self, data: Bytes) -> Result<(), SessionError> {
-        let result = if !self.header_datagram.is_empty() {
-            // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
-            // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
-            let mut buf = BytesMut::with_capacity(self.header_datagram.len() + data.len());
-
-            // Prepend the datagram with the header indicating the session ID.
-            buf.extend_from_slice(&self.header_datagram);
-            buf.extend_from_slice(&data);
-
-            self.conn.send_datagram(buf.into())
-        } else {
-            self.conn.send_datagram(data)
-        };
-
-        result.map_err(|e| self.map_error(e))?;
-        Ok(())
+        self.conn
+            .send_datagram(self.framed_datagram(data))
+            .map_err(|e| self.map_error(e))
     }
 
     /// Sends an application datagram, waiting for buffer space if the send buffer is full.
@@ -388,22 +375,19 @@ impl Session {
     /// Datagrams are unreliable and may be dropped or delivered out of order.
     /// The data must be smaller than [`max_datagram_size`](Self::max_datagram_size).
     pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), SessionError> {
-        let result = if !self.header_datagram.is_empty() {
-            // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
-            // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
-            let mut buf = BytesMut::with_capacity(self.header_datagram.len() + data.len());
+        self.conn
+            .send_datagram_wait(self.framed_datagram(data))
+            .await
+            .map_err(|e| self.map_error(e))
+    }
 
-            // Prepend the datagram with the header indicating the session ID.
-            buf.extend_from_slice(&self.header_datagram);
-            buf.extend_from_slice(&data);
-
-            self.conn.send_datagram_wait(buf.into()).await
+    /// `data` behind the session ID header, or unchanged for a raw session.
+    fn framed_datagram(&self, data: Bytes) -> Bytes {
+        if self.header_datagram.is_empty() {
+            data
         } else {
-            self.conn.send_datagram_wait(data).await
-        };
-
-        result.map_err(|e| self.map_error(e))?;
-        Ok(())
+            Self::frame_datagram(&self.header_datagram, &data)
+        }
     }
 
     /// Computes the maximum size of datagrams that may be passed to
@@ -565,18 +549,8 @@ impl Session {
 
     /// Replace connection-level errors with the stored session error if available.
     fn map_error(&self, e: impl Into<SessionError>) -> SessionError {
-        map_error_with(&self.error, e)
+        self.error.map(e)
     }
-
-    // The owned-argument form, for futures that outlive the borrow that created them.
-    fn map_error_owned(error: &CloseReason, e: impl Into<SessionError>) -> SessionError {
-        map_error_with(error, e)
-    }
-}
-
-/// Replace connection-level errors with the stored session error if available.
-fn map_error_with(stored: &CloseReason, e: impl Into<SessionError>) -> SessionError {
-    stored.map(e.into())
 }
 
 impl Session {
@@ -707,18 +681,22 @@ impl Eq for Session {}
 // inline, and the first thing a resumed accepter does is take this same lock. An
 // arrival or a failure is exactly what the others are parked waiting to retry
 // after, so `Ready` is the signal.
-fn poll_accept_uni_shared(
+/// Poll one direction of the shared accept state, waking the other waiters on that
+/// direction when a stream is taken.
+fn poll_accept_shared<T>(
     accept: &Mutex<SessionAccept>,
     waiter: &Waiter,
-) -> Poll<Result<RecvStream, SessionError>> {
+    waiters: impl FnOnce(&SessionAccept) -> &Fan,
+    poll: impl FnOnce(&mut SessionAccept, &Waiter) -> Poll<Result<T, SessionError>>,
+) -> Poll<Result<T, SessionError>> {
     let (result, waiters, hold) = {
         let mut accept = accept.lock().unwrap();
-        let waiters = accept.uni_waiters.clone();
+        let waiters = waiters(&accept).clone();
 
         // The poll below drives the shared accept futures with this list's waker, and one
         // of them may wake it inline. `Fan` holds those back while this guard is alive.
         let hold = waiters.hold();
-        let result = accept.poll_accept_uni(waiter);
+        let result = poll(&mut accept, waiter);
 
         (result, waiters, hold)
     };
@@ -734,31 +712,28 @@ fn poll_accept_uni_shared(
     result
 }
 
+fn poll_accept_uni_shared(
+    accept: &Mutex<SessionAccept>,
+    waiter: &Waiter,
+) -> Poll<Result<RecvStream, SessionError>> {
+    poll_accept_shared(
+        accept,
+        waiter,
+        |a| &a.uni_waiters,
+        SessionAccept::poll_accept_uni,
+    )
+}
+
 fn poll_accept_bi_shared(
     accept: &Mutex<SessionAccept>,
     waiter: &Waiter,
 ) -> Poll<Result<(SendStream, RecvStream), SessionError>> {
-    let (result, waiters, hold) = {
-        let mut accept = accept.lock().unwrap();
-        let waiters = accept.bi_waiters.clone();
-
-        // The poll below drives the shared accept futures with this list's waker, and one
-        // of them may wake it inline. `Fan` holds those back while this guard is alive.
-        let hold = waiters.hold();
-        let result = accept.poll_accept_bi(waiter);
-
-        (result, waiters, hold)
-    };
-
-    // Dropped after the accept lock, never before: that is where a held-back wake is
-    // delivered, and delivering it under the lock is the hazard the hold exists for.
-    drop(hold);
-
-    if result.is_ready() {
-        waiters.wake();
-    }
-
-    result
+    poll_accept_shared(
+        accept,
+        waiter,
+        |a| &a.bi_waiters,
+        SessionAccept::poll_accept_bi,
+    )
 }
 
 // Type aliases just so clippy doesn't complain about the complexity.
@@ -1126,8 +1101,7 @@ impl web_transport_trait::Session for Session {
         Self::protocol(self)
     }
 
-    #[allow(refining_impl_trait)]
-    fn stats(&self) -> SessionStats {
+    fn stats(&self) -> impl web_transport_trait::Stats {
         Self::stats(self)
     }
 }
@@ -1135,25 +1109,30 @@ impl web_transport_trait::Session for Session {
 impl Session {
     // Open plus stream-header write, over owned arguments so the result can live in
     // a retained future. Mirrors `open_uni`/`open_bi`, including the priority dance.
+    // Max priority for the header so the application cannot queue lower-priority
+    // data in front of it, then back to the default.
+    async fn write_header(
+        send: &mut quinn::SendStream,
+        header: &[u8],
+        error: &CloseReason,
+    ) -> Result<(), SessionError> {
+        send.set_priority(i32::MAX).ok();
+        Self::write_full(send, header)
+            .await
+            .map_err(|e| error.map(e))?;
+        send.set_priority(0).ok();
+        Ok(())
+    }
+
     async fn open_uni_owned(
         conn: quinn::Connection,
         header: Bytes,
         error: Arc<CloseReason>,
         raw: bool,
     ) -> Result<SendStream, SessionError> {
-        let mut send = conn
-            .open_uni()
-            .await
-            .map_err(|e| Self::map_error_owned(&error, e))?;
+        let mut send = conn.open_uni().await.map_err(|e| error.map(e))?;
 
-        // Max priority for the header so the application cannot queue lower-priority
-        // data in front of it, then back to the default.
-        send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &header)
-            .await
-            .map_err(|e| Self::map_error_owned(&error, e))?;
-        send.set_priority(0).ok();
-
+        Self::write_header(&mut send, &header, &error).await?;
         Ok(SendStream::new(send, error, raw))
     }
 
@@ -1163,17 +1142,9 @@ impl Session {
         error: Arc<CloseReason>,
         raw: bool,
     ) -> Result<(SendStream, RecvStream), SessionError> {
-        let (mut send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| Self::map_error_owned(&error, e))?;
+        let (mut send, recv) = conn.open_bi().await.map_err(|e| error.map(e))?;
 
-        send.set_priority(i32::MAX).ok();
-        Self::write_full(&mut send, &header)
-            .await
-            .map_err(|e| Self::map_error_owned(&error, e))?;
-        send.set_priority(0).ok();
-
+        Self::write_header(&mut send, &header, &error).await?;
         Ok((
             SendStream::new(send, error.clone(), raw),
             RecvStream::new(recv, error, raw),
@@ -1205,11 +1176,11 @@ impl Session {
         self.op_send_datagram.poll(cx, move || async move {
             conn.send_datagram_wait(payload)
                 .await
-                .map_err(|e| Session::map_error_owned(&error, e))
+                .map_err(|e| error.map(e))
         })
     }
 
-    // Prepend the session ID, as `send_datagram`/`send_datagram_wait` do.
+    // Prepend the session ID.
     //
     // Unfortunately, we need to allocate/copy each datagram because of the Quinn API.
     // Pls go +1 if you care: https://github.com/quinn-rs/quinn/issues/1724
@@ -1225,10 +1196,7 @@ impl Session {
         session_id: Option<VarInt>,
         error: Arc<CloseReason>,
     ) -> Result<Bytes, SessionError> {
-        let mut datagram = conn
-            .read_datagram()
-            .await
-            .map_err(|e| Self::map_error_owned(&error, e))?;
+        let mut datagram = conn.read_datagram().await.map_err(|e| error.map(e))?;
 
         let mut cursor = Cursor::new(&datagram);
 
@@ -1264,10 +1232,7 @@ impl web_transport_trait::poll::Session for Session {
         let error = self.error.clone();
 
         self.op_accept_uni.poll(cx, move || async move {
-            let recv = conn
-                .accept_uni()
-                .await
-                .map_err(|e| Session::map_error_owned(&error, e))?;
+            let recv = conn.accept_uni().await.map_err(|e| error.map(e))?;
             Ok(RecvStream::new(recv, error, true))
         })
     }
@@ -1286,10 +1251,7 @@ impl web_transport_trait::poll::Session for Session {
         let error = self.error.clone();
 
         self.op_accept_bi.poll(cx, move || async move {
-            let (send, recv) = conn
-                .accept_bi()
-                .await
-                .map_err(|e| Session::map_error_owned(&error, e))?;
+            let (send, recv) = conn.accept_bi().await.map_err(|e| error.map(e))?;
             Ok((
                 SendStream::new(send, error.clone(), true),
                 RecvStream::new(recv, error, true),
@@ -1356,13 +1318,11 @@ impl web_transport_trait::poll::Session for Session {
         let conn = self.conn.clone();
         let error = self.error.clone();
 
-        self.op_closed.poll(cx, move || async move {
-            Session::map_error_owned(&error, conn.closed().await)
-        })
+        self.op_closed
+            .poll(cx, move || async move { error.map(conn.closed().await) })
     }
 
-    #[allow(refining_impl_trait)]
-    fn stats(&self) -> SessionStats {
+    fn stats(&self) -> impl web_transport_trait::Stats {
         Self::stats(self)
     }
 }

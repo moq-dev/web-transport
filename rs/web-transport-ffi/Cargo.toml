@@ -10,6 +10,9 @@ edition = "2021"
 keywords = ["webtransport", "quic", "http3", "uniffi"]
 categories = ["network-programming", "web-programming"]
 
+[lints]
+workspace = true
+
 [package.metadata.cargo-shear]
 # A version pin only; see the Android dependencies below.
 ignored = ["rustls-platform-verifier-android"]

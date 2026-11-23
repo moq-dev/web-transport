@@ -1158,8 +1158,7 @@ impl web_transport_trait::Session for Session {
         Self::protocol(self)
     }
 
-    #[allow(refining_impl_trait)]
-    fn stats(&self) -> SessionStats {
+    fn stats(&self) -> impl web_transport_trait::Stats {
         Self::stats(self)
     }
 }

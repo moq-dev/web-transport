@@ -14,6 +14,9 @@ categories = ["network-programming", "web-programming"]
 # async traits
 rust-version = "1.75"
 
+[lints]
+workspace = true
+
 [dependencies]
 bytes = "1"
 
