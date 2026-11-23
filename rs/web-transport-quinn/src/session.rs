@@ -1101,7 +1101,10 @@ impl web_transport_trait::Session for Session {
         Self::protocol(self)
     }
 
-    #[expect(refining_impl_trait, reason = "callers of the concrete type get the concrete stats")]
+    #[expect(
+        refining_impl_trait,
+        reason = "callers of the concrete type get the concrete stats"
+    )]
     fn stats(&self) -> SessionStats {
         Self::stats(self)
     }
@@ -1323,7 +1326,10 @@ impl web_transport_trait::poll::Session for Session {
             .poll(cx, move || async move { error.map(conn.closed().await) })
     }
 
-    #[expect(refining_impl_trait, reason = "callers of the concrete type get the concrete stats")]
+    #[expect(
+        refining_impl_trait,
+        reason = "callers of the concrete type get the concrete stats"
+    )]
     fn stats(&self) -> SessionStats {
         Self::stats(self)
     }
