@@ -26,6 +26,7 @@ use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{AsyncRead, ReadBuf},
+    sync::Notify,
     time::timeout,
 };
 use web_transport_quiche::ez;
@@ -36,18 +37,23 @@ const ABANDONED: usize = 256;
 
 /// A waker whose `Arc` count the test watches: anything still holding a clone is
 /// retaining this allocation.
+///
+/// A wake drops the clone it consumed *before* signalling, so a test that waits for the
+/// signal knows that clone is gone.
 #[derive(Default)]
 struct FlagWaker {
-    woken: AtomicBool,
+    woken: Arc<Notify>,
 }
 
 impl Wake for FlagWaker {
     fn wake(self: Arc<Self>) {
-        self.woken.store(true, Ordering::SeqCst);
+        let woken = self.woken.clone();
+        drop(self);
+        woken.notify_one();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.woken.store(true, Ordering::SeqCst);
+        self.woken.notify_one();
     }
 }
 
@@ -239,6 +245,15 @@ async fn a_finished_read_releases_the_poller() -> Result<()> {
         }
     }
     assert_eq!(buf.filled(), b"done");
+
+    // The driver takes the parked waiter out of the stream, under the lock that queues the
+    // data, and wakes it only after letting go of that lock. The read can finish in
+    // between, with the driver's clone still in flight: wait for that wake, which drops
+    // the clone, before counting what is left.
+    let woken = flag.woken.clone();
+    timeout(Duration::from_secs(10), woken.notified())
+        .await
+        .context("the driver never woke the parked read")?;
 
     // The test's own `Waker` counts too, so it goes first.
     drop(waker);

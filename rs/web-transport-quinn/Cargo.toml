@@ -31,7 +31,7 @@ quinn = { version = "0.11", default-features = false, features = [
 ] }
 
 quinn-proto = { version = "0.11.19", default-features = false }
-rind = "0.2.1"
+rind = "0.3.2"
 rind-rustls = "0.23"
 
 rustls = { version = "0.23", default-features = false, features = [

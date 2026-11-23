@@ -43,7 +43,7 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 
-tokio-quiche = "0.20"
+tokio-quiche = "0.23"
 tracing = "0.1"
 url = "2"
 web-transport-proto = { workspace = true }
