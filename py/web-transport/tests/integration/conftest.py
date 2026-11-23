@@ -54,11 +54,11 @@ async def connect_pair(cert, key, cert_hash, *, server_kwargs=None, client_kwarg
     if client_kwargs:
         client_kw.update(client_kwargs)
 
-    server = web_transport.Server(**server_kw)  # type: ignore[invalid-argument-type]
+    server = web_transport.Server(**server_kw)
     async with server:
         _, port = server.local_addr
 
-        client = web_transport.Client(**client_kw)  # type: ignore[invalid-argument-type]
+        client = web_transport.Client(**client_kw)
         async with client:
 
             async def accept():
