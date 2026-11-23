@@ -42,7 +42,8 @@ check:
 	# requires: cargo install cargo-hack
 	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-iroh
 	# Iroh's features only forward to iroh and gate no code here, so its powerset
-	# (36 runs) would test iroh's feature combinations rather than ours.
+	# (36 runs) would test iroh's feature combinations rather than ours. Move it
+	# back into the powerset if it gains `cfg(feature)` code.
 	cargo hack check --each-feature -p web-transport-iroh --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going

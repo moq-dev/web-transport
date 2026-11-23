@@ -11,7 +11,8 @@ on:
     branches: ["main"]
 
 # Cancel a superseded run so a newer push to the PR frees its runner. Main's
-# runs finish, so a burst of merges still saves a cache.
+# running run finishes rather than cancel, so a burst of merges still saves a
+# cache (GitHub keeps only the newest queued run).
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

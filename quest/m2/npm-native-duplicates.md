@@ -14,6 +14,7 @@ An install therefore fetches about 47 MB where about 9 MB would do.
 Reproduce it by running `napi artifacts` over dummy binaries and `npm pack --dry-run`.
 
 Drop the root copies from the published main package, keeping the `napi.cjs` loader's fallback to the platform packages.
+Local builds (`bun run --cwd js/web-transport build`, `just test`) keep writing a root `.node`, which `napi.cjs` loads first; only what `npm pack` includes changes.
 `js/web-transport/scripts/test-runtime.ts` asserts the packed main package contains a `.node`, so rework it to install the host's platform package beside the main one, which also exercises the loader path users take, and to fail if the main package holds any `.node`.
 Verify with `npm pack --dry-run` on the release layout and `bun run --cwd js/web-transport test:runtime`.
 
