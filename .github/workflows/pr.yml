@@ -53,8 +53,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      # Backtraces keep file:line, and the cache and test binaries shrink by
-      # about 40% without full debuginfo.
+      # Backtraces keep file:line, while smaller artifacts speed up restoring
+      # the cache and linking the tests.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
     steps:
