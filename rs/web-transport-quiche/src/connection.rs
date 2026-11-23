@@ -1012,7 +1012,8 @@ impl web_transport_trait::poll::Session for Connection {
             .map(Into::into)
     }
 
-    fn stats(&self) -> impl web_transport_trait::Stats {
+    #[expect(refining_impl_trait, reason = "callers of the concrete type get the concrete stats")]
+    fn stats(&self) -> ez::ConnectionStats {
         Self::stats(self)
     }
 }

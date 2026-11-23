@@ -24,6 +24,7 @@ The code audit ([moq-dev/web-transport#579](https://github.com/moq-dev/web-trans
   - Make `ez::Server` and `Server` non-generic, with `new<M>` generic, since `M` lives only in `PhantomData`.
 - `web-transport-iroh`: delete the never-constructed `UnexpectedEnd` variants in `settings.rs` and `connect.rs`, coordinating with [moq-dev/web-transport#493](https://github.com/moq-dev/web-transport/pull/493).
 - `web-transport-ffi`: make the Rust-only `map_*_error` helpers, `WebTransportError::invalid`/`protocol`, and the `Session`/`SendStream`/`RecvStream`/`SessionRequest::new` constructors `pub(crate)`. The UniFFI surface is unchanged.
+- quinn (both trait impls), noq, and quiche: return `impl web_transport_trait::Stats` from the trait `stats` impls and drop their `#[expect(refining_impl_trait)]`. The inherent `stats()` already returns the concrete type, so only a fully qualified trait call loses it.
 - `web-transport-trait`: `RecvStream::read_all` grows a `BytesMut` until the peer finishes, so a peer chooses how much it allocates. Give it a required maximum length that errors past the limit; only qmux's examples call it.
 - `@moq/web-transport`: drop the exported `WebTransportErrorOptions`, which duplicates the DOM global of the same name and shape.
 
