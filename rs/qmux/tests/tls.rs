@@ -22,9 +22,17 @@ fn cert() -> Cert {
     }
 }
 
+/// Name the provider: the workspace's feature unification can enable more than
+/// one, and then rustls has no process default.
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
 /// Accept one TLS connection whose server selects from `alpns`.
 async fn serve(cert: &Cert, alpns: &[&str]) -> (SocketAddr, JoinHandle<Result<Session, Error>>) {
-    let mut config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert.der.clone()], cert.key.clone_key().into())
         .unwrap();
@@ -44,7 +52,9 @@ async fn serve(cert: &Cert, alpns: &[&str]) -> (SocketAddr, JoinHandle<Result<Se
 fn client(cert: &Cert) -> tls::Client {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.der.clone()).unwrap();
-    let config = rustls::ClientConfig::builder()
+    let config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls::Client::new(Arc::new(config))
