@@ -20,9 +20,6 @@ and reason. A clean CONNECT FIN without a capsule reports code 0 and an empty re
 Malformed capsule data reports `WebTransportError::CapsuleError(String)` and closes
 HTTP/3 with H3_MESSAGE_ERROR (0x10e). An existing connection failure keeps its cause.
 
-`CapsuleError(String)` is a new public enum variant; downstream exhaustive matches
-must handle it when upgrading.
-
 Dropping a receive stream sends application code 0 in the session's code space:
 HTTP/3 maps the code, while raw QUIC sends it unchanged.
 
@@ -57,6 +54,4 @@ Inspect successful headers with `Session::response()`. A rejected CONNECT
 is a structured `ConnectError::ErrorStatus(Box<ConnectResponse>)` error; inspect
 `response.status` and `response.headers.get_all(name)`. The response stays inside
 the backend's `ClientError`, with no string conversion needed. Raw QUIC has no
-CONNECT response. See the protocol crate's migration notes for the breaking
-error payload change and replacement of `ConnectResponse::OK` with
-`ConnectResponse::default()`.
+CONNECT response.
