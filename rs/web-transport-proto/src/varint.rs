@@ -50,8 +50,12 @@ impl VarInt {
     }
 
     /// Whether this is a reserved HTTP/3 value (`0x1f * N + 0x21`) that receivers must ignore.
+    #[expect(
+        clippy::manual_is_multiple_of,
+        reason = "u64::is_multiple_of needs Rust 1.87, and proto declares no MSRV"
+    )]
     pub(crate) fn is_grease(self) -> bool {
-        self.0 >= 0x21 && (self.0 - 0x21).is_multiple_of(0x1f)
+        self.0 >= 0x21 && (self.0 - 0x21) % 0x1f == 0
     }
 
     /// Compute the number of bytes needed to encode this value

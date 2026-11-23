@@ -1,7 +1,7 @@
 import type { NapiSession } from "../napi.cjs";
 
 /**
- * Datagrams over a session that may still be connecting.
+ * Datagrams over a session, which may still be connecting.
  * Reads wait for the session and end if it fails; writes before it connects throw.
  */
 export class Datagrams implements WebTransportDatagramDuplexStream {
@@ -16,14 +16,18 @@ export class Datagrams implements WebTransportDatagramDuplexStream {
 
 	#session: NapiSession | undefined;
 
-	constructor(session: Promise<NapiSession>) {
-		// Registered first, so the session is set before anyone else observes it resolving.
-		void session.then(
-			(session) => {
-				this.#session = session;
-			},
-			() => {},
-		);
+	constructor(session: NapiSession | Promise<NapiSession>) {
+		if (session instanceof Promise) {
+			// Registered first, so the session is set before anyone else observes it resolving.
+			void session.then(
+				(session) => {
+					this.#session = session;
+				},
+				() => {},
+			);
+		} else {
+			this.#session = session;
+		}
 
 		this.readable = new ReadableStream({
 			async pull(controller) {

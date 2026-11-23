@@ -101,7 +101,7 @@ export default class Session implements WebTransport {
 		// Check if we got an existing NapiSession (server-side path)
 		if (typeof urlOrSession === "object" && !(urlOrSession instanceof URL)) {
 			this.#session = urlOrSession;
-			this.datagrams = new Datagrams(Promise.resolve(urlOrSession));
+			this.datagrams = new Datagrams(urlOrSession);
 
 			ready.resolve();
 
