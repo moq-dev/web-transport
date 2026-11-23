@@ -4,9 +4,10 @@ const ERROR_LAST: u64 = 0x52e5ac983162;
 
 /// Decode a WebTransport application error code from an HTTP/3 error code, or
 /// `None` if the code is outside the WebTransport range or a reserved codepoint.
+#[allow(unknown_lints, clippy::manual_is_multiple_of)] // `is_multiple_of` needs Rust 1.87.
 pub const fn error_from_http3(code: u64) -> Option<u32> {
     // Reserved (GREASE) codepoints sit inside the range but encode no application code.
-    if code < ERROR_FIRST || code > ERROR_LAST || (code - 0x21).is_multiple_of(0x1f) {
+    if code < ERROR_FIRST || code > ERROR_LAST || (code - 0x21) % 0x1f == 0 {
         return None;
     }
 
@@ -26,8 +27,9 @@ pub const fn error_to_http3(code: u32) -> u64 {
 mod tests {
     use super::*;
 
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     fn is_reserved(code: u64) -> bool {
-        code >= 0x21 && (code - 0x21).is_multiple_of(0x1f)
+        code >= 0x21 && (code - 0x21) % 0x1f == 0
     }
 
     #[test]

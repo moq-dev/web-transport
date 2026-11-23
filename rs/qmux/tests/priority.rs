@@ -88,11 +88,14 @@ async fn pair(delay: Duration) -> (Session, Session) {
     (client, server)
 }
 
+/// Permits that never run out in these tests, and fit `Semaphore::MAX_PERMITS` on every target.
+const UNLIMITED: usize = 1 << 20;
+
 /// Like [`pair`], plus the meter on the client's sends, initially unlimited.
 async fn metered_pair(delay: Duration) -> (Session, Session, Arc<Semaphore>) {
     let (c2s_tx, c2s_rx) = mpsc::channel(64);
     let (s2c_tx, s2c_rx) = mpsc::channel(64);
-    let meter = Arc::new(Semaphore::new(u32::MAX as usize));
+    let meter = Arc::new(Semaphore::new(UNLIMITED));
 
     let client_transport = ThrottledTransport {
         tx: c2s_tx,
@@ -104,7 +107,7 @@ async fn metered_pair(delay: Duration) -> (Session, Session, Arc<Semaphore>) {
         tx: s2c_tx,
         rx: c2s_rx,
         delay,
-        meter: Arc::new(Semaphore::new(u32::MAX as usize)),
+        meter: Arc::new(Semaphore::new(UNLIMITED)),
     };
 
     let config = Config::new(Version::QMux01);
@@ -202,7 +205,7 @@ async fn higher_priority_completes_first() {
     );
 
     // The low-priority stream still delivers everything.
-    meter.add_permits(u32::MAX as usize);
+    meter.add_permits(UNLIMITED);
     lo.finish().unwrap();
     let (_server, readers) = reader.await.unwrap();
     for reader in readers {
@@ -325,7 +328,7 @@ async fn control_precedes_data_backlog() {
     );
 
     // The backlog still drains in full.
-    meter.add_permits(u32::MAX as usize);
+    meter.add_permits(UNLIMITED);
     bulk.finish().unwrap();
     let _server = reader.await.unwrap();
     assert_eq!(bulk_bytes.load(Ordering::SeqCst), 3 * CHUNK);

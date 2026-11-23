@@ -46,7 +46,7 @@ const EXPIRY_BOUND_MS = 10_000;
 // Short enough to keep the test quick, long enough that a keep-alive delayed by a loaded CI host can't
 // expire a healthy connection.
 const IDLE_MS = 300;
-const KEEP_ALIVE_MS = 100;
+const KEEP_ALIVE_MS = 50;
 
 async function expectExpiry(serverOptions: ServerOptions | undefined, clientOptions: SessionOptions) {
 	const { client, peer } = await connect(serverOptions, clientOptions);
