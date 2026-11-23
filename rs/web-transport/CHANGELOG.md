@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1](https://github.com/moq-dev/web-transport/compare/web-transport-v0.14.0...web-transport-v0.14.1) - 2026-11-23
+
+### Other
+
+- updated the following local packages: web-transport-wasm
+
 ## [0.14.0](https://github.com/moq-dev/web-transport/compare/web-transport-v0.13.9...web-transport-v0.14.0) - 2026-11-23
 
 ### Added
