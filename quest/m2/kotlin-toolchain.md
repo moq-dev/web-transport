@@ -20,5 +20,8 @@ The 2026-11-22 dependency audit found `kt/` a year or more behind, since Dependa
 | `compileSdk` | 35 | check the current Android API level |
 
 Dependabot's `gradle` group takes the minor and patch bumps; this quest owns the majors, which it leaves ungrouped.
-AGP 9 drops `androidTarget {}` under `com.android.library` for Kotlin Multiplatform libraries in favor of the `com.android.kotlin.multiplatform.library` plugin, so the Android target in `kt/web-transport/build.gradle.kts` and `kt/r8-check` needs migrating, not just a version bump.
-PR CI runs only the JVM variant (`just test-kotlin`); exercise the Android AAR build and the R8 check from `release-kt.yml` locally or through a dispatched run before landing.
+AGP 9 drops `androidTarget {}` under `com.android.library` for Kotlin Multiplatform libraries in favor of the `com.android.kotlin.multiplatform.library` plugin, so the Android target in `kt/web-transport/build.gradle.kts` needs migrating, not just a version bump.
+`kt/r8-check` is a `com.android.application` that consumes the AAR to validate it; it only takes the AGP bump and stays an app.
+A PR touching `kt/**` runs `release-kt.yml`, including its Android packaging and R8 check, so that PR's run validates the Android side.
+
+Decided 2026-11-22 (maintainer, /quest-run on #569): ✅ keep this quest in m2 (rejected: drop).
