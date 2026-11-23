@@ -14,8 +14,6 @@ keywords = ["webtransport", "quic", "http3", "asyncio", "networking"]
 dependencies = ["cryptography>=50.0.0"]
 classifiers = [
     "Development Status :: 3 - Alpha",
-    "License :: OSI Approved :: MIT License",
-    "License :: OSI Approved :: Apache Software License",
     "Topic :: Internet",
     "Topic :: System :: Networking",
     "Programming Language :: Rust",

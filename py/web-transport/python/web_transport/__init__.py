@@ -40,10 +40,6 @@ from web_transport._errors import (
     reraise,
 )
 
-# Re-export the _errors module under its private name so tests / advanced
-# users can reach it if needed; not part of __all__.
-from web_transport import _errors  # noqa: F401
-
 __all__ = [
     "generate_self_signed",
     "certificate_hash",
@@ -154,7 +150,6 @@ class SendStream:
             return await self._inner.write_some(data)
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable, satisfies type checker
 
     async def finish(self) -> None:
         try:
@@ -173,7 +168,6 @@ class SendStream:
             return await self._inner.wait_closed()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
 
     @property
     def priority(self) -> int:
@@ -235,14 +229,12 @@ class RecvStream:
             return data
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
 
     async def readexactly(self, n: int) -> bytes:
         try:
             return await self._inner.read_exact(n)
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
 
     def stop(self, error_code: int = 0) -> None:
         try:
@@ -255,7 +247,6 @@ class RecvStream:
             return await self._inner.wait_closed()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
 
 
 # ---------------------------------------------------------------------------
@@ -287,17 +278,11 @@ class Session:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        try:
-            self._inner.close(0, "")
-        except _UniffiError:
-            pass
+        self._inner.close(0, "")
         # Mirror the legacy PyO3 binding: await closed() so the close
         # capsule actually transmits before __aexit__ returns. Without
         # this, peer-side observers won't see the close in time.
-        try:
-            await self._inner.wait_closed()
-        except _UniffiError:
-            pass
+        await self._inner.wait_closed()
         return None
 
     # -- Streams --------------------------------------------------------
@@ -307,7 +292,6 @@ class Session:
             bi = await self._inner.open_bi()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return SendStream(bi.send), RecvStream(bi.recv)
 
     async def open_uni(self) -> SendStream:
@@ -315,7 +299,6 @@ class Session:
             send = await self._inner.open_uni()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return SendStream(send)
 
     async def accept_bi(self) -> tuple[SendStream, RecvStream]:
@@ -323,7 +306,6 @@ class Session:
             bi = await self._inner.accept_bi()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return SendStream(bi.send), RecvStream(bi.recv)
 
     async def accept_uni(self) -> RecvStream:
@@ -331,7 +313,6 @@ class Session:
             recv = await self._inner.accept_uni()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return RecvStream(recv)
 
     # -- Datagrams ------------------------------------------------------
@@ -355,7 +336,6 @@ class Session:
             return await self._inner.receive_datagram()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
 
     # -- Lifecycle ------------------------------------------------------
 
@@ -364,17 +344,11 @@ class Session:
         # OverflowError (uniffi would raise ValueError for the same case).
         if not 0 <= code < 2**32:
             raise OverflowError(f"code out of range for u32: {code}")
-        try:
-            self._inner.close(code, reason)
-        except _UniffiError:
-            pass
+        self._inner.close(code, reason)
 
     async def wait_closed(self) -> None:
-        # Legacy contract: never raises; absorbs the close reason.
-        try:
-            await self._inner.wait_closed()
-        except _UniffiError:
-            pass
+        # Legacy contract: never raises; read the reason from close_reason.
+        await self._inner.wait_closed()
 
     # -- Properties -----------------------------------------------------
 
@@ -394,15 +368,13 @@ class Session:
             return None
         # Translate the structured FFI variant into the legacy subclass.
         try:
-            reraise(raw)  # type: ignore[arg-type]
+            reraise(raw)
         except SessionError as exc:
             return exc
         except WebTransportError as exc:
             # Defensive: a non-session WebTransportError variant somehow
             # surfaced. Wrap it so the return type stays SessionError.
             return SessionError(str(exc))
-        # `reraise()` always raises, but ty doesn't know that.
-        return SessionError(str(raw))
 
     @property
     def max_datagram_size(self) -> int:
@@ -442,7 +414,6 @@ class SessionRequest:
             sess = await self._inner.accept()
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return Session(sess)
 
     async def reject(
@@ -511,10 +482,7 @@ class Client:
             self._inner.close(0, "")
         except _UniffiError:
             pass
-        try:
-            await self._inner.wait_closed()
-        except _UniffiError:
-            pass
+        await self._inner.wait_closed()
         return None
 
     def close(self, code: int = 0, reason: str = "") -> None:
@@ -524,18 +492,13 @@ class Client:
             reraise(e)
 
     async def wait_closed(self) -> None:
-        try:
-            await self._inner.wait_closed()
-        except _UniffiError:
-            # Legacy semantics: wait_closed is non-raising.
-            pass
+        await self._inner.wait_closed()
 
     async def connect(self, url: str) -> Session:
         try:
             sess = await self._inner.connect(url)
         except _UniffiError as e:
             reraise(e)
-            raise  # unreachable
         return Session(sess)
 
 
@@ -583,10 +546,7 @@ class Server:
             self._inner.close(0, "")
         except _UniffiError:
             pass
-        try:
-            await self._inner.wait_closed()
-        except (_UniffiError, AttributeError):
-            pass
+        await self._inner.wait_closed()
         return None
 
     def __aiter__(self) -> AsyncIterator[SessionRequest]:
@@ -599,11 +559,7 @@ class Server:
         return req
 
     async def accept(self) -> SessionRequest | None:
-        try:
-            req = await self._inner.accept()
-        except _UniffiError as e:
-            reraise(e)
-            raise  # unreachable
+        req = await self._inner.accept()
         if req is None:
             return None
         return SessionRequest(req)
@@ -615,15 +571,7 @@ class Server:
             reraise(e)
 
     async def wait_closed(self) -> None:
-        # The FFI Server has no `wait_closed`; provide a no-op shim so
-        # the legacy API still resolves.
-        fn = getattr(self._inner, "wait_closed", None)
-        if fn is None:
-            return None
-        try:
-            await fn()
-        except _UniffiError:
-            pass
+        await self._inner.wait_closed()
 
     @property
     def local_addr(self) -> tuple[str, int]:

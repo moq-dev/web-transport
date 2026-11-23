@@ -849,11 +849,11 @@ async def test_asyncio_cancel_pending_read(session_pair):
     read_fut = asyncio.ensure_future(recv.read())
     await asyncio.sleep(0.1)
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
         await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = asyncio.get_running_loop().time() - t0
 
     # Must resolve almost instantly, not after server_sleep expires
     assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
@@ -886,11 +886,11 @@ async def test_asyncio_cancel_pending_readexactly(session_pair):
     read_fut = asyncio.ensure_future(recv.readexactly(100))
     await asyncio.sleep(0.1)
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
         await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = asyncio.get_running_loop().time() - t0
 
     assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
 
@@ -927,11 +927,11 @@ async def test_asyncio_cancel_read_then_read_again(session_pair):
     read_fut = asyncio.ensure_future(recv.read())
     await asyncio.sleep(0.1)
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
         await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = asyncio.get_running_loop().time() - t0
 
     assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
 
@@ -975,11 +975,11 @@ async def test_asyncio_cancel_readexactly_then_read_again(session_pair):
     read_fut = asyncio.ensure_future(recv.readexactly(100))
     await asyncio.sleep(0.1)
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
         await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = asyncio.get_running_loop().time() - t0
 
     assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
 
@@ -1018,11 +1018,11 @@ async def test_asyncio_cancel_pending_write(session_pair):
     write_task = asyncio.create_task(write_loop())
     await asyncio.sleep(0.1)
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
     write_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await write_task
-    elapsed = asyncio.get_event_loop().time() - t0
+    elapsed = asyncio.get_running_loop().time() - t0
 
     assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
 

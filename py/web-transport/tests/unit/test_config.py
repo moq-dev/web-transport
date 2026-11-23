@@ -41,7 +41,7 @@ def test_server_invalid_certificate(self_signed_cert):
 def test_client_invalid_congestion_control():
     """Client(congestion_control="invalid") -> ValueError."""
     with pytest.raises(ValueError):
-        web_transport.Client(congestion_control="invalid")  # type: ignore[invalid-argument-type]
+        web_transport.Client(congestion_control="invalid")
 
 
 def test_server_invalid_congestion_control(self_signed_cert):
@@ -51,7 +51,7 @@ def test_server_invalid_congestion_control(self_signed_cert):
         web_transport.Server(
             certificate_chain=[cert],
             private_key=key,
-            congestion_control="invalid",  # type: ignore[invalid-argument-type]
+            congestion_control="invalid",
         )
 
 

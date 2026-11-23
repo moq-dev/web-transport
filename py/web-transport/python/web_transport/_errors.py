@@ -15,19 +15,12 @@ the variant instance.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, NoReturn
 
 from web_transport import _uniffi
 
-# UniFFI generates two classes named WebTransportError in the same module:
-# the real Exception subclass (renamed to a private helper), and a container
-# class that holds the variant subclasses. ty/pyright resolve the public name
-# to the container, which isn't an Exception subclass. Reach through one of
-# the variants to recover the real base class — every variant inherits from
-# the original Exception subclass — so `except _UniffiError` is a single
-# valid catch type that covers every variant.
-_UniffiError = _uniffi.WebTransportError.Connect.__bases__[0]
-assert issubclass(_UniffiError, Exception)
+# Base class of every UniFFI error variant, so one `except` catches them all.
+_UniffiError = _uniffi.WebTransportError
 
 # ---------------------------------------------------------------------------
 # Class hierarchy (matches the original PyO3 binding)
@@ -138,12 +131,10 @@ class DatagramNotSupportedError(DatagramError):
 # ---------------------------------------------------------------------------
 
 
-def reraise(err: BaseException) -> None:
+def reraise(err: BaseException) -> NoReturn:
     """Translate a ``_uniffi.WebTransportError`` into the legacy subclass.
 
-    Call as ``_errors.reraise(e)`` from an ``except`` clause — this function
-    always raises and never returns. The original exception is preserved
-    via ``raise ... from err``.
+    Always raises. The original exception is preserved via ``raise ... from err``.
     """
     # Anything that isn't from uniffi is passed through unchanged so we
     # don't accidentally swallow KeyboardInterrupt / asyncio.CancelledError.
