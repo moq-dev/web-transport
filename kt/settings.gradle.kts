@@ -15,7 +15,7 @@ pluginManagement {
     // the plugin marker is never resolved.
     plugins {
         id("com.android.library") version "8.7.3"
-        id("com.android.application") version "8.7.3"
+        id("com.android.application") version "9.5.2"
     }
 }
 
