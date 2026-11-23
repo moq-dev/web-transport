@@ -6,6 +6,11 @@ import pytest
 
 import web_transport
 
+from .conftest import suspended
+
+# Exceeds the peer's stream flow-control window, so writing it blocks until read.
+UNBOUNDED = b"x" * (16 * 1024 * 1024)
+
 
 @pytest.mark.asyncio
 async def test_send_reset_with_code(session_pair):
@@ -14,15 +19,19 @@ async def test_send_reset_with_code(session_pair):
 
     send, _recv = await client_session.open_bi()
 
+    accepted = asyncio.Event()
+
     async def server_side():
         _send_s, recv_s = await server_session.accept_bi()
+        accepted.set()
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
             await recv_s.read()
         assert exc_info.value.kind == "reset"
         assert exc_info.value.code == 42
 
     task = asyncio.create_task(server_side())
-    await asyncio.sleep(0.05)
+    # A reset before the peer accepts discards the stream header (see note below).
+    await asyncio.wait_for(accepted.wait(), timeout=5.0)
     send.reset(42)
     await asyncio.wait_for(task, timeout=5.0)
 
@@ -34,15 +43,18 @@ async def test_send_reset_default_code(session_pair):
 
     send, _recv = await client_session.open_bi()
 
+    accepted = asyncio.Event()
+
     async def server_side():
         _send_s, recv_s = await server_session.accept_bi()
+        accepted.set()
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
             await recv_s.read()
         assert exc_info.value.kind == "reset"
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(server_side())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(accepted.wait(), timeout=5.0)
     send.reset()
     await asyncio.wait_for(task, timeout=5.0)
 
@@ -89,11 +101,9 @@ async def test_recv_stop_with_code(session_pair):
 
     async def server_side():
         send_s, _recv_s = await server_session.accept_bi()
-        # Wait for STOP_SENDING to arrive
-        await asyncio.sleep(0.1)
+        assert await send_s.wait_closed() == 42
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-            for _ in range(100):
-                await send_s.write(b"x" * 1024)
+            await send_s.write(b"x")
         assert exc_info.value.kind == "stop"
         assert exc_info.value.code == 42
 
@@ -111,10 +121,9 @@ async def test_recv_stop_default_code(session_pair):
 
     async def server_side():
         send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
+        assert await send_s.wait_closed() == 0
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-            for _ in range(100):
-                await send_s.write(b"x" * 1024)
+            await send_s.write(b"x")
         assert exc_info.value.kind == "stop"
         assert exc_info.value.code == 0
 
@@ -152,27 +161,16 @@ async def test_reset_cancels_pending_write(session_pair):
 
     send, _recv = await client_session.open_bi()
 
-    # Accept the stream on the server side but don't read (causes backpressure)
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
-
     async def write_large():
         with pytest.raises(web_transport.StreamClosedLocally):
-            while True:
-                await send.write(b"x" * 65536)
+            await send.write(UNBOUNDED)
 
     write_task = asyncio.create_task(write_large())
-    await asyncio.sleep(0.1)
+    # Once the peer sees data the write is in flight, and flow control blocks it.
+    _send_s, recv_s = await server_session.accept_bi()
+    assert await recv_s.read(1) == b"x"
     send.reset()
     await asyncio.wait_for(write_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 @pytest.mark.asyncio
@@ -183,25 +181,16 @@ async def test_stop_cancels_pending_read(session_pair):
     _send, recv = await client_session.open_bi()
 
     # Accept the stream on the server side but don't write anything
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
+    _send_s, _recv_s = await server_session.accept_bi()
 
     async def read_pending():
         with pytest.raises(web_transport.StreamClosedLocally):
             await recv.read()
 
     read_task = asyncio.create_task(read_pending())
-    await asyncio.sleep(0.1)
+    await suspended(read_task)
     recv.stop()
     await asyncio.wait_for(read_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 # NOTE: There is no `test_send_context_manager_resets_on_exception` test.
@@ -225,11 +214,9 @@ async def test_recv_context_manager_stops_on_exception(session_pair):
 
     async def server_side():
         send_s, _recv_s = await server_session.accept_bi()
-        # Give time for STOP_SENDING to propagate
-        await asyncio.sleep(0.2)
+        assert await send_s.wait_closed() == 0
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-            for _ in range(100):
-                await send_s.write(b"x" * 1024)
+            await send_s.write(b"x")
         assert exc_info.value.kind == "stop"
         assert exc_info.value.code == 0
 
@@ -253,16 +240,13 @@ async def test_recv_context_manager_stops_if_not_at_eof(session_pair):
         send_s, _recv_s = await server_session.accept_bi()
         # Write some data but don't finish
         await send_s.write(b"hello")
-        # Give time for STOP_SENDING after context manager exit
-        await asyncio.sleep(0.2)
+        assert await send_s.wait_closed() == 0
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-            for _ in range(100):
-                await send_s.write(b"x" * 1024)
+            await send_s.write(b"x")
         assert exc_info.value.kind == "stop"
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(server_side())
-    await asyncio.sleep(0.05)
 
     async with recv:
         # Read some data but exit before EOF
@@ -362,20 +346,17 @@ async def test_peer_reset_during_read(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
+    send_s, _recv_s = await server_session.accept_bi()
 
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
-        send_s.reset(7)
-
-    task = asyncio.create_task(server_side())
+    read_task = asyncio.create_task(recv.read())
+    await suspended(read_task)
+    send_s.reset(7)
 
     with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-        await recv.read()
+        await asyncio.wait_for(read_task, timeout=5.0)
 
     assert exc_info.value.kind == "reset"
     assert exc_info.value.code == 7
-    await task
 
 
 @pytest.mark.asyncio
@@ -385,15 +366,18 @@ async def test_uni_send_reset(session_pair):
 
     send = await client_session.open_uni()
 
+    accepted = asyncio.Event()
+
     async def server_side():
         recv = await server_session.accept_uni()
+        accepted.set()
         with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
             await recv.read()
         assert exc_info.value.kind == "reset"
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(server_side())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(accepted.wait(), timeout=5.0)
     send.reset()
     await asyncio.wait_for(task, timeout=5.0)
 
@@ -410,11 +394,10 @@ async def test_uni_recv_stop(session_pair):
         recv.stop(42)
 
     task = asyncio.create_task(server_side())
-    await asyncio.sleep(0.2)
+    assert await asyncio.wait_for(send.wait_closed(), timeout=5.0) == 42
 
     with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-        for _ in range(100):
-            await send.write(b"x" * 1024)
+        await send.write(b"x")
 
     assert exc_info.value.kind == "stop"
     assert exc_info.value.code == 42
@@ -427,20 +410,17 @@ async def test_readexactly_during_peer_reset(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
+    send_s, _recv_s = await server_session.accept_bi()
 
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
-        send_s.reset(7)
-
-    task = asyncio.create_task(server_side())
+    read_task = asyncio.create_task(recv.readexactly(1000))
+    await suspended(read_task)
+    send_s.reset(7)
 
     with pytest.raises(web_transport.StreamClosedByPeer) as exc_info:
-        await recv.readexactly(1000)
+        await asyncio.wait_for(read_task, timeout=5.0)
 
     assert exc_info.value.kind == "reset"
     assert exc_info.value.code == 7
-    await task
 
 
 @pytest.mark.asyncio
@@ -473,11 +453,7 @@ async def test_stop_cancels_pending_iteration(session_pair):
     _send, recv = await client_session.open_bi()
 
     # Accept stream but don't write anything — iterator will block
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
+    _send_s, _recv_s = await server_session.accept_bi()
 
     async def iterate():
         with pytest.raises(web_transport.StreamClosedLocally):
@@ -485,14 +461,9 @@ async def test_stop_cancels_pending_iteration(session_pair):
                 pass
 
     iter_task = asyncio.create_task(iterate())
-    await asyncio.sleep(0.1)
+    await suspended(iter_task)
     recv.stop()
     await asyncio.wait_for(iter_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 @pytest.mark.asyncio
@@ -515,22 +486,18 @@ async def test_peer_session_close_during_pending_read(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
+    _send_s, _recv_s = await server_session.accept_bi()
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
-        server_session.close(1, "going away")
-        await server_session.wait_closed()
-
-    task = asyncio.create_task(server_side())
+    read_task = asyncio.create_task(recv.read())
+    await suspended(read_task)
+    server_session.close(1, "going away")
+    await server_session.wait_closed()
 
     with pytest.raises(web_transport.SessionClosedByPeer) as exc_info:
-        await recv.read()
+        await asyncio.wait_for(read_task, timeout=5.0)
     assert exc_info.value.source == "session"
     assert exc_info.value.code == 1
     assert exc_info.value.reason == "going away"
-
-    await task
 
 
 @pytest.mark.asyncio
@@ -540,24 +507,18 @@ async def test_peer_session_close_during_pending_write(session_pair):
 
     send, _recv = await client_session.open_bi()
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        # Don't read — create backpressure, then close session
-        await asyncio.sleep(0.1)
-        server_session.close(2, "closing")
-        await server_session.wait_closed()
-
-    task = asyncio.create_task(server_side())
+    write_task = asyncio.create_task(send.write(UNBOUNDED))
+    # Once the peer sees data the write is in flight, and flow control blocks it.
+    _send_s, recv_s = await server_session.accept_bi()
+    assert await recv_s.read(1) == b"x"
+    server_session.close(2, "closing")
+    await server_session.wait_closed()
 
     with pytest.raises(web_transport.SessionClosedByPeer) as exc_info:
-        # Write enough to block on backpressure
-        for _ in range(200):
-            await send.write(b"x" * 65536)
+        await asyncio.wait_for(write_task, timeout=5.0)
     assert exc_info.value.source == "session"
     assert exc_info.value.code == 2
     assert exc_info.value.reason == "closing"
-
-    await task
 
 
 @pytest.mark.asyncio
@@ -568,25 +529,16 @@ async def test_stop_cancels_pending_readexactly(session_pair):
     _send, recv = await client_session.open_bi()
 
     # Accept stream but don't write anything — readexactly will block
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
+    _send_s, _recv_s = await server_session.accept_bi()
 
     async def read_pending():
         with pytest.raises(web_transport.StreamClosedLocally):
             await recv.readexactly(100)
 
     read_task = asyncio.create_task(read_pending())
-    await asyncio.sleep(0.1)
+    await suspended(read_task)
     recv.stop()
     await asyncio.wait_for(read_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 @pytest.mark.asyncio
@@ -652,25 +604,16 @@ async def test_reset_cancels_pending_send_wait_closed(session_pair):
     send, _recv = await client_session.open_bi()
 
     # Accept stream but don't send STOP_SENDING — wait_closed will block
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
+    _send_s, _recv_s = await server_session.accept_bi()
 
     async def wait():
         with pytest.raises(web_transport.StreamClosedLocally):
             await send.wait_closed()
 
     wait_task = asyncio.create_task(wait())
-    await asyncio.sleep(0.1)
+    await suspended(wait_task)
     send.reset()
     await asyncio.wait_for(wait_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 @pytest.mark.asyncio
@@ -700,21 +643,18 @@ async def test_send_wait_closed_session_closed_by_peer(session_pair):
     server_session, client_session = session_pair
 
     send, _recv = await client_session.open_bi()
+    _send_s, _recv_s = await server_session.accept_bi()
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
-        server_session.close(0, "done")
-        await server_session.wait_closed()
-
-    task = asyncio.create_task(server_side())
+    wait_task = asyncio.create_task(send.wait_closed())
+    await suspended(wait_task)
+    server_session.close(0, "done")
+    await server_session.wait_closed()
 
     with pytest.raises(web_transport.SessionClosedByPeer) as exc_info:
-        await asyncio.wait_for(send.wait_closed(), timeout=5.0)
+        await asyncio.wait_for(wait_task, timeout=5.0)
     assert exc_info.value.source == "session"
     assert exc_info.value.code == 0
     assert exc_info.value.reason == "done"
-    await task
 
 
 # ---------------------------------------------------------------------------
@@ -757,25 +697,16 @@ async def test_stop_cancels_pending_recv_wait_closed(session_pair):
 
     _send, recv = await client_session.open_bi()
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(2.0)
-
-    server_task = asyncio.create_task(server_side())
+    _send_s, _recv_s = await server_session.accept_bi()
 
     async def wait():
         with pytest.raises(web_transport.StreamClosedLocally):
             await recv.wait_closed()
 
     wait_task = asyncio.create_task(wait())
-    await asyncio.sleep(0.1)
+    await suspended(wait_task)
     recv.stop()
     await asyncio.wait_for(wait_task, timeout=5.0)
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
 
 
 @pytest.mark.asyncio
@@ -807,24 +738,24 @@ async def test_recv_wait_closed_session_closed_by_peer(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
+    _send_s, _recv_s = await server_session.accept_bi()
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(0.1)
-        server_session.close(0, "done")
-        await server_session.wait_closed()
-
-    task = asyncio.create_task(server_side())
+    wait_task = asyncio.create_task(recv.wait_closed())
+    await suspended(wait_task)
+    server_session.close(0, "done")
+    await server_session.wait_closed()
 
     with pytest.raises(web_transport.SessionClosedByPeer) as exc_info:
-        await asyncio.wait_for(recv.wait_closed(), timeout=5.0)
+        await asyncio.wait_for(wait_task, timeout=5.0)
     assert exc_info.value.source == "session"
     assert exc_info.value.code == 0
     assert exc_info.value.reason == "done"
-    await task
 
 
 # --- asyncio task cancellation tests ---
+#
+# The server makes no further progress until the cancelled call has returned,
+# so a cancellation that waited on the peer would hang until the guard fires.
 
 
 @pytest.mark.asyncio
@@ -833,36 +764,18 @@ async def test_asyncio_cancel_pending_read(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
-
-    server_sleep = 5.0
-
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        # Send a small chunk so the read starts, then hold the stream open
-        await send_s.write(b"partial")
-        await asyncio.sleep(server_sleep)
-
-    server_task = asyncio.create_task(server_side())
+    send_s, _recv_s = await server_session.accept_bi()
+    # Send a small chunk so the read starts, then hold the stream open
+    await send_s.write(b"partial")
 
     # read() with no size reads until EOF — it will receive "partial" but
     # keep waiting because the server hasn't finished the stream yet.
     read_fut = asyncio.ensure_future(recv.read())
-    await asyncio.sleep(0.1)
+    await suspended(read_fut)
 
-    t0 = asyncio.get_event_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
-
-    # Must resolve almost instantly, not after server_sleep expires
-    assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
-
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(read_fut, timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -871,34 +784,16 @@ async def test_asyncio_cancel_pending_readexactly(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
+    send_s, _recv_s = await server_session.accept_bi()
+    # Send fewer bytes than requested so readexactly blocks mid-read
+    await send_s.write(b"short")
 
-    server_sleep = 5.0
-
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        # Send fewer bytes than requested so readexactly blocks mid-read
-        await send_s.write(b"short")
-        await asyncio.sleep(server_sleep)
-
-    server_task = asyncio.create_task(server_side())
-
-    # readexactly(100) needs 100 bytes but only 5 arrive — blocks
     read_fut = asyncio.ensure_future(recv.readexactly(100))
-    await asyncio.sleep(0.1)
+    await suspended(read_fut)
 
-    t0 = asyncio.get_event_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
-
-    assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
-
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(read_fut, timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -907,46 +802,25 @@ async def test_asyncio_cancel_read_then_read_again(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
-
-    server_sleep = 5.0
-    sent_initial = asyncio.Event()
-
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        # Send a partial chunk so the read is in progress, then hold open
-        await send_s.write(b"first-chunk")
-        sent_initial.set()
-        await asyncio.sleep(server_sleep)
-        await send_s.write(b"after-cancel")
-        await send_s.finish()
-
-    server_task = asyncio.create_task(server_side())
-    await sent_initial.wait()
+    send_s, _recv_s = await server_session.accept_bi()
+    # Send a partial chunk so the read is in progress, then hold open
+    await send_s.write(b"first-chunk")
 
     # First read — cancel it via asyncio while it's mid-stream
     read_fut = asyncio.ensure_future(recv.read())
-    await asyncio.sleep(0.1)
+    await suspended(read_fut)
 
-    t0 = asyncio.get_event_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+        await asyncio.wait_for(read_fut, timeout=5.0)
 
-    assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
+    await send_s.write(b"after-cancel")
+    await send_s.finish()
 
     # Second read — should succeed because no STOP_SENDING was sent.
     # The cancelled read may have consumed "first-chunk", so we just
     # verify the stream is still functional and eventually reaches EOF.
-    chunks = []
-    while True:
-        chunk = await asyncio.wait_for(recv.read(), timeout=10.0)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    assert b"after-cancel" in b"".join(chunks)
-
-    await asyncio.wait_for(server_task, timeout=10.0)
+    assert b"after-cancel" in await asyncio.wait_for(recv.read(), timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -955,44 +829,23 @@ async def test_asyncio_cancel_readexactly_then_read_again(session_pair):
     server_session, client_session = session_pair
 
     _send, recv = await client_session.open_bi()
-
-    server_sleep = 5.0
-    sent_initial = asyncio.Event()
-
-    async def server_side():
-        send_s, _recv_s = await server_session.accept_bi()
-        # Send fewer bytes than readexactly requests, so it blocks mid-read
-        await send_s.write(b"short")
-        sent_initial.set()
-        await asyncio.sleep(server_sleep)
-        await send_s.write(b"hello")
-        await send_s.finish()
-
-    server_task = asyncio.create_task(server_side())
-    await sent_initial.wait()
+    send_s, _recv_s = await server_session.accept_bi()
+    # Send fewer bytes than readexactly requests, so it blocks mid-read
+    await send_s.write(b"short")
 
     # First readexactly — cancel it via asyncio while it's mid-read
     read_fut = asyncio.ensure_future(recv.readexactly(100))
-    await asyncio.sleep(0.1)
+    await suspended(read_fut)
 
-    t0 = asyncio.get_event_loop().time()
     read_fut.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await read_fut
-    elapsed = asyncio.get_event_loop().time() - t0
+        await asyncio.wait_for(read_fut, timeout=5.0)
 
-    assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
+    await send_s.write(b"hello")
+    await send_s.finish()
 
     # Stream should still work — read remaining data
-    chunks = []
-    while True:
-        chunk = await asyncio.wait_for(recv.read(), timeout=10.0)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    assert b"hello" in b"".join(chunks)
-
-    await asyncio.wait_for(server_task, timeout=10.0)
+    assert b"hello" in await asyncio.wait_for(recv.read(), timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -1002,32 +855,11 @@ async def test_asyncio_cancel_pending_write(session_pair):
 
     send, _recv = await client_session.open_bi()
 
-    server_sleep = 5.0
+    write_task = asyncio.ensure_future(send.write(UNBOUNDED))
+    # Once the peer sees data the write is in flight, and flow control blocks it.
+    _send_s, recv_s = await server_session.accept_bi()
+    assert await recv_s.read(1) == b"x"
 
-    async def server_side():
-        _send_s, _recv_s = await server_session.accept_bi()
-        await asyncio.sleep(server_sleep)
-
-    server_task = asyncio.create_task(server_side())
-
-    # Write in a loop until blocked by flow control, then cancel
-    async def write_loop():
-        while True:
-            await send.write(b"x" * 65536)
-
-    write_task = asyncio.create_task(write_loop())
-    await asyncio.sleep(0.1)
-
-    t0 = asyncio.get_event_loop().time()
     write_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await write_task
-    elapsed = asyncio.get_event_loop().time() - t0
-
-    assert elapsed < 1.0, f"cancel took {elapsed:.2f}s, expected < 1s"
-
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(write_task, timeout=5.0)

@@ -914,9 +914,10 @@ async def test_server_close_interrupts_client_write(
                 const writer = stream.writable.getWriter();
                 await writer.write(new Uint8Array([1]));
                 try {
-                    for (let i = 0; i < 100; i++) {
+                    // 64 MiB outlasts any flow-control window, so the loop
+                    // ends only when the server's close rejects a write.
+                    for (let i = 0; i < 65536; i++) {
                         await writer.write(new Uint8Array(1024));
-                        await new Promise(r => setTimeout(r, 10));
                     }
                     return { interrupted: false };
                 } catch (e) {
@@ -940,7 +941,9 @@ async def test_server_close_interrupts_client_accept_bi(
             assert request is not None
             session = await request.accept()
             async with session:
-                await asyncio.sleep(0.1)
+                # The browser signals once its accept is pending.
+                recv = await session.accept_uni()
+                assert await recv.read() == b"waiting"
                 session.close(0, "")
 
         async with asyncio.TaskGroup() as tg:
@@ -950,8 +953,12 @@ async def test_server_close_interrupts_client_accept_bi(
                 hash_b64,
                 """
                 const reader = transport.incomingBidirectionalStreams.getReader();
+                const next = reader.read();
+                const signal = await transport.createUnidirectionalStream();
+                // The server closes on receipt, so this write may still be pending then.
+                writeAllString(signal, "waiting").catch(() => {});
                 try {
-                    const { done } = await reader.read();
+                    const { done } = await next;
                     return { ended: done };
                 } catch (e) {
                     return { ended: true, error: e.toString() };
@@ -974,7 +981,9 @@ async def test_server_close_interrupts_client_accept_uni(
             assert request is not None
             session = await request.accept()
             async with session:
-                await asyncio.sleep(0.1)
+                # The browser signals once its accept is pending.
+                _send, recv = await session.accept_bi()
+                assert await recv.read() == b"waiting"
                 session.close(0, "")
 
         async with asyncio.TaskGroup() as tg:
@@ -984,8 +993,12 @@ async def test_server_close_interrupts_client_accept_uni(
                 hash_b64,
                 """
                 const reader = transport.incomingUnidirectionalStreams.getReader();
+                const next = reader.read();
+                const signal = await transport.createBidirectionalStream();
+                // The server closes on receipt, so this write may still be pending then.
+                writeAllString(signal.writable, "waiting").catch(() => {});
                 try {
-                    const { done } = await reader.read();
+                    const { done } = await next;
                     return { ended: done };
                 } catch (e) {
                     return { ended: true, error: e.toString() };

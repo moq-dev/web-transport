@@ -20,6 +20,7 @@
 		"build": "rimraf dist && tsc && tsx ../common/package.ts",
 		"dev": "tsc --watch",
 		"check": "tsc --noEmit",
+		"test": "bun test src",
 		"release": "bun ../common/release.ts"
 	},
 	"devDependencies": {

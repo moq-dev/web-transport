@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, spyOn, test } from "bun:test";
 import type { WebSocketLike, WebSocketStreamLike } from "@moq/web-socket-stream";
 import { SessionError, StreamError } from "./error.ts";
 import * as Frame from "./frame.ts";
@@ -171,11 +171,11 @@ class FakeServerSocket implements WebSocketLike {
 	}
 }
 
-/** Poll an observable condition with a bounded timeout (no fixed-yield sleeps). */
-async function waitFor(check: () => boolean, timeoutMs = 1000): Promise<void> {
-	const start = Date.now();
-	while (!check()) {
-		if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+/** Poll an observable condition, yielding a bounded number of macrotask turns
+ *  (not wall-clock time, so a loaded machine can't fail it). */
+async function waitFor(check: () => boolean, turns = 1000): Promise<void> {
+	for (let i = 0; !check(); i++) {
+		if (i >= turns) throw new Error("timed out waiting for condition");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	}
 }
@@ -196,6 +196,26 @@ async function flushMicrotasks(turns = 10): Promise<void> {
 
 /** Settle a promise to its value or its rejection error, without leaking an
  *  unhandled rejection while the test arranges the teardown that resolves it. */
+/** Report whether `p` has settled, without awaiting it. */
+function settledFlag(p: Promise<unknown>): () => boolean {
+	let settled = false;
+	const mark = () => {
+		settled = true;
+	};
+	p.then(mark, mark);
+	return () => settled;
+}
+
+/** Advance fake timers 1ms at a time, draining microtasks at each step so async
+ *  sends and receives land at the fake time they were issued. */
+async function advance(ms: number): Promise<void> {
+	for (let i = 0; i < ms; i++) {
+		await flushMicrotasks();
+		jest.advanceTimersByTime(1);
+	}
+	await flushMicrotasks();
+}
+
 function settleTo<T>(p: Promise<T>): Promise<T | Error> {
 	return p.then(
 		(v) => v,
@@ -454,13 +474,12 @@ describe("Session integration (scripted peer)", () => {
 		peer.send({ type: "ping_request", sequence: 1n });
 		await waitFor(() => peer.has("ping_response"));
 
+		// Frames are handled in order, so a resurrected stream would already be queued.
 		const reader = session.incomingUnidirectionalStreams.getReader();
 		const next = reader.read();
-		const resurrected = await Promise.race([
-			next.then(() => true),
-			new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
-		]);
-		expect(resurrected).toBe(false);
+		const resurrected = settledFlag(next);
+		await settle();
+		expect(resurrected()).toBe(false);
 		session.close();
 		await next;
 		reader.releaseLock();
@@ -871,72 +890,84 @@ describe("Session integration (scripted peer)", () => {
 			expect((err.cause as Error).message).toBe("connection reset");
 		});
 
-		test("an idle timeout rejects closed when neither direction makes progress", async () => {
-			// The sharpest case: an idle timeout used to resolve with { closeCode: 0,
-			// reason: "idle timeout" }, while a graceful close() with no args resolves
-			// with { closeCode: 0, reason: "" }. A dead peer and a clean shutdown differed
-			// only by a free-text string.
-			const { session, peer } = connect({ maxIdleTimeout: 150n });
-			await session.ready;
-			await waitFor(() => peer.has("transport_parameters"));
-			// A successfully written keep-alive is send activity under QMux. Block the
-			// sink so neither inbound nor outbound frames can reset the idle deadline.
-			peer.blockWrites();
-			peer.send({ type: "transport_parameters", params: peerParams() });
+		describe("idle timeout", () => {
+			// The idle timer polls every 50ms at these timeouts; fake time makes each
+			// tick land at a known instant.
+			beforeEach(() => {
+				jest.useFakeTimers();
+			});
+			afterEach(() => {
+				jest.clearAllTimers();
+				jest.useRealTimers();
+			});
 
-			const err = await expectSessionFailure(session);
-			expect(err.message).toContain("idle timeout");
-			peer.unblockWrites();
-		});
+			test("rejects closed when neither direction makes progress", async () => {
+				// The sharpest case: an idle timeout used to resolve with { closeCode: 0,
+				// reason: "idle timeout" }, while a graceful close() with no args resolves
+				// with { closeCode: 0, reason: "" }. A dead peer and a clean shutdown differed
+				// only by a free-text string.
+				const { session, peer } = connect({ maxIdleTimeout: 150n });
+				await session.ready;
+				await peer.waitForFrame((f) => f.type === "transport_parameters");
+				// A successfully written keep-alive is send activity under QMux. Block the
+				// sink so neither inbound nor outbound frames can reset the idle deadline.
+				peer.blockWrites();
+				peer.send({ type: "transport_parameters", params: peerParams() });
+				const ended = settledFlag(session.closed);
 
-		test("outbound frame activity resets the idle timeout", async () => {
-			const { session, peer } = connect({ maxIdleTimeout: 120n });
-			await session.ready;
-			peer.send({ type: "transport_parameters", params: peerParams() });
+				await advance(150);
+				expect(ended()).toBe(false);
+				await advance(150);
+				expect(ended()).toBe(true);
+				const err = await expectSessionFailure(session);
+				expect(err.message).toContain("idle timeout");
+				peer.unblockWrites();
+			});
 
-			const writable = await session.createUnidirectionalStream();
-			const writer = writable.getWriter();
-			for (let i = 0; i < 6; i++) {
-				await new Promise((resolve) => setTimeout(resolve, 45));
-				await writer.write(new Uint8Array([i]));
-				// The peer answers every other write, as a live peer responding to the
-				// keep-alive would. A send restarts the deadline only once per receive
-				// (RFC 9000 §10.1), so proof of life has to keep arriving.
-				if (i % 2 === 0) peer.send({ type: "ping_response", sequence: BigInt(i) });
-			}
+			test("outbound frame activity resets it", async () => {
+				const { session, peer } = connect({ maxIdleTimeout: 120n });
+				await session.ready;
+				peer.send({ type: "transport_parameters", params: peerParams() });
+				const writer = (await session.createUnidirectionalStream()).getWriter();
+				const ended = settledFlag(session.closed);
 
-			// More than two idle windows elapsed with only occasional inbound frames,
-			// but the successful STREAM writes kept resetting the shared deadline.
-			expect(peer.has("connection_close")).toBe(false);
-			session.close();
-			expect(await session.closed).toEqual({ closeCode: 0, reason: "" });
-		});
-
-		test("a silent peer idle-closes even while our own writes land", async () => {
-			// The dead-peer case: nothing ever arrives again, but the socket still
-			// accepts everything we send. Our own keep-alive pings advance the send
-			// clock, so counting every send as activity left the deadline permanently
-			// in the future and the session never closed.
-			const { session, peer } = connect({ maxIdleTimeout: 120n });
-			await session.ready;
-			peer.send({ type: "transport_parameters", params: peerParams() });
-
-			const writable = await session.createUnidirectionalStream();
-			const writer = writable.getWriter();
-			const writes = (async () => {
-				try {
-					for (let i = 0; i < 12; i++) {
-						await new Promise((resolve) => setTimeout(resolve, 45));
-						await writer.write(new Uint8Array([i]));
-					}
-				} catch {
-					// The session closes out from under the writer; that's the point.
+				// The peer speaks every 150ms, right after an idle tick, so receives alone
+				// lapse the 120ms deadline. Our write just before the next tick is the
+				// first send since that receive, which restarts the deadline (RFC 9000
+				// §10.1) and carries the session to the peer's next frame.
+				for (let i = 0; i < 4; i++) {
+					await advance(49);
+					await writer.write(new Uint8Array([i]));
+					await advance(101);
+					expect(ended()).toBe(false);
+					peer.send({ type: "ping_response", sequence: BigInt(i) });
 				}
-			})();
 
-			const err = await expectSessionFailure(session);
-			expect(err.message).toContain("idle timeout");
-			await writes;
+				session.close();
+				expect(await session.closed).toEqual({ closeCode: 0, reason: "" });
+			});
+
+			test("a silent peer idle-closes even while our own writes land", async () => {
+				// The dead-peer case: nothing ever arrives again, but the socket still
+				// accepts everything we send. Our own keep-alive pings advance the send
+				// clock, so counting every send as activity left the deadline permanently
+				// in the future and the session never closed.
+				const { session, peer } = connect({ maxIdleTimeout: 120n });
+				await session.ready;
+				peer.send({ type: "transport_parameters", params: peerParams() });
+				const writer = (await session.createUnidirectionalStream()).getWriter();
+				const ended = settledFlag(session.closed);
+
+				for (let i = 0; i < 12 && !ended(); i++) {
+					await advance(45);
+					// The session closes out from under the writer; that's the point.
+					await writer.write(new Uint8Array([i])).catch(() => {});
+				}
+
+				expect(ended()).toBe(true);
+				const err = await expectSessionFailure(session);
+				expect(err.message).toContain("idle timeout");
+			});
 		});
 
 		test("the standard reconnect idiom sees a drop", async () => {

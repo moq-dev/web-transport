@@ -6,6 +6,33 @@ import pytest
 
 import web_transport
 
+from .conftest import connect_pair
+
+
+async def _idle_period(cert, key, cert_hash):
+    """Return once a silent control session with a 0.5s idle timeout times out.
+
+    Idle timers have no clock injection, so this measures a real idle period by
+    the timer under test instead of guessing a sleep long enough.
+    """
+    idle = {"max_idle_timeout": 0.5}
+    async with connect_pair(
+        cert, key, cert_hash, server_kwargs=idle, client_kwargs=idle
+    ) as (_, _, _, client_session):
+        await asyncio.wait_for(client_session.wait_closed(), timeout=5.0)
+        assert isinstance(client_session.close_reason, web_transport.SessionTimeout)
+
+
+async def _assert_open(server_session, client_session):
+    """Assert both ends are open and a stream round trip still works."""
+    assert server_session.close_reason is None
+    assert client_session.close_reason is None
+    send = await client_session.open_uni()
+    async with send:
+        await send.write(b"ping")
+    recv = await asyncio.wait_for(server_session.accept_uni(), timeout=5.0)
+    assert await recv.read() == b"ping"
+
 
 @pytest.mark.asyncio
 async def test_connect_invalid_url(cert_hash):
@@ -241,42 +268,13 @@ async def test_idle_timeout_fires(self_signed_cert, cert_hash):
 async def test_keep_alive_prevents_timeout(self_signed_cert, cert_hash):
     """keep_alive prevents idle timeout."""
     cert, key = self_signed_cert
+    config = {"max_idle_timeout": 0.5, "keep_alive_interval": 0.1}
 
-    async with web_transport.Server(
-        certificate_chain=[cert],
-        private_key=key,
-        bind="[::1]:0",
-        max_idle_timeout=1.0,
-        keep_alive_interval=0.1,
-    ) as server:
-        _, port = server.local_addr
-
-        async def server_task():
-            request = await server.accept()
-            assert request is not None
-            session = await request.accept()
-            # Wait longer than the idle timeout
-            await asyncio.sleep(1.5)
-            # Session should still be alive
-            assert session.close_reason is None
-            await session.wait_closed()
-
-        async def client_task():
-            async with web_transport.Client(
-                server_certificate_hashes=[cert_hash],
-                max_idle_timeout=1.0,
-                keep_alive_interval=0.1,
-            ) as client:
-                session = await client.connect(f"https://[::1]:{port}")
-                await asyncio.sleep(1.5)
-                # Session should still be alive
-                assert session.close_reason is None
-                session.close()
-
-        await asyncio.gather(
-            asyncio.create_task(server_task()),
-            asyncio.create_task(client_task()),
-        )
+    async with connect_pair(
+        cert, key, cert_hash, server_kwargs=config, client_kwargs=config
+    ) as (_, _, server_session, client_session):
+        await _idle_period(cert, key, cert_hash)
+        await _assert_open(server_session, client_session)
 
 
 @pytest.mark.asyncio
@@ -487,36 +485,18 @@ async def test_client_close_code_propagates_to_server(self_signed_cert, cert_has
 
 @pytest.mark.asyncio
 async def test_idle_timeout_disabled(self_signed_cert, cert_hash):
-    """max_idle_timeout=None -> alive after 2s."""
+    """max_idle_timeout=None -> alive after an idle period."""
     cert, key = self_signed_cert
+    config = {"max_idle_timeout": None}
 
-    async with web_transport.Server(
-        certificate_chain=[cert],
-        private_key=key,
-        bind="[::1]:0",
-        max_idle_timeout=None,
-    ) as server:
-        _, port = server.local_addr
+    async with connect_pair(
+        cert, key, cert_hash, server_kwargs=config, client_kwargs=config
+    ) as (_, _, server_session, client_session):
+        await _idle_period(cert, key, cert_hash)
+        await _assert_open(server_session, client_session)
 
-        async def server_task():
-            request = await server.accept()
-            assert request is not None
-            session = await request.accept()
-            await session.wait_closed()
-            assert isinstance(session.close_reason, web_transport.SessionClosedByPeer)
-
-        async def client_task():
-            async with web_transport.Client(
-                server_certificate_hashes=[cert_hash],
-                max_idle_timeout=None,
-            ) as client:
-                session = await client.connect(f"https://[::1]:{port}")
-                await asyncio.sleep(1.5)
-                assert session.close_reason is None
-                session.close()
-                await session.wait_closed()
-
-        await asyncio.gather(
-            asyncio.create_task(server_task()),
-            asyncio.create_task(client_task()),
+        client_session.close()
+        await asyncio.wait_for(server_session.wait_closed(), timeout=5.0)
+        assert isinstance(
+            server_session.close_reason, web_transport.SessionClosedByPeer
         )

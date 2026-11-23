@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
 	install,
 	openWebSocketStream,
@@ -66,6 +66,22 @@ async function tick(n = 1): Promise<void> {
 	}
 }
 
+/** Drain queued microtasks without letting (fake) time pass. */
+async function flushMicrotasks(turns = 20): Promise<void> {
+	for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
+/** Re-checking `bufferedAmount` runs on a timer; fake time fires it on demand. */
+async function advance(ms: number): Promise<void> {
+	await flushMicrotasks();
+	jest.advanceTimersByTime(ms);
+	await flushMicrotasks();
+}
+
+afterEach(() => {
+	jest.useRealTimers();
+});
+
 describe("WebSocketStream ponyfill", () => {
 	test("opened resolves with streams and negotiated protocol", async () => {
 		const wss = new WebSocketStream("wss://x/y", { webSocket: ctor, protocols: ["p1"] });
@@ -95,6 +111,7 @@ describe("WebSocketStream ponyfill", () => {
 	});
 
 	test("writes are sent and backpressure follows bufferedAmount", async () => {
+		jest.useFakeTimers();
 		const wss = new WebSocketStream("wss://x", { webSocket: ctor, highWaterMark: 100 });
 		const ws = FakeWebSocket.last as FakeWebSocket;
 		ws.open();
@@ -112,16 +129,17 @@ describe("WebSocketStream ponyfill", () => {
 		void pending.then(() => {
 			settled = true;
 		});
-		await tick(5);
+		await advance(100);
 		expect(settled).toBe(false); // still backpressured
 		expect(ws.sent.length).toBe(2); // but the bytes were already sent
 
 		ws.bufferedAmount = 0; // drained
-		await pending;
+		await advance(100);
 		expect(settled).toBe(true);
 	});
 
 	test("setHighWaterMark resizes backpressure live (mid-drain)", async () => {
+		jest.useFakeTimers();
 		const wss = new WebSocketStream("wss://x", { webSocket: ctor, highWaterMark: 100 });
 		const ws = FakeWebSocket.last as FakeWebSocket;
 		ws.open();
@@ -134,14 +152,14 @@ describe("WebSocketStream ponyfill", () => {
 		void pending.then(() => {
 			settled = true;
 		});
-		await tick(5);
+		await advance(100);
 		expect(settled).toBe(false); // backpressured at 100
 
 		// Raise the mark above the buffered amount — the in-progress drain resolves
 		// without bufferedAmount having to change.
 		wss.setHighWaterMark(1000);
 		expect(wss.highWaterMark).toBe(1000);
-		await pending;
+		await advance(100);
 		expect(settled).toBe(true);
 	});
 
@@ -285,6 +303,7 @@ describe("WebSocketStream.adopt", () => {
 	});
 
 	test("backpressure applies to an adopted socket", async () => {
+		jest.useFakeTimers();
 		const ws = accepted();
 		ws.bufferedAmount = 100;
 		const wss = WebSocketStream.adopt(ws, { highWaterMark: 10 });
@@ -298,14 +317,11 @@ describe("WebSocketStream.adopt", () => {
 			.then(() => {
 				written = true;
 			});
-		await tick(2);
+		await advance(100);
 		expect(written).toBe(false); // parked until the buffer drains
 
-		// The ponyfill re-checks `bufferedAmount` on a timer, so poll rather than
-		// assume how many turns the drain takes.
 		ws.bufferedAmount = 0;
-		const deadline = Date.now() + 1000;
-		while (!written && Date.now() < deadline) await tick();
+		await advance(100);
 		expect(written).toBe(true);
 	});
 });

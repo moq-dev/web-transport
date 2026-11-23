@@ -40,7 +40,6 @@ async def test_server_async_iterator(self_signed_cert, cert_hash):
                 session = await client.connect(f"https://[::1]:{port}")
                 session.close()
 
-            await asyncio.sleep(0.1)
             server.close()
 
         await asyncio.gather(
@@ -48,7 +47,7 @@ async def test_server_async_iterator(self_signed_cert, cert_hash):
             asyncio.create_task(connect_and_close()),
         )
 
-        assert len(requests) >= 1
+        assert len(requests) == 1
         assert isinstance(requests[0], web_transport.SessionRequest)
 
 
@@ -310,11 +309,13 @@ async def test_session_close_with_code(self_signed_cert, cert_hash):
     ) as server:
         _, port = server.local_addr
 
+        connected = asyncio.Event()
+
         async def server_task():
             request = await server.accept()
             assert request is not None
             session = await request.accept()
-            await asyncio.sleep(0.1)
+            await connected.wait()
             session.close(42, "shutting down")
             await session.wait_closed()
 
@@ -323,6 +324,7 @@ async def test_session_close_with_code(self_signed_cert, cert_hash):
                 server_certificate_hashes=[cert_hash]
             ) as client:
                 session = await client.connect(f"https://[::1]:{port}")
+                connected.set()
                 with pytest.raises(web_transport.SessionClosedByPeer) as exc_info:
                     await session.accept_bi()
                 assert exc_info.value.source == "session"

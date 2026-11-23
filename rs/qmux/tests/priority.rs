@@ -3,7 +3,8 @@
 //! These drive a real `Session` over a `ThrottledTransport` whose `send`
 //! sleeps a few milliseconds, so the session's bounded priority queue fills up
 //! and the scheduler's ordering policy actually takes effect (when the socket
-//! accepts everything instantly, prioritization is moot).
+//! accepts everything instantly, prioritization is moot). Time is paused, so the
+//! throttle is virtual: it orders events deterministically and costs no wall time.
 
 use std::time::Duration;
 
@@ -99,7 +100,7 @@ async fn pair(delay: Duration) -> (Session, Session) {
 /// small high-priority one. With prioritization, the high-priority stream's
 /// FIN-terminated data fully arrives while the low-priority stream is still
 /// trickling through.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn higher_priority_completes_first() {
     let (client, server) = pair(Duration::from_millis(5)).await;
 
@@ -167,7 +168,7 @@ async fn higher_priority_completes_first() {
 
 /// Equal-priority streams interleave (round-robin) rather than one draining
 /// fully before the other starts.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn equal_priority_interleaves() {
     let (client, server) = pair(Duration::from_millis(2)).await;
 
@@ -227,7 +228,7 @@ async fn equal_priority_interleaves() {
 
 /// A control frame (RESET_STREAM, via `reset()`) reaches the peer ahead of a
 /// large data backlog queued on another stream.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn control_precedes_data_backlog() {
     let (client, server) = pair(Duration::from_millis(5)).await;
 
@@ -246,7 +247,8 @@ async fn control_precedes_data_backlog() {
         client.closed().await;
     });
 
-    // Let the bulk backlog build up so the data queue is full.
+    // Let the bulk backlog build up so the data queue is full: on paused time this
+    // runs every task until idle, then a few throttled sends' worth.
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     // Now reset `signal`. Its RESET_STREAM goes through the control lane and
@@ -271,7 +273,7 @@ async fn control_precedes_data_backlog() {
 
 /// Raising a stream's priority mid-stream must not corrupt its byte sequence:
 /// the receiver reassembles exactly what was written, in order.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mid_stream_set_priority_preserves_order() {
     let (client, server) = pair(Duration::from_millis(2)).await;
 
@@ -319,7 +321,7 @@ async fn mid_stream_set_priority_preserves_order() {
 
 /// Tearing down the session unblocks a producer parked on a full queue: the
 /// pending `write` returns `Error::Closed`.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn teardown_unblocks_blocked_writer() {
     // Long delay so the queue stays full and `write` blocks.
     let (client, server) = pair(Duration::from_millis(500)).await;
@@ -332,7 +334,8 @@ async fn teardown_unblocks_blocked_writer() {
         s.write(&vec![b'Z'; 1024 * 1024]).await
     });
 
-    // Give it a moment to fill the queue and park.
+    // On paused time this runs every task until idle, so the writer has filled
+    // the queue and parked behind the throttled send.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !handle.is_finished(),

@@ -12,7 +12,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use rcgen::{CertifiedKey, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::client::{
+    ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
+    Tls13ClientSessionValue,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 // `Session::raw` and the inherent `protocol()` accessor are used directly.
 use web_transport_quinn::Session;
 
@@ -31,8 +35,62 @@ fn self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     Ok((cert_der, key_der))
 }
 
-/// Bind a server endpoint and a client endpoint, both offering only `RAW_ALPN`.
-fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
+/// rustls's in-memory resumption store, signalling each TLS 1.3 ticket it stores.
+///
+/// A ticket arrives after the handshake with nothing else to await, so this is the
+/// only exact signal that a later connection can resume.
+#[derive(Debug)]
+struct TicketStore {
+    inner: ClientSessionMemoryCache,
+    stored: tokio::sync::Notify,
+}
+
+impl ClientSessionStore for TicketStore {
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: rustls::NamedGroup) {
+        self.inner.set_kx_hint(server_name, group)
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+
+    fn set_tls12_session(&self, server_name: ServerName<'static>, value: Tls12ClientSessionValue) {
+        self.inner.set_tls12_session(server_name, value)
+    }
+
+    fn tls12_session(&self, server_name: &ServerName<'_>) -> Option<Tls12ClientSessionValue> {
+        self.inner.tls12_session(server_name)
+    }
+
+    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name)
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: ServerName<'static>,
+        value: Tls13ClientSessionValue,
+    ) {
+        self.inner.insert_tls13_ticket(server_name, value);
+        self.stored.notify_one();
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &ServerName<'static>,
+    ) -> Option<Tls13ClientSessionValue> {
+        self.inner.take_tls13_ticket(server_name)
+    }
+}
+
+/// Bind a server endpoint and a client endpoint, both offering only `RAW_ALPN`,
+/// plus the client's resumption store.
+fn endpoints() -> Result<(
+    quinn::Endpoint,
+    quinn::Endpoint,
+    SocketAddr,
+    Arc<TicketStore>,
+)> {
     let (cert, key) = self_signed()?;
     let provider = web_transport_quinn::crypto::default_provider()?;
 
@@ -64,9 +122,14 @@ fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![RAW_ALPN.as_bytes().to_vec()];
-    // Needed for the client-side 0-RTT test below; harmless elsewhere. The default
-    // `resumption` is an in-memory store, so one endpoint can resume its own ticket.
+    // Needed for the client-side 0-RTT test below; harmless elsewhere. The store is
+    // in memory, so one endpoint can resume its own ticket.
     client_crypto.enable_early_data = true;
+    let tickets = Arc::new(TicketStore {
+        inner: ClientSessionMemoryCache::new(32),
+        stored: tokio::sync::Notify::new(),
+    });
+    client_crypto.resumption = Resumption::store(tickets.clone());
 
     let client_config = quinn::ClientConfig::new(Arc::new(
         web_transport_quinn::crypto::QuicClientConfig::try_from(client_crypto)?,
@@ -80,12 +143,12 @@ fn endpoints() -> Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
     )?;
     client.set_default_client_config(client_config);
 
-    Ok((server, client, server_addr))
+    Ok((server, client, server_addr, tickets))
 }
 
 /// Bind a QUIC server and connect a client to it, both fully handshaken.
 async fn connect_raw() -> Result<(quinn::Connection, quinn::Connection)> {
-    let (server, client, server_addr) = endpoints()?;
+    let (server, client, server_addr, _) = endpoints()?;
 
     let accept = tokio::spawn(async move {
         let conn = server.accept().await.context("no connection")?.await?;
@@ -148,7 +211,7 @@ async fn raw_session_reports_alpn_as_protocol() -> Result<()> {
 /// that window must not stop a later read from seeing the real value.
 #[tokio::test]
 async fn a_handshaking_session_reports_its_alpn_once_it_completes() -> Result<()> {
-    let (server, client, server_addr) = endpoints()?;
+    let (server, client, server_addr, tickets) = endpoints()?;
 
     // Accept connections for the whole test; 0-RTT needs a prior session to resume.
     let accepting = tokio::spawn(async move {
@@ -161,30 +224,19 @@ async fn a_handshaking_session_reports_its_alpn_once_it_completes() -> Result<()
         }
     });
 
-    // 0-RTT needs a ticket from an earlier session, and the ticket arrives after that
-    // handshake with no completion to await. Connect until one is available rather than
-    // sleeping on a guess: the first attempt is what produces the ticket, and a later
-    // one resumes it.
-    let mut zero_rtt = None;
-    for _ in 0..10 {
-        match client.connect(server_addr, "localhost")?.into_0rtt() {
-            Ok(resumed) => {
-                zero_rtt = Some(resumed);
-                break;
-            }
-            Err(connecting) => {
-                let conn = connecting.await?;
-                // The ticket arrives on this connection shortly after the handshake,
-                // with nothing to await on, so hold it open long enough to receive
-                // one. Retrying is what makes this robust — not the wait itself.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                conn.close(0u32.into(), b"");
-                conn.closed().await;
-            }
-        }
-    }
+    // 0-RTT needs a ticket from an earlier session, which arrives after its handshake.
+    let first = client.connect(server_addr, "localhost")?.await?;
+    tokio::time::timeout(Duration::from_secs(10), tickets.stored.notified())
+        .await
+        .context("the server never sent a session ticket")?;
+    first.close(0u32.into(), b"");
+    first.closed().await;
 
-    let (conn, accepted) = zero_rtt.context("0-RTT never became available")?;
+    let (conn, accepted) = client
+        .connect(server_addr, "localhost")?
+        .into_0rtt()
+        .ok()
+        .context("0-RTT was unavailable despite a stored ticket")?;
 
     let session = Session::raw(conn);
 

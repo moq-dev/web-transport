@@ -531,14 +531,19 @@ async def test_session_wait_closed_blocks_until_browser_closes(
 ) -> None:
     """wait_closed() does not return until the browser calls transport.close()."""
     async with start_server() as (server, port, hash_b64):
-        wait_closed_done = asyncio.Event()
 
         async def server_side() -> None:
             request = await server.accept()
             assert request is not None
             session = await request.accept()
-            await session.wait_closed()
-            wait_closed_done.set()
+            closed = asyncio.create_task(session.wait_closed())
+            # An echo round trip shows wait_closed() blocks while the browser is connected.
+            send, recv = await session.accept_bi()
+            data = await recv.read()
+            assert not closed.done()
+            async with send:
+                await send.write(data)
+            await closed
 
         setup = _webtransport_connect_js(port, hash_b64)
         async with asyncio.TaskGroup() as tg:
@@ -547,15 +552,15 @@ async def test_session_wait_closed_blocks_until_browser_closes(
                 {setup}
                 const transport = new WebTransport(url, transportOptions);
                 await transport.ready;
-                // Wait a bit to prove wait_closed blocks
-                await new Promise(r => setTimeout(r, 300));
+                const stream = await transport.createBidirectionalStream();
+                await writeAllString(stream.writable, "ping");
+                const echoed = await readAllString(stream.readable);
                 transport.close({{closeCode: 0, reason: ""}});
                 await transport.closed;
-                return true;
+                return echoed;
             """)
 
-    assert result is True
-    assert wait_closed_done.is_set()
+    assert result == "ping"
 
 
 async def test_open_uni_after_close_raises(

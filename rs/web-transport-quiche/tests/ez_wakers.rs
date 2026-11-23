@@ -283,7 +283,7 @@ async fn teardown_wakes_outside_the_driver_lock() -> Result<()> {
 
     struct Probe {
         conn: ez::Connection,
-        woken: AtomicBool,
+        woken: tokio::sync::Notify,
         locked_out: AtomicBool,
     }
 
@@ -304,13 +304,13 @@ async fn teardown_wakes_outside_the_driver_lock() -> Result<()> {
 
             let held = rx.recv_timeout(Duration::from_secs(2)).is_err();
             self.locked_out.store(held, Ordering::SeqCst);
-            self.woken.store(true, Ordering::SeqCst);
+            self.woken.notify_one();
         }
     }
 
     let probe = Arc::new(Probe {
         conn: server.clone(),
-        woken: AtomicBool::new(false),
+        woken: tokio::sync::Notify::new(),
         locked_out: AtomicBool::new(false),
     });
     let waker = Waker::from(probe.clone());
@@ -326,13 +326,9 @@ async fn teardown_wakes_outside_the_driver_lock() -> Result<()> {
     // The peer goes away, so the driver runs its teardown and wakes what is parked.
     client.close(0, "bye");
 
-    timeout(Duration::from_secs(10), async {
-        while !probe.woken.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context("teardown never woke the parked reader")?;
+    timeout(Duration::from_secs(10), probe.woken.notified())
+        .await
+        .context("teardown never woke the parked reader")?;
 
     assert!(
         !probe.locked_out.load(Ordering::SeqCst),

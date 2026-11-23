@@ -3439,7 +3439,7 @@ mod timer_tests {
 
     /// A genuinely idle peer (no backpressure) is closed once the idle window
     /// elapses — the timer, not the reader/writer select, owns this now.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_close_when_silent() {
         let h = spawn_timer(100);
 
@@ -3453,7 +3453,7 @@ mod timer_tests {
     /// idle close is deferred — the peer is likely alive, we're just not reading it —
     /// but only for one bounded extra window, after which it's reclaimed regardless.
     /// This is the read-side twin of the writer-backpressure deferral.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_close_deferred_while_reader_backpressured() {
         let h = spawn_timer(100);
         h.reader_backpressured.store(true, Ordering::Release);
@@ -3474,7 +3474,7 @@ mod timer_tests {
 
     /// Receive progress clears a pending deferral: a reader that catches up (its
     /// `last_recv_at` advances) before the grace elapses is not closed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn receive_progress_averts_idle_close() {
         let h = spawn_timer(100);
 
@@ -3496,7 +3496,7 @@ mod timer_tests {
     /// so a mostly one-way sender stays open across many idle windows while its
     /// peer is still answering — here at a keep-alive-like cadence, far slower
     /// than the writes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_progress_averts_idle_close() {
         let h = spawn_timer(100);
 
@@ -3524,7 +3524,7 @@ mod timer_tests {
     /// any application writes into a socket that still accepts them) advance
     /// `last_send_at`, so letting every send reset the deadline lets us hold a dead
     /// session open by talking to ourselves — the timeout can never fire.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_close_when_peer_silent_despite_our_sends() {
         let h = spawn_timer(100);
 
@@ -3984,7 +3984,7 @@ mod recv_open_tests {
     /// peer-initiated recv stream is retired by a FIN, a duplicate/late STREAM
     /// frame on the same id must be ignored, not turned into a brand-new accepted
     /// stream.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retired_recv_stream_is_not_resurrected() {
         let (session, tx) = scripted_session();
 
@@ -4053,7 +4053,7 @@ mod recv_open_tests {
     /// A RESET_STREAM can be the first frame for a peer-initiated stream. It must
     /// still retire the id, so a later STREAM frame on it isn't accepted as a
     /// brand-new stream. (Guards the RESET-first resurrection path.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reset_as_first_frame_prevents_resurrection() {
         let (session, tx) = scripted_session();
 
@@ -4621,7 +4621,6 @@ mod recv_open_tests {
 // also keeps the compatibility ceiling required by released receivers.
 #[cfg(test)]
 mod stream_payload_tests {
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -4632,15 +4631,15 @@ mod stream_payload_tests {
     use crate::proto::{Frame, Stream, DEFAULT_MAX_RECORD_SIZE};
     use crate::{Config, Error, StreamDir, StreamId, Version, MAX_FRAME_PAYLOAD};
 
-    /// A scripted transport that also keeps every record the session wrote, so a
-    /// test can measure the frames it emitted.
+    /// A scripted transport that also hands every record the session wrote to the
+    /// test, so it can measure the frames it emitted.
     struct ScriptedTransport {
         incoming: mpsc::UnboundedReceiver<Bytes>,
-        outgoing: Arc<Mutex<Vec<Bytes>>>,
+        outgoing: mpsc::UnboundedSender<Bytes>,
     }
 
     struct ScriptedWriter {
-        outgoing: Arc<Mutex<Vec<Bytes>>>,
+        outgoing: mpsc::UnboundedSender<Bytes>,
     }
 
     struct ScriptedReader {
@@ -4665,7 +4664,8 @@ mod stream_payload_tests {
 
     impl Writer for ScriptedWriter {
         async fn send(&mut self, data: Bytes) -> Result<(), Error> {
-            self.outgoing.lock().unwrap().push(data);
+            // A test that has stopped watching doesn't make the transport fail.
+            let _ = self.outgoing.send(data);
             Ok(())
         }
 
@@ -4685,7 +4685,7 @@ mod stream_payload_tests {
 
     struct Peer {
         inbound: mpsc::UnboundedSender<Bytes>,
-        outbound: Arc<Mutex<Vec<Bytes>>>,
+        outbound: mpsc::UnboundedReceiver<Bytes>,
     }
 
     impl Peer {
@@ -4703,30 +4703,31 @@ mod stream_payload_tests {
                 .unwrap();
         }
 
-        /// Every record carrying a STREAM frame, in send order.
-        fn stream_records(&self) -> Vec<Bytes> {
-            self.outbound
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|record| {
-                    Frame::decode_record((*record).clone())
-                        .map(|frames| frames.iter().any(|f| matches!(f, Frame::Stream(_))))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
+        /// The next record the session writes that carries a STREAM frame.
+        async fn next_stream_record(&mut self) -> Bytes {
+            let next = async {
+                loop {
+                    let record = self.outbound.recv().await.expect("session writer gone");
+                    let frames = Frame::decode_record(record.clone()).unwrap();
+                    if frames.iter().any(|f| matches!(f, Frame::Stream(_))) {
+                        return record;
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(1), next)
+                .await
+                .expect("the session did not write a stream record")
         }
     }
 
     /// A client session fed by a scripted peer.
     fn scripted_session(version: Version) -> (Session, Peer) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let (outgoing, outbound) = mpsc::unbounded_channel();
         let session = Session::new(
             ScriptedTransport {
                 incoming: rx,
-                outgoing: outbound.clone(),
+                outgoing,
             },
             false,
             Config::new(version),
@@ -4759,21 +4760,6 @@ mod stream_payload_tests {
             .expect("accept_uni timed out")
             .expect("accept_uni failed");
         recv.read_all().await.unwrap().to_vec()
-    }
-
-    /// Wait for the session to write `count` records carrying stream data.
-    async fn wait_for_stream_records(peer: &Peer, count: usize) -> Vec<Bytes> {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let records = peer.stream_records();
-                if records.len() >= count {
-                    return records;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the session did not write the expected stream records")
     }
 
     fn stream_payload_len(record: &Bytes) -> usize {
@@ -4842,7 +4828,7 @@ mod stream_payload_tests {
     /// record they advertise can hold a slightly larger STREAM frame.
     #[tokio::test]
     async fn stream_payloads_stay_within_the_released_receiver_ceiling() {
-        let (session, peer) = scripted_session(Version::QMux01);
+        let (session, mut peer) = scripted_session(Version::QMux01);
         peer.params(DEFAULT_MAX_RECORD_SIZE);
 
         let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
@@ -4853,8 +4839,8 @@ mod stream_payload_tests {
             .await
             .unwrap();
 
-        let records = wait_for_stream_records(&peer, 1).await;
-        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
+        let record = peer.next_stream_record().await;
+        assert_eq!(stream_payload_len(&record), MAX_FRAME_PAYLOAD);
     }
 
     /// A larger peer record limit does not bypass the compatibility ceiling.
@@ -4862,7 +4848,7 @@ mod stream_payload_tests {
     async fn larger_record_limit_keeps_the_compatibility_ceiling() {
         const MAX_RECORD_SIZE: u64 = 32_768;
 
-        let (session, peer) = scripted_session(Version::QMux01);
+        let (session, mut peer) = scripted_session(Version::QMux01);
         peer.params(MAX_RECORD_SIZE);
 
         let mut send = tokio::time::timeout(Duration::from_secs(1), session.open_uni())
@@ -4873,8 +4859,8 @@ mod stream_payload_tests {
             .await
             .unwrap();
 
-        let records = wait_for_stream_records(&peer, 1).await;
-        assert_eq!(stream_payload_len(&records[0]), MAX_FRAME_PAYLOAD);
+        let record = peer.next_stream_record().await;
+        assert_eq!(stream_payload_len(&record), MAX_FRAME_PAYLOAD);
     }
 }
 

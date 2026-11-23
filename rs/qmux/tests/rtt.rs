@@ -1,79 +1,101 @@
-//! Round-trip time reported from QX_PING exchanges, over the TCP transport.
+//! Round-trip time reported from QX_PING exchanges, and from the kernel over TCP.
 
 #![cfg(feature = "tcp")]
 
 use std::time::Duration;
 
 use qmux::{transport::Stream, Config, Session, Version};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 use web_transport_trait::{SendStream as _, Session as _, Stats as _};
 
-/// Pair a client and server over TCP loopback with the given configs, awaiting
-/// establishment on both ends.
-async fn pair(client_cfg: Config, server_cfg: Config) -> (Session, Session) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+/// One-way latency of the in-memory link, so every QX_PING sample is exactly twice it.
+const LATENCY: Duration = Duration::from_millis(10);
 
-    let server = tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        let transport = Stream::new(sock, server_cfg.version, server_cfg.max_record_size);
-        Session::accept(transport, server_cfg).await.unwrap()
+/// The probe interval the protocol tests configure.
+const INTERVAL: Duration = Duration::from_millis(20);
+
+/// Virtual time for the first probe to go out and its response to return.
+const SETTLE: Duration = Duration::from_millis(100);
+
+/// Pair a client and server over an in-memory link that delays each direction by
+/// [`LATENCY`], awaiting establishment on both ends. Tests run on paused time, so
+/// the latency is exact and nothing waits on the wall clock.
+async fn pair(client_cfg: Config, server_cfg: Config) -> (Session, Session) {
+    let (client_io, client_link) = tokio::io::duplex(64 * 1024);
+    let (server_link, server_io) = tokio::io::duplex(64 * 1024);
+    let (client_rx, client_tx) = tokio::io::split(client_link);
+    let (server_rx, server_tx) = tokio::io::split(server_link);
+    tokio::spawn(delay(client_rx, server_tx));
+    tokio::spawn(delay(server_rx, client_tx));
+
+    let client = Stream::new(client_io, client_cfg.version, client_cfg.max_record_size);
+    let server = Stream::new(server_io, server_cfg.version, server_cfg.max_record_size);
+    let (client, server) = tokio::join!(
+        Session::connect(client, client_cfg),
+        Session::accept(server, server_cfg),
+    );
+    (client.unwrap(), server.unwrap())
+}
+
+/// Copy `from` to `to`, delivering each chunk [`LATENCY`] after it was read.
+async fn delay(mut from: impl AsyncRead + Unpin, mut to: impl AsyncWrite + Unpin + Send + 'static) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    let forward = tokio::spawn(async move {
+        while let Some((at, chunk)) = rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if to.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
     });
 
-    let sock = TcpStream::connect(addr).await.unwrap();
-    let transport = Stream::new(sock, client_cfg.version, client_cfg.max_record_size);
-    let client = Session::connect(transport, client_cfg).await.unwrap();
-
-    (client, server.await.unwrap())
+    let mut buf = vec![0u8; 16 * 1024];
+    while let Ok(n @ 1..) = from.read(&mut buf).await {
+        if tx
+            .send((Instant::now() + LATENCY, buf[..n].to_vec()))
+            .is_err()
+        {
+            break;
+        }
+    }
+    drop(tx);
+    let _ = forward.await;
 }
 
-/// A config that probes often enough to keep the test quick.
+/// A config that probes every [`INTERVAL`].
 fn probing(version: Version) -> Config {
     let mut cfg = Config::new(version);
-    cfg.rtt_interval = Duration::from_millis(20);
+    cfg.rtt_interval = INTERVAL;
     cfg
-}
-
-/// Poll `session` until it reports an RTT, or give up.
-async fn wait_for_rtt(session: &Session) -> Option<Duration> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(rtt) = session.stats().rtt() {
-                return rtt;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .ok()
 }
 
 /// Both ends measure an RTT from the QX_PING exchange, with no application
 /// traffic at all. Before RTT tracking, `stats()` reported `None` forever.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn both_ends_measure_rtt() {
     let (client, server) = pair(probing(Version::QMux02), probing(Version::QMux02)).await;
 
-    let client_rtt = wait_for_rtt(&client).await.expect("client measured no RTT");
-    let server_rtt = wait_for_rtt(&server).await.expect("server measured no RTT");
+    tokio::time::sleep(SETTLE).await;
 
-    // Loopback, so the figure is small, but it must be a real measurement rather
-    // than a zero placeholder standing in for "unknown".
-    for rtt in [client_rtt, server_rtt] {
-        assert!(rtt < Duration::from_secs(1), "implausible RTT: {rtt:?}");
-    }
+    // The link's round trip exactly, rather than a placeholder standing in for
+    // "unknown" or a figure that includes local queueing.
+    assert_eq!(client.stats().rtt(), Some(2 * LATENCY), "client");
+    assert_eq!(server.stats().rtt(), Some(2 * LATENCY), "server");
 }
 
 /// RTT is measured while the application is actively sending, which is exactly
 /// when the activity-gated keep-alive ping never fires.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn measures_rtt_under_load() {
-    let (client, server) = pair(probing(Version::QMux02), probing(Version::QMux02)).await;
+    let (client, _server) = pair(probing(Version::QMux02), probing(Version::QMux02)).await;
 
-    // Keep the connection busy so `last_send_at` never goes quiet.
+    // Keep the client busy so its `last_send_at` never goes quiet.
+    let sender = client.clone();
     let busy = tokio::spawn(async move {
         loop {
-            let mut send = match client.open_uni().await {
+            let mut send = match sender.open_uni().await {
                 Ok(send) => send,
                 Err(_) => return,
             };
@@ -84,20 +106,26 @@ async fn measures_rtt_under_load() {
         }
     });
 
-    let rtt = wait_for_rtt(&server).await;
+    tokio::time::sleep(SETTLE).await;
+    assert!(!busy.is_finished(), "the busy sender stopped early");
     busy.abort();
 
-    assert!(rtt.is_some(), "no RTT measured while actively sending");
+    // The busy side is the one whose keep-alive never fires.
+    assert_eq!(
+        client.stats().rtt(),
+        Some(2 * LATENCY),
+        "no RTT measured while actively sending"
+    );
 }
 
 /// A zero interval opts out, leaving RTT unreported.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn zero_interval_disables_probing() {
     let mut cfg = Config::new(Version::QMux02);
     cfg.rtt_interval = Duration::ZERO;
     let (client, _server) = pair(cfg.clone(), cfg).await;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(SETTLE).await;
     assert_eq!(client.stats().rtt(), None);
 }
 
@@ -135,6 +163,7 @@ async fn tcp_reports_rtt_immediately() {
 #[cfg(unix)]
 async fn pair_with_socket_stats(client_cfg: Config, server_cfg: Config) -> (Session, Session) {
     use std::sync::Arc;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn stats(sock: &TcpStream) -> qmux::SharedSocketStats {
         Arc::new(qmux::TcpStats::new(sock).unwrap())

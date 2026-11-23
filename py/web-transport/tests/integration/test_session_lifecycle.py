@@ -6,6 +6,8 @@ import pytest
 
 import web_transport
 
+from .conftest import suspended
+
 
 @pytest.mark.asyncio
 async def test_session_close_with_code_and_reason(session_pair):
@@ -19,9 +21,8 @@ async def test_session_close_with_code_and_reason(session_pair):
         assert exc_info.value.code == 42
         assert exc_info.value.reason == "goodbye"
 
-    # Start waiting before close so the notification is properly received
     task = asyncio.create_task(accept_side())
-    await asyncio.sleep(0.05)
+    await suspended(task)
     client_session.close(42, "goodbye")
     await client_session.wait_closed()
     await asyncio.wait_for(task, timeout=5.0)
@@ -62,7 +63,13 @@ async def test_session_wait_closed(session_pair):
         closed = True
 
     task = asyncio.create_task(wait_for_close())
-    await asyncio.sleep(0.1)
+
+    # A stream round trip shows the session is still open.
+    send = await client_session.open_uni()
+    async with send:
+        await send.write(b"ping")
+    recv = await server_session.accept_uni()
+    assert await recv.read() == b"ping"
     assert not closed
 
     client_session.close()
@@ -182,7 +189,7 @@ async def test_session_close_max_code(session_pair):
         assert exc_info.value.reason == "max code"
 
     task = asyncio.create_task(accept_side())
-    await asyncio.sleep(0.05)
+    await suspended(task)
     client_session.close(2**32 - 1, "max code")
     await client_session.wait_closed()
     await asyncio.wait_for(task, timeout=5.0)
@@ -223,7 +230,7 @@ async def test_accept_stream_after_peer_close(session_pair):
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(accept_side())
-    await asyncio.sleep(0.05)
+    await suspended(task)
     client_session.close()
     await client_session.wait_closed()
     await asyncio.wait_for(task, timeout=5.0)
@@ -253,7 +260,7 @@ async def test_receive_datagram_after_peer_close(session_pair):
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(recv_side())
-    await asyncio.sleep(0.05)
+    await suspended(task)
     client_session.close()
     await client_session.wait_closed()
     await asyncio.wait_for(task, timeout=5.0)
@@ -321,7 +328,7 @@ async def test_accept_uni_after_peer_close(session_pair):
         assert exc_info.value.code == 0
 
     task = asyncio.create_task(accept_side())
-    await asyncio.sleep(0.05)
+    await suspended(task)
     client_session.close()
     await client_session.wait_closed()
     await asyncio.wait_for(task, timeout=5.0)

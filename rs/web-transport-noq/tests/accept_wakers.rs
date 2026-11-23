@@ -39,21 +39,29 @@ const ABANDONED: usize = 256;
 #[derive(Default)]
 struct FlagWaker {
     woken: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 impl FlagWaker {
     fn woken(&self) -> bool {
         self.woken.load(Ordering::SeqCst)
     }
+
+    /// Resolves once the waker has been woken, even if that already happened.
+    async fn wait(&self) {
+        self.notify.notified().await
+    }
 }
 
 impl Wake for FlagWaker {
     fn wake(self: Arc<Self>) {
         self.woken.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.woken.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
     }
 }
 
@@ -214,13 +222,9 @@ async fn a_departing_accepter_does_not_strand_the_others() -> Result<()> {
     send.finish()?;
 
     // Nothing here polls the accept path again: A has to be woken by the arrival.
-    for _ in 0..500 {
-        if a.woken() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(a.woken(), "the remaining accepter was never woken");
+    timeout(Duration::from_secs(10), a.wait())
+        .await
+        .context("the remaining accepter was never woken")?;
 
     client.close(0, b"bye");
     Ok(())

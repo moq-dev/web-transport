@@ -40,6 +40,12 @@ async def session_pair(self_signed_cert, cert_hash):
             await server_session.wait_closed()
 
 
+async def suspended(task: asyncio.Future) -> None:
+    """Run ``task`` up to its first await and assert it is still pending there."""
+    await asyncio.sleep(0)
+    assert not task.done()
+
+
 @asynccontextmanager
 async def connect_pair(cert, key, cert_hash, *, server_kwargs=None, client_kwargs=None):
     """Create a connected session pair with custom server/client config.
