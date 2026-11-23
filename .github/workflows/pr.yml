@@ -10,10 +10,11 @@ on:
   push:
     branches: ["main"]
 
-# Cancel a superseded run so a newer push to the PR frees its runner.
+# Cancel a superseded run so a newer push to the PR frees its runner. Main's
+# runs finish, so a burst of merges still saves a cache.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
