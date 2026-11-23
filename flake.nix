@@ -6,7 +6,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     # Quest serves its guide and skills; the repository keeps only skill stubs.
     quest = {
-      url = "github:moq-dev/quest";
+      url = "github:kixel-ai/quest";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };
