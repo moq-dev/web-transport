@@ -69,8 +69,6 @@ export interface TransportOptions {
 export interface SessionOptions extends WebTransportOptions, TransportOptions {
 	/** Skip all certificate verification. Only use for testing. */
 	serverCertificateDisableVerify?: boolean;
-	/** Subprotocols for WT-Available-Protocols negotiation. */
-	protocols?: string[];
 }
 
 export default class Session implements WebTransport {
@@ -103,7 +101,7 @@ export default class Session implements WebTransport {
 		// Check if we got an existing NapiSession (server-side path)
 		if (typeof urlOrSession === "object" && !(urlOrSession instanceof URL)) {
 			this.#session = urlOrSession;
-			this.datagrams = new Datagrams(urlOrSession);
+			this.datagrams = new Datagrams(Promise.resolve(urlOrSession));
 
 			ready.resolve();
 
@@ -112,15 +110,10 @@ export default class Session implements WebTransport {
 			// Client-side: create NapiClient and connect
 			const url = typeof urlOrSession === "string" ? urlOrSession : urlOrSession.toString();
 
-			// Provide a deferred Datagrams that works before connect resolves.
-			// The real session will be bound once connect succeeds.
-			this.datagrams = new DeferredDatagrams();
+			const connected = Promise.withResolvers<NapiSession>();
+			this.datagrams = new Datagrams(connected.promise);
 
 			const hashes = options?.serverCertificateHashes;
-			if (options?.serverCertificateDisableVerify && hashes && hashes.length > 0) {
-				throw new Error("serverCertificateDisableVerify and serverCertificateHashes cannot be used together");
-			}
-
 			const client = NapiClient.withOptions({
 				serverCertificateDisableVerify: options?.serverCertificateDisableVerify,
 				serverCertificateHashes:
@@ -141,21 +134,21 @@ export default class Session implements WebTransport {
 					// Check if close() was called before connect completed.
 					if (this.#pendingClose) {
 						session.close(this.#pendingClose.closeCode, this.#pendingClose.reason);
-						(this.datagrams as DeferredDatagrams).fail(new Error("session closed before connect"));
+						connected.reject(new Error("session closed before connect"));
 						closed.resolve(this.#pendingClose);
 						ready.reject(new Error("session closed before connect"));
 						return;
 					}
 
 					this.#session = session;
-					(this.datagrams as DeferredDatagrams).bind(session);
+					connected.resolve(session);
 					ready.resolve();
 
 					watchSession(session);
 				})
 				.catch((err) => {
 					const error = sessionError(err);
-					(this.datagrams as DeferredDatagrams).fail(error);
+					connected.reject(error);
 					ready.reject(error);
 					closed.reject(error);
 				});
@@ -249,68 +242,5 @@ export default class Session implements WebTransport {
 
 	get congestionControl(): WebTransportCongestionControl {
 		return "default";
-	}
-}
-
-/**
- * A WebTransportDatagramDuplexStream that works before the session is connected.
- * Readable/writable block until bind() is called with the real session.
- */
-class DeferredDatagrams implements WebTransportDatagramDuplexStream {
-	readonly readable: ReadableStream<Uint8Array>;
-	readonly writable: WritableStream<Uint8Array>;
-
-	incomingHighWaterMark = 1;
-	incomingMaxAge: number | null = null;
-	outgoingHighWaterMark = 1;
-	outgoingMaxAge: number | null = null;
-
-	#session: NapiSession | undefined;
-	#bound = Promise.withResolvers<void>();
-
-	constructor() {
-		this.readable = new ReadableStream({
-			pull: async (controller) => {
-				// Wait for session to be bound
-				if (!this.#session) {
-					try {
-						await this.#bound.promise;
-					} catch {
-						controller.close();
-						return;
-					}
-				}
-				if (!this.#session) {
-					controller.close();
-					return;
-				}
-				try {
-					const data = await this.#session.recvDatagram();
-					controller.enqueue(new Uint8Array(data));
-				} catch {
-					controller.close();
-				}
-			},
-		});
-
-		this.writable = new WritableStream({
-			write: (chunk) => {
-				if (!this.#session) throw new Error("session not connected");
-				this.#session.sendDatagram(Buffer.from(chunk));
-			},
-		});
-	}
-
-	bind(session: NapiSession) {
-		this.#session = session;
-		this.#bound.resolve();
-	}
-
-	fail(_error: Error) {
-		this.#bound.reject(_error);
-	}
-
-	get maxDatagramSize(): number {
-		return this.#session?.maxDatagramSize() ?? 0;
 	}
 }
