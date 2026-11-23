@@ -35,9 +35,11 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: gradle/actions/setup-gradle@v6
+      # Keyed like the build job's cache below.
+      - run: nix develop --command cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
         with:
-          key: kotlin-jvm-${{ hashFiles('flake.lock') }}
+          cmd-format: nix develop --command {0}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise packaged Kotlin/JVM binding
         run: nix develop --command just test-kotlin
@@ -66,11 +68,15 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Cargo.lock is gitignored, so resolve one for the cache key: a new
+      # dependency release then misses the exact key and restores main's latest
+      # cache, rebuilding only what changed.
+      - run: nix develop --command cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
         with:
-          # The toolchain comes from the dev shell, which the runner's rustc in
-          # the default key does not track.
-          key: ${{ hashFiles('flake.lock') }}
+          # Key on the dev shell's rustc rather than flake.lock, which changes
+          # with every dev tool bump.
+          cmd-format: nix develop --command {0}
           # Only main saves, so pull requests share one warm cache instead of
           # evicting it with their own.
           save-if: ${{ github.ref == 'refs/heads/main' }}
