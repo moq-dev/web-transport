@@ -7,7 +7,3 @@ Run the `code` audit: `quest audit code` prints what it checks, what each findin
 ## Audit
 
 - code
-
-## Required
-
-- [m1](/quest/m1/README.md) - the audit runs after it
