@@ -17,8 +17,7 @@
 		"./src"
 	],
 	"scripts": {
-		"build": "rimraf dist && tsc && tsx ../common/package.ts",
-		"dev": "tsc --watch",
+		"build": "rimraf dist && tsc && bun ../common/package.ts",
 		"check": "tsc --noEmit",
 		"release": "bun ../common/release.ts"
 	},
@@ -26,7 +25,6 @@
 		"@types/bun": "^1.4.4",
 		"@types/node": "^26.6.6",
 		"rimraf": "^6.1.4",
-		"tsx": "^4.23.15",
 		"typescript": "7.0.2"
 	},
 	"keywords": [
