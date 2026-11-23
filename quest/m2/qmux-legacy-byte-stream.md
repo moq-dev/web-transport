@@ -16,6 +16,4 @@ Three paths reach it:
 
 Reject the legacy version at setup on every byte-stream transport, stop offering `webtransport` over TLS, and add a regression test per path; `rs/qmux/tests/tls.rs` holds the TLS cases. This is a bug fix, which QMux still takes while its retirement is planned in moq-dev/moq.
 
-## Waiting
-
-- Maintainer: what a TLS session with no negotiated ALPN becomes. Options: fail with `Error::InvalidProtocol("<none>")`, as `require_protocol` already does (recommended: a QMux TLS server must configure ALPN, and every other choice guesses the peer's wire format); or default to the newest QMux draft (keeps ALPN-less servers working, but silently mismatches a peer on another draft).
+A TLS session with no negotiated ALPN fails with `Error::InvalidProtocol("<none>")`, as `require_protocol` already does: the maintainer's choice (2026-11-23), since a QMux TLS server must configure ALPN (rejected: defaulting to the newest QMux draft, which silently mismatches a peer on another draft).
