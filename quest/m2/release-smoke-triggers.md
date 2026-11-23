@@ -18,6 +18,4 @@ A failure on `main` then shows on the merged commit, one merge later than today.
 Also keep `rs/web-transport-ffi/Cargo.toml` in the pull-request trigger: release-plz pushes the `web-transport-ffi-v*` tag as soon as its release PR merges, before the `main` matrix finishes, and that PR always bumps this file, so it runs the full matrix on the tree it tags.
 Coordinate with the `ffi-release-pipeline` quest from [moq-dev/web-transport#579](https://github.com/moq-dev/web-transport/pull/579), which reshapes the same workflows.
 
-## Waiting
-
-- Maintainer: choose where cross-target release builds run for crate changes, since it moves a pre-merge check after merge. Options: (a) pushes to `main`, keeping pull-request runs for packaging paths (recommended: catches a break one merge later and frees macOS runners); (b) a nightly schedule, cheaper but a day late and reported only by email; (c) keep them on pull requests, so crate changes merge in about 15 minutes instead of 5.
+The maintainer chose pushes to `main` for crate changes (2026-11-23), keeping the pull-request runs above (rejected: a nightly schedule, a day late and reported only by email; keeping crate PRs on the matrix, about 15 minutes per merge).
