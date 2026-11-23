@@ -12,6 +12,8 @@ This crate provides a generic WebTransport implementation depending on the platf
 -   Native: [web-transport-quinn](../web-transport-quinn)
 -   Browser WASM (`wasm32`, excluding WASI): [web-transport-wasm](../web-transport-wasm)
 
+WASI targets have no backend and fail to compile.
+
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 

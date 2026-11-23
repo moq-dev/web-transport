@@ -46,8 +46,12 @@
 #[path = "quinn.rs"]
 mod quic;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 #[path = "wasm.rs"]
 mod quic;
+
+// The browser backend would build for WASI but needs a browser at runtime.
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+compile_error!("web-transport has no WASI backend");
 
 pub use quic::*;

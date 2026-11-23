@@ -7,8 +7,8 @@ However, quiche doesn't support client certificates, so we have to disable verif
 
 # Commands
 - cd `web-transport-quiche`
--   Generate a certificate: `../dev/setup`
--   Run the Rust server: `cargo run --example echo-server -- --tls-cert ../dev/localhost.crt --tls-key ../dev/localhost.key`
+-   Generate a certificate: `../../dev/setup`
+-   Run the Rust server: `cargo run --example echo-server -- --tls-cert ../../dev/localhost.crt --tls-key ../../dev/localhost.key`
 -   Run the Rust client: `cargo run --example echo-client -- --tls-disable-verify`
 -   Run a Web client: `cd ../web-demo; npm install; npx parcel serve client.html --open`
 

@@ -190,6 +190,8 @@ impl Client {
     ///
     /// Pass `&[v]` to pin to one version, `&[v1, v2]` to enumerate, or `&[]`
     /// to let the polyfill expand to every QMux draft it knows about.
+    /// Listing `Version::WebTransport`, which has no prefixed form, fails the
+    /// handshake with [`Error::InvalidProtocol`].
     pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
         self.protocols.push((alpn.to_string(), versions.to_vec()));
         self
@@ -275,7 +277,7 @@ impl Client {
             .protocols
             .iter()
             .map(|(a, vs)| (a.as_str(), vs.as_slice()));
-        let protocol_value = alpn::build(entries, self.require_protocol).join(", ");
+        let protocol_value = alpn::build(entries, self.require_protocol)?.join(", ");
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
@@ -361,6 +363,8 @@ impl Server {
     ///
     /// Pass `&[v]` to support one version, `&[v1, v2]` to enumerate, or `&[]`
     /// to accept every QMux draft this crate knows about.
+    /// Listing `Version::WebTransport`, which has no prefixed form, fails the
+    /// handshake with [`Error::InvalidProtocol`].
     pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
         self.protocols.push((alpn.to_string(), versions.to_vec()));
         self
@@ -445,7 +449,7 @@ impl Server {
             .protocols
             .iter()
             .map(|(a, vs)| (a.as_str(), vs.as_slice()));
-        let supported = alpn::build(entries, self.require_protocol);
+        let supported = alpn::build(entries, self.require_protocol)?;
 
         #[expect(
             clippy::result_large_err,
@@ -820,6 +824,24 @@ mod tests {
     use web_transport_trait::Session as _;
 
     const DEADLINE: Duration = Duration::from_secs(5);
+
+    // The legacy format has no `webtransport.{alpn}` form, so listing it is a
+    // configuration error, refused before any handshake I/O.
+    #[tokio::test]
+    async fn webtransport_in_an_entry_is_rejected() {
+        let (_, socket) = tokio::io::duplex(64);
+        let server = Server::new().with_protocol("test", &[Version::WebTransport]);
+        let Err(err) = server.accept(socket).await else {
+            panic!("accepted a webtransport pair");
+        };
+        assert!(matches!(err, Error::InvalidProtocol(wire) if wire == "webtransport.test"));
+
+        let client = Client::new().with_protocol("test", &[Version::WebTransport]);
+        let Err(err) = client.connect("ws://127.0.0.1:9").await else {
+            panic!("connected with a webtransport pair");
+        };
+        assert!(matches!(err, Error::InvalidProtocol(wire) if wire == "webtransport.test"));
+    }
 
     trait Peer:
         Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
