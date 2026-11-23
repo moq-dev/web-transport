@@ -28,6 +28,4 @@ The code audit ([moq-dev/web-transport#579](https://github.com/moq-dev/web-trans
 - `web-transport-trait`: `RecvStream::read_all` grows a `BytesMut` until the peer finishes, so a peer chooses how much it allocates. Give it a required maximum length that errors past the limit; only qmux's examples call it.
 - `@moq/web-transport`: drop the exported `WebTransportErrorOptions`, which duplicates the DOM global of the same name and shape.
 
-## Waiting
-
-- Maintainer: approve these breaking removals. Recommendation: remove all of them in one breaking release per crate, since no in-repo or `moq` caller uses any. The alternative is to keep a specific item, which leaves dead surface to maintain.
+The maintainer approved every removal above, in one breaking release per crate (2026-11-23).
