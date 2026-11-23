@@ -54,7 +54,7 @@ plugins {
     // project unless `-Pandroid.enabled=true`. The pluginManagement block
     // in settings.gradle.kts only resolves the plugin marker; the
     // classpath/types come from this block.
-    id("com.android.library") version "8.7.3" apply false
+    id("com.android.library") version "9.5.2" apply false
 }
 
 // AGP is applied imperatively only when the Android target is enabled, so
