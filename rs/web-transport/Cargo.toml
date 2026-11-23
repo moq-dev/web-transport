@@ -27,7 +27,6 @@ anyhow = "1"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lints]
 workspace = true
