@@ -46,8 +46,8 @@ val androidEnabled = providers.gradleProperty("android.enabled").orNull == "true
 val artifactSmokeEnabled = providers.gradleProperty("artifactSmoke").orNull == "true"
 
 plugins {
-    kotlin("multiplatform") version "2.0.21"
-    id("com.vanniktech.maven.publish") version "0.30.0"
+    kotlin("multiplatform") version "2.4.21"
+    id("com.vanniktech.maven.publish") version "0.37.0"
     // AGP needs to be on the buildscript classpath (so the Kotlin DSL
     // resolves `androidTarget {}`, `LibraryExtension`, `ndk {}`, etc.)
     // *and* its version pinned here, but `apply false` keeps it off the
@@ -107,13 +107,13 @@ kotlin {
     sourceSets {
         val commonMain by getting {
             dependencies {
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
             }
         }
         val commonTest by getting {
             dependencies {
                 implementation(kotlin("test"))
-                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.11.0")
             }
         }
 
@@ -121,7 +121,7 @@ kotlin {
             dependsOn(commonMain)
             dependencies {
                 // compileOnly: each platform's runtime adds its own JNA artifact.
-                compileOnly("net.java.dev.jna:jna:5.15.0")
+                compileOnly("net.java.dev.jna:jna:5.19.1")
             }
         }
         val jvmAndAndroidTest by creating {
@@ -131,7 +131,7 @@ kotlin {
         val jvmMain by getting {
             dependsOn(jvmAndAndroidMain)
             dependencies {
-                implementation("net.java.dev.jna:jna:5.15.0")
+                implementation("net.java.dev.jna:jna:5.19.1")
             }
         }
         val jvmTest by getting {
@@ -145,7 +145,7 @@ kotlin {
             val androidMain by getting {
                 dependsOn(jvmAndAndroidMain)
                 dependencies {
-                    implementation("net.java.dev.jna:jna:5.15.0@aar")
+                    implementation("net.java.dev.jna:jna:5.19.1@aar")
                     implementation(rustlsPlatformVerifierJar!!)
                 }
             }
