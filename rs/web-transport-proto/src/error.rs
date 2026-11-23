@@ -6,7 +6,7 @@ const ERROR_LAST: u64 = 0x52e5ac983162;
 /// `None` if the code is outside the WebTransport range or a reserved codepoint.
 pub const fn error_from_http3(code: u64) -> Option<u32> {
     // Reserved (GREASE) codepoints sit inside the range but encode no application code.
-    if code < ERROR_FIRST || code > ERROR_LAST || (code - 0x21) % 0x1f == 0 {
+    if code < ERROR_FIRST || code > ERROR_LAST || (code - 0x21).is_multiple_of(0x1f) {
         return None;
     }
 
@@ -27,7 +27,7 @@ mod tests {
     use super::*;
 
     fn is_reserved(code: u64) -> bool {
-        code >= 0x21 && (code - 0x21) % 0x1f == 0
+        code >= 0x21 && (code - 0x21).is_multiple_of(0x1f)
     }
 
     #[test]
