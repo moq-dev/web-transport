@@ -96,7 +96,7 @@ With the Android target enabled and the bindings staged, `:r8-check:checkKeepRul
 kt/
   build.gradle.kts          Root config (group, version)
   settings.gradle.kts       include(":web-transport"), pins the Android plugin versions
-  gradle.properties         Defaults: version, android.useAndroidX, etc.
+  gradle.properties         Defaults: version, source-set hierarchy, verifier pin
   web-transport/
     build.gradle.kts        KMP plugin, jvm() always, Android target conditional
     consumer-rules.pro      R8 keep rules for JNA, the UniFFI bindings, and the verifier
