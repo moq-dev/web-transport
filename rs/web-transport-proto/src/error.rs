@@ -44,7 +44,8 @@ mod tests {
     /// code that encodes back to it, or is reserved and decodes to nothing.
     #[test]
     fn decode_inverts_encode() {
-        let edges = (ERROR_FIRST - 64..ERROR_FIRST + 4096).chain(ERROR_LAST - 4096..ERROR_LAST + 64);
+        let edges =
+            (ERROR_FIRST - 64..ERROR_FIRST + 4096).chain(ERROR_LAST - 4096..ERROR_LAST + 64);
         for http3 in edges {
             match error_from_http3(http3) {
                 Some(code) => assert_eq!(error_to_http3(code), http3, "{http3:#x}"),
