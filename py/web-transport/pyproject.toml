@@ -43,21 +43,10 @@ module-name = "web_transport._uniffi"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
-# UniFFI-generated bindings live at python/web_transport/_uniffi/ after
-# `maturin develop` (and in the wheel). They're vendored, machine-emitted
-# Python — ruff/ty would never agree with the generator's style choices.
-[tool.ruff]
-extend-exclude = ["python/web_transport/_uniffi"]
-
-[tool.ty.src]
-exclude = ["python/web_transport/_uniffi"]
-
 [dependency-groups]
 dev = [
     "maturin>=1.0,<2.0",
     "playwright>=1.57",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24",
-    "ruff>=0.8",
-    "ty>=0.0.1a1",
 ]

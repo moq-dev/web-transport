@@ -3,6 +3,7 @@ use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::sync::{watch, Mutex};
 
 // Teardown safety: every `#[napi] async fn` below runs on napi-rs's global tokio
@@ -308,12 +309,11 @@ impl NapiServer {
         napi::bindgen_prelude::within_runtime_if_available(|| {
             let transport = transport_config(options.idle_timeout, options.keep_alive_interval)?;
 
-            let certs = rustls_pemfile::certs(&mut &cert_pem[..])
+            let certs = CertificateDer::pem_slice_iter(&cert_pem)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| Error::from_reason(format!("invalid certificate PEM: {e}")))?;
-            let key = rustls_pemfile::private_key(&mut &key_pem[..])
-                .map_err(|e| Error::from_reason(format!("invalid private key PEM: {e}")))?
-                .ok_or_else(|| Error::from_reason("no private key found in PEM"))?;
+            let key = PrivateKeyDer::from_pem_slice(&key_pem)
+                .map_err(|e| Error::from_reason(format!("invalid private key PEM: {e}")))?;
 
             let addr: std::net::SocketAddr = addr
                 .parse()
@@ -504,9 +504,8 @@ mod server_tests {
 
     fn bind() -> NapiServer {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = rustls_pemfile::private_key(&mut cert.signing_key.serialize_pem().as_bytes())
-            .unwrap()
-            .unwrap();
+        let key =
+            PrivateKeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()).unwrap();
         let server = web_transport_quinn::ServerBuilder::new()
             .with_addr("127.0.0.1:0".parse().unwrap())
             .with_certificate(vec![cert.cert.der().clone()], key)

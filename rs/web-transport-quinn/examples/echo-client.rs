@@ -1,8 +1,8 @@
-use std::{fs, io, path};
+use std::path;
 
 use anyhow::Context;
 use clap::Parser;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use url::Url;
 use web_transport_quinn::proto::ConnectRequest;
 
@@ -46,10 +46,8 @@ async fn main() -> anyhow::Result<()> {
         client.dangerous().with_no_certificate_verification()?
     } else if let Some(path) = &args.tls_cert {
         // Read the PEM certificate chain
-        let chain = fs::File::open(path).context("failed to open cert file")?;
-        let mut chain = io::BufReader::new(chain);
-
-        let chain: Vec<CertificateDer> = rustls_pemfile::certs(&mut chain)
+        let chain: Vec<CertificateDer> = CertificateDer::pem_file_iter(path)
+            .context("failed to open cert file")?
             .collect::<Result<_, _>>()
             .context("failed to load certs")?;
 

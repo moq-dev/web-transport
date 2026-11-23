@@ -28,11 +28,11 @@
 //!   response half available.
 //! - `close <code> <reason>` — close the whole session.
 
-use std::{fs, io, path, time::Duration};
+use std::{path, time::Duration};
 
 use anyhow::Context;
 use clap::Parser;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use web_transport_quinn::{proto::ConnectResponse, Session};
 
 #[derive(Parser, Debug)]
@@ -61,16 +61,13 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let chain = fs::File::open(args.tls_cert).context("failed to open cert file")?;
-    let chain: Vec<CertificateDer> = rustls_pemfile::certs(&mut io::BufReader::new(chain))
+    let chain: Vec<CertificateDer> = CertificateDer::pem_file_iter(args.tls_cert)
+        .context("failed to open cert file")?
         .collect::<Result<_, _>>()
         .context("failed to load certs")?;
     anyhow::ensure!(!chain.is_empty(), "could not find certificate");
 
-    let keys = fs::File::open(args.tls_key).context("failed to open key file")?;
-    let key = rustls_pemfile::private_key(&mut io::BufReader::new(keys))
-        .context("failed to load private key")?
-        .context("missing private key")?;
+    let key = PrivateKeyDer::from_pem_file(args.tls_key).context("failed to load private key")?;
 
     let mut server = web_transport_quinn::ServerBuilder::new()
         .with_addr(args.addr)
