@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: kotlin-jvm-${{ hashFiles('flake.lock') }}
-          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'quest/m2/audit-cost' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise packaged Kotlin/JVM binding
         run: nix develop --command just test-kotlin
       - name: Upload JVM test results
@@ -67,7 +67,7 @@ jobs:
           key: ${{ hashFiles('flake.lock') }}
           # Only main saves, so pull requests share one warm cache instead of
           # evicting it with their own.
-          save-if: ${{ github.ref == 'refs/heads/main' || github.head_ref == 'quest/m2/audit-cost' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Make sure u guys don't write bad code
       - run: nix develop --command just check
