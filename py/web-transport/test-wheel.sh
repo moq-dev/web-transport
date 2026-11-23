@@ -11,20 +11,6 @@ fi
 
 package=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-# Remaining arguments go to pytest. Test paths are relative to this package,
-# since pytest runs from the scratch directory; without any, the whole suite runs.
-pytest_args=()
-has_path=false
-for arg in "$@"; do
-    if [[ $arg != -* && -e $package/${arg%%::*} ]]; then
-        arg=$package/$arg
-        has_path=true
-    fi
-    pytest_args+=("$arg")
-done
-if [[ $has_path == false ]]; then
-    pytest_args+=("$package/tests")
-fi
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 export UV_PROJECT_ENVIRONMENT="$scratch/venv"
@@ -38,7 +24,10 @@ uv pip install --python "$python" --no-deps "$scratch"/wheels/*.whl
 
 # Isolated mode ignores PYTHONPATH and the working directory. Importlib mode
 # also prevents pytest from inserting the checkout into sys.path.
+# Run from the scratch directory, with the tests linked in so that arguments
+# such as tests/unit or -k expr behave as in the package.
+ln -s "$package/tests" "$package/pyproject.toml" "$scratch/"
 cd "$scratch"
 timeout --signal=TERM --kill-after=10s 15m \
     "$python" -I -m pytest --import-mode=importlib --installed-wheel \
-    -ra --tb=short -o faulthandler_timeout=60 "${pytest_args[@]}"
+    -ra --tb=short -o faulthandler_timeout=60 "$@"

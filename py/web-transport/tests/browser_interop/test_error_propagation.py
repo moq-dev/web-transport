@@ -300,7 +300,10 @@ async def test_server_close_all_connections(
                 {setup}
                 const transport = new WebTransport(url, transportOptions);
                 await transport.ready;
-                await writeAllString(await transport.createUnidirectionalStream(), "ready");
+                // The server closes on seeing this stream's FIN, which can
+                // reach us before the stream's close() settles and reject it.
+                await writeAllString(await transport.createUnidirectionalStream(), "ready")
+                    .catch(() => {{}});
                 try {{
                     await transport.closed;
                     return {{ closed: true }};
