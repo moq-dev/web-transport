@@ -8,7 +8,7 @@ plugins {
 
 android {
     namespace = "dev.moq.webtransport.r8check"
-    compileSdk = 35
+    compileSdk = 37
     defaultConfig {
         minSdk = 24
     }
@@ -28,7 +28,7 @@ dependencies {
     implementation(project(":web-transport"))
 }
 
-val checkKeepRules by tasks.registering {
+tasks.register("checkKeepRules") {
     description = "Fails if R8 removed or renamed anything the library reaches by name."
     val outputs = layout.buildDirectory.dir("outputs/mapping/release")
     val mapping = outputs.map { it.file("mapping.txt") }

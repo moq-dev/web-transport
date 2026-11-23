@@ -12,9 +12,12 @@ See the [package and backend selection guide](../PACKAGE-SELECTION.md) for alter
 // build.gradle.kts
 dependencies {
     implementation("dev.moq:web-transport:0.1.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
 }
 ```
+
+The library is built with Kotlin 2.4, so consumers compile with Kotlin 2.3 or newer.
+Android consumers need `minSdk` 24 or higher.
 
 ## Certificate verification
 
@@ -53,7 +56,7 @@ just test-kotlin
 ./kt/gradlew -p kt :web-transport:assemble
 ```
 
-`kt/scripts/check.sh` uses the checksum-pinned Gradle 8.10.2 wrapper, builds
+`kt/scripts/check.sh` uses the checksum-pinned Gradle wrapper, builds
 `web-transport-ffi` in release mode for the host, regenerates UniFFI Kotlin
 bindings, and stages the host library in the JNA resource layout. Missing tools
 or an unsupported host fail the command. This focused smoke supports Linux GNU
@@ -92,10 +95,10 @@ With the Android target enabled and the bindings staged, `:r8-check:checkKeepRul
 ```
 kt/
   build.gradle.kts          Root config (group, version)
-  settings.gradle.kts       include(":web-transport"), pins AGP version
+  settings.gradle.kts       include(":web-transport"), pins the Android plugin versions
   gradle.properties         Defaults: version, android.useAndroidX, etc.
   web-transport/
-    build.gradle.kts        KMP plugin, jvm() always, androidTarget() conditional
+    build.gradle.kts        KMP plugin, jvm() always, Android target conditional
     consumer-rules.pro      R8 keep rules for JNA, the UniFFI bindings, and the verifier
     src/
       commonMain/           Public Kotlin facade (reserved for future K/N)
