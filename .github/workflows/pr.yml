@@ -5,6 +5,10 @@ permissions:
 on:
   pull_request:
     branches: ["main"]
+  # Main's runs seed the Rust caches: a pull request can restore its base
+  # branch's caches but never another pull request's.
+  push:
+    branches: ["main"]
 
 # Cancel a superseded run so a newer push to the PR frees its runner.
 concurrency:
@@ -31,7 +35,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
       - uses: Swatinem/rust-cache@v2
         with:
-          key: kotlin-jvm
+          key: kotlin-jvm-${{ hashFiles('flake.lock') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise packaged Kotlin/JVM binding
         run: nix develop --command just test-kotlin
       - name: Upload JVM test results
@@ -55,8 +60,14 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Set RUSTFLAGS
-      - run: echo "RUSTFLAGS=--cfg=web_sys_unstable_apis" >> $GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The toolchain comes from the dev shell, which the runner's rustc in
+          # the default key does not track.
+          key: ${{ hashFiles('flake.lock') }}
+          # Only main saves, so pull requests share one warm cache instead of
+          # evicting it with their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Make sure u guys don't write bad code
       - run: nix develop --command just check

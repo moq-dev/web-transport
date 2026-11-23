@@ -40,7 +40,10 @@ check:
 	cargo fmt --all --check
 
 	# requires: cargo install cargo-hack
-	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node
+	cargo hack check --feature-powerset --workspace --keep-going --exclude web-transport-node --exclude web-transport-iroh
+	# Iroh's features only forward to iroh and gate no code here, so its powerset
+	# (36 runs) would test iroh's feature combinations rather than ours.
+	cargo hack check --each-feature -p web-transport-iroh --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport --keep-going
 	cargo hack check --feature-powerset --target wasm32-unknown-unknown -p web-transport-wasm --keep-going
 	# Each package's examples and tests on their own, so workspace feature unification

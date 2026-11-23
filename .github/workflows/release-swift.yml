@@ -15,7 +15,6 @@ on:
       - "rs/web-transport-proto/**"
       - "rs/web-transport-trait/**"
       - "Cargo.toml"
-      - "Cargo.lock"
       - "swift/**"
       - ".github/workflows/release-swift.yml"
       - ".github/scripts/release.sh"
