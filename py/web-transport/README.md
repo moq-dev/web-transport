@@ -157,6 +157,14 @@ test runs for 60 seconds. The temporary environment and wheel are removed
 on exit, and browser fixtures close their processes. Cargo and browser download
 caches remain available for subsequent runs.
 
+Arguments are passed to pytest, and test paths are relative to `py/web-transport`.
+To repeat one test until it fails (a warm rebuild takes seconds):
+
+```bash
+until ! nix develop --command ./py/web-transport/test-wheel.sh \
+    tests/browser_interop/test_error_propagation.py::test_server_close_all_connections; do :; done
+```
+
 For editable development:
 
 ```bash

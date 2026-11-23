@@ -6,7 +6,7 @@ Provide a consistent WebTransport API across native backends, browsers, and lang
 
 ## Plan
 
-Keep living development plans under `quest/`, ordered by priority horizon. Each leaf quest completes in one PR; epics group related outcomes. Finished quests are deleted and git history preserves them. The acts remain permanent.
+Keep living development plans under `quest/`, ordered by priority horizon. Each leaf quest completes in one PR; epics group related outcomes. Finished quests are deleted and git history preserves them.
 
 The initial backlog prioritizes safety and regression foundations, then binding coverage/configuration/documentation, then optional metrics and measured optimization. External conditions remain visible as ready quests rather than hidden blockers. Existing PRs retain ownership of their implementation work.
 
