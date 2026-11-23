@@ -10,8 +10,7 @@ use crate::{alpn, Config, Error, Session, Version};
 ///
 /// Each entry's `versions` slice is expanded into the TLS ALPN list as
 /// `{v.prefix()}{alpn}` per version (empty = every QMux draft this crate knows
-/// about). The bare version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) are
-/// appended as well unless [`require_protocol`](Client::require_protocol) is
+/// about). The bare version ALPNs ([`ALPNS`](crate::ALPNS)) are appended as well unless [`require_protocol`](Client::require_protocol) is
 /// set, in which case only the prefixed pairs are offered. The peer's chosen
 /// ALPN determines the QMux wire-format version; the `alpn_protocols` field on
 /// the supplied `rustls::ClientConfig` is ignored and rebuilt from the entries.
@@ -57,7 +56,7 @@ impl Client {
     }
 
     /// Offer only the prefixed `(alpn, version)` pairs, suppressing the bare
-    /// version ALPNs (`qmux-01`, `qmux-00`, `webtransport`) offered by default.
+    /// version ALPNs ([`ALPNS`](crate::ALPNS)) offered by default.
     pub fn require_protocol(mut self) -> Self {
         self.require_protocol = true;
         self

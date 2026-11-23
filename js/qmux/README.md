@@ -132,4 +132,4 @@ violations use the existing CONNECTION_CLOSE code 1002.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/moq-dev/web-transport/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/moq-dev/web-transport/blob/main/LICENSE-MIT) at your option.

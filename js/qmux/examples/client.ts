@@ -7,7 +7,7 @@ import { WebSocket } from "ws";
 import { install } from "../src/index";
 
 // Install the polyfill globally for Node.js. The example doesn't advertise any
-// application protocols, so no alpnVersions map is needed. Apps that pass
+// application protocols, so no `versions` map is needed. Apps that pass
 // bare ALPNs in WebTransportOptions.protocols supply a map here keyed by ALPN.
 globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
 install();

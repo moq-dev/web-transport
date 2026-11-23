@@ -24,7 +24,7 @@ using [rustls-platform-verifier](https://github.com/rustls/rustls-platform-verif
 
 Keep the Session object alive while using its streams. Streams do not retain the Session: releasing the final Session reference closes the connection, even if stream objects remain. A helper that returns streams must also return or retain their Session. An explicit close already underway keeps its bounded graceful close after the Session is released; awaiting closure lets it finish, but timeout or cancellation can prevent capsule delivery.
 
-Swift can release a local after its last use, before its lexical scope ends. For async stream work, put `defer { withExtendedLifetime(session) {} }` in the scope that awaits the stream operations. This uses [`withExtendedLifetime`](https://docs.swift.org/documentation/swift/withextendedlifetime(_:_:)) at scope exit to retain the Session across those awaits. Close the Session explicitly when finished.
+Swift can release a local after its last use, before its lexical scope ends. For async stream work, put `defer { withExtendedLifetime(session) {} }` in the scope that awaits the stream operations. This uses [`withExtendedLifetime`](https://developer.apple.com/documentation/swift/withextendedlifetime(_:_:)) at scope exit to retain the Session across those awaits. Close the Session explicitly when finished.
 
 ## Local development
 
@@ -83,19 +83,14 @@ swift/
 
 The generated `WebTransportError.SessionRejected` case includes the HTTP status,
 selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
-lowercase names and byte values. Repeated names retain all values. Regenerate
-the bindings and native library together when migrating to this expanded error
-record; update exhaustive matches or constructors for the new fields.
+lowercase names and byte values. Repeated names retain all values.
 
 Generated `SessionRequest.reject` accepts defaulted `headers` (`HttpHeader`
-field lines) and `protocol` arguments alongside the status code. Existing calls
-keep their defaults. The selected protocol must have been offered by the peer;
+field lines) and `protocol` arguments alongside the status code. The selected protocol must have been offered by the peer;
 malformed or reserved generic fields fail before consuming the request.
 
 ## Native crypto
 
-The native Quinn backend uses rind through rind-rustls, with an installed process-wide
-rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
-Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
-returns an error if the CPU lacks a required feature. This also applies with another
-TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+The native library follows web-transport-quinn's TLS provider selection and CPU
+requirements; see [its crypto section](https://github.com/moq-dev/web-transport/blob/main/rs/web-transport-quinn/README.md#crypto).
+Constructing a client or server on an unsupported CPU throws `WebTransportError`.

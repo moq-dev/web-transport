@@ -110,25 +110,20 @@ kt/
 
 ## Publishing
 
-Publishing to Maven Central is CI-only via `.github/workflows/release-kt.yml`, which runs on every `web-transport-ffi-v*` tag. See the moq-dev org docs for Sonatype credentials.
+Publishing to Maven Central is CI-only via `.github/workflows/release-kt.yml`, which runs on every `web-transport-ffi-v*` tag. Its publish step runs only when the repository variable `PUBLISH_KOTLIN` is `true` and the `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD`, `SIGNING_KEY` and `SIGNING_PASSWORD` secrets are set.
 
 ## Rejection diagnostics
 
-The generated `WebTransportError.SessionRejected` case includes the HTTP status,
+The generated `WebTransportException.SessionRejected` case includes the HTTP status,
 selected protocol, and `headers`, a sequence of `HttpHeader` field lines with
-lowercase names and byte values. Repeated names retain all values. Regenerate
-the bindings and native library together when migrating to this expanded error
-record; update exhaustive matches or constructors for the new fields.
+lowercase names and byte values. Repeated names retain all values.
 
 Generated `SessionRequest.reject` accepts defaulted `headers` (`HttpHeader`
-field lines) and `protocol` arguments alongside the status code. Existing calls
-keep their defaults. The selected protocol must have been offered by the peer;
+field lines) and `protocol` arguments alongside the status code. The selected protocol must have been offered by the peer;
 malformed or reserved generic fields fail before consuming the request.
 
 ## Native crypto
 
-The native Quinn backend uses rind through rind-rustls, with an installed process-wide
-rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
-Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
-returns an error if the CPU lacks a required feature. This also applies with another
-TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+The native library follows web-transport-quinn's TLS provider selection and CPU
+requirements; see [its crypto section](https://github.com/moq-dev/web-transport/blob/main/rs/web-transport-quinn/README.md#crypto).
+Constructing a client or server on an unsupported CPU throws `WebTransportException`.

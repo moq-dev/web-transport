@@ -283,8 +283,8 @@ export interface SessionOptions extends WebTransportOptions {
 
 	/** Require the peer to negotiate one of the app protocols in `protocols`.
 	 *
-	 * When `false` (the default), the bare version ALPNs `qmux-01`,
-	 * `qmux-00`, and `webtransport` (no application protocol attached) are
+	 * When `false` (the default), the bare version ALPNs (each supported QMux
+	 * draft and `webtransport`, with no application protocol attached) are
 	 * also offered, so a peer that only knows a wire-format version can still
 	 * connect. That covers a relay speaking the legacy `webtransport` format,
 	 * or one that negotiates the app protocol at a higher layer (e.g. moq's
@@ -394,8 +394,7 @@ const BARE_ALPNS = ["qmux-02", "qmux-01", "qmux-00", "webtransport"] as const;
  * emits one pair; an array emits one pair per element; `null` emits one
  * pair per [[QMUX_VERSIONS]] entry. Entries already in `{qmux-VV}.{alpn}`
  * pair form pass through. Unless `requireProtocol` is true, the bare version
- * ALPNs (`qmux-01`, `qmux-00`, `webtransport`) are appended after the
- * prefixed pairs so a peer that doesn't pin an app protocol can still
+ * ALPNs ([[BARE_ALPNS]]) are appended after the prefixed pairs so a peer that doesn't pin an app protocol can still
  * negotiate a wire format.
  *
  * Throws if any bare entry has no matching `versions` mapping.

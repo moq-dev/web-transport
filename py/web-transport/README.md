@@ -111,7 +111,7 @@ Malformed or reserved generic fields raise `ValueError` before consuming the req
 
 `Server` and `Client` accept DER-encoded `bytes` for certificates and keys, so you can use any TLS library (e.g. [`cryptography`](https://cryptography.io/)) to generate or load them.
 
-All exceptions inherit from `web_transport.WebTransportError`. See the [typed Python wrapper](https://github.com/moq-dev/web-transport/blob/main/py/web-transport/python/web_transport/__init__.py) for the full API reference.
+Transport errors inherit from `web_transport.WebTransportError`; invalid arguments raise `ValueError` or `OverflowError`. See the [typed Python wrapper](https://github.com/moq-dev/web-transport/blob/main/py/web-transport/python/web_transport/__init__.py) for the full API reference.
 
 ## Certificate pinning
 
@@ -131,7 +131,7 @@ async with web_transport.Client(
 Send and receive unreliable datagrams over an established session:
 
 ```python
-await session.send_datagram(b"ping")
+session.send_datagram(b"ping")
 data = await session.receive_datagram()
 ```
 
@@ -186,13 +186,8 @@ except web_transport.SessionRejected as error:
             print(value.decode("ascii"))
 ```
 
-Rebuild the wheel when updating the UniFFI native library; the generated
-rejection error now carries protocol and header fields.
-
 ## Native crypto
 
-The native Quinn backend uses rind through rind-rustls, with an installed process-wide
-rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
-Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
-returns an error if the CPU lacks a required feature. This also applies with another
-TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
+The native library follows web-transport-quinn's TLS provider selection and CPU
+requirements; see [its crypto section](https://github.com/moq-dev/web-transport/blob/main/rs/web-transport-quinn/README.md#crypto).
+Constructing a client or server on an unsupported CPU raises an error.

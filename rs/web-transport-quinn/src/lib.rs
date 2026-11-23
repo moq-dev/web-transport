@@ -75,3 +75,8 @@ pub use web_transport_trait as generic;
 
 /// Re-export the WebTransport protocol implementation.
 pub use web_transport_proto as proto;
+
+// Compile the README examples as doctests so they track the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

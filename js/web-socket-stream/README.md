@@ -45,7 +45,7 @@ const wss = new WebSocketStream("wss://example.com")
 
 ### Node / Bun
 
-Modern Node and Bun expose a global `WebSocket`, which is used automatically. To use a specific implementation (e.g. the [`ws`](https://www.npmjs.com/package/ws) package), inject it — this forces the ponyfill:
+Modern Node and Bun expose a global `WebSocket`, which is used automatically. To use a specific implementation (e.g. the [`ws`](https://www.npmjs.com/package/ws) package), pass it as `webSocket`:
 
 ```ts
 import WebSocket from "ws"
@@ -73,4 +73,4 @@ it — messages delivered beforehand are dropped by the platform rather than buf
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](https://github.com/moq-dev/web-transport/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/moq-dev/web-transport/blob/main/LICENSE-MIT) at your option.

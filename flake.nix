@@ -52,6 +52,8 @@
           pkgs.cargo-hack
           pkgs.just
           pkgs.bun
+          # Offline check of local Markdown links and anchors in `just check`.
+          pkgs.lychee
           # The CLI has to supply the same bindgen schema as the `wasm-bindgen`
           # crate the workspace links, or `just harness` aborts rather than
           # emitting bad bindings. Schemas span several releases -- 0.2.126

@@ -12,6 +12,8 @@ This crate provides a generic WebTransport implementation depending on the platf
 -   Native: [web-transport-quinn](../web-transport-quinn)
 -   Browser WASM (`wasm32`, excluding WASI): [web-transport-wasm](../web-transport-wasm)
 
+WASI is unsupported: the crate does not build for `wasm32-wasi*` targets.
+
 WASM builds additionally require `--cfg=web_sys_unstable_apis`; see
 [web-transport-wasm](../web-transport-wasm/README.md#requirements).
 
@@ -96,7 +98,12 @@ Dropping the final `Session` clone closes the Quinn connection, even if streams 
 On native builds, `Session::response()` exposes the CONNECT response and
 ordinary headers. `Error::response()` exposes the complete rejection response:
 
-```rust,ignore
+```rust,no_run
+# #[cfg(not(target_arch = "wasm32"))]
+# async fn connect(
+#     client: web_transport::Client,
+#     url: url::Url,
+# ) -> Result<web_transport::Session, web_transport::Error> {
 match client.connect(url).await {
     Ok(session) => {
         if let Some(response) = session.response() {
@@ -104,6 +111,7 @@ match client.connect(url).await {
                 eprintln!("request id: {value:?}");
             }
         }
+#       Ok(session)
     }
     Err(error) => {
         if let Some(response) = error.response() {
@@ -115,6 +123,7 @@ match client.connect(url).await {
         return Err(error);
     }
 }
+# }
 ```
 
 These accessors are native-only. The WASM wrapper exposes what its browser
@@ -125,11 +134,6 @@ every browser. Raw QUIC sessions have no CONNECT response.
 
 ## Native crypto
 
-The native Quinn backend uses rind through rind-rustls, with an installed process-wide
-rustls provider taking precedence. Endpoint keys and Retry integrity always use rind.
-Native builds support x86_64, aarch64 and 32-bit ARM; constructing a client or server
-returns an error if the CPU lacks a required feature. This also applies with another
-TLS provider installed. The native dependency graph no longer builds ring or aws-lc-rs.
-
-WASM uses the browser's TLS and does not depend on rind. Advanced native callers use
-[`web_transport_quinn::crypto`](../web-transport-quinn/README.md#crypto-and-migration).
+The native backend's TLS provider and CPU requirements are described in
+[web-transport-quinn](../web-transport-quinn/README.md#crypto); advanced native callers
+use its `crypto` module. WASM uses the browser's TLS and does not depend on rind.

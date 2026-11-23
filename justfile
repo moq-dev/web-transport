@@ -23,6 +23,9 @@ setup-tools:
 check:
 	quest check
 
+	# Local Markdown links and anchors must resolve; quest check covers quest/.
+	git ls-files -z '*.md' ':!:quest/' | xargs -0 lychee --offline --include-fragments --no-progress
+
 	cargo check --workspace --all-targets --all-features
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 

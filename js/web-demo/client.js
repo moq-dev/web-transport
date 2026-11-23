@@ -1,5 +1,5 @@
 // @ts-expect-error embed the certificate fingerprint using bundler
-import fingerprintHex from "bundle-text:../dev/localhost.hex";
+import fingerprintHex from "bundle-text:../../dev/localhost.hex";
 
 // Convert the hex to binary.
 const fingerprint = [];
