@@ -194,8 +194,6 @@ async function flushMicrotasks(turns = 10): Promise<void> {
 	for (let i = 0; i < turns; i++) await Promise.resolve();
 }
 
-/** Settle a promise to its value or its rejection error, without leaking an
- *  unhandled rejection while the test arranges the teardown that resolves it. */
 /** Report whether `p` has settled, without awaiting it. */
 function settledFlag(p: Promise<unknown>): () => boolean {
 	let settled = false;
@@ -216,6 +214,8 @@ async function advance(ms: number): Promise<void> {
 	await flushMicrotasks();
 }
 
+/** Settle a promise to its value or its rejection error, without leaking an
+ *  unhandled rejection while the test arranges the teardown that resolves it. */
 function settleTo<T>(p: Promise<T>): Promise<T | Error> {
 	return p.then(
 		(v) => v,
