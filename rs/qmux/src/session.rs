@@ -1571,10 +1571,7 @@ impl<R: Reader> SessionState<R> {
                         let fin = stream.fin;
                         // The frontend stopped: nothing will read this, so credit
                         // it back now.
-                        if recv.inbound_data.send(stream).is_err()
-                            && self.config.version.is_qmux()
-                            && data_len > 0
-                        {
+                        if !recv.deliver(stream) && self.config.version.is_qmux() && data_len > 0 {
                             self.conn_recv_credit
                                 .consume(data_len, &self.control, Frame::MaxData);
                         }
@@ -1663,11 +1660,13 @@ impl<R: Reader> SessionState<R> {
                     })
                 });
 
+                let unread = Unread::default();
                 let recv_backend = RecvState {
                     inbound_data: tx,
                     inbound_reset: tx2,
                     recv_credit: recv_credit.clone(),
                     recv_offset: data_len,
+                    unread: unread.clone(),
                     _slot: slot.clone(),
                 };
 
@@ -1682,6 +1681,7 @@ impl<R: Reader> SessionState<R> {
                     recv_credit,
                     conn_recv_credit: self.conn_recv_credit.clone(),
                     version: self.config.version,
+                    unread,
                     _slot: slot,
                 };
 
@@ -1751,7 +1751,7 @@ impl<R: Reader> SessionState<R> {
                 // The application may already have dropped the stream; credit
                 // the data back as the fast path does.
                 if (data_len > 0 || fin)
-                    && recv_backend.inbound_data.send(stream).is_err()
+                    && !recv_backend.deliver(stream)
                     && self.config.version.is_qmux()
                     && data_len > 0
                 {
@@ -2642,11 +2642,13 @@ impl generic::Session for Session {
             u64::MAX
         };
         let recv_credit = Credit::new(recv_window);
+        let unread = Unread::default();
         let recv_backend = RecvState {
             inbound_data: tx,
             inbound_reset: tx2,
             recv_credit: recv_credit.clone(),
             recv_offset: 0,
+            unread: unread.clone(),
             _slot: None,
         };
         let recv_frontend = RecvStream {
@@ -2660,6 +2662,7 @@ impl generic::Session for Session {
             recv_credit,
             conn_recv_credit: self.conn_recv_credit.clone(),
             version: self.config.version,
+            unread,
             _slot: None, // We initiated this stream, so it holds no MAX_STREAMS slot.
         };
 
@@ -3053,15 +3056,76 @@ impl generic::SendStream for SendStream {
 /// Backend half of a receive stream, retired on FIN or RESET_STREAM. Under QMux it
 /// outlives a stopped or dropped [`RecvStream`] until then, so bytes the peer
 /// still sends up to the final size are credited back to the connection window
-/// (RFC 9000 §4.5). The frontend closes `inbound_data` when it stops, which is how
-/// the reader learns to credit late data instead of queueing it.
+/// (RFC 9000 §4.5). [`Unread`] tells the reader when to credit late data instead
+/// of queueing it.
 pub(crate) struct RecvState {
     inbound_data: mpsc::UnboundedSender<Stream>,
     inbound_reset: mpsc::UnboundedSender<ResetStream>,
     recv_credit: Credit,
     recv_offset: u64,
+    unread: Unread,
     // Held until retired; see `StreamSlot`.
     _slot: Option<Arc<StreamSlot>>,
+}
+
+impl RecvState {
+    /// Queue `stream` for the frontend. Returns false, queueing nothing, once the
+    /// frontend has stopped: its data is then the caller's to credit.
+    fn deliver(&self, stream: Stream) -> bool {
+        if !self.unread.add(stream.data.len() as u64) {
+            return false;
+        }
+        // A send racing the stop can still fail; `discard` credited it.
+        self.inbound_data.send(stream).ok();
+        true
+    }
+}
+
+/// Bytes the reader has queued for a [`RecvStream`] that it has not taken yet,
+/// plus whether it has stopped. Every queued byte is credited exactly once: by the
+/// frontend when it reads or discards it, or by the reader when it arrives after
+/// the stop.
+///
+/// Closing the channel cannot settle this on its own: a send that reserved its
+/// slot before `close` succeeds after a `try_recv` drain has already seen it empty.
+#[derive(Clone, Default)]
+struct Unread(Arc<AtomicU64>);
+
+impl Unread {
+    const STOPPED: u64 = 1 << 63;
+
+    /// Count `len` bytes about to be queued, unless the frontend stopped.
+    fn add(&self, len: u64) -> bool {
+        let mut queued = self.0.load(Ordering::Acquire);
+        while queued & Self::STOPPED == 0 {
+            match self.0.compare_exchange_weak(
+                queued,
+                queued + len,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => queued = actual,
+            }
+        }
+        false
+    }
+
+    /// Uncount `len` bytes the frontend took off the queue.
+    fn take(&self, len: u64) {
+        self.0.fetch_sub(len, Ordering::AcqRel);
+    }
+
+    /// Mark the frontend stopped, returning the bytes still queued the first time
+    /// and zero after.
+    fn stop(&self) -> u64 {
+        let queued = self.0.fetch_or(Self::STOPPED, Ordering::AcqRel);
+        if queued & Self::STOPPED == 0 {
+            queued
+        } else {
+            0
+        }
+    }
 }
 
 /// A peer-initiated QMux stream's MAX_STREAMS slot, shared by the backend entry
@@ -3106,6 +3170,7 @@ pub struct RecvStream {
     // Flow control: per-stream and connection-level recv credit
     recv_credit: Credit,
     conn_recv_credit: Credit,
+    unread: Unread,
 
     // Held until drop; see `StreamSlot`.
     _slot: Option<Arc<StreamSlot>>,
@@ -3121,12 +3186,13 @@ impl RecvStream {
         Error::StreamReset(code)
     }
 
-    /// Queue a received chunk for the application to read.
+    /// Move a chunk the reader queued into the buffer for the application to read.
     ///
     /// Empty chunks are dropped so the queue head is always readable; a STREAM
     /// frame can carry no payload (an empty FIN, for example), and its `fin` flag
     /// is tracked separately.
     fn recv_data(&mut self, data: Bytes) {
+        self.unread.take(data.len() as u64);
         if !data.is_empty() {
             self.buffer.push_back(data);
         }
@@ -3149,14 +3215,13 @@ impl RecvStream {
     }
 
     /// Stop accepting data and return every unread byte to the connection window.
-    /// Closing the channel first makes the drain exact: anything the reader sends
-    /// afterwards fails, and the reader credits it instead.
+    /// Data the reader queues afterwards is its own to credit; see [`Unread`].
     fn discard(&mut self) {
+        let buffered: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
+        let unread = buffered + self.unread.stop();
+        // Already counted in `unread`; drop the queue to free it now.
         self.inbound_data.close();
-        let mut unread: u64 = self.buffer.drain(..).map(|chunk| chunk.len() as u64).sum();
-        while let Ok(stream) = self.inbound_data.try_recv() {
-            unread += stream.data.len() as u64;
-        }
+        while self.inbound_data.try_recv().is_ok() {}
         if self.version.is_qmux() && unread > 0 {
             self.conn_recv_credit
                 .consume(unread, &self.outbound_priority, Frame::MaxData);
@@ -4300,6 +4365,7 @@ mod recv_open_tests {
             inbound_reset: reset,
             recv_credit: super::Credit::new(0),
             recv_offset: 0,
+            unread: super::Unread::default(),
             _slot: None,
         };
         streams.close();
@@ -4471,6 +4537,54 @@ mod recv_open_tests {
             tx.send(uni_stream(i, b"y", false)).unwrap();
             drop(recv);
         }
+    }
+
+    /// The reader's send lands in a window of a few instructions, so this race
+    /// needs more iterations than the others to hit it.
+    const DROP_RACE_ITERATIONS: u64 = 100_000;
+
+    /// Data the reader delivers while a dropped `RecvStream` drains its queue is
+    /// credited exactly once, by one side or the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn data_racing_drop_is_credited() {
+        // Wide enough that a peer sending 90 bytes a stream never outruns the
+        // credit `Credit` holds back below its update threshold.
+        let mut config = Config::new(Version::QMux01);
+        config.max_data = 1_000;
+        config.max_streams_uni = DROP_RACE_ITERATIONS + 1;
+        let params = config.to_transport_params();
+        let (session, tx) = scripted_session_with_config(config);
+        // Establish the session: this runs in real time, so a slow host would
+        // otherwise hit the handshake timeout and close it mid-loop.
+        tx.send(
+            Frame::TransportParameters(params)
+                .encode(Version::QMux01)
+                .unwrap(),
+        )
+        .unwrap();
+        for i in 0..DROP_RACE_ITERATIONS {
+            tx.send(uni_stream(i, &[0; 60], false)).unwrap();
+            let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+                .await
+                .expect("accept_uni timed out")
+                .expect("accept_uni failed");
+            tx.send(uni_stream_at(i, 60, &[0; 30], false)).unwrap();
+            drop(recv);
+            tx.send(uni_reset(i, 90)).unwrap();
+        }
+
+        // The reader handles frames in order, so once this stream is read every
+        // frame above has been credited, or lost.
+        tx.send(uni_stream(DROP_RACE_ITERATIONS, b"x", true))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
+            .await
+            .expect("accept_uni timed out")
+            .expect("accept_uni failed")
+            .read_all()
+            .await
+            .unwrap();
+        assert_eq!(session.conn_recv_credit.window(), 1_000);
     }
 
     /// Older QMux drafts were emitted by implementations that always wrote a
