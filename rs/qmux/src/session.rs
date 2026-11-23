@@ -4552,7 +4552,16 @@ mod recv_open_tests {
         let mut config = Config::new(Version::QMux01);
         config.max_data = 1_000;
         config.max_streams_uni = DROP_RACE_ITERATIONS + 1;
+        let params = config.to_transport_params();
         let (session, tx) = scripted_session_with_config(config);
+        // Establish the session: this runs in real time, so a slow host would
+        // otherwise hit the handshake timeout and close it mid-loop.
+        tx.send(
+            Frame::TransportParameters(params)
+                .encode(Version::QMux01)
+                .unwrap(),
+        )
+        .unwrap();
         for i in 0..DROP_RACE_ITERATIONS {
             tx.send(uni_stream(i, &[0; 60], false)).unwrap();
             let recv = tokio::time::timeout(Duration::from_secs(1), session.accept_uni())
