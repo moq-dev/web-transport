@@ -1,0 +1,21 @@
+# [S] Run the cross-target release builds off the pull-request path
+
+## Goal
+
+A pull request that changes shared Rust code waits on checks no slower than the gate, while every cross-target release build still runs before a release tag can fail on it.
+
+## Plan
+
+`release-kt.yml`, `release-py.yml`, and `release-swift.yml` build every release target (Android, iOS, macOS, Windows, Linux) on any pull request touching `rs/web-transport-ffi`, `rs/web-transport-quinn`, `rs/web-transport-proto`, `rs/web-transport-trait`, or the root `Cargo.toml`.
+The 2026-11-23 cost audit measured them, in 400 pull-request runs over 35 hours, at 765 of 960 macOS runner minutes, with a macOS queue of p90 11 and max 56 minutes.
+End to end they took p50 12 to 16 and p90 23 to 27 minutes, while the gate with its cache restored takes about 5.
+Agents landing with `quest merge` wait for every check, so on those pull requests the release builds, not the gate, decide merge time.
+In that window they failed only on `kt/` changes, which a packaging-path trigger keeps catching before merge.
+Every pull request still exercises the FFI through the Swift host (macOS), Kotlin/JVM (Linux), and Python wheel (Linux) checks.
+
+Keep the pull-request trigger for each workflow's own packaging paths (`kt/`, `swift/`, `py/web-transport/`, `rs/web-transport-ffi/build.sh`, `.github/scripts/release.sh`, and the workflow file), and run the full matrix on pushes to `main` that touch the crate paths.
+A failure on `main` then shows on the merged commit, one merge later than today.
+Also keep `rs/web-transport-ffi/Cargo.toml` in the pull-request trigger: release-plz pushes the `web-transport-ffi-v*` tag as soon as its release PR merges, before the `main` matrix finishes, and that PR always bumps this file, so it runs the full matrix on the tree it tags.
+Coordinate with the `ffi-release-pipeline` quest from [moq-dev/web-transport#579](https://github.com/moq-dev/web-transport/pull/579), which reshapes the same workflows.
+
+The maintainer chose pushes to `main` for crate changes (2026-11-23), keeping the pull-request runs above (rejected: a nightly schedule, a day late and reported only by email; keeping crate PRs on the matrix, about 15 minutes per merge).

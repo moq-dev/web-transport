@@ -33,8 +33,12 @@
           overlays = [ (import rust-overlay) ];
         };
 
-        rust-toolchain = pkgs.rust-bin.stable.latest.default.override {
+        # `minimal` rather than `default`, which adds 750 MB of offline docs to
+        # every CI job's download.
+        rust-toolchain = pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [
+            "clippy"
+            "rustfmt"
             "rust-src"
             "rust-analyzer"
           ];
@@ -68,8 +72,6 @@
           pkgs.python312
           pkgs.uv
           pkgs.pkg-config
-          pkgs.glib
-          pkgs.gtk3
           pkgs.cmake
           # Required to compile boringssl (via bindgen loading libclang)
           pkgs.llvmPackages.libclang.lib

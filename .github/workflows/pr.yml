@@ -5,11 +5,17 @@ permissions:
 on:
   pull_request:
     branches: ["main"]
+  # Main's runs seed the Rust caches: a pull request can restore its base
+  # branch's caches but never another pull request's.
+  push:
+    branches: ["main"]
 
-# Cancel a superseded run so a newer push to the PR frees its runner.
+# Cancel a superseded run so a newer push to the PR frees its runner. Main's
+# running run finishes rather than cancel, so a burst of merges still saves a
+# cache (GitHub keeps only the newest queued run).
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,9 +35,12 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: gradle/actions/setup-gradle@v6
+      # Keyed like the build job's cache below.
+      - run: nix develop --command cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
         with:
-          key: kotlin-jvm
+          cmd-format: nix develop --command {0}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise packaged Kotlin/JVM binding
         run: nix develop --command just test-kotlin
       - name: Upload JVM test results
@@ -46,6 +55,10 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    env:
+      # Backtraces keep file:line, while smaller artifacts speed up restoring
+      # the cache and linking the tests.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
     steps:
       - uses: actions/checkout@v7
@@ -55,8 +68,18 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Set RUSTFLAGS
-      - run: echo "RUSTFLAGS=--cfg=web_sys_unstable_apis" >> $GITHUB_ENV
+      # Cargo.lock is gitignored, so resolve one for the cache key: a new
+      # dependency release then misses the exact key and restores main's latest
+      # cache, rebuilding only what changed.
+      - run: nix develop --command cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Key on the dev shell's rustc rather than flake.lock, which changes
+          # with every dev tool bump.
+          cmd-format: nix develop --command {0}
+          # Only main saves, so pull requests share one warm cache instead of
+          # evicting it with their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Make sure u guys don't write bad code
       - run: nix develop --command just check
