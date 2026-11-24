@@ -91,7 +91,8 @@ async fn qmux00_tcp_round_trip_unchanged() {
         send.write(&payload).await.unwrap();
         send.finish().unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Hold the session until the client has read the echo and closed.
+        session.closed().await;
     });
 
     let session = qmux::tcp::Config::new(Version::QMux00)
@@ -110,12 +111,11 @@ async fn qmux00_tcp_round_trip_unchanged() {
     server.await.unwrap();
 }
 
-/// End-to-end QMux01 over a real TCP socket: STREAM data + PING/PONG keep-alive.
-///
-/// Exercises the full transport — record size-varint framing on the wire,
-/// session-level frame routing, and the QX_PING request/response path.
+/// End-to-end QMux01 over a real TCP socket: record size-varint framing on the
+/// wire and session-level STREAM routing. Keep-alive is covered by
+/// `qmux01_ping_keeps_idle_session_alive`.
 #[tokio::test]
-async fn qmux01_tcp_stream_and_ping() {
+async fn qmux01_tcp_stream_round_trip() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -134,10 +134,8 @@ async fn qmux01_tcp_stream_and_ping() {
         send.write(&payload).await.unwrap();
         send.finish().unwrap();
 
-        // Hold the session open long enough for the client to receive the response
-        // and run its ping round-trip; tying our shutdown to the client's `close`
-        // would race the ping flow we're actually trying to test.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Hold the session until the client has read the echo and closed.
+        session.closed().await;
     });
 
     let session = qmux::tcp::Config::new(Version::QMux01)
@@ -145,7 +143,6 @@ async fn qmux01_tcp_stream_and_ping() {
         .await
         .unwrap();
 
-    // Send "ping" over a uni stream.
     let mut send = session.open_uni().await.unwrap();
     send.write(b"qmux01").await.unwrap();
     send.finish().unwrap();
@@ -164,13 +161,13 @@ async fn qmux01_tcp_stream_and_ping() {
 /// resets the other's idle deadline. So the connection survives well past the idle
 /// window instead of self-closing — and the timer keeps pinging regardless of where
 /// the reader/writer happen to be parked.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn qmux01_ping_keeps_idle_session_alive() {
     use qmux::transport::Stream;
     use qmux::{Config, Session};
 
     let (a, b) = tokio::io::duplex(64 * 1024);
-    // Short idle window so the test is quick; the ping cadence is a third of it.
+    // Paused time over an in-memory pipe, so the idle window elapses virtually.
     let mut config = Config::new(Version::QMux01);
     config.max_idle_timeout = 150;
 
@@ -219,7 +216,7 @@ async fn qmux01_ping_keeps_idle_session_alive() {
 /// keep-alive pings advance the send clock every idle/3, so counting every send as
 /// activity left the deadline permanently in the future and the session lived until
 /// the process died. Only a *received* frame proves the peer is still there.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn qmux01_silent_peer_is_idle_closed() {
     use qmux::transport::Stream;
     use qmux::{Config, Error, Session};

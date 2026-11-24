@@ -34,7 +34,8 @@ async fn qmux02_tcp_stream_round_trip() {
         send.write(&payload).await.unwrap();
         send.finish().unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Hold the session until the client has read the echo and closed.
+        session.closed().await;
     });
 
     let session = qmux::tcp::Config::new(Version::QMux02)
@@ -89,14 +90,14 @@ async fn default_config_uses_qmux02() {
 /// increasing requests and echoes the peer's, and neither the strict-increase
 /// (requests) nor the echo-bound (responses) check wrongly closes the session.
 /// A regression here would surface as a spurious PROTOCOL_VIOLATION close.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn qmux02_ping_keeps_idle_session_alive() {
     use qmux::transport::Stream;
     use qmux::{Config, Session};
 
     let (a, b) = tokio::io::duplex(64 * 1024);
     let mut config = Config::new(Version::QMux02);
-    config.max_idle_timeout = 150; // short window; ping cadence is a third of it
+    config.max_idle_timeout = 150; // virtual under paused time; ping cadence is a third of it
 
     let ta = Stream::new(a, config.version, config.max_record_size);
     let tb = Stream::new(b, config.version, config.max_record_size);

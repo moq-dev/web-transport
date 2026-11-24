@@ -160,6 +160,7 @@ async def test_datagram_multiple_roundtrips(
 
 async def test_datagram_rapid_burst(start_server: ServerFactory, run_js: RunJS) -> None:
     """Browser sends 20 datagrams rapidly — server receives at least some (unreliable)."""
+    sent = [f"burst-{i}".encode() for i in range(20)]
     async with start_server() as (server, port, hash_b64):
         received: list[bytes] = []
 
@@ -168,11 +169,17 @@ async def test_datagram_rapid_burst(start_server: ServerFactory, run_js: RunJS) 
             assert request is not None
             session = await request.accept()
             async with session:
+                received.append(
+                    await asyncio.wait_for(session.receive_datagram(), timeout=5.0)
+                )
+                # Tell the browser to stay connected until the burst is seen.
+                ack = await session.open_uni()
+                async with ack:
+                    await ack.write(b"ok")
                 # Collect datagrams until the browser closes the session
                 try:
                     while True:
-                        dgram = await session.receive_datagram()
-                        received.append(dgram)
+                        received.append(await session.receive_datagram())
                 except web_transport.SessionClosed:
                     pass
 
@@ -184,18 +191,18 @@ async def test_datagram_rapid_burst(start_server: ServerFactory, run_js: RunJS) 
                 """
                 const writer = transport.datagrams.writable.getWriter();
                 for (let i = 0; i < 20; i++) {
-                    const msg = new TextEncoder().encode("burst-" + i);
-                    await writer.write(msg);
-                    await new Promise(r => setTimeout(r, 10));
+                    await writer.write(new TextEncoder().encode("burst-" + i));
                 }
                 writer.releaseLock();
-                // Wait for server to collect
-                return true;
+                const ack = transport.incomingUnidirectionalStreams.getReader();
+                const { value } = await ack.read();
+                return await readAllString(value);
             """,
             )
 
     # Datagrams are unreliable — on loopback we expect most but not necessarily all
-    assert len(received) >= 1
+    assert received
+    assert set(received) <= set(sent)
 
 
 async def test_datagram_max_size_property(

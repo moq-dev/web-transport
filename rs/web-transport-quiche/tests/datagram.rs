@@ -77,9 +77,9 @@ async fn datagram_round_trip() -> Result<()> {
             session.send_datagram(data).context("server send")?;
         }
 
-        // Give the driver a moment to actually flush the last datagram before
-        // we drop the session — otherwise the close races the send.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Hold the session until the client has read every echo and closed;
+        // dropping it earlier races the last send.
+        session.closed().await;
         anyhow::Ok(())
     });
 
@@ -191,25 +191,15 @@ async fn datagram_send_drops_when_channel_full() -> Result<()> {
         .await
         .context("client handshake")?;
 
-    // Hammer the API with far more datagrams than fit in the channel.
-    // None of these should panic, block, or fail — drops are silent.
+    // Hammer the API with far more datagrams than fit in the channel. None of
+    // these should panic, block, or fail — drops are silent. `send_datagram` is
+    // synchronous, so a regression to a blocking send hangs here.
     let payload = Bytes::from_static(b"x");
-    let start = std::time::Instant::now();
-    let attempts = 50_000;
-    for _ in 0..attempts {
+    for _ in 0..50_000 {
         session
             .send_datagram(payload.clone())
             .context("send_datagram surfaced an error on full channel")?;
     }
-    let elapsed = start.elapsed();
-
-    // 50k synchronous calls should be far faster than 2 s even on a slow CI
-    // box. If we ever regress to a blocking send, this hangs and the test
-    // harness times out instead of producing a bad pass.
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "send_datagram took {elapsed:?} for {attempts} calls — likely blocking"
-    );
 
     session.close(0, "bye");
     session.closed().await;

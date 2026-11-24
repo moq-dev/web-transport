@@ -43,6 +43,10 @@ async function connect(serverOptions: ServerOptions | undefined, clientOptions: 
 
 // Default timeouts are 30 seconds, so expiring within this bound proves a configured value applied.
 const EXPIRY_BOUND_MS = 10_000;
+// Short enough to keep the test quick, long enough that a keep-alive delayed by a loaded CI host can't
+// expire a healthy connection.
+const IDLE_MS = 300;
+const KEEP_ALIVE_MS = 50;
 
 async function expectExpiry(serverOptions: ServerOptions | undefined, clientOptions: SessionOptions) {
 	const { client, peer } = await connect(serverOptions, clientOptions);
@@ -54,14 +58,15 @@ async function expectExpiry(serverOptions: ServerOptions | undefined, clientOpti
 	assert(performance.now() - start < EXPIRY_BOUND_MS);
 }
 
-// Wait several idle timeouts, then prove the session still carries data both ways.
+// Wait out two idle timeouts, then prove the session still carries data. The timers run in the native QUIC
+// stack, out of reach of fake time, so this waits in real time.
 async function expectAlive(serverOptions: ServerOptions | undefined, clientOptions: SessionOptions) {
 	const { client, peer } = await connect(serverOptions, clientOptions);
 	let closed = false;
 	void client.closed.then(() => {
 		closed = true;
 	});
-	await sleep(1_500);
+	await sleep(2 * IDLE_MS);
 	assert.equal(closed, false);
 
 	const reader = peer.datagrams.readable.getReader();
@@ -76,13 +81,13 @@ async function expectAlive(serverOptions: ServerOptions | undefined, clientOptio
 
 await Promise.all([
 	// A configured timeout on either endpoint applies to the connection.
-	expectExpiry({ idleTimeout: 300 }, {}),
-	expectExpiry(undefined, { idleTimeout: 300 }),
+	expectExpiry({ idleTimeout: IDLE_MS }, {}),
+	expectExpiry(undefined, { idleTimeout: IDLE_MS }),
 	// Disabling one endpoint's timeout leaves the peer's in effect.
-	expectExpiry({ idleTimeout: 300 }, { idleTimeout: 0 }),
+	expectExpiry({ idleTimeout: IDLE_MS }, { idleTimeout: 0 }),
 	// Keep-alive holds open a connection that would otherwise expire.
-	expectAlive(undefined, { idleTimeout: 300, keepAliveInterval: 100 }),
-	expectAlive({ idleTimeout: 300, keepAliveInterval: 100 }, {}),
+	expectAlive(undefined, { idleTimeout: IDLE_MS, keepAliveInterval: KEEP_ALIVE_MS }),
+	expectAlive({ idleTimeout: IDLE_MS, keepAliveInterval: KEEP_ALIVE_MS }, {}),
 	// A timeout disabled on both endpoints is not treated as an immediate expiry.
 	expectAlive({ idleTimeout: 0 }, { idleTimeout: 0 }),
 ]);

@@ -107,7 +107,8 @@ async fn keep_alive_outlives_idle_timeout() -> Result<()> {
         .await?;
 
     // Nothing is sent on the session, so only the keep-alive PINGs can hold the
-    // idle timer open on either end.
+    // idle timer open on either end. Real time is the only observable here:
+    // quiche's timers run on its own clock, which paused tokio time can't drive.
     if let Ok(err) = tokio::time::timeout(IDLE_WAIT, session.closed()).await {
         anyhow::bail!("keep-alive connection closed after {IDLE_WAIT:?}: {err}");
     }

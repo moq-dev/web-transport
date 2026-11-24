@@ -1029,7 +1029,7 @@ mod ws_transport {
         /// parks delivering the second frame while we sit idle well past the
         /// keep-alive `timeout`, then we drain — and both frames must arrive intact,
         /// with no `Error::Closed` from a phantom timeout.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn survives_a_slow_consumer() {
             let (feed, stream) = mock_stream();
             feed.unbounded_send(Ok(Message::Binary(Bytes::from_static(b"one"))))
@@ -1062,7 +1062,7 @@ mod ws_transport {
         /// The deadline must still fire for a genuinely silent peer: once the pump is
         /// caught up and reading (not parked on delivery), `timeout` of silence is a
         /// dead peer, surfaced as `Error::Closed`.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn times_out_a_silent_peer() {
             // Held open but never fed — `stream.next()` pends forever.
             let (_feed, stream) = mock_stream();
@@ -1084,7 +1084,7 @@ mod ws_transport {
 
         /// With no keep-alive configured the pump never times out: a silent-but-open
         /// peer just leaves `recv` pending rather than closing.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn no_keep_alive_never_times_out() {
             let (feed, stream) = mock_stream();
             let _feed = feed;

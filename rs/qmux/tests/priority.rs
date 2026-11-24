@@ -1,30 +1,39 @@
 //! Integration tests for per-stream send prioritization.
 //!
 //! These drive a real `Session` over a `ThrottledTransport` whose `send`
-//! sleeps a few milliseconds, so the session's bounded priority queue fills up
-//! and the scheduler's ordering policy actually takes effect (when the socket
-//! accepts everything instantly, prioritization is moot).
+//! sleeps a few milliseconds and can be metered, so the session's bounded
+//! priority queue fills up and the scheduler's ordering policy actually takes
+//! effect (when the socket accepts everything instantly, prioritization is moot).
+//! Time is paused, so the throttle is virtual: it orders events
+//! deterministically and costs no wall time.
 
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use bytes::Bytes;
 use qmux::transport::{Reader, Transport, Writer};
 use qmux::{Config, Error, Session, Version};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use web_transport_trait::{RecvStream as _, SendStream as _, Session as _};
 
 /// An in-memory transport that relays whole messages between a connected pair,
-/// adding a fixed per-`send` delay to create backpressure.
+/// adding a fixed per-`send` delay to create backpressure. Each `send` also takes
+/// a permit from `meter`, so a test can release records one at a time.
 struct ThrottledTransport {
     tx: mpsc::Sender<Bytes>,
     rx: mpsc::Receiver<Bytes>,
     delay: Duration,
+    meter: Arc<Semaphore>,
 }
 
 /// The throttled send half.
 struct ThrottledWriter {
     tx: mpsc::Sender<Bytes>,
     delay: Duration,
+    meter: Arc<Semaphore>,
 }
 
 /// The receive half.
@@ -41,6 +50,7 @@ impl Transport for ThrottledTransport {
             ThrottledWriter {
                 tx: self.tx,
                 delay: self.delay,
+                meter: self.meter,
             },
             ThrottledReader { rx: self.rx },
         )
@@ -53,6 +63,11 @@ impl Writer for ThrottledWriter {
         // we're sleeping here, the writer task can't pull the next frame, so
         // producers back up behind the capacity bound.
         tokio::time::sleep(self.delay).await;
+        self.meter
+            .acquire()
+            .await
+            .map_err(|_| Error::Closed)?
+            .forget();
         self.tx.send(data).await.map_err(|_| Error::Closed)
     }
 
@@ -69,18 +84,30 @@ impl Reader for ThrottledReader {
 
 /// Build a connected client/server session pair over throttled in-memory pipes.
 async fn pair(delay: Duration) -> (Session, Session) {
+    let (client, server, _meter) = metered_pair(delay).await;
+    (client, server)
+}
+
+/// Permits that never run out in these tests, and fit `Semaphore::MAX_PERMITS` on every target.
+const UNLIMITED: usize = 1 << 20;
+
+/// Like [`pair`], plus the meter on the client's sends, initially unlimited.
+async fn metered_pair(delay: Duration) -> (Session, Session, Arc<Semaphore>) {
     let (c2s_tx, c2s_rx) = mpsc::channel(64);
     let (s2c_tx, s2c_rx) = mpsc::channel(64);
+    let meter = Arc::new(Semaphore::new(UNLIMITED));
 
     let client_transport = ThrottledTransport {
         tx: c2s_tx,
         rx: s2c_rx,
         delay,
+        meter: meter.clone(),
     };
     let server_transport = ThrottledTransport {
         tx: s2c_tx,
         rx: c2s_rx,
         delay,
+        meter: Arc::new(Semaphore::new(UNLIMITED)),
     };
 
     let config = Config::new(Version::QMux01);
@@ -90,84 +117,106 @@ async fn pair(delay: Duration) -> (Session, Session) {
         Session::connect(client_transport, config.clone()),
         Session::accept(server_transport, config),
     );
-    (client.unwrap(), server.unwrap())
+    (client.unwrap(), server.unwrap(), meter)
+}
+
+/// Stop the metered side from sending anything more until permits are added.
+async fn stop(meter: &Semaphore) {
+    let available = meter.available_permits() as u32;
+    meter.acquire_many(available).await.unwrap().forget();
+}
+
+/// Run every task until idle: paused time only advances once nothing can make
+/// progress.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 /// Higher-priority stream data jumps ahead of a low-priority backlog.
 ///
-/// We write a large low-priority payload first (filling the queue), then a
-/// small high-priority one. With prioritization, the high-priority stream's
-/// FIN-terminated data fully arrives while the low-priority stream is still
-/// trickling through.
-#[tokio::test]
+/// With the transport stopped, a low-priority stream queues three records and
+/// then a high-priority one queues three (two writes and its FIN), all within the
+/// scheduler's capacity. Records are then released one at a time: the whole
+/// high-priority stream must reach the peer before a second low-priority record.
+/// Round-robin among equal priorities would interleave them instead.
+#[tokio::test(start_paused = true)]
 async fn higher_priority_completes_first() {
-    let (client, server) = pair(Duration::from_millis(5)).await;
+    const CHUNK: usize = 1000;
 
-    const LO_LEN: usize = 200 * 1024;
-    const HI_LEN: usize = 4 * 1024;
+    let (client, server, meter) = metered_pair(Duration::ZERO).await;
+    let mut lo = client.open_uni().await.unwrap();
+    let mut hi = client.open_uni().await.unwrap();
+    lo.set_priority(10);
+    hi.set_priority(200);
 
-    let writer = tokio::spawn(async move {
-        let mut lo = client.open_uni().await.unwrap();
-        let mut hi = client.open_uni().await.unwrap();
-        lo.set_priority(10);
-        hi.set_priority(200);
+    stop(&meter).await;
+    for _ in 0..3 {
+        lo.write(&[b'L'; CHUNK]).await.unwrap();
+    }
+    for _ in 0..2 {
+        hi.write(&[b'H'; CHUNK]).await.unwrap();
+    }
+    hi.finish().unwrap();
 
-        // Fill the queue with low-priority data first.
-        lo.write(&vec![b'L'; LO_LEN]).await.unwrap();
-        lo.finish().unwrap();
-
-        // Then enqueue the small high-priority payload.
-        hi.write(&vec![b'H'; HI_LEN]).await.unwrap();
-        hi.finish().unwrap();
-
-        // Return the client so the session stays alive and the test can await
-        // this task deterministically rather than detaching it.
-        client
-    });
-
-    // The server accepts streams in arrival order: lo first, then hi.
-    let lo = server.accept_uni().await.unwrap();
-    let mut hi = server.accept_uni().await.unwrap();
-
-    // Drain lo in the background while we read hi in the foreground. (We can't
-    // probe lo with lo.closed(): qmux's recv closed() consumes inbound data,
-    // which would corrupt the byte-count assertion below.)
-    let lo_task = tokio::spawn(async move {
-        let mut lo = lo;
-        let mut total = 0usize;
-        while let Some(chunk) = lo.read_chunk(64 * 1024).await.unwrap() {
-            assert!(chunk.iter().all(|&b| b == b'L'));
-            total += chunk.len();
+    // Tally what the peer has received, per stream, as it arrives.
+    let lo_bytes = Arc::new(AtomicUsize::new(0));
+    let hi_done = Arc::new(AtomicBool::new(false));
+    let reader = tokio::spawn({
+        let (lo_bytes, hi_done) = (lo_bytes.clone(), hi_done.clone());
+        async move {
+            let mut readers = Vec::new();
+            for _ in 0..2 {
+                let mut recv = server.accept_uni().await.unwrap();
+                let (lo_bytes, hi_done) = (lo_bytes.clone(), hi_done.clone());
+                readers.push(tokio::spawn(async move {
+                    let mut is_hi = false;
+                    while let Some(chunk) = recv.read_chunk(usize::MAX).await.unwrap() {
+                        if chunk.iter().all(|&b| b == b'L') {
+                            lo_bytes.fetch_add(chunk.len(), Ordering::SeqCst);
+                        } else {
+                            assert!(chunk.iter().all(|&b| b == b'H'));
+                            is_hi = true;
+                        }
+                    }
+                    if is_hi {
+                        hi_done.store(true, Ordering::SeqCst);
+                    }
+                }));
+            }
+            (server, readers)
         }
-        total
     });
 
-    let hi_data = hi.read_all().await.unwrap();
-    assert_eq!(hi_data.len(), HI_LEN);
-    assert!(hi_data.iter().all(|&b| b == b'H'));
-
-    // The high-priority stream must finish while the low-priority backlog is
-    // still in-flight — proof that it preempted, not merely that lo arrives.
+    for _ in 0..6 {
+        if hi_done.load(Ordering::SeqCst) {
+            break;
+        }
+        meter.add_permits(1);
+        settle().await;
+    }
     assert!(
-        !lo_task.is_finished(),
-        "low-priority stream should still be in-flight when the high-priority stream completes"
+        hi_done.load(Ordering::SeqCst),
+        "the high-priority stream never finished"
+    );
+    assert!(
+        lo_bytes.load(Ordering::SeqCst) <= CHUNK,
+        "{} low-priority bytes reached the peer before the high-priority stream finished",
+        lo_bytes.load(Ordering::SeqCst)
     );
 
-    let lo_total = lo_task.await.unwrap();
-    assert_eq!(
-        lo_total, LO_LEN,
-        "low-priority stream must still deliver all bytes"
-    );
-
-    let _client = tokio::time::timeout(Duration::from_secs(2), writer)
-        .await
-        .expect("writer task should complete")
-        .expect("writer task panicked");
+    // The low-priority stream still delivers everything.
+    meter.add_permits(UNLIMITED);
+    lo.finish().unwrap();
+    let (_server, readers) = reader.await.unwrap();
+    for reader in readers {
+        reader.await.unwrap();
+    }
+    assert_eq!(lo_bytes.load(Ordering::SeqCst), 3 * CHUNK);
 }
 
 /// Equal-priority streams interleave (round-robin) rather than one draining
 /// fully before the other starts.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn equal_priority_interleaves() {
     let (client, server) = pair(Duration::from_millis(2)).await;
 
@@ -226,52 +275,68 @@ async fn equal_priority_interleaves() {
 }
 
 /// A control frame (RESET_STREAM, via `reset()`) reaches the peer ahead of a
-/// large data backlog queued on another stream.
-#[tokio::test]
+/// data backlog queued on another stream.
+///
+/// With the transport stopped, a bulk stream queues three records and then
+/// another stream is reset. Releasing records one at a time, the reset must
+/// arrive before a second bulk record.
+#[tokio::test(start_paused = true)]
 async fn control_precedes_data_backlog() {
-    let (client, server) = pair(Duration::from_millis(5)).await;
+    const CHUNK: usize = 1000;
 
-    const LO_LEN: usize = 200 * 1024;
-
+    let (client, server, meter) = metered_pair(Duration::ZERO).await;
     let mut bulk = client.open_uni().await.unwrap();
     let mut signal = client.open_uni().await.unwrap();
     bulk.set_priority(10);
+
+    // `signal` reaches the peer before the transport stops.
     signal.write(b"x").await.unwrap();
+    let mut signal_recv = server.accept_uni().await.unwrap();
+    let reset = tokio::spawn(async move { signal_recv.closed().await });
 
-    // Backlog of bulk data, written concurrently so the queue stays saturated
-    // while we issue the reset below. The writer keeps `client` alive (and thus
-    // the session) until we abort it during cleanup.
-    let bulk_writer = tokio::spawn(async move {
-        bulk.write(&vec![b'B'; LO_LEN]).await.ok();
-        client.closed().await;
-    });
-
-    // Let the bulk backlog build up so the data queue is full.
-    tokio::time::sleep(Duration::from_millis(30)).await;
-
-    // Now reset `signal`. Its RESET_STREAM goes through the control lane and
-    // must preempt the bulk backlog.
+    stop(&meter).await;
+    for _ in 0..3 {
+        bulk.write(&[b'B'; CHUNK]).await.unwrap();
+    }
     signal.reset(7);
 
-    // `signal`'s `b"x"` is written before the bulk backlog, so the server
-    // accepts it first.
-    let mut signal_recv = server.accept_uni().await.unwrap();
+    let bulk_bytes = Arc::new(AtomicUsize::new(0));
+    let reader = tokio::spawn({
+        let bulk_bytes = bulk_bytes.clone();
+        async move {
+            let mut recv = server.accept_uni().await.unwrap();
+            while let Some(chunk) = recv.read_chunk(usize::MAX).await.unwrap() {
+                bulk_bytes.fetch_add(chunk.len(), Ordering::SeqCst);
+            }
+            server
+        }
+    });
 
-    // The reset should surface quickly even though `bulk` has a big backlog.
-    // `closed()` returns once the RESET_STREAM is observed.
-    let reset_result = tokio::time::timeout(Duration::from_millis(500), signal_recv.closed()).await;
+    for _ in 0..4 {
+        if reset.is_finished() {
+            break;
+        }
+        meter.add_permits(1);
+        settle().await;
+    }
+    assert!(reset.is_finished(), "the RESET_STREAM never arrived");
+    assert!(matches!(reset.await.unwrap(), Err(Error::StreamReset(_))));
     assert!(
-        reset_result.is_ok(),
-        "RESET_STREAM should arrive ahead of the data backlog"
+        bulk_bytes.load(Ordering::SeqCst) <= CHUNK,
+        "{} bulk bytes reached the peer ahead of the RESET_STREAM",
+        bulk_bytes.load(Ordering::SeqCst)
     );
-    assert!(matches!(reset_result.unwrap(), Err(Error::StreamReset(_))));
 
-    bulk_writer.abort();
+    // The backlog still drains in full.
+    meter.add_permits(UNLIMITED);
+    bulk.finish().unwrap();
+    let _server = reader.await.unwrap();
+    assert_eq!(bulk_bytes.load(Ordering::SeqCst), 3 * CHUNK);
 }
 
 /// Raising a stream's priority mid-stream must not corrupt its byte sequence:
 /// the receiver reassembles exactly what was written, in order.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mid_stream_set_priority_preserves_order() {
     let (client, server) = pair(Duration::from_millis(2)).await;
 
@@ -319,7 +384,7 @@ async fn mid_stream_set_priority_preserves_order() {
 
 /// Tearing down the session unblocks a producer parked on a full queue: the
 /// pending `write` returns `Error::Closed`.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn teardown_unblocks_blocked_writer() {
     // Long delay so the queue stays full and `write` blocks.
     let (client, server) = pair(Duration::from_millis(500)).await;
@@ -332,7 +397,8 @@ async fn teardown_unblocks_blocked_writer() {
         s.write(&vec![b'Z'; 1024 * 1024]).await
     });
 
-    // Give it a moment to fill the queue and park.
+    // On paused time this runs every task until idle, so the writer has filled
+    // the queue and parked behind the throttled send.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !handle.is_finished(),

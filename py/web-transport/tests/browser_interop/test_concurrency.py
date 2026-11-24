@@ -426,7 +426,7 @@ async def test_rapid_stream_creation(
 async def test_server_close_while_client_creating_streams(
     start_server: ServerFactory, run_js: RunJS
 ) -> None:
-    """Server closes session after brief delay while browser tries to open 20 streams."""
+    """Server closes the session while the browser is opening 19 more streams."""
     async with start_server() as (server, port, hash_b64):
 
         async def server_side() -> None:
@@ -434,13 +434,11 @@ async def test_server_close_while_client_creating_streams(
             assert request is not None
             session = await request.accept()
             async with session:
-                try:
-                    send, recv = await session.accept_bi()
-                    async with send:
-                        await recv.read()
-                except web_transport.SessionClosed:
-                    return
-                await asyncio.sleep(0.1)
+                send, recv = await session.accept_bi()
+                async with send:
+                    assert await recv.read() == b"\x00"
+                # The browser opens the rest only after the first succeeded.
+                await session.accept_bi()
                 session.close(99, "closing")
 
         async with asyncio.TaskGroup() as tg:
@@ -449,22 +447,23 @@ async def test_server_close_while_client_creating_streams(
                 port,
                 hash_b64,
                 """
-                const N = 20;
+                const open = async (i) => {
+                    try {
+                        const stream = await transport.createBidirectionalStream();
+                        const writer = stream.writable.getWriter();
+                        await writer.write(new Uint8Array([i]));
+                        await writer.close();
+                        return true;
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                const first = await open(0);
                 const promises = [];
-                for (let i = 0; i < N; i++) {
-                    promises.push((async () => {
-                        try {
-                            const stream = await transport.createBidirectionalStream();
-                            const writer = stream.writable.getWriter();
-                            await writer.write(new Uint8Array([i]));
-                            await writer.close();
-                            return true;
-                        } catch (e) {
-                            return false;
-                        }
-                    })());
+                for (let i = 1; i < 20; i++) {
+                    promises.push(open(i));
                 }
-                const results = await Promise.all(promises);
+                const results = [first, ...(await Promise.all(promises))];
                 const succeeded = results.filter(r => r).length;
                 const failed = results.filter(r => !r).length;
                 try { await transport.closed; } catch (e) {}
@@ -474,6 +473,7 @@ async def test_server_close_while_client_creating_streams(
 
     assert isinstance(result, dict)
     assert result["succeeded"] >= 1
+    assert result["succeeded"] + result["failed"] == 20
 
 
 async def test_bidirectional_open(start_server: ServerFactory, run_js: RunJS) -> None:

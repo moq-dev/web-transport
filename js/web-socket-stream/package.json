@@ -19,7 +19,8 @@
 	"scripts": {
 		"build": "rimraf dist && tsc && tsx ../common/package.ts",
 		"dev": "tsc --watch",
-		"check": "tsc --noEmit",
+		"check": "tsc --project tsconfig.tests.json --noEmit",
+		"test": "bun test src",
 		"release": "bun ../common/release.ts"
 	},
 	"devDependencies": {

@@ -130,13 +130,20 @@ mod tcp {
         // the client can't short-circuit on an EOF — it must hit the timeout.
         let server = tokio::spawn(async move {
             let (_sock, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            std::future::pending::<()>().await;
         });
 
-        let result = qmux::tcp::Config::new(Version::QMux01)
-            .handshake_timeout(Duration::from_millis(100))
-            .connect(addr)
-            .await;
+        // Real time over real TCP: paused time would auto-advance past the
+        // timeout while loopback I/O is still in flight. The outer bound turns a
+        // deadline that never fires into a failure rather than a hang.
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            qmux::tcp::Config::new(Version::QMux01)
+                .handshake_timeout(Duration::from_millis(100))
+                .connect(addr),
+        )
+        .await
+        .expect("handshake deadline never fired");
 
         match result {
             Err(Error::HandshakeTimeout) => {}

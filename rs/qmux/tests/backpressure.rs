@@ -99,7 +99,7 @@ async fn pair(gate: watch::Receiver<bool>) -> (Session, Session) {
 /// transport backpressure, the client must still receive data from the server.
 /// Under the old single-task design the blocked `send().await` also froze the
 /// reader, so this read would hang.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reads_are_not_blocked_by_a_stalled_writer() {
     let (gate_tx, gate_rx) = watch::channel(true); // open: handshake flows
     let (client, server) = pair(gate_rx).await;
@@ -116,7 +116,8 @@ async fn reads_are_not_blocked_by_a_stalled_writer() {
         client_writer // keep the session alive
     });
 
-    // Give the writer time to fill the pipeline and park on the gate.
+    // On paused time this runs every task until idle: the writer has filled the
+    // pipeline and parked on the gate.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !writer.is_finished(),
@@ -146,7 +147,7 @@ async fn reads_are_not_blocked_by_a_stalled_writer() {
 
 /// Datagrams enqueued while the transport is backpressured are shed, not
 /// buffered: after releasing the writer, the peer sees far fewer than were sent.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn datagrams_are_shed_under_backpressure() {
     let (gate_tx, gate_rx) = watch::channel(true);
     let (client, server) = pair(gate_rx).await;
@@ -165,6 +166,7 @@ async fn datagrams_are_shed_under_backpressure() {
         let _ = s.write(&vec![b'F'; 512 * 1024]).await;
         client_filler
     });
+    // Paused time: runs every task until idle, so the filler is parked on the gate.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Every datagram in this burst should be shed: the writer is backpressured.
@@ -202,7 +204,7 @@ async fn datagrams_are_shed_under_backpressure() {
 /// we simply can't get a keep-alive out. But the deferral is *bounded*: a peer that
 /// dies with our send buffer full is still reclaimed within roughly one extra idle
 /// window, instead of hanging until the transport's own (much longer) timeout.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn idle_timeout_deferred_but_bounded_under_backpressure() {
     let (c2s_tx, c2s_rx) = mpsc::channel(256);
     let (s2c_tx, s2c_rx) = mpsc::channel(256);
@@ -225,7 +227,7 @@ async fn idle_timeout_deferred_but_bounded_under_backpressure() {
         gate: Some(gate_rx),
     };
 
-    // Short idle timeout so the test is quick; the deferral grace is one more
+    // Idle timeout in paused (virtual) time; the deferral grace is one more
     // window, so a stuck-backpressured peer is reclaimed at roughly 2× (~300ms).
     let mut config = Config::new(Version::QMux01);
     config.max_idle_timeout = 150;
