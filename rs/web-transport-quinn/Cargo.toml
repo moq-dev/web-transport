@@ -64,3 +64,6 @@ rcgen = "0.14"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+[lints]
+workspace = true

@@ -39,3 +39,6 @@ web-transport-trait = { workspace = true }
 iroh = { version = "1", features = ["tls-ring"] }
 n0-tracing-test = "0.3.0"
 tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

@@ -101,17 +101,27 @@ async fn finish(
     // rate) from the TCP handshake, so the session can report both immediately
     // rather than waiting on its own QX_PING round trip. A socket we can't read
     // stats from just leaves them unreported.
-    #[cfg(unix)]
-    let socket_stats = crate::TcpStats::new(&stream)
-        .ok()
-        .map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats);
-    #[cfg(not(unix))]
-    let socket_stats = None;
+    let socket_stats = socket_stats(&stream);
 
     // `build_stream_session` awaits the peer's transport parameters before
     // returning, so `protocol()` is resolved on the session we hand back
     // (bounded by the config's handshake timeout).
     build_stream_session(stream, config, is_server, socket_stats).await
+}
+
+/// The kernel's view of `stream`, when this platform exposes one.
+pub(crate) fn socket_stats(stream: &TcpStream) -> Option<crate::SharedSocketStats> {
+    #[cfg(unix)]
+    {
+        crate::TcpStats::new(stream)
+            .ok()
+            .map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+        None
+    }
 }
 
 #[cfg(test)]

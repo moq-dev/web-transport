@@ -11,12 +11,11 @@ use std::{
     time::Duration,
 };
 
+mod common;
+
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose,
-};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use common::{ca_chain, CaChain};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use url::Url;
 use web_transport_quiche::{
     ez::{CertResolver, CertifiedKey},
@@ -28,43 +27,6 @@ const DIAL_NAME: &str = "localhost";
 
 /// A name the client cannot dial: it only ever reaches the wire as an override.
 const OVERRIDE_NAME: &str = "override.invalid";
-
-/// A CA plus a leaf issued for `sans`. Returns `(ca_root, chain, key)`.
-#[allow(clippy::type_complexity)]
-fn make_ca_chain(
-    sans: &[&str],
-) -> Result<(
-    CertificateDer<'static>,
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-)> {
-    let ca_key = KeyPair::generate().context("ca key")?;
-    let mut ca_params = CertificateParams::new(Vec::new()).context("ca params")?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "web-transport test CA");
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).context("self-sign ca")?;
-
-    let leaf_key = KeyPair::generate().context("leaf key")?;
-    let sans: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
-    let mut leaf_params = CertificateParams::new(sans.clone()).context("leaf params")?;
-    leaf_params
-        .distinguished_name
-        .push(DnType::CommonName, sans.first().context("no SAN")?);
-    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_issuer)
-        .context("sign leaf")?;
-
-    Ok((
-        CertificateDer::from(ca_cert.der().to_vec()),
-        vec![CertificateDer::from(leaf_cert.der().to_vec())],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KeyPair::serialize_der(&leaf_key))),
-    ))
-}
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -134,7 +96,11 @@ fn loopback_for(addr: SocketAddr) -> SocketAddr {
 async fn server_name_reported() -> Result<()> {
     init_tracing();
 
-    let (ca_root, chain, key) = make_ca_chain(&[DIAL_NAME])?;
+    let CaChain {
+        root: ca_root,
+        chain,
+        key,
+    } = ca_chain(&[DIAL_NAME])?;
     let (addr, server, server_name) = spawn_server(chain, key).await?;
 
     let session = ClientBuilder::default()
@@ -158,7 +124,11 @@ async fn server_name_reported() -> Result<()> {
 async fn server_name_override_accept() -> Result<()> {
     init_tracing();
 
-    let (ca_root, chain, key) = make_ca_chain(&[OVERRIDE_NAME])?;
+    let CaChain {
+        root: ca_root,
+        chain,
+        key,
+    } = ca_chain(&[OVERRIDE_NAME])?;
     let (addr, server, server_name) = spawn_server(chain, key).await?;
 
     let session = ClientBuilder::default()
@@ -187,7 +157,11 @@ async fn server_name_default_reject() -> Result<()> {
     // Without the override the dial target is the name checked, and this
     // certificate isn't valid for it. If this ever passes, the hostname check
     // isn't happening at all and the test above proves nothing.
-    let (ca_root, chain, key) = make_ca_chain(&[OVERRIDE_NAME])?;
+    let CaChain {
+        root: ca_root,
+        chain,
+        key,
+    } = ca_chain(&[OVERRIDE_NAME])?;
     let (addr, server, _server_name) = spawn_server(chain, key).await?;
 
     let url = url_for(addr)?;
@@ -241,7 +215,11 @@ async fn server_name_reaches_cert_resolver() -> Result<()> {
 
     // The resolver picks the certificate mid-handshake, so it's the one place the
     // server sees SNI *before* deciding anything.
-    let (ca_root, chain, key) = make_ca_chain(&[DIAL_NAME])?;
+    let CaChain {
+        root: ca_root,
+        chain,
+        key,
+    } = ca_chain(&[DIAL_NAME])?;
     let resolver = Arc::new(RecordingResolver {
         chain,
         key,

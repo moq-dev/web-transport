@@ -69,9 +69,10 @@ interface Waiter {
 export interface SchedulerOptions {
 	/** Called after each frame is actually written (to track send activity). */
 	onActivity?: () => void;
-	/** Soft cap on buffered control bytes before we warn. */
-	controlHighWater?: number;
 }
+
+/** Soft cap on buffered control bytes before we warn. */
+const CONTROL_HIGH_WATER = 256 * 1024;
 
 /** Default `sendOrder` for streams that don't set one. */
 export const DEFAULT_SEND_ORDER = 0;
@@ -84,7 +85,6 @@ const DATAGRAM_QUEUE_LIMIT = 1024;
 export class SendScheduler {
 	#sink: SendSink;
 	#onActivity: () => void;
-	#controlHighWater: number;
 	#closed?: Error;
 
 	// Control frames preempt all stream data, FIFO among themselves.
@@ -110,7 +110,6 @@ export class SendScheduler {
 	constructor(sink: SendSink, options?: SchedulerOptions) {
 		this.#sink = sink;
 		this.#onActivity = options?.onActivity ?? (() => {});
-		this.#controlHighWater = options?.controlHighWater ?? 256 * 1024;
 		// Start the writer loop. It never rejects — failures are captured by #fail.
 		void this.#run();
 	}
@@ -120,7 +119,7 @@ export class SendScheduler {
 		if (this.#closed) throw this.#closed;
 		this.#control.push(bytes);
 		this.#controlBytes += bytes.byteLength;
-		if (this.#controlBytes > this.#controlHighWater) {
+		if (this.#controlBytes > CONTROL_HIGH_WATER) {
 			// Control frames now ride behind transport backpressure (the loop), so
 			// they can't flood the socket buffer — but a wedged socket can still let
 			// them pile up in memory. Warn rather than drop: dropping flow-control or
@@ -227,7 +226,6 @@ export class SendScheduler {
 		return bestId as bigint;
 	}
 
-	// biome-ignore lint/correctness/noUnusedPrivateClassMembers: invoked from the constructor; Biome's analysis misses the call into this infinite writer loop.
 	async #run(): Promise<void> {
 		try {
 			while (true) {

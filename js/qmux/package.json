@@ -17,8 +17,7 @@
 		"@moq/web-socket-stream": "workspace:*"
 	},
 	"scripts": {
-		"build": "rimraf dist && tsc && tsx ../common/package.ts",
-		"dev": "tsc --watch",
+		"build": "rimraf dist && tsc && bun ../common/package.ts",
 		"check": "tsc --project tsconfig.tests.json --noEmit",
 		"example": "tsx examples/client.ts",
 		"test": "bun test src",

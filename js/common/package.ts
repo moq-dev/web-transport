@@ -14,43 +14,16 @@ function rewritePath(p: string, ext: string): string {
 	return p.replace(/^\.\/src/, ".").replace(/\.ts(x)?$/, `.${ext}`);
 }
 
-pkg.main &&= rewritePath(pkg.main, "js");
-pkg.types &&= rewritePath(pkg.types, "d.ts");
+pkg.types = rewritePath(pkg.types, "d.ts");
 
-if (pkg.exports) {
-	for (const key in pkg.exports) {
-		const val = pkg.exports[key];
-		if (typeof val === "string") {
-			pkg.exports[key] = {
-				types: rewritePath(val, "d.ts"),
-				default: rewritePath(val, "js"),
-			};
-		} else if (typeof val === "object") {
-			for (const sub in val) {
-				if (typeof val[sub] === "string") {
-					val[sub] = rewritePath(val[sub], sub === "types" ? "d.ts" : "js");
-				}
-			}
-		}
-	}
-}
-
-if (pkg.sideEffects) {
-	pkg.sideEffects = pkg.sideEffects.map((p: string) => rewritePath(p, "js"));
+// Each export is a source path, published as compiled JS with its declarations.
+for (const key in pkg.exports) {
+	const path: string = pkg.exports[key];
+	pkg.exports[key] = { types: rewritePath(path, "d.ts"), default: rewritePath(path, "js") };
 }
 
 // Remove the files field; everything in dist/ should be published.
 delete pkg.files;
-
-if (pkg.bin) {
-	if (typeof pkg.bin === "string") {
-		pkg.bin = rewritePath(pkg.bin, "js");
-	} else if (typeof pkg.bin === "object") {
-		for (const key in pkg.bin) {
-			pkg.bin[key] = rewritePath(pkg.bin[key], "js");
-		}
-	}
-}
 
 // Convert workspace dependencies to published versions
 if (pkg.dependencies) {

@@ -215,19 +215,6 @@ export const DEFAULT_TRANSPORT_PARAMS: TransportParams = {
 	resetStreamAt: false,
 };
 
-export const RECOMMENDED_TRANSPORT_PARAMS: TransportParams = {
-	maxIdleTimeout: 30_000n,
-	initialMaxData: 1_048_576n,
-	initialMaxStreamDataBidiLocal: 262_144n,
-	initialMaxStreamDataBidiRemote: 262_144n,
-	initialMaxStreamDataUni: 262_144n,
-	initialMaxStreamsBidi: 100n,
-	initialMaxStreamsUni: 100n,
-	maxDatagramFrameSize: DEFAULT_MAX_RECORD_SIZE,
-	maxRecordSize: DEFAULT_MAX_RECORD_SIZE,
-	resetStreamAt: false,
-};
-
 export interface Padding {
 	type: "padding";
 }

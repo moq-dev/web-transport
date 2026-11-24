@@ -17,7 +17,6 @@ use web_transport_quinn::android::init_platform_verifier;
 /// Called by `System.loadLibrary`; JNA loads skip it, so the per-client retry
 /// also needs the `JavaVM` singleton registered here.
 #[no_mangle]
-#[allow(non_snake_case)]
 pub extern "system" fn JNI_OnLoad(vm: *mut sys::JavaVM, _reserved: *mut c_void) -> jint {
     // SAFETY: the JVM passes `JNI_OnLoad` a valid `JavaVM` pointer.
     unsafe { JavaVM::from_raw(vm) };

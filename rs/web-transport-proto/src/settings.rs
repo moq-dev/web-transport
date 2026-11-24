@@ -26,15 +26,7 @@ impl Setting {
 
     // Reference : https://datatracker.ietf.org/doc/html/rfc9114#section-7.2.4.1
     pub fn is_grease(&self) -> bool {
-        let val = self.0.into_inner();
-        if val < 0x21 {
-            return false;
-        }
-
-        #[allow(unknown_lints, clippy::manual_is_multiple_of)]
-        {
-            (val - 0x21) % 0x1f == 0
-        }
+        self.0.is_grease()
     }
 }
 

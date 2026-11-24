@@ -100,6 +100,13 @@ test("install() defines WebTransportError alongside WebTransport", () => {
 	}
 });
 
+test("disabling verification while pinning certificate hashes throws from the constructor", () => {
+	const hash = { algorithm: "sha-256", value: new Uint8Array(32) };
+	expect(() => new Session(url, { serverCertificateDisableVerify: true, serverCertificateHashes: [hash] })).toThrow(
+		"serverCertificateDisableVerify and serverCertificateHashes cannot be used together",
+	);
+});
+
 test("a failed TLS connection rejects ready and closed with a session error", async () => {
 	// The loopback server has a self-signed certificate, which system roots reject.
 	const client = new Session(url);
@@ -320,7 +327,7 @@ test("concurrent read requests keep pulling through data and FIN", async () => {
 });
 
 test("native cancellation rejects pending and subsequent reads instead of reporting FIN", async () => {
-	const client = await napi.NapiClient.disableVerify().connect(url);
+	const client = await napi.NapiClient.withOptions({ serverCertificateDisableVerify: true }).connect(url);
 	const peer = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
 	try {
 		const writer = (await peer.createUnidirectionalStream()).getWriter();
@@ -350,7 +357,7 @@ test("native cancellation rejects pending and subsequent reads instead of report
 
 test("native cancellation is idempotent after FIN and RESET_STREAM", async () => {
 	for (const reset of [false, true]) {
-		const client = await napi.NapiClient.disableVerify().connect(url);
+		const client = await napi.NapiClient.withOptions({ serverCertificateDisableVerify: true }).connect(url);
 		const peer = accepted.shift() ?? (await new Promise<Session>((resolve) => waiters.push(resolve)));
 		try {
 			const writer = (await peer.createUnidirectionalStream()).getWriter();

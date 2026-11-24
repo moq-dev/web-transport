@@ -15,19 +15,10 @@
 //! `webtransport` wire format only shows up as the bare ALPN, so this module
 //! never emits or strips a `webtransport.` prefix.
 
-use crate::Version;
+use crate::{Error, Version};
 
 /// QMux versions that can ride under a `{prefix}{alpn}` pair, newest first.
 pub(crate) const QMUX_VERSIONS: &[Version] = &[Version::QMux02, Version::QMux01, Version::QMux00];
-
-/// Bare version ALPNs added (offered by clients, accepted by servers) unless
-/// the caller opts out via `require_protocol`. Newest first.
-pub(crate) const BARE_ALPNS: &[Version] = &[
-    Version::QMux02,
-    Version::QMux01,
-    Version::QMux00,
-    Version::WebTransport,
-];
 
 /// Resolve an entry's `versions` slice: empty falls back to every supported
 /// QMux draft, mirroring JS's `null` value.
@@ -48,29 +39,30 @@ pub(crate) fn expand_versions(versions: &[Version]) -> &[Version] {
 ///
 /// Suitable for TLS ALPN or WebSocket `Sec-WebSocket-Protocol`.
 ///
-/// Passing `Version::WebTransport` inside an entry's `versions` is a usage
-/// bug (the bare ALPN is controlled by `require_protocol`, not by listing it
-/// as a pair version) and panics in debug builds.
+/// Fails with [`Error::InvalidProtocol`] when an entry lists
+/// `Version::WebTransport`: that format has no prefixed form, and its bare
+/// ALPN is controlled by `require_protocol`.
 pub(crate) fn build<'a>(
     entries: impl IntoIterator<Item = (&'a str, &'a [Version])>,
     require_protocol: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, Error> {
     let mut out: Vec<String> = Vec::new();
     for (alpn, versions) in entries {
         for &version in expand_versions(versions) {
-            debug_assert!(
-                version.is_qmux(),
-                "webtransport doesn't use prefixed ALPN; pair entries are qmux only. Bare ALPNs are controlled by require_protocol."
-            );
-            out.push(format!("{}{}", version.prefix(), alpn));
+            let wire = format!("{}{}", version.prefix(), alpn);
+            if !version.is_qmux() {
+                return Err(Error::InvalidProtocol(wire));
+            }
+            out.push(wire);
         }
     }
     if !require_protocol {
-        for &v in BARE_ALPNS {
+        // Every bare version ALPN, newest first.
+        for &v in Version::ALL {
             out.push(v.alpn().to_string());
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse a negotiated wire-format ALPN into `(version, app_protocol)`.
@@ -108,7 +100,7 @@ mod tests {
 
     #[test]
     fn build_appends_bare_alpns_by_default() {
-        let out = build([("moq-lite-04", &[Version::QMux01][..])], false);
+        let out = build([("moq-lite-04", &[Version::QMux01][..])], false).unwrap();
         assert_eq!(
             out,
             vec![
@@ -129,13 +121,14 @@ mod tests {
                 ("moq-transport-17", &[Version::QMux00][..]),
             ],
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(out, vec!["qmux-01.moq-lite-04", "qmux-00.moq-transport-17"]);
     }
 
     #[test]
     fn build_expands_empty_versions_to_all_qmux_drafts() {
-        let out = build([("moq-lite-04", &[][..])], true);
+        let out = build([("moq-lite-04", &[][..])], true).unwrap();
         assert_eq!(
             out,
             vec![
@@ -151,22 +144,33 @@ mod tests {
         let out = build(
             [("moq-lite-04", &[Version::QMux00, Version::QMux01][..])],
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(out, vec!["qmux-00.moq-lite-04", "qmux-01.moq-lite-04"]);
     }
 
     #[test]
     fn build_empty_by_default_emits_only_bare_alpns() {
         let entries: [(&str, &[Version]); 0] = [];
-        let out = build(entries, false);
+        let out = build(entries, false).unwrap();
         assert_eq!(out, vec!["qmux-02", "qmux-01", "qmux-00", "webtransport"]);
     }
 
     #[test]
     fn build_empty_with_require_protocol_emits_nothing() {
         let entries: [(&str, &[Version]); 0] = [];
-        let out = build(entries, true);
+        let out = build(entries, true).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn build_rejects_webtransport_in_an_entry() {
+        let err = build(
+            [("test", &[Version::QMux01, Version::WebTransport][..])],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidProtocol(wire) if wire == "webtransport.test"));
     }
 
     #[test]

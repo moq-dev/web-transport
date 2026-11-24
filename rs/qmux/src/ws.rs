@@ -190,6 +190,8 @@ impl Client {
     ///
     /// Pass `&[v]` to pin to one version, `&[v1, v2]` to enumerate, or `&[]`
     /// to let the polyfill expand to every QMux draft it knows about.
+    /// Listing `Version::WebTransport`, which has no prefixed form, fails the
+    /// handshake with [`Error::InvalidProtocol`].
     pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
         self.protocols.push((alpn.to_string(), versions.to_vec()));
         self
@@ -275,7 +277,7 @@ impl Client {
             .protocols
             .iter()
             .map(|(a, vs)| (a.as_str(), vs.as_slice()));
-        let protocol_value = alpn::build(entries, self.require_protocol).join(", ");
+        let protocol_value = alpn::build(entries, self.require_protocol)?.join(", ");
 
         request.headers_mut().insert(
             http::header::SEC_WEBSOCKET_PROTOCOL,
@@ -361,6 +363,8 @@ impl Server {
     ///
     /// Pass `&[v]` to support one version, `&[v1, v2]` to enumerate, or `&[]`
     /// to accept every QMux draft this crate knows about.
+    /// Listing `Version::WebTransport`, which has no prefixed form, fails the
+    /// handshake with [`Error::InvalidProtocol`].
     pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
         self.protocols.push((alpn.to_string(), versions.to_vec()));
         self
@@ -440,10 +444,17 @@ impl Server {
 
         let negotiated = Arc::new(Mutex::new(None::<(Version, Option<String>)>));
         let negotiated_clone = negotiated.clone();
-        let supported = self.protocols.clone();
-        let require_protocol = self.require_protocol;
+        // The same list a client would offer, in our preference order.
+        let entries = self
+            .protocols
+            .iter()
+            .map(|(a, vs)| (a.as_str(), vs.as_slice()));
+        let supported = alpn::build(entries, self.require_protocol)?;
 
-        #[allow(clippy::result_large_err)]
+        #[expect(
+            clippy::result_large_err,
+            reason = "tungstenite's handshake callback fixes the error type"
+        )]
         let callback = move |req: &server::Request,
                              mut response: server::Response|
               -> Result<server::Response, server::ErrorResponse> {
@@ -457,40 +468,16 @@ impl Server {
                 .filter(|p| !p.is_empty())
                 .collect();
 
-            // Iterate supported entries in preference order; for each, expand
-            // the listed versions (empty = every supported QMux draft) and pick
-            // the first `{prefix}{alpn}` permutation the client offered.
-            for (alpn, versions) in &supported {
-                for &version in alpn::expand_versions(versions) {
-                    let wire = format!("{}{}", version.prefix(), alpn);
-                    if header_protocols.iter().any(|p| *p == wire) {
-                        response.headers_mut().insert(
-                            http::header::SEC_WEBSOCKET_PROTOCOL,
-                            http::HeaderValue::from_str(&wire).unwrap(),
-                        );
-                        *negotiated_clone.lock().unwrap() = Some((version, Some(alpn.clone())));
-                        return Ok(response);
-                    }
-                }
-            }
-
-            // Default fallback: accept bare version ALPNs (qmux-01, qmux-00,
-            // webtransport) for clients that didn't request an app protocol,
-            // unless require_protocol was set. The session ends up with
-            // `protocol = None` and the wire-format version implied by
-            // whichever bare ALPN won.
-            if !require_protocol {
-                for &version in alpn::BARE_ALPNS {
-                    let bare = version.alpn();
-                    if header_protocols.contains(&bare) {
-                        response.headers_mut().insert(
-                            http::header::SEC_WEBSOCKET_PROTOCOL,
-                            http::HeaderValue::from_str(bare).unwrap(),
-                        );
-                        *negotiated_clone.lock().unwrap() = Some((version, None));
-                        return Ok(response);
-                    }
-                }
+            if let Some(wire) = supported
+                .iter()
+                .find(|wire| header_protocols.contains(&wire.as_str()))
+            {
+                response.headers_mut().insert(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    http::HeaderValue::from_str(wire).unwrap(),
+                );
+                *negotiated_clone.lock().unwrap() = Some(alpn::parse(Some(wire)));
+                return Ok(response);
             }
 
             Err(http::Response::builder()
@@ -604,7 +591,10 @@ mod record_size_tests {
             }
             let accept = async {
                 let (socket, _) = listener.accept().await.unwrap();
-                #[allow(clippy::result_large_err)]
+                #[expect(
+                    clippy::result_large_err,
+                    reason = "tungstenite's handshake callback fixes the error type"
+                )]
                 let callback =
                     |_: &tungstenite::handshake::server::Request,
                      mut response: tungstenite::handshake::server::Response| {
@@ -835,6 +825,24 @@ mod tests {
 
     const DEADLINE: Duration = Duration::from_secs(5);
 
+    // The legacy format has no `webtransport.{alpn}` form, so listing it is a
+    // configuration error, refused before any handshake I/O.
+    #[tokio::test]
+    async fn webtransport_in_an_entry_is_rejected() {
+        let (_, socket) = tokio::io::duplex(64);
+        let server = Server::new().with_protocol("test", &[Version::WebTransport]);
+        let Err(err) = server.accept(socket).await else {
+            panic!("accepted a webtransport pair");
+        };
+        assert!(matches!(err, Error::InvalidProtocol(wire) if wire == "webtransport.test"));
+
+        let client = Client::new().with_protocol("test", &[Version::WebTransport]);
+        let Err(err) = client.connect("ws://127.0.0.1:9").await else {
+            panic!("connected with a webtransport pair");
+        };
+        assert!(matches!(err, Error::InvalidProtocol(wire) if wire == "webtransport.test"));
+    }
+
     trait Peer:
         Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
         + Sink<tungstenite::Message, Error = tungstenite::Error>
@@ -876,7 +884,7 @@ mod tests {
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let server = async {
                 let (socket, _) = listener.accept().await.unwrap();
-                #[allow(clippy::result_large_err)]
+                #[expect(clippy::result_large_err, reason = "tungstenite's handshake callback fixes the error type")]
                 let callback =
                     move |request: &tungstenite::handshake::server::Request,
                      mut response: tungstenite::handshake::server::Response| {

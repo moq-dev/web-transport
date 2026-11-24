@@ -89,9 +89,7 @@ impl SendStream {
             match stopped.await {
                 Ok(Some(code)) => Ok(decode_stream_code(code, raw)),
                 Ok(None) => Ok(None),
-                Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                    Err(error.map(conn_err.into()))
-                }
+                Err(quinn::StoppedError::ConnectionLost(conn_err)) => Err(error.map(conn_err)),
                 Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
             }
         }
@@ -271,7 +269,7 @@ impl web_transport_trait::poll::SendStream for SendStream {
                 },
                 Ok(None) => Ok(()),
                 Err(quinn::StoppedError::ConnectionLost(conn_err)) => {
-                    Err(WriteError::SessionError(error.map(conn_err.into())))
+                    Err(WriteError::SessionError(error.map(conn_err)))
                 }
                 Err(quinn::StoppedError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
             }

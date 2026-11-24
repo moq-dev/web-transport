@@ -52,3 +52,6 @@ uniffi = { version = "0.32", features = ["build"] }
 rcgen = "0.14"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

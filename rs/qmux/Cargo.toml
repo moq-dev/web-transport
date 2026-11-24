@@ -49,6 +49,9 @@ url = "2"
 web-transport-proto = { workspace = true }
 web-transport-trait = { workspace = true }
 
+[lints]
+workspace = true
+
 [[bench]]
 name = "credit"
 harness = false

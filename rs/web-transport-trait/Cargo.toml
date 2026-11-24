@@ -17,6 +17,9 @@ rust-version = "1.75"
 [dependencies]
 bytes = "1"
 
+[lints]
+workspace = true
+
 [[bench]]
 name = "receive"
 harness = false

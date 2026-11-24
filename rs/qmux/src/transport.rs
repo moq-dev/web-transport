@@ -86,7 +86,7 @@ pub trait Reader: Send + 'static {
 // `recv_record`/`recv_qmux00_frame` are safe to keep as-is.
 #[cfg(any(feature = "tcp", all(unix, feature = "uds")))]
 mod stream_transport {
-    use bytes::{BufMut, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
@@ -263,62 +263,31 @@ mod stream_transport {
         }
     }
 
-    /// Read a varint from the stream, returning the decoded value.
-    /// If `buf` is provided, appends the raw bytes to it.
+    /// Read one varint's raw bytes: the buffer and how many of them it used.
+    async fn read_varint_raw<R: AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> Result<([u8; 8], usize), Error> {
+        let mut raw = [0u8; 8];
+        raw[0] = reader.read_u8().await?;
+        let len = 1usize << (raw[0] >> 6);
+        reader.read_exact(&mut raw[1..len]).await?;
+        Ok((raw, len))
+    }
+
+    /// Read a varint from the stream, appending its raw bytes to `buf`.
     async fn read_varint_into<R: AsyncRead + Unpin>(
         reader: &mut R,
         buf: &mut BytesMut,
     ) -> Result<VarInt, Error> {
-        let first = reader.read_u8().await?;
-        buf.put_u8(first);
-
-        let tag = first >> 6;
-        let len = 1usize << tag;
-
-        if len == 1 {
-            return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
-        }
-
-        let start = buf.len();
-        buf.resize(start + len - 1, 0);
-        reader.read_exact(&mut buf[start..]).await?;
-
-        let mut raw = [0u8; 8];
-        raw[0] = first & 0x3f;
-        raw[1..len].copy_from_slice(&buf[start..start + len - 1]);
-
-        let value = match len {
-            2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
-            4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
-            8 => u64::from_be_bytes(raw),
-            _ => unreachable!(),
-        };
-
-        VarInt::try_from(value).map_err(|_| Error::Short)
+        let (raw, len) = read_varint_raw(reader).await?;
+        buf.extend_from_slice(&raw[..len]);
+        VarInt::decode(&mut &raw[..len]).map_err(|_| Error::Short)
     }
 
     /// Read a varint from the stream without collecting raw bytes.
     async fn read_varint<R: AsyncRead + Unpin>(reader: &mut R) -> Result<VarInt, Error> {
-        let first = reader.read_u8().await?;
-        let tag = first >> 6;
-        let len = 1usize << tag;
-
-        if len == 1 {
-            return Ok(VarInt::try_from((first & 0x3f) as u64).unwrap());
-        }
-
-        let mut raw = [0u8; 8];
-        raw[0] = first & 0x3f;
-        reader.read_exact(&mut raw[1..len]).await?;
-
-        let value = match len {
-            2 => u16::from_be_bytes([raw[0], raw[1]]) as u64,
-            4 => u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64,
-            8 => u64::from_be_bytes(raw),
-            _ => unreachable!(),
-        };
-
-        VarInt::try_from(value).map_err(|_| Error::Short)
+        let (raw, len) = read_varint_raw(reader).await?;
+        VarInt::decode(&mut &raw[..len]).map_err(|_| Error::Short)
     }
 
     /// Read exactly `len` bytes, appending to buf.

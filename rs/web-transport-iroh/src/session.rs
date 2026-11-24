@@ -372,8 +372,7 @@ struct H3SessionState {
     header_datagram: Vec<u8>,
 
     // Keep a reference to the settings and connect stream to avoid closing them until dropped.
-    #[allow(unused)]
-    settings: Arc<Settings>,
+    _settings: Arc<Settings>,
     // The accept logic is stateful, so use an Arc<Mutex> to share it.
     accept: Arc<Mutex<H3SessionAccept>>,
 
@@ -425,7 +424,7 @@ impl H3SessionState {
             header_uni,
             header_bi,
             header_datagram,
-            settings: Arc::new(settings),
+            _settings: Arc::new(settings),
             accept: Arc::new(Mutex::new(accept)),
             peer_close,
             request: connect.request.clone(),

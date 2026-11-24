@@ -3,6 +3,7 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
+use crate::tcp::socket_stats;
 use crate::transport::Stream;
 use crate::{alpn, Config, Error, Session, Version};
 
@@ -38,6 +39,8 @@ impl Client {
     ///
     /// Pass `&[v]` to pin to one version, `&[v1, v2]` to enumerate, or `&[]`
     /// to expand to every QMux draft this crate knows about.
+    /// Listing `Version::WebTransport`, which has no prefixed form, fails the
+    /// handshake with [`Error::InvalidProtocol`].
     pub fn with_protocol(mut self, alpn: &str, versions: &[Version]) -> Self {
         self.protocols.push((alpn.to_string(), versions.to_vec()));
         self
@@ -77,6 +80,12 @@ impl Client {
         addr: impl ToSocketAddrs,
         server_name: &str,
     ) -> Result<Session, Error> {
+        let entries = self
+            .protocols
+            .iter()
+            .map(|(a, vs)| (a.as_str(), vs.as_slice()));
+        let prefixed = alpn::build(entries, self.require_protocol)?;
+
         let stream = TcpStream::connect(&addr).await?;
         // Read the socket's stats handle before TLS takes ownership; the kernel's
         // view of the TCP connection is the same either side of the encryption.
@@ -85,12 +94,6 @@ impl Client {
         let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|_| Error::InvalidServerName)?
             .to_owned();
-
-        let entries = self
-            .protocols
-            .iter()
-            .map(|(a, vs)| (a.as_str(), vs.as_slice()));
-        let prefixed = alpn::build(entries, self.require_protocol);
 
         let mut config = (*self.config).clone();
         config.alpn_protocols = prefixed.iter().map(|s| s.as_bytes().to_vec()).collect();
@@ -181,20 +184,5 @@ impl Server {
         }
         // `accept` awaits the peer's transport parameters so `protocol()` is resolved.
         Session::accept(transport, session_config).await
-    }
-}
-
-/// The kernel's view of `stream`, when this platform exposes one.
-fn socket_stats(stream: &TcpStream) -> Option<crate::SharedSocketStats> {
-    #[cfg(unix)]
-    {
-        crate::TcpStats::new(stream)
-            .ok()
-            .map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = stream;
-        None
     }
 }

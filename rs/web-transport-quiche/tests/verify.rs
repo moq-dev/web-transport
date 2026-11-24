@@ -9,11 +9,11 @@ use std::{
     time::Duration,
 };
 
+mod common;
+
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedKey, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose,
-};
+use common::{ca_chain, CaChain};
+use rcgen::{CertifiedKey, KeyPair};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -29,42 +29,6 @@ fn make_self_signed() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'st
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes));
 
     Ok((vec![cert_der], key_der))
-}
-
-/// A CA certificate plus a leaf signed by it. Returns `(ca_root, leaf_chain, leaf_key)`.
-#[allow(clippy::type_complexity)]
-fn make_ca_chain() -> Result<(
-    CertificateDer<'static>,
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-)> {
-    let ca_key = KeyPair::generate().context("ca key")?;
-    let mut ca_params = CertificateParams::new(Vec::new()).context("ca params")?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "web-transport test CA");
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).context("self-sign ca")?;
-
-    let leaf_key = KeyPair::generate().context("leaf key")?;
-    let mut leaf_params = CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])
-        .context("leaf params")?;
-    leaf_params
-        .distinguished_name
-        .push(DnType::CommonName, "localhost");
-    leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
-    let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_issuer)
-        .context("sign leaf")?;
-
-    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
-    let leaf_der = CertificateDer::from(leaf_cert.der().to_vec());
-    let leaf_key_der =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KeyPair::serialize_der(&leaf_key)));
-
-    Ok((ca_der, vec![leaf_der], leaf_key_der))
 }
 
 fn cert_sha256(chain: &[CertificateDer<'static>]) -> [u8; 32] {
@@ -203,7 +167,11 @@ async fn cert_hash_reject() -> Result<()> {
 async fn custom_roots_accept() -> Result<()> {
     init_tracing();
 
-    let (ca_root, chain, key) = make_ca_chain()?;
+    let CaChain {
+        root: ca_root,
+        chain,
+        key,
+    } = ca_chain(&["localhost", "127.0.0.1"])?;
     let (addr, server) = spawn_server(chain, key).await?;
 
     let session = ClientBuilder::default()
@@ -227,8 +195,8 @@ async fn custom_roots_reject() -> Result<()> {
 
     // Server presents a leaf from one CA; the client trusts a *different* CA.
     // Verification must fail rather than fall back to accepting the peer.
-    let (_server_ca, chain, key) = make_ca_chain()?;
-    let (other_ca, _other_chain, _other_key) = make_ca_chain()?;
+    let CaChain { chain, key, .. } = ca_chain(&["localhost", "127.0.0.1"])?;
+    let other_ca = ca_chain(&["localhost", "127.0.0.1"])?.root;
     let (addr, server) = spawn_server(chain, key).await?;
 
     let url = url_for(addr)?;
