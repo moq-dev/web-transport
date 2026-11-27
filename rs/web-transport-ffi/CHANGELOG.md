@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.3.0...web-transport-ffi-v0.3.1) - 2026-11-27
+
+### Other
+
+- *(agents)* canonicalize AGENTS.md and deduplicate against quest context ([#586](https://github.com/moq-dev/web-transport/pull/586))
+
 ## [0.3.0](https://github.com/moq-dev/web-transport/compare/web-transport-ffi-v0.2.2...web-transport-ffi-v0.3.0) - 2026-11-23
 
 ### Added
