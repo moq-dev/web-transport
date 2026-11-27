@@ -21,7 +21,7 @@ while the underlying browser stream locks are shared — a browser stream can on
 
 ## Testing
 
-Pull requests run the harness in headless Chromium on Linux through Playwright. Every result row
+`just test-browser` runs the harness in headless Chromium on Linux through Playwright. Every result row
 must pass, including clone/cancellation, stream-opening cleanup, peer reset, datagram and close
 checks. Missing browser dependencies, an unavailable peer, page errors and timeouts fail the run.
 
@@ -47,7 +47,7 @@ manager; install those separately when using NixOS. The harness dev-dependency a
 the wasm-bindgen crate/CLI schema. The repository Cargo configuration supplies the unstable
 web-sys flags. The build
 honors `CARGO_TARGET_DIR`. Playwright reports, traces, screenshots and peer logs are written under
-that target directory's `browser-results` folder; CI uploads them on failure. No browser coverage
+that target directory's `browser-results` folder. No browser coverage
 is silently skipped and failed checks are not retried.
 
 For interactive inspection, `just harness` builds the same page and QUIC peer, then serves it at

@@ -1,7 +1,6 @@
-# Authenticates as the moq-bot GitHub App (APP_CLIENT_ID / APP_PRIVATE_KEY) so the release PR
-# and the auto-pushed web-transport-ffi-v* tag trigger workflows; GITHUB_TOKEN-authored
-# refs deliberately do not, which would leave the release PR unchecked and the downstream
-# release-py/release-kt/release-swift workflows unfired.
+# Authenticates as the moq-bot GitHub App (APP_CLIENT_ID / APP_PRIVATE_KEY) so the auto-pushed
+# web-transport-ffi-v* tag triggers workflows; GITHUB_TOKEN-authored refs deliberately do not,
+# which would leave the downstream release-py/release-kt/release-swift workflows unfired.
 name: release-rs
 
 permissions:

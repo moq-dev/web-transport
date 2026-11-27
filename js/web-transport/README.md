@@ -222,9 +222,6 @@ leaked handles and reports the last completed phase. Temporary files and timed-o
 process groups are removed; no registry publishing is needed. OpenSSL generates a
 short-lived test certificate.
 
-The independent Node runtime PR workflow runs this command on Linux for all pull
-requests, including changes to shared Rust code and build/workflow files.
-
 `bun run --cwd js/web-transport build` builds the native module and its JavaScript
 wrapper. Packing or publishing runs `build:js` through `prepack`, so the package
 exports JavaScript and declarations from `dist/` without requiring a TypeScript

@@ -72,9 +72,8 @@ checks JNA extraction, connects a loopback client/server on an ephemeral port,
 exchanges a bidirectional stream, and closes sessions and endpoints. Fresh test
 credentials live under `.tmp/` and are removed on exit; the loopback client
 disables certificate verification. No publishing or Android SDK is required.
-The independent Kotlin/JVM PR job runs this same command on Linux and uploads
-JUnit XML and HTML results. Other staged platform libraries are preserved. The
-release matrix and packaging remain separate.
+Other staged platform libraries are preserved. The release matrix and packaging
+remain separate.
 
 After staging with `just test-kotlin`, rerun through that command so test
 credentials are regenerated. Results are in
@@ -88,7 +87,7 @@ after explicit lifecycle cleanup.
 
 The Android target is opt-in via `-Pandroid.enabled=true`. Local dev without the Android SDK still builds the JVM variant.
 
-With the Android target enabled and the bindings staged, `:r8-check:checkKeepRules` minifies a consumer app with R8 and fails if it removed or renamed anything in the JNA, UniFFI, or verifier packages. The Kotlin release workflow runs it on every PR that touches `kt/` or the FFI crate.
+With the Android target enabled and the bindings staged, `:r8-check:checkKeepRules` minifies a consumer app with R8 and fails if it removed or renamed anything in the JNA, UniFFI, or verifier packages. The Kotlin release workflow runs it on every `web-transport-ffi-v*` tag.
 
 ## Layout
 

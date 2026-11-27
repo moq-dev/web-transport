@@ -61,14 +61,14 @@ Built from `rs/web-transport-ffi` via UniFFI; all three release workflows fire f
 
 ### Runtime coverage
 
-Each binding's runtime job runs on every PR to `main` with no path filter, so any Rust, FFI, build script, or workspace change exercises every package. The release workflows also run as path-filtered PR smoke builds covering `rs/web-transport-ffi`, the workspace crates it depends on, `Cargo.toml`, `Cargo.lock`, and their own sources. Mobile emulators are out of scope; Android and iOS are only cross-compiled by those smoke builds.
+CI runs no checks on pull requests. Before pushing a change that can affect a binding (any Rust, FFI, build script, or workspace change), run its runtime test on the listed host. The release workflows build every platform only when a `web-transport-ffi-v*` tag is pushed. Mobile emulators are out of scope; Android and iOS are only cross-compiled by those release builds.
 
-| Package | PR job | Host | Local command |
-|---------|--------|------|---------------|
-| Python  | [`test-py.yml`](.github/workflows/test-py.yml) | Linux | `nix develop --command ./py/web-transport/test-wheel.sh` |
-| Node    | [`node.yml`](.github/workflows/node.yml) | Linux | `nix develop --command bun run --cwd js/web-transport test:runtime` |
-| Kotlin/JVM | `kotlin` in [`pr.yml`](.github/workflows/pr.yml) | Linux | `nix develop --command just test-kotlin` |
-| Swift   | [`test-swift.yml`](.github/workflows/test-swift.yml) | macOS | `just test-swift` |
+| Package | Host | Command |
+|---------|------|---------|
+| Python  | Linux | `nix develop --command ./py/web-transport/test-wheel.sh` |
+| Node    | Linux | `nix develop --command bun run --cwd js/web-transport test:runtime` |
+| Kotlin/JVM | Linux | `nix develop --command just test-kotlin` |
+| Swift   | macOS | `just test-swift` |
 
 ## Quests
 
@@ -79,4 +79,4 @@ entering the shell, use `nix run .#quest -- guide`.
 Restart your agent session after setup to load the quest skills. Use
 `$quest-plan` in Codex or `/quest-plan` in Claude Code to plan work, and
 `$quest-import` or `/quest-import` to bring in GitHub issues. `quest check`
-validates the tree and runs as part of `just check` and CI.
+validates the tree and runs as part of `just check`.
