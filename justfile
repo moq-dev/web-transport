@@ -77,7 +77,7 @@ test:
 	bun run --cwd js/web-transport build
 	bun run --cwd js/web-transport test
 	# The build regenerates the loader; it must match the committed copy.
-	git diff --exit-code -- js/web-transport/napi.cjs js/web-transport/napi.d.cts
+	git diff --exit-code HEAD -- js/web-transport/napi.cjs js/web-transport/napi.d.cts
 
 # Automatically fix some issues.
 fix:
