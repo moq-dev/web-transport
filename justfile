@@ -76,6 +76,8 @@ test:
 	# The Node polyfill's tests load its native module.
 	bun run --cwd js/web-transport build
 	bun run --cwd js/web-transport test
+	# The build regenerates the loader; it must match the committed copy.
+	git diff --exit-code -- js/web-transport/napi.cjs js/web-transport/napi.d.cts
 
 # Automatically fix some issues.
 fix:
