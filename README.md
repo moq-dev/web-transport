@@ -69,6 +69,7 @@ CI runs no checks on pull requests. Before pushing a change that can affect a bi
 | Node    | Linux | `nix develop --command bun run --cwd js/web-transport test:runtime` |
 | Kotlin/JVM | Linux | `nix develop --command just test-kotlin` |
 | Swift   | macOS | `just test-swift` |
+| WASM (browser) | Linux | `nix develop --command just test-browser` (setup in [rs/web-transport-wasm](rs/web-transport-wasm/README.md#testing)) |
 
 ## Quests
 
