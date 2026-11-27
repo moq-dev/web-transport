@@ -2,12 +2,13 @@
   description = "Web Transport development environment";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # quest's nixpkgs, so every repository's dev shell gets the same C compiler and mbx
+    # shares build scripts, proc-macros, and the crates built on them across repositories.
+    nixpkgs.follows = "quest/nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     # Quest serves its guide and skills; the repository keeps only skill stubs.
     quest = {
       url = "github:kixel-ai/quest";
-      inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };
     rust-overlay = {
