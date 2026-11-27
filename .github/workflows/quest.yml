@@ -11,16 +11,9 @@ on:
       - "flake.nix"
       - "flake.lock"
       - ".github/workflows/quest.yml"
-  pull_request:
-    branches: ["main"]
-    paths:
-      - "quest/**"
-      - "flake.nix"
-      - "flake.lock"
-      - ".github/workflows/quest.yml"
 
 concurrency:
-  group: quest-${{ github.event.pull_request.number || github.ref }}
+  group: quest-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

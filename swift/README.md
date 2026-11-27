@@ -56,8 +56,7 @@ cancellation after stopping the test process group. Test output remains in
 fails after 120 seconds if a native call hangs, allowing five seconds for graceful
 termination before forcing exit. Interrupted runs may have partial logs and no XML;
 unbuffered phase messages identify the last lifecycle operation. The command leaves `Package.swift` and
-developer-generated bindings untouched. The independent `Swift runtime` PR job
-runs this command on macOS for every PR, including shared Rust and build changes.
+developer-generated bindings untouched.
 It does not publish or test the release XCFramework platform matrix or iOS simulators.
 
 To compute the XCFramework checksum yourself for a local `Package.swift` edit:

@@ -150,8 +150,7 @@ This builds a UniFFI wheel with the release profile used for publishing and inst
 it with locked dependencies into a temporary virtual environment. It verifies that
 imports come from that installation. It downloads Playwright's Chromium;
 Linux browser system dependencies must already be installed. On Ubuntu, pass
-`--with-browser-deps` to install them (requires sudo). PR CI runs this command
-on every change, including shared Rust and build configuration changes.
+`--with-browser-deps` to install them (requires sudo).
 Test execution is bounded to 15 minutes; pytest prints Python stacks when a
 test runs for 60 seconds. The temporary environment and wheel are removed
 on exit, and browser fixtures close their processes. Cargo and browser download

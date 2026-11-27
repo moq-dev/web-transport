@@ -1,31 +1,17 @@
 name: Release Swift
 
-# Tag-triggered for real releases; pull_request mode (paths-filtered) runs
-# the build / bindings / package jobs as a smoke test. The release-assets
-# step is skipped on PRs (no tag to attach to).
+# Tag-triggered by the `web-transport-ffi-v*` tag that release-plz pushes.
 
 on:
   push:
     tags:
       - "web-transport-ffi-v*"
-  pull_request:
-    paths:
-      - "rs/web-transport-ffi/**"
-      - "rs/web-transport-quinn/**"
-      - "rs/web-transport-proto/**"
-      - "rs/web-transport-trait/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "swift/**"
-      - ".github/workflows/release-swift.yml"
-      - ".github/scripts/release.sh"
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-swift-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: release-swift-${{ github.ref }}
 
 jobs:
   parse-version:
@@ -39,14 +25,7 @@ jobs:
 
       - name: Parse version
         id: parse
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            VERSION=$(grep '^version' rs/web-transport-ffi/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "PR build, using Cargo.toml version: ${VERSION}"
-          else
-            .github/scripts/release.sh parse-version web-transport-ffi
-          fi
+        run: .github/scripts/release.sh parse-version web-transport-ffi
 
   build:
     name: Build web-transport-ffi (${{ matrix.target }})
@@ -170,8 +149,6 @@ jobs:
     name: Attach assets to GitHub Release
     needs: [package, parse-version]
     runs-on: ubuntu-latest
-    # Tag pushes only — there's no GitHub Release to attach to on a PR.
-    if: github.event_name != 'pull_request'
     permissions:
       contents: write
 
@@ -206,8 +183,8 @@ jobs:
     needs: [package, parse-version]
     runs-on: ubuntu-latest
     # Re-enable by adding a publish.sh and setting PUBLISH_SPM=true; see
-    # swift/README.md. Always skipped on PRs.
-    if: github.event_name != 'pull_request' && vars.PUBLISH_SPM == 'true'
+    # swift/README.md.
+    if: vars.PUBLISH_SPM == 'true'
 
     steps:
       - name: Placeholder

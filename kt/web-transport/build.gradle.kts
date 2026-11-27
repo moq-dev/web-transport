@@ -29,7 +29,7 @@
 //   ORG_GRADLE_PROJECT_signingInMemoryKey
 //   ORG_GRADLE_PROJECT_signingInMemoryKeyPassword
 // signAllPublications() is gated on ORG_GRADLE_PROJECT_signingInMemoryKey
-// being present so PR smoke tests (which run publishToMavenLocal without
+// being present so local package.sh runs (publishToMavenLocal without
 // the signing key) don't trip on "no configured signatory".
 
 import com.android.build.api.dsl.KotlinMultiplatformAndroidLibraryTarget
@@ -164,8 +164,8 @@ if (artifactSmokeEnabled) {
 
 mavenPublishing {
     publishToMavenCentral(automaticRelease = true)
-    // Only sign when a non-empty signing key is configured. PR smoke tests
-    // run gradle `:web-transport:publishToMavenLocal` (via package.sh)
+    // Only sign when a non-empty signing key is configured. Local runs of
+    // gradle `:web-transport:publishToMavenLocal` (via package.sh) go
     // without the SIGNING_* env vars; if SIGNING_KEY is declared in repo
     // secrets but unset, `${{ secrets.SIGNING_KEY }}` expands to the empty
     // string and the env var ends up as "" — a bare null-check would call
