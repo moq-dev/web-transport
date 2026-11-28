@@ -77,6 +77,11 @@ test:
 	bun run --cwd js/web-transport build
 	bun run --cwd js/web-transport test
 
+# Run what the pull request CI ran: the checks and tests, then fail if the regenerated Node loader differs from HEAD.
+# Leaves out the Kotlin, Python, Swift, Node-runtime, and browser jobs: they need a JVM, a wheel build, macOS, or Chromium.
+ci: check test
+	git diff --exit-code -- js/web-transport/napi.cjs js/web-transport/napi.d.cts
+
 # Automatically fix some issues.
 fix:
 	cargo fix --allow-staged --allow-dirty --workspace --all-targets --all-features
