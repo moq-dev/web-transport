@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run the repository's CI before every push, so a failure surfaces here instead of in the merge queue.
+# Delete this hook once this repository's kixel.quest merge queue is live.
+set -e
+if [ -f flake.nix ]; then
+	exec nix develop --command just ci
+fi
+exec just ci
